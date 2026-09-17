@@ -1,8 +1,8 @@
 use std::fs::File;
 use std::path::Path;
 
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{ArrayRef, Float64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 use parquet::arrow::ArrowWriter;
 
@@ -63,8 +63,12 @@ pub fn normalize_ashare_symbol(raw_code: &str) -> Option<String> {
 
 pub fn normalize_binance_perp_symbol(raw_symbol: &str) -> Option<String> {
     let normalized = raw_symbol.trim().to_uppercase();
-    if normalized.ends_with(".BINANCE_PERP") {
-        return Some(normalized);
+    if let Some(contract) = normalized.strip_suffix(".BINANCE_PERP") {
+        let is_valid = !contract.is_empty() && contract.chars().all(|c| c.is_ascii_alphanumeric());
+        if is_valid {
+            return Some(normalized);
+        }
+        return None;
     }
 
     let contract: String = normalized
@@ -83,7 +87,11 @@ pub fn daily_bars_to_record_batch(
     let schema = Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
         Field::new("market", DataType::Utf8, false),
-        Field::new("ts_utc_us", DataType::Int64, false),
+        Field::new(
+            "ts_utc_us",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("open", DataType::Float64, false),
         Field::new("high", DataType::Float64, false),
         Field::new("low", DataType::Float64, false),
@@ -105,11 +113,12 @@ pub fn daily_bars_to_record_batch(
             .map(|b| Some(b.market.as_str()))
             .collect::<Vec<Option<&str>>>(),
     );
-    let ts_utc_us = Int64Array::from(
+    let ts_utc_us = TimestampMicrosecondArray::from(
         bars.iter()
             .map(|b| b.timestamp_utc.timestamp_micros())
             .collect::<Vec<i64>>(),
-    );
+    )
+    .with_timezone("UTC");
     let open = Float64Array::from(bars.iter().map(|b| b.open).collect::<Vec<f64>>());
     let high = Float64Array::from(bars.iter().map(|b| b.high).collect::<Vec<f64>>());
     let low = Float64Array::from(bars.iter().map(|b| b.low).collect::<Vec<f64>>());
@@ -230,6 +239,12 @@ mod tests {
             normalize_binance_perp_symbol("btc/usdt"),
             Some("BTCUSDT.BINANCE_PERP".to_string())
         );
+        assert_eq!(
+            normalize_binance_perp_symbol("BTCUSDT.BINANCE_PERP"),
+            Some("BTCUSDT.BINANCE_PERP".to_string())
+        );
+        assert_eq!(normalize_binance_perp_symbol(".BINANCE_PERP"), None);
+        assert_eq!(normalize_binance_perp_symbol("BTC-USDT.BINANCE_PERP"), None);
     }
 
     #[test]
@@ -246,6 +261,14 @@ mod tests {
                 .expect("symbol field")
                 .data_type(),
             &DataType::Utf8
+        );
+        assert_eq!(
+            batch
+                .schema()
+                .field_with_name("ts_utc_us")
+                .expect("timestamp field")
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
     }
 
