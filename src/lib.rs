@@ -39,8 +39,14 @@ pub struct DailyBar {
 
 pub fn normalize_ashare_symbol(raw_code: &str) -> Option<String> {
     let normalized = raw_code.trim().to_uppercase();
-    if normalized.ends_with(".SH") || normalized.ends_with(".SZ") {
-        return Some(normalized);
+    if let Some((code, exchange)) = normalized.split_once('.') {
+        if code.len() == 6
+            && code.chars().all(|c| c.is_ascii_digit())
+            && (exchange == "SH" || exchange == "SZ")
+        {
+            return Some(normalized);
+        }
+        return None;
     }
 
     if normalized.len() != 6 || !normalized.chars().all(|c| c.is_ascii_digit()) {
@@ -212,9 +218,14 @@ mod tests {
             Some("600519.SH".to_string())
         );
         assert_eq!(
+            normalize_ashare_symbol("600519.SH"),
+            Some("600519.SH".to_string())
+        );
+        assert_eq!(
             normalize_ashare_symbol("000001"),
             Some("000001.SZ".to_string())
         );
+        assert_eq!(normalize_ashare_symbol("ABC.SH"), None);
         assert_eq!(
             normalize_binance_perp_symbol("btc/usdt"),
             Some("BTCUSDT.BINANCE_PERP".to_string())

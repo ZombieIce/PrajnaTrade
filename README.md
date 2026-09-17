@@ -12,4 +12,4 @@ Phase-1 implementation now includes:
 
 Core implementation is in:
 
-- `/home/runner/work/PrajnaTrade/PrajnaTrade/src/lib.rs`
+- `src/lib.rs`
