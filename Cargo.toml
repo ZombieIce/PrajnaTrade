@@ -1,0 +1,10 @@
+[package]
+name = "prajna_trade"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow-array = "53"
+arrow-schema = "53"
+chrono = { version = "0.4", features = ["serde"] }
+parquet = { version = "53", features = ["arrow"] }
