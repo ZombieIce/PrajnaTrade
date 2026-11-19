@@ -275,6 +275,9 @@ def advance_campaign(
             reflection_limits["remaining_cost_usd"]
             - proposal.usage.get("estimated_cost_usd", 0.0),
         )
+        reflection_limits["remaining_seconds"] = max(
+            0.0, campaign["max_seconds"] - (prior_elapsed + time.monotonic() - started)
+        )
         reflection_context["limits"] = reflection_limits
         try:
             reflection = provider.reflect(proposal, outcome, reflection_context)
