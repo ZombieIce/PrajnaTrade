@@ -8,10 +8,18 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlparse, urlunparse
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import STRATEGY_FAMILIES, normalize_strategy_spec
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+
+urlopen = build_opener(_RejectRedirects()).open
 
 
 class ProviderError(RuntimeError):

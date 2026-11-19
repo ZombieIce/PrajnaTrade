@@ -3,6 +3,7 @@ import html
 import os
 import subprocess
 import sys
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -179,8 +180,6 @@ def test_mock_campaign_can_pause_resume_and_preserve_every_attempt(
         for item in status_result["experiments"]
     )
 
-    # A process interrupted between checkpoints leaves the persisted status running.
-    SQLiteStore(database).update_campaign(campaign_id, status="running")
     resumed = _run_cli(
         "research",
         "resume",
@@ -359,6 +358,83 @@ def test_interruption_during_reflection_preserves_completed_backtest(tmp_path: P
     assert attempts[1]["provider_usage"]["total_tokens"] == 10
 
 
+def test_interrupted_provider_time_is_counted_on_resume(tmp_path: Path) -> None:
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    _write_bars(bars, day_count=24)
+    started = _run_cli(
+        "research", "run", "--db", str(database), "--data", str(bars),
+        "--price-basis", "total_return", "--data-kind", "synthetic",
+        "--provider", "mock", "--seed", "1", "--experiments", "2", "--steps", "1",
+        "--holdout-start", "2025-01-01", "--holdout-end", "2025-01-31",
+    )
+    assert started.returncode == 0, started.stderr
+    campaign_id = json.loads(started.stdout)["campaign_id"]
+    before = campaign_status(database, campaign_id)["campaign"]["elapsed_seconds"]
+
+    class InterruptedProvider(MockProvider):
+        def propose(self, iteration, context):
+            time.sleep(0.1)
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        resume_campaign(
+            database=database, campaign_id=campaign_id, provider=InterruptedProvider(1),
+        )
+    status = campaign_status(database, campaign_id)["campaign"]
+    assert status["elapsed_seconds"] >= before + 0.09
+    assert status["status"] == "paused"
+
+
+def test_process_kill_recovers_time_conservatively(tmp_path: Path) -> None:
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    marker = tmp_path / "provider-entered"
+    _write_bars(bars, day_count=24)
+    started = _run_cli(
+        "research", "run", "--db", str(database), "--data", str(bars),
+        "--price-basis", "total_return", "--data-kind", "synthetic",
+        "--provider", "mock", "--seed", "1", "--experiments", "2", "--steps", "1",
+        "--holdout-start", "2025-01-01", "--holdout-end", "2025-01-31",
+    )
+    assert started.returncode == 0, started.stderr
+    campaign_id = json.loads(started.stdout)["campaign_id"]
+    before = campaign_status(database, campaign_id)["campaign"]["elapsed_seconds"]
+    code = """
+import sys, time
+from pathlib import Path
+from prajnatrade.providers import MockProvider
+from prajnatrade.research import resume_campaign
+class WaitingProvider(MockProvider):
+    def propose(self, iteration, context):
+        Path(sys.argv[3]).write_text('started')
+        time.sleep(30)
+resume_campaign(database=sys.argv[1], campaign_id=sys.argv[2], provider=WaitingProvider(1))
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(database), campaign_id, str(marker)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError(process.communicate()[1].decode())
+            time.sleep(0.01)
+        assert marker.exists()
+        time.sleep(0.1)
+        process.kill()
+        process.wait(timeout=5)
+        assert campaign_status(database, campaign_id)["campaign"]["status"] == "running"
+        time.sleep(0.1)
+        resumed = resume_campaign(database=database, campaign_id=campaign_id)
+        assert resumed["elapsed_seconds"] >= before + 0.18
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def test_repeated_reflection_failures_stop_at_consecutive_failure_budget(
     tmp_path: Path,
 ) -> None:
@@ -511,6 +587,120 @@ def test_exhausted_reflection_budget_retains_newly_completed_backtest(tmp_path: 
     assert experiment["metrics"] is not None
     assert "Reflection not completed" in experiment["reflection"]
     freeze_candidate(database, started["campaign_id"], experiment["experiment_id"], "candidate", "Frozen")
+
+
+@pytest.mark.parametrize("budget_kind", ["token_budget", "cost_budget"])
+def test_exhausted_proposal_budget_resumes_backtest_without_another_request(
+    tmp_path: Path, budget_kind: str,
+) -> None:
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    marker = tmp_path / "interrupted"
+    _write_bars(bars, day_count=20)
+    started = _run_cli(
+        "research", "run", "--db", str(database), "--data", str(bars),
+        "--price-basis", "total_return", "--data-kind", "synthetic",
+        "--provider", "mock", "--seed", "1", "--experiments", "2", "--steps", "1",
+        "--token-budget", "100" if budget_kind == "token_budget" else "500",
+        "--cost-budget-usd", "1" if budget_kind == "token_budget" else "0.1",
+        "--holdout-start", "2025-01-01",
+        "--holdout-end", "2025-01-31",
+    )
+    assert started.returncode == 0, started.stderr
+    campaign_id = json.loads(started.stdout)["campaign_id"]
+
+    class InterruptedProposal(MockProvider):
+        def __init__(self):
+            super().__init__(1)
+            self.proposals = 0
+            self.reflections = 0
+
+        def propose(self, iteration, context):
+            self.proposals += 1
+            return Proposal(
+                hypothesis="A persisted proposal", rationale="Finish without another request",
+                strategy={
+                    "family": "python", "parameters": {},
+                    "source": (
+                        f"from pathlib import Path\nmarker = Path({str(marker)!r})\n"
+                        "if not marker.exists():\n"
+                        "    marker.write_text('interrupted')\n"
+                        "    raise KeyboardInterrupt\n"
+                        "def strategy(history, state):\n    return {CASH: 1.0}\n"
+                    ),
+                },
+                usage={"requests": 1, "total_tokens": 100, "estimated_cost_usd": 0.1},
+            )
+
+        def reflect(self, proposal, result, context):
+            self.reflections += 1
+            raise AssertionError("A reflection must not be sent after budget exhaustion")
+
+    provider = InterruptedProposal()
+    with pytest.raises(KeyboardInterrupt):
+        resume_campaign(
+            database=database, campaign_id=campaign_id, provider=provider,
+            trusted_local_python=True,
+        )
+    pending = campaign_status(database, campaign_id)["experiments"][1]
+    assert pending["status"] == "running"
+    result = resume_campaign(
+        database=database, campaign_id=campaign_id, provider=provider,
+        trusted_local_python=True,
+    )
+    experiment = campaign_status(database, campaign_id)["experiments"][1]
+    assert result["stop_reason"] == budget_kind
+    assert experiment["status"] == "succeeded"
+    assert experiment["metrics"] is not None
+    assert experiment["experiment_id"] == pending["experiment_id"]
+    assert experiment["provider_usage"]["total_tokens"] == 100
+    assert provider.proposals == 1
+    assert provider.reflections == 0
+
+
+def test_time_budget_exhaustion_finalizes_unfinished_backtest(tmp_path: Path) -> None:
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    _write_bars(bars, day_count=20)
+    started = _run_cli(
+        "research", "run", "--db", str(database), "--data", str(bars),
+        "--price-basis", "total_return", "--data-kind", "synthetic",
+        "--provider", "mock", "--seed", "1", "--experiments", "2", "--steps", "1",
+        "--max-seconds", "1", "--holdout-start", "2025-01-01",
+        "--holdout-end", "2025-01-31",
+    )
+    assert started.returncode == 0, started.stderr
+    campaign_id = json.loads(started.stdout)["campaign_id"]
+
+    class InterruptedBacktest(MockProvider):
+        def propose(self, iteration, context):
+            return Proposal(
+                hypothesis="Incomplete backtest", rationale="Time budget applies",
+                strategy={
+                    "family": "python", "parameters": {},
+                    "source": (
+                        "import time\ntime.sleep(1.1)\nraise KeyboardInterrupt\n"
+                        "def strategy(history, state):\n    return {CASH: 1.0}\n"
+                    ),
+                },
+                usage={"requests": 1, "total_tokens": 1, "estimated_cost_usd": 0.01},
+            )
+
+    provider = InterruptedBacktest(1)
+    with pytest.raises(KeyboardInterrupt):
+        resume_campaign(
+            database=database, campaign_id=campaign_id, provider=provider,
+            trusted_local_python=True,
+        )
+    resumed = resume_campaign(
+        database=database, campaign_id=campaign_id, provider=provider,
+        trusted_local_python=True,
+    )
+    experiment = campaign_status(database, campaign_id)["experiments"][1]
+    assert resumed["stop_reason"] == "time_budget"
+    assert experiment["status"] == "failed"
+    assert experiment["metrics"] is None
+    assert "Backtest not completed: time_budget" in experiment["error"]
 
 
 def test_generated_strategy_cannot_declare_non_numeric_parameters_absent() -> None:

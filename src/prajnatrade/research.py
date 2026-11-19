@@ -100,7 +100,7 @@ def start_campaign(
             "max_consecutive_failures": max_consecutive_failures,
             "max_seconds": max_seconds,
             "elapsed_seconds": 0.0,
-            "status": "running",
+            "status": "paused",
             "stop_reason": None,
             "initial_cash": initial_cash,
             "transaction_cost_bps": transaction_cost_bps,
@@ -176,8 +176,60 @@ def advance_campaign(
         raise ValueError("steps must be greater than zero.")
     if isinstance(provider, OpenAICompatibleProvider):
         provider.bind_budget_store(store, campaign_id)
-    started = time.monotonic()
     prior_elapsed = float(campaign["elapsed_seconds"])
+    checkpoint = campaign["active_checkpoint_at"]
+    if campaign["status"] == "running":
+        if checkpoint is None:
+            raise ValueError(
+                "Interrupted campaign has no recoverable time checkpoint; "
+                "start a new campaign rather than resetting its time budget."
+            )
+        try:
+            checkpoint_time = datetime.fromisoformat(checkpoint)
+            recovery_seconds = (datetime.now(timezone.utc) - checkpoint_time).total_seconds()
+        except (TypeError, ValueError) as error:
+            raise ValueError("Invalid interrupted campaign time checkpoint.") from error
+        if recovery_seconds < 0:
+            raise ValueError("System clock precedes the interrupted campaign time checkpoint.")
+        prior_elapsed += recovery_seconds
+    elif checkpoint is not None:
+        raise ValueError("Paused campaign unexpectedly has an active time checkpoint.")
+    checkpoint_at = _now()
+    started = time.monotonic()
+    store.update_campaign(
+        campaign_id, updated_at=checkpoint_at, elapsed_seconds=prior_elapsed,
+        active_checkpoint_at=checkpoint_at, status="running", stop_reason=None,
+    )
+    finished = False
+    try:
+        result = _advance_active_campaign(
+            store, campaign_id, campaign, dataset, provider, steps=steps,
+            trusted_local_python=trusted_local_python, prior_elapsed=prior_elapsed,
+            started=started,
+        )
+        finished = True
+        return result
+    finally:
+        if not finished:
+            store.update_campaign(
+                campaign_id, updated_at=_now(),
+                elapsed_seconds=prior_elapsed + time.monotonic() - started,
+                active_checkpoint_at=None, status="paused", stop_reason="interrupted",
+            )
+
+
+def _advance_active_campaign(
+    store: SQLiteStore,
+    campaign_id: str,
+    campaign: dict[str, Any],
+    dataset: ValidatedData,
+    provider: ResearchProvider,
+    *,
+    steps: int | None,
+    trusted_local_python: bool,
+    prior_elapsed: float,
+    started: float,
+) -> dict[str, Any]:
     attempts_this_run = 0
     experiments = store.list_experiments(campaign_id)
     pending = None
@@ -196,6 +248,7 @@ def advance_campaign(
             [item["usage"] for item in requests]
             if isinstance(provider, OpenAICompatibleProvider)
             else [item["provider_usage"] for item in experiments]
+            + ([pending["provider_usage"]] if pending is not None else [])
         )
         token_usage = sum(int(item.get("total_tokens", 0)) for item in usages)
         cost_usage = sum(
@@ -211,10 +264,11 @@ def advance_campaign(
         if elapsed >= campaign["max_seconds"]:
             stop_reason = "time_budget"
             break
-        if token_usage >= campaign["token_budget"]:
+        backtest_pending = pending is not None and pending["metrics"] is None and pending["error"] is None
+        if token_usage >= campaign["token_budget"] and not backtest_pending:
             stop_reason = "token_budget"
             break
-        if cost_usage >= campaign["cost_budget_usd"]:
+        if cost_usage >= campaign["cost_budget_usd"] and not backtest_pending:
             stop_reason = "cost_budget"
             break
         if pending is None and steps is not None and attempts_this_run >= steps:
@@ -364,18 +418,31 @@ def advance_campaign(
                 )
             )
         else:
+            attempt_usages = [item["provider_usage"] for item in experiments] + [proposal.usage]
             reflection_limits["remaining_tokens"] = max(
-                0, reflection_limits["remaining_tokens"] - proposal.usage.get("total_tokens", 0)
+                0, campaign["token_budget"] - sum(
+                    int(item.get("total_tokens", 0)) for item in attempt_usages
+                )
             )
             reflection_limits["remaining_cost_usd"] = max(
-                0.0,
-                reflection_limits["remaining_cost_usd"]
-                - proposal.usage.get("estimated_cost_usd", 0.0),
+                0.0, campaign["cost_budget_usd"] - sum(
+                    float(item.get("actual_cost_usd", item.get("estimated_cost_usd", 0.0)))
+                    for item in attempt_usages
+                )
             )
         reflection_limits["remaining_seconds"] = max(
             0.0, campaign["max_seconds"] - (prior_elapsed + time.monotonic() - started)
         )
         reflection_context["limits"] = reflection_limits
+        if reflection_limits["remaining_seconds"] <= 0:
+            stop_reason = "time_budget"
+            break
+        if reflection_limits["remaining_tokens"] <= 0:
+            stop_reason = "token_budget"
+            break
+        if reflection_limits["remaining_cost_usd"] <= 0:
+            stop_reason = "cost_budget"
+            break
         try:
             reflection = provider.reflect(proposal, outcome, reflection_context)
         except ProviderBudgetExceeded as error:
@@ -472,18 +539,22 @@ def advance_campaign(
     if (
         pending is not None
         and stop_reason in {"time_budget", "token_budget", "cost_budget"}
-        and (pending["metrics"] is not None or pending["error"] is not None)
     ):
         usage = (
             store.experiment_request_usage(campaign_id, pending["ordinal"])
             if isinstance(provider, OpenAICompatibleProvider)
             else pending["provider_usage"]
         )
+        backtest_unavailable = pending["metrics"] is None and pending["error"] is None
         store.update_experiment(
             pending["experiment_id"],
-            status="failed" if pending["error"] else "succeeded",
+            status="failed" if pending["error"] or backtest_unavailable else "succeeded",
             decision="stop",
             reflection=f"Reflection not completed: {stop_reason}.",
+            error=(
+                f"Backtest not completed: {stop_reason}."
+                if backtest_unavailable else pending["error"]
+            ),
             provider_usage_json=usage,
         )
         experiments.append(store.get_experiment(campaign_id, pending["experiment_id"]))
@@ -517,6 +588,7 @@ def advance_campaign(
         campaign_id,
         updated_at=_now(),
         elapsed_seconds=elapsed,
+        active_checkpoint_at=None,
         status=status,
         stop_reason=stop_reason,
     )
@@ -671,10 +743,12 @@ def _decode_experiment(experiment: dict[str, Any]) -> dict[str, Any]:
 def _save_progress(
     store: SQLiteStore, campaign_id: str, prior_elapsed: float, started: float
 ) -> None:
+    checkpoint_at = _now()
     store.update_campaign(
         campaign_id,
-        updated_at=_now(),
+        updated_at=checkpoint_at,
         elapsed_seconds=prior_elapsed + time.monotonic() - started,
+        active_checkpoint_at=checkpoint_at,
         status="running",
         stop_reason=None,
     )

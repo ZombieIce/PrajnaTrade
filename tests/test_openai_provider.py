@@ -101,6 +101,53 @@ def test_best_effort_requires_explicit_risk_acceptance() -> None:
         )
 
 
+def test_provider_does_not_forward_credentials_on_redirect() -> None:
+    class Destination(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.server.received.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+    destination.received = []
+
+    class Redirect(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{destination.server_port}/stolen")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (destination, redirect)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        provider = _best_effort_provider(
+            endpoint=f"http://127.0.0.1:{redirect.server_port}/v1", model="test-model",
+            api_key="local-test-secret", input_cost_per_1k_tokens=0.1,
+            output_cost_per_1k_tokens=0.2,
+        )
+        with pytest.raises(ProviderError, match="302"):
+            provider.propose(1, {"limits": {"remaining_tokens": 5000, "remaining_cost_usd": 1}})
+        assert destination.received == []
+    finally:
+        for server in (redirect, destination):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
+
+
 def test_unverifiable_budget_pauses_campaign_without_losing_progress(tmp_path: Path) -> None:
     server, thread = _start_server([])
     bars_path = tmp_path / "bars.csv"

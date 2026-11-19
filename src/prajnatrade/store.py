@@ -49,6 +49,7 @@ class SQLiteStore:
                     max_consecutive_failures INTEGER NOT NULL,
                     max_seconds REAL NOT NULL,
                     elapsed_seconds REAL NOT NULL DEFAULT 0,
+                    active_checkpoint_at TEXT,
                     status TEXT NOT NULL,
                     stop_reason TEXT,
                     initial_cash REAL NOT NULL,
@@ -140,6 +141,8 @@ class SQLiteStore:
                 )
             if "max_drawdown_limit" not in campaign_columns:
                 connection.execute("ALTER TABLE campaigns ADD COLUMN max_drawdown_limit REAL")
+            if "active_checkpoint_at" not in campaign_columns:
+                connection.execute("ALTER TABLE campaigns ADD COLUMN active_checkpoint_at TEXT")
             experiment_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(experiments)").fetchall()
@@ -203,6 +206,7 @@ class SQLiteStore:
         allowed = {
             "updated_at",
             "elapsed_seconds",
+            "active_checkpoint_at",
             "status",
             "stop_reason",
         }

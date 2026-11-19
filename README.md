@@ -86,8 +86,15 @@ prajnatrade research resume --db research.sqlite --campaign-id <campaign-id>
 Paused campaigns and campaigns left in `running` state by an interrupted
 process can be resumed from their persisted experiment history. Resume a
 `running` campaign only after its original process has stopped; concurrent
-workers on the same campaign are not supported. The campaign time budget is
-checked between attempts; it does not interrupt an attempt already in progress.
+workers on the same campaign are not supported. Time spent before a handled
+interruption is recorded. After an abrupt termination, the time since the last
+checkpoint is conservatively charged on resume, including downtime; a missing
+or invalid checkpoint or a backwards system clock prevents unsafe recovery.
+Older `running` campaigns without a checkpoint must be recreated. The campaign
+time budget is checked between stages; it does not interrupt a backtest already
+in progress. If provider token or cost budget is exhausted after a proposal is
+saved, its pending backtest may finish without another provider call; if the
+time budget is exhausted before that backtest, the attempt is marked failed.
 
 Freeze a successful experiment before evaluating it on the independent
 validation interval. Each campaign permits at most three frozen candidates.
@@ -138,6 +145,8 @@ explicitly provide `--budget-mode best-effort --accept-budget-overrun-risk`
 on run and on each resume. Best-effort reduces output tokens to fit the
 estimated remaining budget, but input tokenization, provider usage and actual
 charges can differ. The rates are estimates, not invoices.
+Provider redirects are rejected, including same-origin redirects; configure the
+final endpoint directly so credentials are never forwarded by a redirect.
 
 Each request is reserved in SQLite before sending. `research status` and the
 report show the ledger; an interrupted request or a response without complete
