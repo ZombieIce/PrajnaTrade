@@ -51,7 +51,7 @@ def write_campaign_report(
                 "Data fingerprint": campaign["data_hash"],
                 "Price basis": campaign["price_basis"],
                 "Universe": "511260, 518880, 515080, 513300, 159612, CASH",
-                "Research attempts": str(len(experiments)),
+                "Total research attempts": str(len(experiments)),
                 "Failed attempts": str(failed_attempts),
                 "Provider tokens": str(provider_tokens),
                 "Estimated provider cost": f"${provider_cost:.6f}",
@@ -210,11 +210,25 @@ def _candidate_sections(
         return "<p>No candidates have been frozen.</p>"
     sections = []
     for candidate in candidates:
+        split = candidate["split"]
+        split_summary = " | ".join(
+            f"{period}: {split[f'{period}_start']} — {split[f'{period}_end']}"
+            for period in ("discovery", "validation", "holdout")
+        )
         sections.extend(
             [
                 f"<h3>{html.escape(candidate['name'])}</h3>",
                 f"<p>{html.escape(candidate['conclusion'])}</p>",
-                f"<p>Frozen strategy fingerprint: <code>{html.escape(candidate['strategy_hash'])}</code></p>",
+                _definition_list(
+                    {
+                        "Candidate fingerprint": candidate["candidate_hash"],
+                        "Frozen strategy fingerprint": candidate["strategy_hash"],
+                        "Frozen data fingerprint": candidate["data_hash"],
+                        "Source experiment": candidate["experiment_id"],
+                        "Frozen at": candidate["frozen_at"],
+                        "Frozen data split": split_summary,
+                    }
+                ),
             ]
         )
         for evaluation in evaluations_by_candidate[candidate["candidate_id"]]:
@@ -236,13 +250,17 @@ def _candidate_sections(
             )
             if evaluation["kind"] == "validation":
                 sections.append(
-                    f"<p>Cost sensitivity at {result['cost_sensitivity']['transaction_cost_bps']} bps: "
-                    f"total return {_format(result['cost_sensitivity']['total_return'])}</p>"
+                    f"<h5>Cost sensitivity at "
+                    f"{_format(result['cost_sensitivity']['transaction_cost_bps'])} bps</h5>"
                 )
+                sections.append(_metrics_table(result["cost_sensitivity"]["metrics"]))
                 sections.append(
                     "<p>Parameter robustness: "
                     + html.escape(str(result["parameter_robustness"]))
                     + "</p>"
+                )
+                sections.append(
+                    _period_breakdown(result["market_period_breakdown"])
                 )
             else:
                 sections.append(
@@ -251,6 +269,23 @@ def _candidate_sections(
                     + " after explicit confirmation.</p>"
                 )
     return "".join(sections)
+
+
+def _period_breakdown(periods: dict[str, float]) -> str:
+    if not periods:
+        return (
+            '<h5>Market-period breakdown</h5>'
+            '<p class="muted">Unavailable for this interval.</p>'
+        )
+    rows = "".join(
+        f"<tr><td>{html.escape(period)}</td><td>{_format(value)}</td></tr>"
+        for period, value in periods.items()
+    )
+    return (
+        "<h5>Market-period breakdown</h5>"
+        "<table><thead><tr><th>Period</th><th>Return</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
+    )
 
 
 def _equity_and_drawdown(curve: list[dict[str, Any]], title: str) -> str:

@@ -370,7 +370,9 @@ def test_mock_generated_code_is_persisted_and_can_be_evaluated_only_with_opt_in(
         "--conclusion", "Frozen before validation.",
     )
     assert frozen.returncode == 0, frozen.stderr
-    candidate_id = json.loads(frozen.stdout)["candidate_id"]
+    frozen_result = json.loads(frozen.stdout)
+    candidate_id = frozen_result["candidate_id"]
+    assert frozen_result["candidate_hash"]
     args = [
         "research", "validate", "--db", str(database), "--candidate-id", candidate_id,
         "--data", str(bars), "--price-basis", "total_return", "--data-kind", "synthetic",
@@ -455,7 +457,9 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
         "Freeze this strategy before independent validation.",
     )
     assert frozen.returncode == 0, frozen.stderr
-    candidate_id = json.loads(frozen.stdout)["candidate_id"]
+    frozen_result = json.loads(frozen.stdout)
+    candidate_id = frozen_result["candidate_id"]
+    assert frozen_result["candidate_hash"]
 
     altered_bars = tmp_path / "altered.csv"
     altered_bars.write_text(
@@ -499,7 +503,12 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
     assert validation.returncode == 0, validation.stderr
     validation_result = json.loads(validation.stdout)
     assert validation_result["kind"] == "validation"
-    assert "benchmark_excess_return" in validation_result["result"]
+    evidence = validation_result["result"]
+    assert "benchmark_excess_return" in evidence
+    assert evidence["candidate"]["metrics"]["max_drawdown"] is not None
+    assert evidence["cost_sensitivity"]["metrics"]["total_return"] is not None
+    assert evidence["parameter_robustness"]["variants"]
+    assert evidence["market_period_breakdown"]
 
     wrong_confirmation = _run_cli(
         "research",
@@ -560,6 +569,8 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
     )
     assert holdout.returncode == 0, holdout.stderr
     assert json.loads(holdout.stdout)["kind"] == "holdout"
+    holdout_result = json.loads(holdout.stdout)["result"]
+    assert holdout_result["unlocked_at"]
 
     repeated = _run_cli(
         "research",
@@ -629,7 +640,14 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
     assert "synthetic" in html
     assert "Objective" in html
     assert "Candidate A" in html
+    assert frozen_result["candidate_hash"] in html
+    assert "<dt>Total research attempts</dt><dd>1</dd>" in html
+    assert "Frozen data split" in html
+    assert "Market-period breakdown" in html
+    assert "<td>2024</td>" in html
+    assert "Cost sensitivity" in html
     assert "Holdout" in html
+    assert holdout_result["unlocked_at"] in html
     assert "drawdown" in html.lower()
     repeated_report = _run_cli(
         "research", "report", "--db", str(database),
