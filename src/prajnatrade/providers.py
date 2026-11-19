@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, urlparse, urlunparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from prajnatrade.strategies import STRATEGY_FAMILIES
+from prajnatrade.strategies import STRATEGY_FAMILIES, normalize_strategy_spec
 
 
 class ProviderError(RuntimeError):
@@ -292,7 +292,9 @@ class OpenAICompatibleProvider:
             parsed = parse_structured_response(response)
             if _contains_credential(parsed, self._api_key):
                 raise ProviderError("Provider response contains the configured credential.")
-            proposal = validate_proposal_response(parsed)
+            proposal = validate_proposal_response(
+                parsed, trusted_local_python=trusted_local_python
+            )
         except ProviderError as error:
             raise ProviderError(str(error), usage=usage) from error
         return replace(proposal, usage=usage)
@@ -329,6 +331,17 @@ class OpenAICompatibleProvider:
         self, prompt: Mapping[str, Any], context: Mapping[str, Any]
     ) -> tuple[str, dict[str, Any]]:
         limits = context.get("limits", {})
+        try:
+            remaining_seconds = float(limits.get("remaining_seconds", self.timeout))
+        except (TypeError, ValueError) as error:
+            raise ProviderError("Remaining provider time budget must be a number.") from error
+        if not math.isfinite(remaining_seconds):
+            raise ProviderError("Remaining provider time budget must be finite.")
+        if remaining_seconds <= 0:
+            raise ProviderBudgetExceeded(
+                "time_budget", "No campaign time remains for a provider request."
+            )
+        request_timeout = min(self.timeout, remaining_seconds)
         remaining_tokens = int(limits.get("remaining_tokens", self.max_tokens))
         remaining_cost = float(limits.get("remaining_cost_usd", float("inf")))
         request_payload: dict[str, Any] = {
@@ -405,7 +418,7 @@ class OpenAICompatibleProvider:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=request_timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             raise ProviderError(
@@ -496,7 +509,11 @@ def parse_structured_response(content: str, expected_version: str = "1") -> dict
     return response
 
 
-def validate_proposal_response(response: Mapping[str, Any]) -> Proposal:
+def validate_proposal_response(
+    response: Mapping[str, Any], *, trusted_local_python: bool = False
+) -> Proposal:
+    if set(response) != {"schema_version", "hypothesis", "rationale", "strategy"}:
+        raise ProviderError("Provider proposal does not match the versioned response contract.")
     hypothesis = response.get("hypothesis")
     rationale = response.get("rationale")
     strategy = response.get("strategy")
@@ -506,15 +523,34 @@ def validate_proposal_response(response: Mapping[str, Any]) -> Proposal:
         raise ProviderError("Provider rationale must be a string of at most 2,000 characters.")
     if not isinstance(strategy, dict):
         raise ProviderError("Provider strategy must be a JSON object.")
+    family = strategy.get("family")
+    if trusted_local_python:
+        if family != "python":
+            raise ProviderError("Provider strategy must be Python when trusted-local opt-in is enabled.")
+        expected_strategy_fields = {"family", "parameters", "source"}
+    else:
+        if family not in STRATEGY_FAMILIES:
+            raise ProviderError(
+                "Provider strategy family is unsupported; generated Python requires trusted-local opt-in."
+            )
+        expected_strategy_fields = {"family", "parameters"}
+    if set(strategy) != expected_strategy_fields:
+        raise ProviderError("Provider strategy does not match the versioned response contract.")
+    try:
+        normalized_strategy = normalize_strategy_spec(strategy)
+    except (TypeError, ValueError) as error:
+        raise ProviderError(f"Provider strategy contract is invalid: {error}") from error
     return Proposal(
         hypothesis=hypothesis.strip(),
         rationale=rationale.strip(),
-        strategy=strategy,
+        strategy=normalized_strategy,
         usage=_zero_usage(),
     )
 
 
 def validate_reflection_response(response: Mapping[str, Any]) -> Reflection:
+    if set(response) != {"schema_version", "decision", "reflection"}:
+        raise ProviderError("Provider reflection does not match the versioned response contract.")
     allowed = {"keep", "reject", "branch", "investigate", "stop"}
     decision = response.get("decision")
     text = response.get("reflection")

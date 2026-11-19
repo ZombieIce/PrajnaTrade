@@ -227,6 +227,98 @@ def test_structured_contract_rejects_malformed_or_wrong_version_json() -> None:
         parse_structured_response('{"schema_version":"2"}')
 
 
+def test_openai_provider_rejects_strategy_outside_versioned_contract() -> None:
+    proposal = {
+        "schema_version": "1",
+        "hypothesis": "Try an unsupported strategy.",
+        "rationale": "The strategy family is not part of the contract.",
+        "strategy": {"family": "parameter_grid", "parameters": {}},
+    }
+    server, thread = _start_server([_chat_response(json.dumps(proposal))])
+    try:
+        provider = OpenAICompatibleProvider(
+            endpoint=f"http://127.0.0.1:{server.server_port}/v1",
+            model="test-model",
+            api_key="local-test-secret",
+            input_cost_per_1k_tokens=1.0,
+            output_cost_per_1k_tokens=2.0,
+        )
+        with pytest.raises(ProviderError, match="strategy"):
+            provider.propose(
+                1, {"limits": {"remaining_tokens": 2000, "remaining_cost_usd": 1.0}}
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert server.requests[0]["authorization"] == "Bearer local-test-secret"
+
+
+def test_openai_provider_rejects_python_without_trusted_local_opt_in() -> None:
+    proposal = {
+        "schema_version": "1",
+        "hypothesis": "Try generated Python.",
+        "rationale": "Execution is not authorized by the caller.",
+        "strategy": {
+            "family": "python",
+            "parameters": {},
+            "source": "def strategy(history, state):\n    return {CASH: 1.0}\n",
+        },
+    }
+    server, thread = _start_server([_chat_response(json.dumps(proposal))])
+    try:
+        provider = OpenAICompatibleProvider(
+            endpoint=f"http://127.0.0.1:{server.server_port}/v1",
+            model="test-model",
+            api_key="local-test-secret",
+            input_cost_per_1k_tokens=1.0,
+            output_cost_per_1k_tokens=2.0,
+        )
+        with pytest.raises(ProviderError, match="trusted-local opt-in"):
+            provider.propose(
+                1, {"limits": {"remaining_tokens": 2000, "remaining_cost_usd": 1.0}}
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_openai_provider_bounds_http_timeout_by_remaining_campaign_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prajnatrade.providers as providers_module
+
+    timeouts: list[float] = []
+
+    def fail_request(request: object, *, timeout: float) -> None:
+        timeouts.append(timeout)
+        raise TimeoutError
+
+    monkeypatch.setattr(providers_module, "urlopen", fail_request)
+    provider = OpenAICompatibleProvider(
+        endpoint="http://127.0.0.1/v1",
+        model="test-model",
+        api_key="local-test-secret",
+        timeout=30,
+        input_cost_per_1k_tokens=1.0,
+        output_cost_per_1k_tokens=2.0,
+    )
+    with pytest.raises(ProviderError, match="TimeoutError"):
+        provider.propose(
+            1,
+            {
+                "limits": {
+                    "remaining_seconds": 0.25,
+                    "remaining_tokens": 2000,
+                    "remaining_cost_usd": 1.0,
+                }
+            },
+        )
+
+    assert timeouts == [0.25]
+
+
 @pytest.mark.parametrize("generated_python", [False, True])
 def test_campaign_records_provider_usage_without_persisting_api_credentials(
     tmp_path: Path, generated_python: bool,
