@@ -19,14 +19,15 @@ SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
 
 
 def _write_bars(path: Path, day_count: int = 12) -> None:
-    lines = ["date,symbol,open,high,low,close,volume"]
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
     for day_index in range(day_count):
         day = (date(2024, 1, 1) + timedelta(days=day_index)).isoformat()
         for symbol_index, symbol in enumerate(SYMBOLS):
             close = 100 + symbol_index + day_index * (symbol_index + 1)
             open_price = close - 1
             lines.append(
-                f"{day},{symbol},{open_price},{close},{open_price},{close},1000"
+                f"{day},{symbol},{open_price},{close},{open_price},{close},"
+                "1000,total_return"
             )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -458,7 +459,9 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
 
     altered_bars = tmp_path / "altered.csv"
     altered_bars.write_text(
-        bars.read_text(encoding="utf-8").replace(",1000\n", ",1001\n", 1),
+        bars.read_text(encoding="utf-8").replace(
+            ",1000,total_return\n", ",1001,total_return\n", 1
+        ),
         encoding="utf-8",
     )
     for data, kind in ((bars, "real"), (altered_bars, "synthetic")):

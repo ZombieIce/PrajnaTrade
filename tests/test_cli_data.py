@@ -12,9 +12,11 @@ from prajnatrade.data import load_bars
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
 
 
-def _write_bars(path: Path, mixed_basis: bool = False) -> None:
+def _write_bars(
+    path: Path, mixed_basis: bool = False, include_basis: bool = True
+) -> None:
     headers = "date,symbol,open,high,low,close,volume"
-    if mixed_basis:
+    if include_basis:
         headers += ",price_basis"
     lines = [headers]
     for day, open_price, close_price in (
@@ -27,8 +29,12 @@ def _write_bars(path: Path, mixed_basis: bool = False) -> None:
                 continue
             row_open = "" if day == "2024-01-03" and symbol == "515080" else open_price
             row = f"{day},{symbol},{row_open},{close_price},{row_open},{close_price},1000"
-            if mixed_basis:
-                basis = "raw" if day == "2024-01-03" and symbol == "511260" else "total_return"
+            if include_basis:
+                basis = (
+                    "raw"
+                    if mixed_basis and day == "2024-01-03" and symbol == "511260"
+                    else "total_return"
+                )
                 row += f",{basis}"
             lines.append(row)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -70,7 +76,35 @@ def test_data_validate_reports_missing_bars_and_unavailable_opens(
     assert result["data_kind"] == "synthetic"
     assert result["missing_symbols_by_date"]["2024-01-03"] == ["513300"]
     assert result["unavailable_opens"] == 1
-    assert result["calendar_validation"]["status"] == "not_checked"
+    assert result["calendar_validation"] == {
+        "status": "inferred_weekdays",
+        "missing_dates": [],
+        "unexpected_dates": [],
+    }
+
+
+def test_data_validate_reports_a_missing_weekday_without_an_external_calendar(
+    tmp_path: Path,
+) -> None:
+    bars = tmp_path / "bars.csv"
+    _write_bars(bars)
+    lines = bars.read_text(encoding="utf-8").splitlines()
+    bars.write_text(
+        "\n".join(line for line in lines if not line.startswith("2024-01-03,")) + "\n",
+        encoding="utf-8",
+    )
+
+    completed = _run_cli(
+        "data", "validate", "--data", str(bars), "--price-basis", "total_return",
+        "--data-kind", "synthetic",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["calendar_validation"] == {
+        "status": "inferred_weekdays",
+        "missing_dates": ["2024-01-03"],
+        "unexpected_dates": [],
+    }
 
 
 def test_data_validate_checks_entirely_missing_dates_against_calendar(
@@ -128,6 +162,19 @@ def test_data_validate_rejects_mixed_price_bases(tmp_path: Path) -> None:
 
     assert completed.returncode == 2
     assert "Mixed or mismatched price basis" in completed.stderr
+
+
+def test_data_validate_rejects_unverifiable_price_basis(tmp_path: Path) -> None:
+    bars = tmp_path / "unstamped.csv"
+    _write_bars(bars, include_basis=False)
+
+    completed = _run_cli(
+        "data", "validate", "--data", str(bars), "--price-basis", "total_return",
+        "--data-kind", "real",
+    )
+
+    assert completed.returncode == 2
+    assert "Missing required columns: price_basis" in completed.stderr
 
 
 def test_data_validate_reads_parquet_bars(tmp_path: Path) -> None:

@@ -253,12 +253,14 @@ def test_campaign_records_provider_usage_without_persisting_api_credentials(
     )
     bars_path = tmp_path / "bars.csv"
     database = tmp_path / "research.sqlite"
-    lines = ["date,symbol,open,high,low,close,volume"]
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
     for index in range(6):
         day = (date(2024, 1, 1) + timedelta(days=index)).isoformat()
         for symbol_index, symbol in enumerate(ETF_SYMBOLS):
             close = 100 + symbol_index + index
-            lines.append(f"{day},{symbol},{close - 1},{close},{close - 1},{close},1000")
+            lines.append(
+                f"{day},{symbol},{close - 1},{close},{close - 1},{close},1000,total_return"
+            )
     bars_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     secret = "local-test-secret-that-must-not-be-stored"
     endpoint = f"http://127.0.0.1:{server.server_port}/v1"
@@ -336,11 +338,11 @@ def test_invalid_provider_response_retains_reported_usage(
     server, thread = _start_server([_chat_response(content)])
     bars_path = tmp_path / "bars.csv"
     database = tmp_path / "research.sqlite"
-    lines = ["date,symbol,open,high,low,close,volume"]
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
     for index in range(6):
         day = (date(2024, 1, 1) + timedelta(days=index)).isoformat()
         for symbol in ETF_SYMBOLS:
-            lines.append(f"{day},{symbol},100,101,100,101,1000")
+            lines.append(f"{day},{symbol},100,101,100,101,1000,total_return")
     bars_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     provider = OpenAICompatibleProvider(
         endpoint=f"http://127.0.0.1:{server.server_port}/v1",

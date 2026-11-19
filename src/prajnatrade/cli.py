@@ -8,8 +8,12 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from prajnatrade.backtest import equal_weight_buy_and_hold, run_backtest
-from prajnatrade.data import DataValidationError, load_bars, validate_calendar
+from prajnatrade.backtest import (
+    benchmark_relative_returns,
+    equal_weight_buy_and_hold,
+    run_backtest,
+)
+from prajnatrade.data import CASH, DataValidationError, load_bars, validate_calendar
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
@@ -206,11 +210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "valid": True,
                 "data_kind": args.data_kind,
                 **dataset.report,
-                "calendar_validation": (
-                    validate_calendar(args.calendar, dataset.bars)
-                    if args.calendar is not None
-                    else {"status": "not_checked"}
-                ),
+                "calendar_validation": validate_calendar(args.calendar, dataset.bars),
             }
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 0
@@ -222,7 +222,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             transaction_cost_bps=args.transaction_cost_bps,
             slippage_bps=args.slippage_bps,
         )
+        cash_benchmark = run_backtest(
+            dataset,
+            lambda history, state: {CASH: 1.0},
+            initial_cash=args.initial_cash,
+            transaction_cost_bps=args.transaction_cost_bps,
+            slippage_bps=args.slippage_bps,
+        )
         result = backtest.to_dict(args.data_kind)
+        result["relative_benchmark"] = CASH
+        result["relative_returns"] = benchmark_relative_returns(
+            backtest, cash_benchmark
+        )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n",

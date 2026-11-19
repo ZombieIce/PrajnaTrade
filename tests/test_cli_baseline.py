@@ -4,11 +4,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
 
 
 def _write_bars(path: Path) -> None:
-    lines = ["date,symbol,open,high,low,close,volume"]
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
     prices = (
         ("2024-01-02", 48, 50),
         ("2024-01-03", 100, 110),
@@ -18,7 +20,7 @@ def _write_bars(path: Path) -> None:
         for symbol in SYMBOLS:
             lines.append(
                 f"{day},{symbol},{open_price},{close_price},{open_price},"
-                f"{close_price},1000"
+                f"{close_price},1000,total_return"
             )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -69,6 +71,11 @@ def test_baseline_cli_buys_at_the_next_open_and_reports_reproducible_value(
     assert result["metrics"]["turnover"] == 1
     assert {fill["date"] for fill in result["fills"]} == {"2024-01-03"}
     assert {fill["price"] for fill in result["fills"]} == {100}
+    assert result["relative_benchmark"] == "CASH"
+    assert result["relative_returns"]["total_return"] == pytest.approx(0.21)
+    assert result["relative_returns"]["yearly_returns"] == {
+        "2024": pytest.approx(0.21)
+    }
     repeat = subprocess.run(
         completed.args, check=False, capture_output=True, text=True, env=env
     )

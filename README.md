@@ -6,10 +6,10 @@ ETFs `511260`, `518880`, `515080`, `513300`, `159612`, plus cash.
 ## Data format
 
 CSV and Parquet inputs use one row per symbol and date with these columns:
-`date,symbol,open,high,low,close,volume`. Prices must consistently use the
-documented `total_return` adjustment basis. An optional `price_basis` column is
-checked against the CLI declaration. Missing opens or closes are retained and
-reported rather than silently filled.
+`date,symbol,open,high,low,close,volume,price_basis`. Prices must consistently
+use the documented `total_return` adjustment basis, and every row must declare
+that basis so the loader can reject mixed or mismatched data. Missing opens or
+closes are retained and reported rather than silently filled.
 
 ## First workflow
 
@@ -41,15 +41,18 @@ available close and reported. If no earlier close exists for a newly held ETF,
 its executable open is used as the first mark and identified as
 `mark_open_fallback`; subsequent missing closes use the last known mark.
 Missing-symbol coverage is assessed against dates present in the input, not an
-external exchange calendar. To detect whole missing sessions, pass
-`--calendar sessions.csv` to `data validate`; the CSV must have a `date` column
-listing the expected sessions for the period under review. The report lists
-both missing calendar dates and input dates outside the supplied calendar.
-Without it, calendar validation is explicitly marked `not_checked`.
+external exchange calendar. Without `--calendar`, `data validate` reports
+missing weekdays within the observed date range as `inferred_weekdays`; exchange
+holidays can therefore appear as possible gaps. For exact session validation,
+pass `--calendar sessions.csv`; the CSV must have a `date` column listing
+expected sessions for the period under review. The report then lists both
+missing calendar dates and input dates outside the supplied calendar.
 
-The Python backtest interface provides `benchmark_relative_returns(result,
-benchmark)` for total and yearly return differences (strategy return minus
-benchmark return). Both runs must use the same dataset and sessions.
+The baseline CLI reports total and yearly returns relative to an all-cash
+benchmark. The Python backtest interface provides
+`benchmark_relative_returns(result, benchmark)` for return differences
+(strategy return minus benchmark return); both runs must use the same dataset
+and sessions.
 
 Dataset fingerprints preserve the full precision of floating-point values.
 Campaigns created before this change may have an incompatible fingerprint and

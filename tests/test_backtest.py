@@ -23,7 +23,7 @@ def _write_bars(
     unavailable_close: bool = False,
     zero_volume: bool = False,
 ) -> None:
-    lines = ["date,symbol,open,high,low,close,volume"]
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
     days = (
         ("2024-01-02", 48, 50),
         ("2024-01-03", 100, 110),
@@ -54,7 +54,7 @@ def _write_bars(
             )
             lines.append(
                 f"{day},{symbol},{open_text},{close_price},{open_text},"
-                f"{close_text},{volume}"
+                f"{close_text},{volume},total_return"
             )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

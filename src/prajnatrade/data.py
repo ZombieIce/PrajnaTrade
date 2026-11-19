@@ -11,7 +11,16 @@ import pandas as pd
 ETF_SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
 CASH = "CASH"
 PRICE_BASIS = "total_return"
-REQUIRED_COLUMNS = ("date", "symbol", "open", "high", "low", "close", "volume")
+REQUIRED_COLUMNS = (
+    "date",
+    "symbol",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "price_basis",
+)
 PRICE_COLUMNS = ("open", "high", "low", "close")
 
 
@@ -63,13 +72,12 @@ def load_bars(path: str | Path, price_basis: str) -> ValidatedData:
         raise DataValidationError("Date column contains invalid or missing values.")
     bars["date"] = dates.dt.tz_convert(None).dt.normalize()
 
-    if "price_basis" in bars.columns:
-        bases = bars["price_basis"].astype("string").str.strip().str.lower()
-        if bases.isna().any() or set(bases) != {price_basis}:
-            found = ", ".join(sorted(str(value) for value in bases.dropna().unique()))
-            raise DataValidationError(
-                f"Mixed or mismatched price basis; expected {price_basis!r}, found {found or 'blank'}."
-            )
+    bases = bars["price_basis"].astype("string").str.strip().str.lower()
+    if bases.isna().any() or set(bases) != {price_basis}:
+        found = ", ".join(sorted(str(value) for value in bases.dropna().unique()))
+        raise DataValidationError(
+            f"Mixed or mismatched price basis; expected {price_basis!r}, found {found or 'blank'}."
+        )
     bars["price_basis"] = price_basis
 
     for column in (*PRICE_COLUMNS, "volume"):
@@ -150,7 +158,24 @@ def fingerprint_bars(bars: pd.DataFrame) -> str:
     return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
 
 
-def validate_calendar(path: str | Path, bars: pd.DataFrame) -> dict[str, object]:
+def validate_calendar(
+    path: str | Path | None, bars: pd.DataFrame
+) -> dict[str, object]:
+    if path is None:
+        expected = set(
+            pd.date_range(bars["date"].min(), bars["date"].max(), freq="B")
+        )
+        actual = set(bars["date"])
+        return {
+            "status": "inferred_weekdays",
+            "missing_dates": [
+                day.strftime("%Y-%m-%d") for day in sorted(expected - actual)
+            ],
+            "unexpected_dates": [
+                day.strftime("%Y-%m-%d") for day in sorted(actual - expected)
+            ],
+        }
+
     source = Path(path)
     if not source.is_file():
         raise DataValidationError(f"Calendar file does not exist: {source}")
