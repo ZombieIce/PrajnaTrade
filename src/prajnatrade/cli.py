@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     run = research_commands.add_parser("run", help="start a research campaign")
     run.add_argument("--db", required=True, type=Path)
     _add_data_arguments(run)
+    run.add_argument("--holdout-start", required=True, help="first date of the separately stored holdout")
+    run.add_argument("--holdout-end", required=True, help="last date of the separately stored holdout")
     run.add_argument(
         "--provider", choices=["mock", "openai-compatible"], default="mock"
     )
@@ -65,17 +67,30 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--slippage-bps", type=float, default=0.0)
     run.add_argument("--token-budget", type=int, default=12_000)
     run.add_argument("--cost-budget-usd", type=float, default=2.0)
+    _add_budget_mode_arguments(run, default="strict")
     _add_trusted_python_argument(run)
 
     resume = research_commands.add_parser("resume", help="resume a paused campaign")
     resume.add_argument("--db", required=True, type=Path)
     resume.add_argument("--campaign-id", required=True)
     resume.add_argument("--steps", type=int)
+    _add_budget_mode_arguments(resume, default=None)
     _add_trusted_python_argument(resume)
 
     status = research_commands.add_parser("status", help="show campaign and experiment history")
     status.add_argument("--db", required=True, type=Path)
     status.add_argument("--campaign-id", required=True)
+
+    reconcile = research_commands.add_parser(
+        "reconcile-request", help="record verified provider usage and actual charges"
+    )
+    reconcile.add_argument("--db", required=True, type=Path)
+    reconcile.add_argument("--campaign-id", required=True)
+    reconcile.add_argument("--request-id", required=True)
+    reconcile.add_argument("--prompt-tokens", required=True, type=int)
+    reconcile.add_argument("--completion-tokens", required=True, type=int)
+    reconcile.add_argument("--actual-cost-usd", required=True, type=float)
+    reconcile.add_argument("--evidence", required=True)
 
     freeze = research_commands.add_parser("freeze", help="freeze a successful experiment")
     freeze.add_argument("--db", required=True, type=Path)
@@ -124,6 +139,17 @@ def _add_trusted_python_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_budget_mode_arguments(
+    parser: argparse.ArgumentParser, *, default: str | None
+) -> None:
+    parser.add_argument("--budget-mode", choices=["strict", "best-effort"], default=default)
+    parser.add_argument(
+        "--accept-budget-overrun-risk",
+        action="store_true",
+        help="explicitly accept that best-effort calls may exceed the budget",
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -137,6 +163,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     file=sys.stderr,
                 )
             if args.research_command == "run":
+                if args.budget_mode == "best-effort" and args.accept_budget_overrun_risk:
+                    print(
+                        "warning: best-effort provider calls may exceed the configured budget.",
+                        file=sys.stderr,
+                    )
                 dataset = load_bars(args.data, args.price_basis)
                 provider, provider_config = _make_provider(args)
                 result = start_campaign(
@@ -155,12 +186,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     token_budget=args.token_budget,
                     cost_budget_usd=args.cost_budget_usd,
                     steps=args.steps,
+                    holdout_start=args.holdout_start,
+                    holdout_end=args.holdout_end,
                     provider_config=provider_config,
                     trusted_local_python=trusted_local_python,
                 )
             elif args.research_command == "resume":
                 campaign = SQLiteStore(args.db).get_campaign(args.campaign_id)
-                provider = _resume_provider(campaign)
+                provider = _resume_provider(
+                    campaign,
+                    budget_mode=args.budget_mode,
+                    accept_budget_risk=args.accept_budget_overrun_risk,
+                )
+                if args.budget_mode == "best-effort" and args.accept_budget_overrun_risk:
+                    print(
+                        "warning: best-effort provider calls may exceed the configured budget.",
+                        file=sys.stderr,
+                    )
                 result = resume_campaign(
                     database=args.db,
                     campaign_id=args.campaign_id,
@@ -170,6 +212,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             elif args.research_command == "status":
                 result = campaign_status(args.db, args.campaign_id)
+            elif args.research_command == "reconcile-request":
+                result = SQLiteStore(args.db).reconcile_provider_request(
+                    args.campaign_id, args.request_id, prompt_tokens=args.prompt_tokens,
+                    completion_tokens=args.completion_tokens,
+                    actual_cost_usd=args.actual_cost_usd, evidence=args.evidence,
+                )
             elif args.research_command == "freeze":
                 result = freeze_candidate(
                     args.db,
@@ -281,6 +329,7 @@ def _make_provider(args: argparse.Namespace) -> tuple[ResearchProvider, dict[str
         "max_tokens": args.provider_max_tokens,
         "input_cost_per_1k_tokens": args.input_cost_per_1k_tokens,
         "output_cost_per_1k_tokens": args.output_cost_per_1k_tokens,
+        "budget_mode": args.budget_mode,
     }
     return (
         OpenAICompatibleProvider(
@@ -291,12 +340,19 @@ def _make_provider(args: argparse.Namespace) -> tuple[ResearchProvider, dict[str
             max_tokens=args.provider_max_tokens,
             input_cost_per_1k_tokens=args.input_cost_per_1k_tokens,
             output_cost_per_1k_tokens=args.output_cost_per_1k_tokens,
+            budget_mode=args.budget_mode,
+            accept_budget_risk=args.accept_budget_overrun_risk,
         ),
         config,
     )
 
 
-def _resume_provider(campaign: dict[str, object]) -> ResearchProvider | None:
+def _resume_provider(
+    campaign: dict[str, object],
+    *,
+    budget_mode: str | None = None,
+    accept_budget_risk: bool = False,
+) -> ResearchProvider | None:
     if campaign["provider"] == "mock":
         return None
     if campaign["provider"] != "openai-compatible":
@@ -316,4 +372,6 @@ def _resume_provider(campaign: dict[str, object]) -> ResearchProvider | None:
         max_tokens=int(config["max_tokens"]),
         input_cost_per_1k_tokens=float(config["input_cost_per_1k_tokens"]),
         output_cost_per_1k_tokens=float(config["output_cost_per_1k_tokens"]),
+        budget_mode=budget_mode or str(config.get("budget_mode", "strict")),
+        accept_budget_risk=accept_budget_risk,
     )

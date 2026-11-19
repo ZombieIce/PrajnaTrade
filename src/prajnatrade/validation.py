@@ -5,6 +5,7 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import (
     make_strategy,
     normalize_strategy_spec,
+    parameter_constraints_hold,
     require_execution_permission,
     strategy_fingerprint,
 )
@@ -43,6 +45,7 @@ def freeze_candidate(
     fingerprint = strategy_fingerprint(strategy)
     if fingerprint != experiment["strategy_hash"]:
         raise ValueError("Experiment strategy fingerprint does not match its stored strategy.")
+    robustness_plan = _make_robustness_plan(strategy)
     candidate_hash = _candidate_fingerprint(
         fingerprint,
         campaign["data_hash"],
@@ -50,6 +53,7 @@ def freeze_candidate(
         name.strip(),
         conclusion.strip(),
         experiment_id,
+        robustness_plan,
     )
     candidate = {
         "candidate_id": str(uuid.uuid4()),
@@ -61,6 +65,7 @@ def freeze_candidate(
         "candidate_hash": candidate_hash,
         "data_hash": campaign["data_hash"],
         "split": campaign["split"],
+        "robustness_plan": robustness_plan,
         "frozen_at": _now(),
         "conclusion": conclusion.strip(),
     }
@@ -73,6 +78,7 @@ def freeze_candidate(
         "strategy_hash": fingerprint,
         "candidate_hash": candidate_hash,
         "frozen_at": candidate["frozen_at"],
+        "robustness_plan": robustness_plan,
     }
 
 
@@ -130,7 +136,10 @@ def validate_candidate(
         start_date=start_date,
         end_date=end_date,
     )
-    robustness = _parameter_robustness(candidate, campaign, dataset, start_date, end_date)
+    robustness = _parameter_robustness(
+        candidate, campaign, dataset, start_date, end_date, candidate_result.metrics,
+        trusted_local_python=trusted_local_python,
+    )
     candidate_output = candidate_result.to_dict(data_kind)
     baseline_output = baseline_result.to_dict(data_kind)
     candidate_output["source_data_hash"] = dataset.data_hash
@@ -214,9 +223,20 @@ def run_holdout(
     start_date = split["holdout_start"]
     end_date = split["holdout_end"]
 
-    dataset = _load_campaign_data(campaign, data_path, data_kind, price_basis)
-    _require_interval(dataset, start_date, end_date)
-    interval_hash = fingerprint_bars(_interval_bars(dataset, start_date, end_date))
+    development = _load_campaign_data(
+        campaign, campaign["data_path"], data_kind, price_basis
+    )
+    holdout = load_bars(data_path, price_basis)
+    _require_interval(holdout, start_date, end_date)
+    if len(_interval_bars(holdout, start_date, end_date)) != len(holdout.bars):
+        raise ValueError("Holdout file must contain only the frozen holdout interval.")
+    interval_hash = fingerprint_bars(holdout.bars)
+    combined_bars = pd.concat([development.bars, holdout.bars], ignore_index=True)
+    dataset = ValidatedData(
+        bars=combined_bars,
+        data_hash=fingerprint_bars(combined_bars),
+        report=holdout.report,
+    )
     if store.get_holdout_receipt_by_data_hash(interval_hash) is not None:
         raise ValueError(
             f"Final holdout dataset fingerprint {interval_hash} was already consumed."
@@ -266,8 +286,8 @@ def run_holdout(
 
     candidate_output = candidate_result.to_dict(data_kind)
     baseline_output = baseline_result.to_dict(data_kind)
-    candidate_output["source_data_hash"] = dataset.data_hash
-    baseline_output["source_data_hash"] = dataset.data_hash
+    candidate_output["source_data_hash"] = holdout.data_hash
+    baseline_output["source_data_hash"] = holdout.data_hash
     candidate_output["data_hash"] = interval_hash
     baseline_output["data_hash"] = interval_hash
     result = {
@@ -275,7 +295,7 @@ def run_holdout(
         "candidate_hash": candidate["candidate_hash"],
         "data_kind": data_kind,
         "data_hash": interval_hash,
-        "source_data_hash": dataset.data_hash,
+        "source_data_hash": holdout.data_hash,
         "start_date": start_date,
         "end_date": end_date,
         "candidate": candidate_output,
@@ -318,42 +338,192 @@ def _parameter_robustness(
     dataset: ValidatedData,
     start_date: str,
     end_date: str,
+    original_metrics: dict[str, Any],
+    *,
+    trusted_local_python: bool,
 ) -> dict[str, Any]:
     strategy = candidate["strategy"]
-    params = strategy["parameters"]
-    if strategy["family"] == "python":
+    plan = candidate.get("robustness_plan")
+    if plan is None or plan["status"] in {
+        "missing_parameter_schema", "unsupported_non_numeric_parameters"
+    }:
         return {
             "applicable": False,
+            "status": "inconclusive",
             "variants": [],
-            "reason": "Generated Python parameters have no declared robustness schema.",
+            "reason": plan["status"] if plan else "missing_parameter_schema",
         }
-    if "lookback" not in params:
-        return {"applicable": False, "variants": []}
-    lookback = int(params["lookback"])
+    if plan["status"] == "not_applicable":
+        return {"applicable": False, "status": "not_applicable", "variants": [], "plan": plan}
     variants = []
-    for nearby in sorted({max(2, lookback - 1), min(252, lookback + 1)}):
-        varied = {
-            "family": strategy["family"],
-            "parameters": {**params, "lookback": nearby},
-        }
-        result = run_backtest(
-            dataset,
-            make_strategy(varied),
-            initial_cash=campaign["initial_cash"],
-            transaction_cost_bps=campaign["transaction_cost_bps"],
-            slippage_bps=campaign["slippage_bps"],
-            start_date=start_date,
-            end_date=end_date,
-        )
-        variants.append(
-            {"lookback": nearby, "total_return": result.metrics["total_return"]}
-        )
-    returns = [item["total_return"] for item in variants]
+    original_sharpe = original_metrics["sharpe"]
+    original_drawdown = abs(original_metrics["max_drawdown"])
+    thresholds = plan["thresholds"]
+    for entry in plan["variants"]:
+        variant = dict(entry)
+        if entry["reason"] is not None:
+            variant["status"] = "invalid_config"
+        else:
+            varied = {**strategy, "parameters": entry["parameters"]}
+            try:
+                result = run_backtest(
+                    dataset,
+                    make_strategy(varied, trusted_local_python=trusted_local_python),
+                    initial_cash=campaign["initial_cash"],
+                    transaction_cost_bps=campaign["transaction_cost_bps"],
+                    slippage_bps=campaign["slippage_bps"],
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            except ValueError as error:
+                variant.update(status="execution_failed", error=str(error))
+            else:
+                metrics = result.metrics
+                variant["metrics"] = metrics
+                if original_sharpe is None or metrics["sharpe"] is None:
+                    variant["status"] = "not_evaluable"
+                    variant["reason"] = "sharpe_unavailable"
+                else:
+                    sharpe_drop = original_sharpe - metrics["sharpe"]
+                    drawdown_increase = abs(metrics["max_drawdown"]) - original_drawdown
+                    degraded = (
+                        sharpe_drop >= max(
+                            thresholds["sharpe_absolute"],
+                            thresholds["sharpe_relative"] * max(original_sharpe, 0),
+                        )
+                        or drawdown_increase >= max(
+                            thresholds["drawdown_absolute"],
+                            thresholds["drawdown_relative"] * original_drawdown,
+                        )
+                    )
+                    variant.update(
+                        status="evaluated", outcome="degraded" if degraded else "stable",
+                        sharpe_drop=sharpe_drop, drawdown_increase=drawdown_increase,
+                        risk_limit_breach=False,
+                    )
+        variants.append(variant)
+    evaluated = [item for item in variants if item["status"] == "evaluated"]
+    covered = {
+        name for item in evaluated for name in item["changed_parameters"]
+    }
+    sufficient = (
+        bool(variants)
+        and len(evaluated) / len(variants) >= thresholds["coverage"]
+        and set(plan["parameters"]) <= covered
+    )
+    stable = sum(item.get("outcome") == "stable" for item in evaluated)
+    status = (
+        "inconclusive" if not sufficient else
+        "passed" if stable / len(evaluated) >= thresholds["stable_fraction"] else "failed"
+    )
     return {
         "applicable": True,
+        "status": status,
+        "plan": plan,
         "variants": variants,
-        "total_return_spread": max(returns) - min(returns) if returns else 0.0,
+        "coverage": len(evaluated) / len(variants) if variants else 0.0,
+        "stable_fraction": stable / len(evaluated) if evaluated else None,
     }
+
+
+def _make_robustness_plan(strategy: dict[str, Any]) -> dict[str, Any]:
+    params = strategy["parameters"]
+    if strategy["family"] == "python":
+        schema = strategy.get("parameter_schema")
+        if schema is None:
+            return {"status": "missing_parameter_schema"}
+    else:
+        definitions = {}
+        if "lookback" in params:
+            definitions["lookback"] = {
+                "type": "integer", "default": params["lookback"], "min": 2, "max": 252, "step": 1,
+            }
+        if "top_k" in params:
+            definitions["top_k"] = {
+                "type": "integer", "default": params["top_k"], "min": 1, "max": 5, "step": 1,
+            }
+        schema = {"parameters": definitions, "constraints": []}
+    names = sorted(schema["parameters"])
+    if not names:
+        if params:
+            return {"status": "unsupported_non_numeric_parameters", "schema": schema}
+        return {"status": "not_applicable", "schema": schema}
+    plan = {
+        "status": "planned",
+        "schema": schema,
+        "parameters": names,
+        "variants": [],
+        "excluded": [],
+        "thresholds": {
+            "sharpe_absolute": 0.30, "sharpe_relative": 0.25,
+            "drawdown_absolute": 0.03, "drawdown_relative": 0.25,
+            "coverage": 0.8, "stable_fraction": 0.8,
+        },
+        "hard_risk_limit": None,
+    }
+    for name in names:
+        definition = schema["parameters"][name]
+        original = Decimal(str(params[name]))
+        step = Decimal(str(definition["step"]))
+        delta = max(
+            step, (abs(original) * Decimal("0.1") / step).to_integral_value(rounding=ROUND_HALF_UP) * step
+        )
+        options = []
+        for direction in (-1, 1):
+            value = original + direction * delta
+            replacement = int(value) if definition["type"] == "integer" else float(value)
+            varied = {**params, name: replacement}
+            reason = None
+            if value < Decimal(str(definition["min"])) or value > Decimal(str(definition["max"])):
+                reason = "outside_declared_range"
+            elif not parameter_constraints_hold(varied, schema["constraints"]):
+                reason = "joint_constraint"
+            options.append({
+                "parameter": name, "changed_parameters": [name],
+                "parameters": varied, "reason": reason,
+                "requested_delta": float(abs(original) * Decimal("0.1")),
+                "applied_delta": float(delta),
+            })
+        legal = [entry for entry in options if entry["reason"] is None]
+        selected = legal if legal else options
+        if legal:
+            plan["excluded"].extend(entry for entry in options if entry["reason"] is not None)
+        remaining = max(0, 10 - len(plan["variants"]))
+        plan["variants"].extend(selected[:remaining])
+        plan["excluded"].extend(
+            {**entry, "reason": "plan_limit"} for entry in selected[remaining:]
+        )
+    for joint in schema.get("joint_variants", []):
+        names_changed = sorted(joint["parameters"])
+        varied = {**params, **joint["parameters"]}
+        reason = None
+        for name in names_changed:
+            definition = schema["parameters"][name]
+            value = Decimal(str(varied[name]))
+            minimum = Decimal(str(definition["min"]))
+            maximum = Decimal(str(definition["max"]))
+            step = Decimal(str(definition["step"]))
+            if value < minimum or value > maximum or (value - minimum) % step:
+                reason = "outside_declared_range_or_step"
+                break
+            if value == Decimal(str(params[name])):
+                reason = "unchanged_parameter"
+                break
+        if reason is None and not parameter_constraints_hold(varied, schema["constraints"]):
+            reason = "joint_constraint"
+        entry = {
+            "changed_parameters": names_changed, "parameters": varied,
+            "reason": reason, "selection_reason": joint["reason"],
+        }
+        counts = {
+            name: sum(name in item["changed_parameters"] for item in plan["variants"])
+            for name in names_changed
+        }
+        if len(plan["variants"]) >= 10 or any(count >= 2 for count in counts.values()):
+            plan["excluded"].append({**entry, "reason": "plan_limit"})
+        else:
+            plan["variants"].append(entry)
+    return plan
 
 
 def _require_interval(dataset: ValidatedData, start_date: str, end_date: str) -> None:
@@ -396,16 +566,20 @@ def _candidate_fingerprint(
     name: str,
     conclusion: str,
     experiment_id: str,
+    robustness_plan: dict[str, Any] | None = None,
 ) -> str:
-    payload = json.dumps(
-        {
+    contents = {
             "strategy_hash": strategy_hash,
             "data_hash": data_hash,
             "split": split,
             "name": name,
             "conclusion": conclusion,
             "experiment_id": experiment_id,
-        },
+        }
+    if robustness_plan is not None:
+        contents["robustness_plan"] = robustness_plan
+    payload = json.dumps(
+        contents,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -416,6 +590,11 @@ def _candidate_fingerprint(
 def _verify_candidate_freeze(
     candidate: dict[str, Any], campaign: dict[str, Any]
 ) -> None:
+    if campaign["split"].get("holdout_storage") != "external":
+        raise ValueError(
+            "This legacy campaign included holdout data during research; "
+            "start a new campaign with separately stored holdout data."
+        )
     if strategy_fingerprint(candidate["strategy"]) != candidate["strategy_hash"]:
         raise ValueError("Frozen candidate strategy does not match its stored fingerprint.")
     if candidate["data_hash"] != campaign["data_hash"]:
@@ -429,6 +608,7 @@ def _verify_candidate_freeze(
         candidate["name"],
         candidate["conclusion"],
         candidate["experiment_id"],
+        candidate["robustness_plan"],
     )
     if expected_hash != candidate["candidate_hash"]:
         raise ValueError("Frozen candidate fingerprint does not match its stored contents.")

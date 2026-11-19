@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl, urlparse, urlunparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import STRATEGY_FAMILIES, normalize_strategy_spec
 
 
@@ -143,7 +144,7 @@ class MockProvider:
                 prior_direction = 0 if "scores = []" in source else 1
                 if last.get("decision") in {"keep", "investigate"}:
                     direction = prior_direction
-                    lookback = 4 if "iloc[-3" in source else 3
+                    lookback = min(252, int(prior_strategy.get("parameters", {}).get("lookback", 3)) + 1)
                 else:
                     direction = 1 - prior_direction
         if direction == 0:
@@ -152,8 +153,8 @@ class MockProvider:
                 "    scores = []\n"
                 "    for symbol in ETF_SYMBOLS:\n"
                 "        closes = history.loc[(history['symbol'] == symbol) & history['close'].notna(), 'close']\n"
-                "        if len(closes) >= 3:\n"
-                "            scores.append((float(closes.iloc[-1] / closes.iloc[-3] - 1), symbol))\n"
+                "        if len(closes) >= parameters['lookback']:\n"
+                "            scores.append((float(closes.iloc[-1] / closes.iloc[-parameters['lookback']] - 1), symbol))\n"
                 "    if not scores or max(scores)[0] <= 0:\n"
                 "        return {CASH: 1.0}\n"
                 "    return {max(scores)[1]: 1.0}\n"
@@ -165,23 +166,30 @@ class MockProvider:
                 "    selected = []\n"
                 "    for symbol in ETF_SYMBOLS:\n"
                 "        closes = history.loc[(history['symbol'] == symbol) & history['close'].notna(), 'close']\n"
-                "        if len(closes) >= 3 and closes.iloc[-1] > closes.iloc[-3:].mean():\n"
+                "        if len(closes) >= parameters['lookback'] and closes.iloc[-1] > closes.iloc[-parameters['lookback']:].mean():\n"
                 "            selected.append(symbol)\n"
                 "    if not selected:\n"
                 "        return {CASH: 1.0}\n"
                 "    return {symbol: 1.0 / len(selected) for symbol in selected}\n"
             )
             hypothesis = f"Equal-weighting ETFs above their {lookback}-session average improves downside control."
-        source = source.replace(">= 3", f">= {lookback}").replace(
-            "iloc[-3]", f"iloc[-{lookback}]"
-        ).replace("iloc[-3:]", f"iloc[-{lookback}:]")
         return Proposal(
             hypothesis=hypothesis,
             rationale=(
                 "Deterministic Mock-generated Python based on prior feedback; "
                 "this is not AI research."
             ),
-            strategy={"family": "python", "parameters": {}, "source": source},
+            strategy={
+                "family": "python", "parameters": {"lookback": lookback}, "source": source,
+                "parameter_schema": {
+                    "parameters": {
+                        "lookback": {
+                            "type": "integer", "default": 3, "min": 2, "max": 252, "step": 1,
+                        }
+                    },
+                    "constraints": [],
+                },
+            },
             usage=_zero_usage(),
         )
 
@@ -262,6 +270,8 @@ class OpenAICompatibleProvider:
         max_tokens: int = 1024,
         input_cost_per_1k_tokens: float,
         output_cost_per_1k_tokens: float,
+        budget_mode: str = "strict",
+        accept_budget_risk: bool = False,
     ) -> None:
         if not endpoint.startswith(("https://", "http://")):
             raise ValueError("Provider endpoint must be an HTTP(S) URL.")
@@ -278,6 +288,12 @@ class OpenAICompatibleProvider:
             raise ValueError("Provider token rates must be finite and nonnegative.")
         if input_cost_per_1k_tokens + output_cost_per_1k_tokens <= 0:
             raise ValueError("Configure a nonzero token rate to enforce the cost budget.")
+        if budget_mode not in {"strict", "best-effort"}:
+            raise ValueError("Budget mode must be strict or best-effort.")
+        if budget_mode == "best-effort" and not accept_budget_risk:
+            raise ValueError(
+                "Best-effort requires explicit acceptance of potential budget overruns."
+            )
         self.endpoint = _completion_endpoint(endpoint)
         self.model = model.strip()
         self._api_key = api_key
@@ -285,6 +301,13 @@ class OpenAICompatibleProvider:
         self.max_tokens = max_tokens
         self.input_cost_per_1k_tokens = input_cost_per_1k_tokens
         self.output_cost_per_1k_tokens = output_cost_per_1k_tokens
+        self.budget_mode = budget_mode
+        self._budget_store: SQLiteStore | None = None
+        self._budget_campaign_id: str | None = None
+
+    def bind_budget_store(self, store: SQLiteStore, campaign_id: str) -> None:
+        self._budget_store = store
+        self._budget_campaign_id = campaign_id
 
     def propose(self, iteration: int, context: Mapping[str, Any]) -> Proposal:
         trusted_local_python = bool(context.get("trusted_local_python"))
@@ -311,11 +334,26 @@ class OpenAICompatibleProvider:
                 "strategy": {
                     "family": "python" if trusted_local_python else "one allowed family",
                     "parameters": "JSON object",
-                    **({"source": "Python source defining strategy(history, state)"} if trusted_local_python else {}),
+                    **({
+                        "source": "Python source defining strategy(history, state)",
+                        "parameter_schema": {
+                            "parameters": {
+                                "<numeric parameter>": {
+                                    "type": "integer or number", "default": "number",
+                                    "min": "number", "max": "number", "step": "number",
+                                }
+                            },
+                            "constraints": [
+                                {"left": "parameter name", "op": "<, <=, ==, >=, or >", "right": "parameter name or number"}
+                            ],
+                            "no_tunable_parameters": "true only when no parameters exist; otherwise omit",
+                            "joint_variants": "optional list of {parameters: {name: value}, reason: string}",
+                        },
+                    } if trusted_local_python else {}),
                 },
             },
         }
-        response, usage = self._request(prompt, context)
+        response, usage = self._request(prompt, context, stage="proposal")
         try:
             parsed = parse_structured_response(response)
             if _contains_credential(parsed, self._api_key):
@@ -345,7 +383,7 @@ class OpenAICompatibleProvider:
                 "reflection": "string",
             },
         }
-        response, usage = self._request(prompt, context)
+        response, usage = self._request(prompt, context, stage="reflection")
         try:
             parsed = parse_structured_response(response)
             if _contains_credential(parsed, self._api_key):
@@ -356,7 +394,7 @@ class OpenAICompatibleProvider:
         return replace(reflection, usage=usage)
 
     def _request(
-        self, prompt: Mapping[str, Any], context: Mapping[str, Any]
+        self, prompt: Mapping[str, Any], context: Mapping[str, Any], *, stage: str
     ) -> tuple[str, dict[str, Any]]:
         limits = context.get("limits", {})
         try:
@@ -368,6 +406,12 @@ class OpenAICompatibleProvider:
         if remaining_seconds <= 0:
             raise ProviderBudgetExceeded(
                 "time_budget", "No campaign time remains for a provider request."
+            )
+        if self.budget_mode == "strict":
+            raise ProviderBudgetExceeded(
+                "cost_bound_unverifiable",
+                "Cannot verify a provider-enforced request cost upper bound; "
+                "strict mode will not send this request.",
             )
         request_timeout = min(self.timeout, remaining_seconds)
         remaining_tokens = int(limits.get("remaining_tokens", self.max_tokens))
@@ -434,7 +478,16 @@ class OpenAICompatibleProvider:
             ) / 1000.0,
             "requests": 1,
             "usage_estimated": True,
+            "budget_mode": self.budget_mode,
+            "overrun_risk_accepted": True,
         }
+        request_id = (
+            self._budget_store.reserve_provider_request(
+                self._budget_campaign_id, stage, reserved_usage
+            )
+            if self._budget_store is not None and self._budget_campaign_id is not None
+            else None
+        )
 
         request = Request(
             self.endpoint,
@@ -492,11 +545,14 @@ class OpenAICompatibleProvider:
             )
             / 1000.0,
             "requests": 1,
-            "usage_estimated": any(
+            "usage_estimated": total_tokens < prompt_tokens + completion_tokens or any(
                 _nonnegative_int(usage_data.get(name), -1) < 0
                 for name in ("prompt_tokens", "completion_tokens", "total_tokens")
             ),
         }
+        if request_id is not None and self._budget_store is not None:
+            if not usage["usage_estimated"]:
+                self._budget_store.settle_provider_request(request_id, usage)
         return content, usage
 
 
@@ -555,7 +611,7 @@ def validate_proposal_response(
     if trusted_local_python:
         if family != "python":
             raise ProviderError("Provider strategy must be Python when trusted-local opt-in is enabled.")
-        expected_strategy_fields = {"family", "parameters", "source"}
+        expected_strategy_fields = {"family", "parameters", "source", "parameter_schema"}
     else:
         if family not in STRATEGY_FAMILIES:
             raise ProviderError(
@@ -665,10 +721,6 @@ def _contains_credential(value: Any, credential: str) -> bool:
 
 
 def _nonnegative_int(value: Any, default: int) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed >= 0 else default
+    return value if value >= 0 else default

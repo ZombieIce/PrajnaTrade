@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
+from decimal import Decimal
 
 import numpy as np
 import pandas as pd
@@ -39,7 +40,12 @@ def normalize_strategy_spec(spec: Mapping[str, object]) -> dict[str, object]:
             compile(source, "<generated-strategy>", "exec")
         except (TypeError, ValueError, SyntaxError) as error:
             raise ValueError(f"Invalid Python strategy: {error}") from error
-        return {"family": "python", "parameters": parameters, "source": source}
+        normalized = {"family": "python", "parameters": parameters, "source": source}
+        if "parameter_schema" in spec:
+            normalized["parameter_schema"] = _normalize_parameter_schema(
+                spec["parameter_schema"], parameters
+            )
+        return normalized
     normalized_params: dict[str, object] = {}
     if family == "equal_weight":
         if params:
@@ -63,6 +69,121 @@ def normalize_strategy_spec(spec: Mapping[str, object]) -> dict[str, object]:
             + "."
         )
     return {"family": str(family), "parameters": normalized_params}
+
+
+def _normalize_parameter_schema(schema: object, parameters: dict[str, object]) -> dict[str, object]:
+    if (
+        not isinstance(schema, Mapping)
+        or not {"parameters", "constraints"} <= set(schema)
+        or set(schema) - {"parameters", "constraints", "no_tunable_parameters", "joint_variants"}
+    ):
+        raise ValueError("Parameter schema must contain parameters and constraints.")
+    definitions = schema["parameters"]
+    constraints = schema["constraints"]
+    if not isinstance(definitions, Mapping) or not isinstance(constraints, list):
+        raise ValueError("Parameter schema definitions must be an object and constraints a list.")
+    numeric = {
+        key for key, value in parameters.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    if set(definitions) != numeric:
+        raise ValueError("Parameter schema must declare every numeric strategy parameter.")
+    if not definitions and not parameters and schema.get("no_tunable_parameters") is not True:
+        raise ValueError("An empty parameter schema must explicitly declare no_tunable_parameters.")
+    if parameters and schema.get("no_tunable_parameters", False) is not False:
+        raise ValueError("A strategy with parameters cannot declare no_tunable_parameters.")
+    normalized = {}
+    for name, definition in definitions.items():
+        if not isinstance(name, str) or not isinstance(definition, Mapping) or set(definition) != {
+            "type", "default", "min", "max", "step"
+        }:
+            raise ValueError("Each numeric parameter requires type, default, min, max and step.")
+        kind = definition["type"]
+        if kind not in {"integer", "number"}:
+            raise ValueError(f"Unsupported numeric parameter type for {name}.")
+        if kind == "integer" and not isinstance(parameters[name], int):
+            raise ValueError(f"Parameter {name} must be an integer.")
+        for field in ("default", "min", "max", "step"):
+            value = definition[field]
+            if (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or (kind == "integer" and not isinstance(value, int))
+            ):
+                raise ValueError(f"Invalid {field} for parameter {name}.")
+        minimum, maximum, step = (
+            Decimal(str(definition[key])) for key in ("min", "max", "step")
+        )
+        default = Decimal(str(definition["default"]))
+        current = Decimal(str(parameters[name]))
+        if (
+            minimum > maximum or step <= 0 or default < minimum or default > maximum
+            or current < minimum or current > maximum
+            or (default - minimum) % step or (current - minimum) % step
+        ):
+            raise ValueError(f"Parameter {name} has invalid range, step or value.")
+        normalized[name] = dict(definition)
+    clean_constraints = []
+    for constraint in constraints:
+        if (
+            not isinstance(constraint, Mapping) or set(constraint) != {"left", "op", "right"}
+            or not isinstance(constraint["left"], str)
+            or not isinstance(constraint["op"], str)
+            or constraint["left"] not in definitions
+            or constraint["op"] not in {"<", "<=", "==", ">=", ">"}
+        ):
+            raise ValueError("Invalid parameter constraint.")
+        right = constraint["right"]
+        if isinstance(right, str):
+            if right not in definitions:
+                raise ValueError("Constraint refers to an unknown parameter.")
+        elif isinstance(right, bool) or not isinstance(right, (int, float)) or not math.isfinite(right):
+            raise ValueError("Constraint right side must be a parameter name or finite number.")
+        clean_constraints.append(dict(constraint))
+    result = {"parameters": normalized, "constraints": clean_constraints}
+    if not parameters:
+        result["no_tunable_parameters"] = True
+    joint_variants = schema.get("joint_variants", [])
+    if not isinstance(joint_variants, list) or len(joint_variants) > 10:
+        raise ValueError("Joint variants must be a list of at most ten entries.")
+    if joint_variants:
+        result["joint_variants"] = []
+        for variant in joint_variants:
+            if (
+                not isinstance(variant, Mapping) or set(variant) != {"parameters", "reason"}
+                or not isinstance(variant["parameters"], Mapping)
+                or len(variant["parameters"]) < 2
+                or not set(variant["parameters"]) <= set(definitions)
+                or not isinstance(variant["reason"], str) or not variant["reason"].strip()
+            ):
+                raise ValueError("Joint variants require at least two declared parameters and a reason.")
+            for name, value in variant["parameters"].items():
+                if (
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or (definitions[name]["type"] == "integer" and not isinstance(value, int))
+                ):
+                    raise ValueError(f"Invalid joint variant value for {name}.")
+            result["joint_variants"].append({
+                "parameters": dict(variant["parameters"]), "reason": variant["reason"].strip(),
+            })
+    if not parameter_constraints_hold(parameters, clean_constraints):
+        raise ValueError("Strategy parameters violate their declared joint constraints.")
+    return result
+
+
+def parameter_constraints_hold(parameters: Mapping[str, object], constraints: list) -> bool:
+    for constraint in constraints:
+        left = parameters[constraint["left"]]
+        right = constraint["right"]
+        right = parameters[right] if isinstance(right, str) else right
+        op = constraint["op"]
+        if not {
+            "<": left < right, "<=": left <= right, "==": left == right,
+            ">=": left >= right, ">": left > right,
+        }[op]:
+            return False
+    return True
 
 
 def strategy_fingerprint(spec: Mapping[str, object]) -> str:

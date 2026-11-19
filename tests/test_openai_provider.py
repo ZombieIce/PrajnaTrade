@@ -9,13 +9,14 @@ from pathlib import Path
 import pytest
 
 from prajnatrade.data import ETF_SYMBOLS, load_bars
+from prajnatrade.cli import main
 from prajnatrade.providers import (
     OpenAICompatibleProvider,
     ProviderBudgetExceeded,
     ProviderError,
     parse_structured_response,
 )
-from prajnatrade.research import start_campaign
+from prajnatrade.research import campaign_status, resume_campaign, start_campaign
 from prajnatrade.store import SQLiteStore
 
 
@@ -60,6 +61,153 @@ def _chat_response(content: str) -> dict[str, object]:
     }
 
 
+def _best_effort_provider(**kwargs: object) -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider(
+        **kwargs, budget_mode="best-effort", accept_budget_risk=True,
+    )
+
+
+def test_strict_budget_rejects_unverifiable_provider_before_call() -> None:
+    server, thread = _start_server([])
+    try:
+        provider = OpenAICompatibleProvider(
+            endpoint=f"http://127.0.0.1:{server.server_port}/v1",
+            model="test-model",
+            api_key="local-test-secret",
+            input_cost_per_1k_tokens=0.1,
+            output_cost_per_1k_tokens=0.2,
+        )
+        with pytest.raises(ProviderBudgetExceeded, match="upper bound"):
+            provider.propose(
+                1, {"limits": {"remaining_tokens": 2000, "remaining_cost_usd": 1.0}},
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert server.requests == []
+
+
+def test_best_effort_requires_explicit_risk_acceptance() -> None:
+    with pytest.raises(ValueError, match="explicit acceptance"):
+        OpenAICompatibleProvider(
+            endpoint="http://127.0.0.1/v1",
+            model="test-model",
+            api_key="local-test-secret",
+            input_cost_per_1k_tokens=0.1,
+            output_cost_per_1k_tokens=0.2,
+            budget_mode="best-effort",
+        )
+
+
+def test_unverifiable_budget_pauses_campaign_without_losing_progress(tmp_path: Path) -> None:
+    server, thread = _start_server([])
+    bars_path = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
+    for index in range(6):
+        day = (date(2024, 1, 1) + timedelta(days=index)).isoformat()
+        for symbol in ETF_SYMBOLS:
+            lines.append(f"{day},{symbol},100,101,100,101,1000,total_return")
+    bars_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        provider = OpenAICompatibleProvider(
+            endpoint=f"http://127.0.0.1:{server.server_port}/v1",
+            model="test-model", api_key="local-test-secret",
+            input_cost_per_1k_tokens=0.1, output_cost_per_1k_tokens=0.2,
+        )
+        result = start_campaign(
+            database=database, dataset=load_bars(bars_path, "total_return"),
+            data_path=bars_path, data_kind="synthetic", provider=provider, seed=1,
+            experiment_budget=2, max_consecutive_failures=1, max_seconds=60,
+            initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
+            token_budget=5000, cost_budget_usd=1, steps=None,
+            holdout_start="2025-01-01", holdout_end="2025-01-31",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert result["status"] == "paused"
+    assert result["stop_reason"] == "cost_bound_unverifiable"
+    assert SQLiteStore(database).get_campaign(result["campaign_id"])["status"] == "paused"
+    assert server.requests == []
+
+
+def test_interrupted_provider_request_keeps_reservation_and_blocks_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prajnatrade.providers as providers_module
+
+    proposal = json.dumps({
+        "schema_version": "1", "hypothesis": "Control", "rationale": "Reference",
+        "strategy": {"family": "equal_weight", "parameters": {}},
+    })
+    reflection = json.dumps({
+        "schema_version": "1", "decision": "keep", "reflection": "Retain control.",
+    })
+    server, thread = _start_server([
+        _chat_response(proposal), _chat_response(reflection), _chat_response(proposal),
+    ])
+    bars_path = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
+    for index in range(6):
+        day = (date(2024, 1, 1) + timedelta(days=index)).isoformat()
+        for symbol in ETF_SYMBOLS:
+            lines.append(f"{day},{symbol},100,101,100,101,1000,total_return")
+    bars_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    provider = _best_effort_provider(
+        endpoint=f"http://127.0.0.1:{server.server_port}/v1", model="test-model",
+        api_key="local-test-secret", input_cost_per_1k_tokens=0.1,
+        output_cost_per_1k_tokens=0.2,
+    )
+    try:
+        started = start_campaign(
+            database=database, dataset=load_bars(bars_path, "total_return"),
+            data_path=bars_path, data_kind="synthetic", provider=provider, seed=1,
+            experiment_budget=2, max_consecutive_failures=2, max_seconds=60,
+            initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
+            token_budget=5000, cost_budget_usd=1, steps=1,
+            holdout_start="2025-01-01", holdout_end="2025-01-31",
+        )
+        campaign_id = started["campaign_id"]
+        urlopen = providers_module.urlopen
+
+        def interrupted(request, *, timeout):
+            with urlopen(request, timeout=timeout) as response:
+                response.read()
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(providers_module, "urlopen", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            resume_campaign(database=database, campaign_id=campaign_id, provider=provider)
+        status = campaign_status(database, campaign_id)
+        assert status["provider_requests"][-1]["status"] == "reserved"
+        assert status["provider_requests"][-1]["usage"]["estimated_cost_usd"] > 0
+        paused = resume_campaign(database=database, campaign_id=campaign_id, provider=provider)
+        assert paused["status"] == "paused"
+        assert paused["stop_reason"] == "provider_request_unconfirmed"
+        assert len(server.requests) == 3
+        request_id = status["provider_requests"][-1]["request_id"]
+        assert main([
+            "research", "reconcile-request", "--db", str(database),
+            "--campaign-id", campaign_id, "--request-id", request_id,
+            "--prompt-tokens", "200", "--completion-tokens", "100",
+            "--actual-cost-usd", "1.01", "--evidence", "Provider invoice",
+        ]) == 0
+        reconciled = campaign_status(database, campaign_id)["provider_requests"][-1]
+        assert reconciled["status"] == "reconciled"
+        assert reconciled["usage"]["actual_cost_usd"] == 1.01
+        stopped = resume_campaign(database=database, campaign_id=campaign_id, provider=provider)
+        assert stopped["stop_reason"] == "cost_budget"
+        assert len(server.requests) == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_openai_compatible_provider_validates_proposals_and_tracks_usage() -> None:
     proposal = {
         "schema_version": "1",
@@ -79,7 +227,7 @@ def test_openai_compatible_provider_validates_proposals_and_tracks_usage() -> No
         [_chat_response(json.dumps(proposal)), _chat_response(json.dumps(reflection))]
     )
     try:
-        provider = OpenAICompatibleProvider(
+        provider = _best_effort_provider(
             endpoint=f"http://127.0.0.1:{server.server_port}/v1",
             model="test-model",
             api_key="local-test-secret",
@@ -126,12 +274,15 @@ def test_openai_provider_can_propose_python_when_trusted_local_enabled() -> None
         "strategy": {
             "family": "python",
             "parameters": {},
+            "parameter_schema": {
+                "parameters": {}, "constraints": [], "no_tunable_parameters": True,
+            },
             "source": "def strategy(history, state):\n    return {CASH: 1.0}\n",
         },
     }
     server, thread = _start_server([_chat_response(json.dumps(proposal))])
     try:
-        provider = OpenAICompatibleProvider(
+        provider = _best_effort_provider(
             endpoint=f"http://127.0.0.1:{server.server_port}/v1",
             model="test-model",
             api_key="local-test-secret",
@@ -158,7 +309,7 @@ def test_openai_provider_can_propose_python_when_trusted_local_enabled() -> None
 def test_openai_provider_stops_before_a_request_outside_token_budget() -> None:
     server, thread = _start_server([])
     try:
-        provider = OpenAICompatibleProvider(
+        provider = _best_effort_provider(
             endpoint=f"http://127.0.0.1:{server.server_port}/v1",
             model="test-model",
             api_key="local-test-secret",
@@ -185,7 +336,7 @@ def test_openai_provider_stops_before_a_request_outside_token_budget() -> None:
 def test_openai_provider_stops_before_estimated_cost_exceeds_budget() -> None:
     server, thread = _start_server([])
     try:
-        provider = OpenAICompatibleProvider(
+        provider = _best_effort_provider(
             endpoint=f"http://127.0.0.1:{server.server_port}/v1",
             model="test-model",
             api_key="local-test-secret",
@@ -211,7 +362,7 @@ def test_openai_provider_stops_before_estimated_cost_exceeds_budget() -> None:
 
 def test_openai_provider_requires_tls_for_remote_credentials() -> None:
     with pytest.raises(ValueError, match="HTTPS"):
-        OpenAICompatibleProvider(
+        _best_effort_provider(
             endpoint="http://provider.example/v1",
             model="test-model",
             api_key="local-test-secret",
@@ -236,7 +387,7 @@ def test_openai_provider_rejects_strategy_outside_versioned_contract() -> None:
     }
     server, thread = _start_server([_chat_response(json.dumps(proposal))])
     try:
-        provider = OpenAICompatibleProvider(
+        provider = _best_effort_provider(
             endpoint=f"http://127.0.0.1:{server.server_port}/v1",
             model="test-model",
             api_key="local-test-secret",
@@ -267,7 +418,7 @@ def test_openai_provider_rejects_python_without_trusted_local_opt_in() -> None:
     }
     server, thread = _start_server([_chat_response(json.dumps(proposal))])
     try:
-        provider = OpenAICompatibleProvider(
+        provider = _best_effort_provider(
             endpoint=f"http://127.0.0.1:{server.server_port}/v1",
             model="test-model",
             api_key="local-test-secret",
@@ -296,7 +447,7 @@ def test_openai_provider_bounds_http_timeout_by_remaining_campaign_time(
         raise TimeoutError
 
     monkeypatch.setattr(providers_module, "urlopen", fail_request)
-    provider = OpenAICompatibleProvider(
+    provider = _best_effort_provider(
         endpoint="http://127.0.0.1/v1",
         model="test-model",
         api_key="local-test-secret",
@@ -333,6 +484,9 @@ def test_campaign_records_provider_usage_without_persisting_api_credentials(
         proposal["strategy"] = {
             "family": "python",
             "parameters": {},
+            "parameter_schema": {
+                "parameters": {}, "constraints": [], "no_tunable_parameters": True,
+            },
             "source": "def strategy(history, state):\n    return {CASH: 1.0}\n",
         }
     reflection = {
@@ -356,7 +510,7 @@ def test_campaign_records_provider_usage_without_persisting_api_credentials(
     bars_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     secret = "local-test-secret-that-must-not-be-stored"
     endpoint = f"http://127.0.0.1:{server.server_port}/v1"
-    provider = OpenAICompatibleProvider(
+    provider = _best_effort_provider(
         endpoint=endpoint,
         model="test-model",
         api_key=secret,
@@ -380,6 +534,8 @@ def test_campaign_records_provider_usage_without_persisting_api_credentials(
             token_budget=5000,
             cost_budget_usd=1,
             steps=None,
+            holdout_start="2025-01-01",
+            holdout_end="2025-01-31",
             trusted_local_python=generated_python,
             provider_config={
                 "endpoint": endpoint,
@@ -436,7 +592,7 @@ def test_invalid_provider_response_retains_reported_usage(
         for symbol in ETF_SYMBOLS:
             lines.append(f"{day},{symbol},100,101,100,101,1000,total_return")
     bars_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    provider = OpenAICompatibleProvider(
+    provider = _best_effort_provider(
         endpoint=f"http://127.0.0.1:{server.server_port}/v1",
         model="test-model",
         api_key="local-test-secret",
@@ -460,6 +616,8 @@ def test_invalid_provider_response_retains_reported_usage(
             token_budget=5000,
             cost_budget_usd=1,
             steps=None,
+            holdout_start="2025-01-01",
+            holdout_end="2025-01-31",
         )
     finally:
         server.shutdown()
@@ -475,7 +633,7 @@ def test_invalid_provider_response_retains_reported_usage(
 def test_missing_provider_usage_reserves_budget_for_failed_request() -> None:
     server, thread = _start_server([{"choices": []}])
     try:
-        provider = OpenAICompatibleProvider(
+        provider = _best_effort_provider(
             endpoint=f"http://127.0.0.1:{server.server_port}/v1",
             model="test-model",
             api_key="local-test-secret",

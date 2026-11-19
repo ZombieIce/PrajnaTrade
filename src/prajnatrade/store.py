@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+import uuid
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +88,7 @@ class SQLiteStore:
                     candidate_hash TEXT NOT NULL,
                     data_hash TEXT NOT NULL,
                     split_json TEXT NOT NULL,
+                    robustness_plan_json TEXT,
                     frozen_at TEXT NOT NULL,
                     conclusion TEXT NOT NULL
                 );
@@ -110,6 +114,14 @@ class SQLiteStore:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS holdout_data_hash_once
                     ON holdout_receipts(data_hash);
+                CREATE TABLE IF NOT EXISTS provider_requests (
+                    request_id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    usage_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             campaign_columns = {
@@ -140,6 +152,7 @@ class SQLiteStore:
                 ("candidate_hash", "TEXT NOT NULL DEFAULT ''"),
                 ("data_hash", "TEXT NOT NULL DEFAULT ''"),
                 ("split_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("robustness_plan_json", "TEXT"),
             ):
                 if column not in candidate_columns:
                     connection.execute(
@@ -213,6 +226,128 @@ class SQLiteStore:
             )
             connection.commit()
 
+    def reserve_provider_request(
+        self, campaign_id: str, stage: str, usage: dict[str, Any]
+    ) -> str:
+        request_id = str(uuid.uuid4())
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            outstanding = connection.execute(
+                "SELECT 1 FROM provider_requests WHERE campaign_id = ? AND status = 'reserved'",
+                (campaign_id,),
+            ).fetchone()
+            if outstanding is not None:
+                raise ValueError("An unconfirmed provider request requires reconciliation.")
+            connection.execute(
+                """
+                INSERT INTO provider_requests
+                (request_id, campaign_id, stage, status, usage_json, created_at)
+                VALUES (?, ?, ?, 'reserved', ?, ?)
+                """,
+                (
+                    request_id, campaign_id, stage, _json_dump(usage),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            connection.commit()
+        return request_id
+
+    def settle_provider_request(self, request_id: str, usage: dict[str, Any]) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT usage_json FROM provider_requests WHERE request_id = ? AND status = 'reserved'",
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"No reserved provider request: {request_id}")
+            settled = {**usage, "reservation": json.loads(row["usage_json"])}
+            cursor = connection.execute(
+                """
+                UPDATE provider_requests SET status = 'settled', usage_json = ?
+                WHERE request_id = ? AND status = 'reserved'
+                """,
+                (_json_dump(settled), request_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"No reserved provider request: {request_id}")
+            connection.commit()
+
+    def reconcile_provider_request(
+        self, campaign_id: str, request_id: str, *, prompt_tokens: int,
+        completion_tokens: int, actual_cost_usd: float, evidence: str,
+    ) -> dict[str, Any]:
+        if (
+            prompt_tokens < 0 or completion_tokens < 0
+            or not math.isfinite(actual_cost_usd) or actual_cost_usd < 0
+            or not evidence.strip()
+        ):
+            raise ValueError("Reconciliation requires nonnegative usage, finite cost and evidence.")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM provider_requests WHERE request_id = ? AND campaign_id = ?",
+                (request_id, campaign_id),
+            ).fetchone()
+            if row is None or row["status"] not in {"reserved", "settled"}:
+                raise ValueError("Request is unknown or has already been reconciled.")
+            previous = json.loads(row["usage_json"])
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "actual_cost_usd": actual_cost_usd,
+                "requests": 1,
+                "usage_estimated": False,
+                "reconciliation_evidence": evidence.strip(),
+                "reconciled_at": datetime.now(timezone.utc).isoformat(),
+                "previous_usage": previous,
+            }
+            connection.execute(
+                "UPDATE provider_requests SET status = 'reconciled', usage_json = ? WHERE request_id = ?",
+                (_json_dump(usage), request_id),
+            )
+            connection.commit()
+        return {"request_id": request_id, "status": "reconciled", "usage": usage}
+
+    def list_provider_requests(self, campaign_id: str) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM provider_requests WHERE campaign_id = ? ORDER BY rowid",
+                (campaign_id,),
+            ).fetchall()
+        requests = []
+        for row in rows:
+            request = dict(row)
+            request["usage"] = json.loads(request.pop("usage_json"))
+            requests.append(request)
+        return requests
+
+    def update_experiment(self, experiment_id: str, **updates: Any) -> None:
+        allowed = {
+            "strategy_json", "strategy_hash", "parameters_json", "metrics_json",
+            "status", "decision", "reflection", "error", "provider_usage_json",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported experiment fields: {', '.join(sorted(unknown))}.")
+        if not updates:
+            return
+        values = [
+            _json_dump(value) if column in _EXPERIMENT_JSON_COLUMNS and value is not None
+            else value
+            for column, value in updates.items()
+        ]
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                f"UPDATE experiments SET {assignments} WHERE experiment_id = ?",
+                (*values, experiment_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown experiment: {experiment_id}")
+            connection.commit()
+
     def list_experiments(self, campaign_id: str) -> list[dict[str, Any]]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
@@ -245,6 +380,7 @@ class SQLiteStore:
             candidate["candidate_hash"],
             candidate["data_hash"],
             _json_dump(candidate["split"]),
+            _json_dump(candidate["robustness_plan"]),
             candidate["frozen_at"],
             candidate["conclusion"],
         )
@@ -263,8 +399,9 @@ class SQLiteStore:
                 """
                 INSERT INTO candidates
                 (candidate_id, campaign_id, experiment_id, name, strategy_json,
-                 strategy_hash, candidate_hash, data_hash, split_json, frozen_at, conclusion)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 strategy_hash, candidate_hash, data_hash, split_json, robustness_plan_json,
+                 frozen_at, conclusion)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -280,6 +417,8 @@ class SQLiteStore:
         candidate = dict(row)
         candidate["strategy"] = json.loads(candidate.pop("strategy_json"))
         candidate["split"] = json.loads(candidate.pop("split_json"))
+        raw_plan = candidate.pop("robustness_plan_json")
+        candidate["robustness_plan"] = json.loads(raw_plan) if raw_plan is not None else None
         return candidate
 
     def list_candidates(self, campaign_id: str) -> list[dict[str, Any]]:
@@ -293,6 +432,8 @@ class SQLiteStore:
             candidate = dict(row)
             candidate["strategy"] = json.loads(candidate.pop("strategy_json"))
             candidate["split"] = json.loads(candidate.pop("split_json"))
+            raw_plan = candidate.pop("robustness_plan_json")
+            candidate["robustness_plan"] = json.loads(raw_plan) if raw_plan is not None else None
             candidates.append(candidate)
         return candidates
 

@@ -5,7 +5,7 @@ import json
 import math
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +13,10 @@ from prajnatrade.backtest import equal_weight_buy_and_hold, run_backtest
 from prajnatrade.data import ValidatedData, load_bars
 from prajnatrade.providers import (
     MockProvider,
+    OpenAICompatibleProvider,
     ProviderBudgetExceeded,
     ProviderError,
+    Proposal,
     ResearchProvider,
     combine_usage,
     recent_experiment_context,
@@ -48,6 +50,8 @@ def start_campaign(
     token_budget: int,
     cost_budget_usd: float,
     steps: int | None,
+    holdout_start: str,
+    holdout_end: str,
     provider_config: dict[str, Any] | None = None,
     trusted_local_python: bool = False,
 ) -> dict[str, Any]:
@@ -62,7 +66,7 @@ def start_campaign(
     store = SQLiteStore(database)
     campaign_id = str(uuid.uuid4())
     now = _now()
-    split = _split_dates(dataset)
+    split = _split_dates(dataset, holdout_start, holdout_end)
     baseline = run_backtest(
         dataset,
         equal_weight_buy_and_hold,
@@ -124,6 +128,7 @@ def resume_campaign(
         raise ValueError("steps must be greater than zero.")
     store = SQLiteStore(database)
     campaign = store.get_campaign(campaign_id)
+    _require_external_holdout(campaign)
     if campaign["status"] not in {"paused", "running"}:
         raise ValueError(
             f"Campaign {campaign_id} is {campaign['status']!r} and cannot be resumed."
@@ -156,31 +161,43 @@ def advance_campaign(
     trusted_local_python: bool = False,
 ) -> dict[str, Any]:
     campaign = store.get_campaign(campaign_id)
+    _require_external_holdout(campaign)
     if campaign["data_hash"] != dataset.data_hash:
         raise ValueError("Campaign data fingerprint does not match the loaded dataset.")
     if steps is not None and steps <= 0:
         raise ValueError("steps must be greater than zero.")
+    if isinstance(provider, OpenAICompatibleProvider):
+        provider.bind_budget_store(store, campaign_id)
     started = time.monotonic()
     prior_elapsed = float(campaign["elapsed_seconds"])
     attempts_this_run = 0
     experiments = store.list_experiments(campaign_id)
+    pending = None
+    if experiments and experiments[-1]["status"] == "running":
+        pending = experiments.pop()
     consecutive_failures = _trailing_failures(experiments)
     stop_reason: str | None = None
 
     while True:
         elapsed = prior_elapsed + time.monotonic() - started
-        token_usage = sum(
-            int(item["provider_usage"].get("total_tokens", 0))
-            for item in experiments
+        requests = store.list_provider_requests(campaign_id)
+        if any(item["status"] == "reserved" for item in requests):
+            stop_reason = "provider_request_unconfirmed"
+            break
+        usages = (
+            [item["usage"] for item in requests]
+            if isinstance(provider, OpenAICompatibleProvider)
+            else [item["provider_usage"] for item in experiments]
         )
+        token_usage = sum(int(item.get("total_tokens", 0)) for item in usages)
         cost_usage = sum(
-            float(item["provider_usage"].get("estimated_cost_usd", 0.0))
-            for item in experiments
+            float(item.get("actual_cost_usd", item.get("estimated_cost_usd", 0.0)))
+            for item in usages
         )
-        if len(experiments) >= campaign["experiment_budget"]:
+        if pending is None and len(experiments) >= campaign["experiment_budget"]:
             stop_reason = "experiment_budget"
             break
-        if consecutive_failures >= campaign["max_consecutive_failures"]:
+        if pending is None and consecutive_failures >= campaign["max_consecutive_failures"]:
             stop_reason = "consecutive_failures"
             break
         if elapsed >= campaign["max_seconds"]:
@@ -192,7 +209,7 @@ def advance_campaign(
         if cost_usage >= campaign["cost_budget_usd"]:
             stop_reason = "cost_budget"
             break
-        if steps is not None and attempts_this_run >= steps:
+        if pending is None and steps is not None and attempts_this_run >= steps:
             break
 
         ordinal = len(experiments) + 1
@@ -210,76 +227,141 @@ def advance_campaign(
                 "remaining_cost_usd": max(0.0, campaign["cost_budget_usd"] - cost_usage),
             },
         }
-        try:
-            proposal = provider.propose(ordinal, context)
-        except ProviderBudgetExceeded as error:
-            stop_reason = error.budget_kind
-            break
-        except ProviderError as error:
-            consecutive_failures += 1
-            experiment = _failed_experiment(
-                campaign_id,
-                ordinal,
-                hypothesis=f"Provider proposal attempt {ordinal}",
-                rationale="No valid proposal was returned.",
-                strategy={},
-                data_hash=campaign["data_hash"],
-                error=str(error),
-                decision=(
-                    "stop"
-                    if consecutive_failures >= campaign["max_consecutive_failures"]
-                    else "investigate"
-                ),
-                reflection="Retain this failed provider attempt and stop or retry within the configured failure budget.",
-                usage=error.usage or {
-                    "requests": 1, "total_tokens": 0, "estimated_cost_usd": 0.0
-                },
-            )
-            store.insert_experiment(experiment)
-            experiments.append(_decode_experiment(experiment))
-            attempts_this_run += 1
-            _save_progress(store, campaign_id, prior_elapsed, started)
-            continue
-
-        raw_strategy = proposal.strategy
-        try:
-            strategy_spec = normalize_strategy_spec(raw_strategy)
-            strategy = make_strategy(strategy_spec, trusted_local_python=trusted_local_python)
-            backtest = run_backtest(
-                dataset,
-                strategy,
-                initial_cash=campaign["initial_cash"],
-                transaction_cost_bps=campaign["transaction_cost_bps"],
-                slippage_bps=campaign["slippage_bps"],
-                end_date=campaign["split"]["discovery_end"],
-            )
-            metrics: dict[str, Any] | None = {
-                **backtest.metrics,
-                "benchmark_excess_return": (
-                    backtest.metrics["total_return"]
-                    - campaign["baseline"]["metrics"]["total_return"]
-                ),
-                "ending_equity": backtest.ending_equity,
-                "equity_curve": backtest.equity_curve,
-                "fills": backtest.fills,
-                "unavailable_prices": backtest.unavailable_prices,
+        if pending is None:
+            try:
+                proposal = provider.propose(ordinal, context)
+            except ProviderBudgetExceeded as error:
+                stop_reason = error.budget_kind
+                break
+            except ProviderError as error:
+                consecutive_failures += 1
+                experiment = _failed_experiment(
+                    campaign_id,
+                    ordinal,
+                    hypothesis=f"Provider proposal attempt {ordinal}",
+                    rationale="No valid proposal was returned.",
+                    strategy={},
+                    data_hash=campaign["data_hash"],
+                    error=str(error),
+                    decision=(
+                        "stop"
+                        if consecutive_failures >= campaign["max_consecutive_failures"]
+                        else "investigate"
+                    ),
+                    reflection="Retain this failed provider attempt and stop or retry within the configured failure budget.",
+                    usage=error.usage or {
+                        "requests": 1, "total_tokens": 0, "estimated_cost_usd": 0.0
+                    },
+                )
+                store.insert_experiment(experiment)
+                experiments.append(_decode_experiment(experiment))
+                attempts_this_run += 1
+                _save_progress(store, campaign_id, prior_elapsed, started)
+                continue
+            pending_record = {
+                "experiment_id": str(uuid.uuid4()),
+                "campaign_id": campaign_id,
+                "data_hash": campaign["data_hash"],
+                "ordinal": ordinal,
+                "hypothesis": proposal.hypothesis,
+                "rationale": proposal.rationale,
+                "strategy_json": proposal.strategy,
+                "strategy_hash": _strategy_hash(proposal.strategy),
+                "parameters_json": proposal.strategy.get("parameters", {}),
+                "metrics_json": None,
+                "status": "running",
+                "decision": "pending",
+                "reflection": "",
+                "error": None,
+                "provider_usage_json": proposal.usage,
+                "created_at": _now(),
             }
-            outcome = {"status": "succeeded", "metrics": metrics, "error": None}
-        except (ValueError, KeyError, TypeError) as error:
-            strategy_spec = raw_strategy if isinstance(raw_strategy, dict) else {}
-            metrics = None
-            outcome = {"status": "failed", "metrics": None, "error": str(error)}
+            store.insert_experiment(pending_record)
+            pending = _decode_experiment(pending_record)
+            _save_progress(store, campaign_id, prior_elapsed, started)
+        else:
+            proposal = Proposal(
+                hypothesis=pending["hypothesis"],
+                rationale=pending["rationale"],
+                strategy=pending["strategy"],
+                usage=pending["provider_usage"],
+            )
+
+        if pending["metrics"] is not None or pending["error"] is not None:
+            strategy_spec = pending["strategy"]
+            metrics = pending["metrics"]
+            outcome = {
+                "status": "failed" if pending["error"] else "succeeded",
+                "metrics": metrics,
+                "error": pending["error"],
+            }
+        else:
+            raw_strategy = proposal.strategy
+            try:
+                strategy_spec = normalize_strategy_spec(raw_strategy)
+                strategy = make_strategy(strategy_spec, trusted_local_python=trusted_local_python)
+                backtest = run_backtest(
+                    dataset,
+                    strategy,
+                    initial_cash=campaign["initial_cash"],
+                    transaction_cost_bps=campaign["transaction_cost_bps"],
+                    slippage_bps=campaign["slippage_bps"],
+                    end_date=campaign["split"]["discovery_end"],
+                )
+                metrics = {
+                    **backtest.metrics,
+                    "benchmark_excess_return": (
+                        backtest.metrics["total_return"]
+                        - campaign["baseline"]["metrics"]["total_return"]
+                    ),
+                    "ending_equity": backtest.ending_equity,
+                    "equity_curve": backtest.equity_curve,
+                    "fills": backtest.fills,
+                    "unavailable_prices": backtest.unavailable_prices,
+                }
+                outcome = {"status": "succeeded", "metrics": metrics, "error": None}
+            except (ValueError, KeyError, TypeError) as error:
+                strategy_spec = raw_strategy if isinstance(raw_strategy, dict) else {}
+                metrics = None
+                outcome = {"status": "failed", "metrics": None, "error": str(error)}
+            store.update_experiment(
+                pending["experiment_id"],
+                strategy_json=strategy_spec,
+                strategy_hash=_strategy_hash(strategy_spec),
+                parameters_json=strategy_spec.get("parameters", {}),
+                metrics_json=metrics,
+                error=outcome["error"],
+            )
+            _save_progress(store, campaign_id, prior_elapsed, started)
 
         reflection_context = dict(context)
         reflection_limits = dict(context["limits"])
-        reflection_limits["remaining_tokens"] = max(
-            0, reflection_limits["remaining_tokens"] - proposal.usage.get("total_tokens", 0)
-        )
-        reflection_limits["remaining_cost_usd"] = max(
-            0.0,
-            reflection_limits["remaining_cost_usd"]
-            - proposal.usage.get("estimated_cost_usd", 0.0),
-        )
+        if isinstance(provider, OpenAICompatibleProvider):
+            requests = store.list_provider_requests(campaign_id)
+            if any(item["status"] == "reserved" for item in requests):
+                stop_reason = "provider_request_unconfirmed"
+                break
+            reflection_limits["remaining_tokens"] = max(
+                0, campaign["token_budget"] - sum(
+                    int(item["usage"].get("total_tokens", 0)) for item in requests
+                )
+            )
+            reflection_limits["remaining_cost_usd"] = max(
+                0.0, campaign["cost_budget_usd"] - sum(
+                    float(item["usage"].get(
+                        "actual_cost_usd", item["usage"].get("estimated_cost_usd", 0.0)
+                    )) for item in requests
+                )
+            )
+        else:
+            reflection_limits["remaining_tokens"] = max(
+                0, reflection_limits["remaining_tokens"] - proposal.usage.get("total_tokens", 0)
+            )
+            reflection_limits["remaining_cost_usd"] = max(
+                0.0,
+                reflection_limits["remaining_cost_usd"]
+                - proposal.usage.get("estimated_cost_usd", 0.0),
+            )
         reflection_limits["remaining_seconds"] = max(
             0.0, campaign["max_seconds"] - (prior_elapsed + time.monotonic() - started)
         )
@@ -287,10 +369,8 @@ def advance_campaign(
         try:
             reflection = provider.reflect(proposal, outcome, reflection_context)
         except ProviderBudgetExceeded as error:
-            reflection = None
-            reflection_error = str(error)
-            provider_stop_reason = error.budget_kind
-            failed_reflection_usage: dict[str, Any] = {}
+            stop_reason = error.budget_kind
+            break
         except ProviderError as error:
             reflection = None
             reflection_error = str(error)
@@ -349,8 +429,22 @@ def advance_campaign(
                 "provider_usage_json": provider_usage,
                 "created_at": _now(),
             }
-        store.insert_experiment(experiment)
+        experiment["experiment_id"] = pending["experiment_id"]
+        experiment["created_at"] = pending["created_at"]
+        store.update_experiment(
+            experiment["experiment_id"],
+            strategy_json=experiment["strategy_json"],
+            strategy_hash=experiment["strategy_hash"],
+            parameters_json=experiment["parameters_json"],
+            metrics_json=experiment["metrics_json"],
+            status=experiment["status"],
+            decision=experiment["decision"],
+            reflection=experiment["reflection"],
+            error=experiment["error"],
+            provider_usage_json=experiment["provider_usage_json"],
+        )
         experiments.append(_decode_experiment(experiment))
+        pending = None
         attempts_this_run += 1
         _save_progress(store, campaign_id, prior_elapsed, started)
         if decision == "stop":
@@ -380,7 +474,13 @@ def advance_campaign(
             stop_reason = "cost_budget"
 
     if stop_reason:
-        status = "completed" if stop_reason == "experiment_budget" else "stopped"
+        status = (
+            "completed" if stop_reason == "experiment_budget"
+            else "paused" if stop_reason in {
+                "cost_bound_unverifiable", "provider_request_unconfirmed"
+            }
+            else "stopped"
+        )
     else:
         status = "paused"
         stop_reason = "step_limit"
@@ -412,6 +512,7 @@ def campaign_status(database: str | Path, campaign_id: str) -> dict[str, Any]:
     return {
         "campaign": campaign,
         "experiments": experiments,
+        "provider_requests": store.list_provider_requests(campaign_id),
     }
 
 
@@ -437,22 +538,42 @@ def _validate_campaign_limits(
         raise ValueError("steps must be greater than zero.")
 
 
-def _split_dates(dataset: ValidatedData) -> dict[str, str]:
+def _split_dates(
+    dataset: ValidatedData, holdout_start: str, holdout_end: str
+) -> dict[str, str]:
     dates = list(dataset.bars["date"].drop_duplicates())
     if len(dates) < 5:
-        raise ValueError("Research campaigns require at least five distinct sessions for data splits.")
-    discovery_end = max(1, int(len(dates) * 0.6) - 1)
+        raise ValueError("Research campaigns require at least five development sessions.")
+    try:
+        start = date.fromisoformat(holdout_start)
+        end = date.fromisoformat(holdout_end)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Holdout boundaries must be valid ISO dates (YYYY-MM-DD).") from error
+    if start <= dates[-1].date():
+        raise ValueError(
+            "Development data must end before the separately stored holdout starts."
+        )
+    if end < start:
+        raise ValueError("Holdout end must not precede its start.")
+    discovery_end = max(1, int(len(dates) * 0.75) - 1)
     validation_start = discovery_end + 1
-    validation_end = max(validation_start, int(len(dates) * 0.8) - 1)
-    holdout_start = validation_end + 1
     return {
         "discovery_start": dates[0].strftime("%Y-%m-%d"),
         "discovery_end": dates[discovery_end].strftime("%Y-%m-%d"),
         "validation_start": dates[validation_start].strftime("%Y-%m-%d"),
-        "validation_end": dates[validation_end].strftime("%Y-%m-%d"),
-        "holdout_start": dates[holdout_start].strftime("%Y-%m-%d"),
-        "holdout_end": dates[-1].strftime("%Y-%m-%d"),
+        "validation_end": dates[-1].strftime("%Y-%m-%d"),
+        "holdout_start": start.isoformat(),
+        "holdout_end": end.isoformat(),
+        "holdout_storage": "external",
     }
+
+
+def _require_external_holdout(campaign: dict[str, Any]) -> None:
+    if campaign["split"].get("holdout_storage") != "external":
+        raise ValueError(
+            "This legacy campaign included holdout data during research; "
+            "start a new campaign with separately stored holdout data."
+        )
 
 
 def _trailing_failures(experiments: list[dict[str, Any]]) -> int:

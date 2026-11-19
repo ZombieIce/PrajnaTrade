@@ -14,15 +14,16 @@ def write_campaign_report(
     store = SQLiteStore(database)
     campaign = store.get_campaign(campaign_id)
     experiments = store.list_experiments(campaign_id)
+    requests = store.list_provider_requests(campaign_id)
     candidates = store.list_candidates(campaign_id)
     holdout_receipt = store.get_holdout_receipt(campaign_id)
-    provider_tokens = sum(
-        int(item["provider_usage"].get("total_tokens", 0)) for item in experiments
+    usages = (
+        [item["usage"] for item in requests] if requests
+        else [item["provider_usage"] for item in experiments]
     )
-    provider_cost = sum(
-        float(item["provider_usage"].get("estimated_cost_usd", 0.0))
-        for item in experiments
-    )
+    provider_tokens = sum(int(item.get("total_tokens", 0)) for item in usages)
+    provider_cost = sum(float(item.get("estimated_cost_usd", 0.0)) for item in usages)
+    actual_provider_cost = sum(float(item.get("actual_cost_usd", 0.0)) for item in usages)
     failed_attempts = sum(item["status"] == "failed" for item in experiments)
     provenance = campaign["baseline"].get("data_provenance")
     evaluations_by_candidate = {
@@ -64,7 +65,9 @@ def write_campaign_report(
                 "Total research attempts": str(len(experiments)),
                 "Failed attempts": str(failed_attempts),
                 "Provider tokens": str(provider_tokens),
-                "Estimated provider cost": f"${provider_cost:.6f}",
+                "Unreconciled estimated provider cost": f"${provider_cost:.6f}",
+                "Reconciled actual provider cost": f"${actual_provider_cost:.6f}",
+                "Unconfirmed provider requests": str(sum(item["status"] == "reserved" for item in requests)),
                 "Initial cash": _format(campaign["initial_cash"]),
                 "Discovery interval": (
                     f"{campaign['split']['discovery_start']} — "
@@ -93,6 +96,10 @@ def write_campaign_report(
         "<section><h2>Experiment history</h2>",
         _experiment_table(experiments),
         "</section>",
+        "<section><h2>Provider request ledger</h2>",
+        f"<pre>{html.escape(json.dumps(requests, indent=2, sort_keys=True))}</pre>",
+        "<p>Estimated cost is not an invoice; actual charges are known only after reconciliation.</p>",
+        "</section>",
         "<section><h2>Frozen candidates and independent evaluations</h2>",
         _candidate_sections(candidates, evaluations_by_candidate),
         "</section>",
@@ -101,7 +108,8 @@ def write_campaign_report(
         "<li>Validation uses a separate interval; the final holdout is one-use and requires explicit confirmation.</li>",
         "<li>Mock provider runs test orchestration, not AI novelty. Synthetic data is never market evidence.</li>",
         "<li>Generated Python requires explicit trusted-local opt-in and is not sandboxed; "
-        "it can access files, credentials, network, and holdout data.</li>",
+        "it can access files, credentials and the network. Keep holdout data inaccessible "
+        "to the process until confirmation.</li>",
         "<li>Historical backtests do not establish future profitability.</li></ul>",
         "</section>",
         "</main></body></html>",
@@ -237,6 +245,7 @@ def _candidate_sections(
                         "Source experiment": candidate["experiment_id"],
                         "Frozen at": candidate["frozen_at"],
                         "Frozen data split": split_summary,
+                        "Frozen robustness plan": json.dumps(candidate["robustness_plan"], sort_keys=True),
                     }
                 ),
             ]
