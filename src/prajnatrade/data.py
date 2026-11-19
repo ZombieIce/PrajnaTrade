@@ -67,10 +67,10 @@ def load_bars(path: str | Path, price_basis: str) -> ValidatedData:
         details = ", ".join(invalid_symbols) if invalid_symbols else "blank symbol"
         raise DataValidationError(f"Unsupported or missing ETF symbol(s): {details}.")
 
-    dates = pd.to_datetime(bars["date"], errors="coerce", utc=True)
+    dates = _exchange_dates(bars["date"])
     if dates.isna().any():
         raise DataValidationError("Date column contains invalid or missing values.")
-    bars["date"] = dates.dt.tz_convert(None).dt.normalize()
+    bars["date"] = dates
 
     bases = bars["price_basis"].astype("string").str.strip().str.lower()
     if bases.isna().any() or set(bases) != {price_basis}:
@@ -158,6 +158,19 @@ def fingerprint_bars(bars: pd.DataFrame) -> str:
     return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
 
 
+def _exchange_dates(values: pd.Series) -> pd.Series:
+    def parse(value: object) -> pd.Timestamp:
+        try:
+            date = pd.Timestamp(value)
+            if date.tzinfo is not None:
+                date = date.tz_convert("Asia/Shanghai").tz_localize(None)
+            return date.normalize()
+        except (ValueError, TypeError, OverflowError):
+            return pd.NaT
+
+    return pd.to_datetime(values.map(parse))
+
+
 def validate_calendar(
     path: str | Path | None, bars: pd.DataFrame
 ) -> dict[str, object]:
@@ -185,10 +198,9 @@ def validate_calendar(
         raise DataValidationError("Calendar file is empty.") from error
     if "date" not in calendar.columns or calendar.empty:
         raise DataValidationError("Calendar CSV must contain a nonempty date column.")
-    dates = pd.to_datetime(calendar["date"], errors="coerce", utc=True)
+    dates = _exchange_dates(calendar["date"])
     if dates.isna().any():
         raise DataValidationError("Calendar contains invalid or missing dates.")
-    dates = dates.dt.tz_convert(None).dt.normalize()
     if dates.duplicated().any():
         raise DataValidationError("Calendar contains duplicate dates.")
     expected = set(dates)

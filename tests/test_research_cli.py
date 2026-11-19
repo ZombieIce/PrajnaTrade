@@ -50,7 +50,7 @@ def test_mock_campaign_can_pause_resume_and_preserve_every_attempt(
 ) -> None:
     bars = tmp_path / "bars.csv"
     database = tmp_path / "research.sqlite"
-    _write_bars(bars)
+    _write_bars(bars, day_count=24)
     common = [
         "--db",
         str(database),
@@ -63,7 +63,7 @@ def test_mock_campaign_can_pause_resume_and_preserve_every_attempt(
         "--provider",
         "mock",
         "--seed",
-        "17",
+        "1",
     ]
 
     first = _run_cli(
@@ -125,6 +125,50 @@ def test_mock_campaign_can_pause_resume_and_preserve_every_attempt(
     assert len(experiments) == 4
     assert len({item["experiment_id"] for item in experiments}) == 4
     assert len({item["strategy"]["family"] for item in experiments}) > 1
+    assert {"keep", "reject", "branch"} <= {item["decision"] for item in experiments}
+    for previous, following in zip(experiments, experiments[1:]):
+        if previous["decision"] in {"keep", "investigate"}:
+            assert following["strategy"]["family"] == previous["strategy"]["family"]
+            if previous["strategy"]["family"] != "equal_weight":
+                assert following["parameters"] != previous["parameters"]
+        elif previous["decision"] in {"reject", "branch"}:
+            assert following["strategy"]["family"] != previous["strategy"]["family"]
+
+    uninterrupted = _run_cli(
+        "research", "run", "--db", str(tmp_path / "second.sqlite"),
+        "--data", str(bars), "--price-basis", "total_return",
+        "--data-kind", "synthetic", "--provider", "mock", "--seed", "1",
+        "--experiments", "4",
+    )
+    assert uninterrupted.returncode == 0, uninterrupted.stderr
+    second_id = json.loads(uninterrupted.stdout)["campaign_id"]
+    second_status = _run_cli(
+        "research", "status", "--db", str(tmp_path / "second.sqlite"),
+        "--campaign-id", second_id,
+    )
+    second = json.loads(second_status.stdout)["experiments"]
+    assert [(e["strategy"], e["decision"]) for e in experiments] == [
+        (e["strategy"], e["decision"]) for e in second
+    ]
+
+
+def test_mock_investigates_a_recorded_control_result(tmp_path: Path) -> None:
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    _write_bars(bars, day_count=24)
+    started = _run_cli(
+        "research", "run", "--db", str(database), "--data", str(bars),
+        "--price-basis", "total_return", "--data-kind", "synthetic",
+        "--provider", "mock", "--seed", "0", "--experiments", "7",
+    )
+    assert started.returncode == 0, started.stderr
+    status = _run_cli(
+        "research", "status", "--db", str(database), "--campaign-id",
+        json.loads(started.stdout)["campaign_id"],
+    )
+    experiments = json.loads(status.stdout)["experiments"]
+    assert experiments[5]["decision"] == "investigate"
+    assert experiments[6]["strategy"]["family"] == experiments[5]["strategy"]["family"]
 
 
 def test_provider_failure_is_retained_and_stops_at_the_failure_budget(
@@ -504,6 +548,9 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
     validation_result = json.loads(validation.stdout)
     assert validation_result["kind"] == "validation"
     evidence = validation_result["result"]
+    assert validation_result["data_hash"] == evidence["data_hash"]
+    assert validation_result["data_hash"] == evidence["candidate"]["data_hash"]
+    assert validation_result["data_hash"] != evidence["source_data_hash"]
     assert "benchmark_excess_return" in evidence
     assert evidence["candidate"]["metrics"]["max_drawdown"] is not None
     assert evidence["cost_sensitivity"]["metrics"]["total_return"] is not None
@@ -568,8 +615,12 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
         confirmation,
     )
     assert holdout.returncode == 0, holdout.stderr
-    assert json.loads(holdout.stdout)["kind"] == "holdout"
-    holdout_result = json.loads(holdout.stdout)["result"]
+    holdout_response = json.loads(holdout.stdout)
+    assert holdout_response["kind"] == "holdout"
+    holdout_result = holdout_response["result"]
+    assert holdout_response["data_hash"] == holdout_result["data_hash"]
+    assert holdout_response["data_hash"] == holdout_result["candidate"]["data_hash"]
+    assert holdout_response["data_hash"] != holdout_result["source_data_hash"]
     assert holdout_result["unlocked_at"]
 
     repeated = _run_cli(
@@ -625,6 +676,20 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
     assert second_candidate_holdout.returncode == 2
     assert "already consumed" in second_candidate_holdout.stderr.lower()
 
+    for name in ("Candidate C", "Candidate D"):
+        extra = _run_cli(
+            "research", "freeze", "--db", str(database),
+            "--campaign-id", campaign_id, "--experiment-id", experiment_id,
+            "--name", name, "--conclusion", "Frozen before validation.",
+        )
+        if name == "Candidate C":
+            assert extra.returncode == 0, extra.stderr
+        else:
+            assert extra.returncode == 2
+            assert "limit" in extra.stderr.lower()
+            assert "3" in extra.stderr
+
+    bars.unlink()
     report = _run_cli(
         "research",
         "report",
@@ -639,6 +704,9 @@ def test_frozen_candidate_validation_holdout_gate_and_report(
     html = report_path.read_text(encoding="utf-8")
     assert "synthetic" in html
     assert "Objective" in html
+    assert f"<dt>Data source path</dt><dd>{bars.resolve()}</dd>" in html
+    assert "<dt>Data date range</dt><dd>2024-01-01 — 2024-01-24</dd>" in html
+    assert "<dt>Data rows</dt><dd>120</dd>" in html
     assert "Candidate A" in html
     assert frozen_result["candidate_hash"] in html
     assert "<dt>Total research attempts</dt><dd>1</dd>" in html

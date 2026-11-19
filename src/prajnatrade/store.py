@@ -6,6 +6,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+MAX_CANDIDATES_PER_CAMPAIGN = 3
+
 
 _CAMPAIGN_JSON_COLUMNS = {"baseline_json", "provider_config_json", "split_json"}
 _EXPERIMENT_JSON_COLUMNS = {
@@ -247,6 +249,16 @@ class SQLiteStore:
             candidate["conclusion"],
         )
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            count = connection.execute(
+                "SELECT COUNT(*) FROM candidates WHERE campaign_id = ?",
+                (candidate["campaign_id"],),
+            ).fetchone()[0]
+            if count >= MAX_CANDIDATES_PER_CAMPAIGN:
+                raise ValueError(
+                    f"Candidate limit of {MAX_CANDIDATES_PER_CAMPAIGN} reached for this campaign; "
+                    "validate the frozen candidates or start a new campaign."
+                )
             connection.execute(
                 """
                 INSERT INTO candidates

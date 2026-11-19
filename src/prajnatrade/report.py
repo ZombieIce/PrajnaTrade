@@ -24,6 +24,7 @@ def write_campaign_report(
         for item in experiments
     )
     failed_attempts = sum(item["status"] == "failed" for item in experiments)
+    provenance = campaign["baseline"].get("data_provenance")
     evaluations_by_candidate = {
         candidate["candidate_id"]: store.list_evaluations(candidate["candidate_id"])
         for candidate in candidates
@@ -49,6 +50,15 @@ def write_campaign_report(
                 "Stop reason": campaign["stop_reason"] or "—",
                 "Provider": f"{campaign['provider']} / {campaign['provider_model']}",
                 "Data fingerprint": campaign["data_hash"],
+                "Data source path": campaign["data_path"],
+                "Data date range": (
+                    f"{provenance['start_date']} — {provenance['end_date']}"
+                    if provenance else "Unavailable for this older campaign"
+                ),
+                "Data rows": (
+                    str(provenance["rows"]) if provenance
+                    else "Unavailable for this older campaign"
+                ),
                 "Price basis": campaign["price_basis"],
                 "Universe": "511260, 518880, 515080, 513300, 159612, CASH",
                 "Total research attempts": str(len(experiments)),

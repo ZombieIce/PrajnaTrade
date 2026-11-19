@@ -70,12 +70,37 @@ class MockProvider:
             return self._propose_python(iteration, context)
         rng = random.Random(self.seed + iteration)
         family = STRATEGY_FAMILIES[(self.seed + iteration - 1) % len(STRATEGY_FAMILIES)]
+        previous = context.get("experiments", [])
+        last = previous[-1] if previous else {}
+        prior_strategy = last.get("strategy") or {}
+        prior_family = prior_strategy.get("family")
+        decision = last.get("decision")
+        if prior_family in STRATEGY_FAMILIES:
+            if last.get("status") == "failed":
+                family = STRATEGY_FAMILIES[
+                    (STRATEGY_FAMILIES.index(prior_family) + 1) % len(STRATEGY_FAMILIES)
+                ]
+            elif decision in {"keep", "investigate"}:
+                family = prior_family
+            elif decision in {"reject", "branch"}:
+                family = STRATEGY_FAMILIES[
+                    (STRATEGY_FAMILIES.index(prior_family) + 1) % len(STRATEGY_FAMILIES)
+                ]
         parameters: dict[str, object] = {}
         if family != "equal_weight":
-            parameters["lookback"] = rng.randint(3, 8)
+            if family == prior_family and decision in {"keep", "investigate"}:
+                prior_lookback = prior_strategy.get("parameters", {}).get("lookback", 3)
+                parameters["lookback"] = 2 if prior_lookback >= 252 else prior_lookback + 1
+            else:
+                parameters["lookback"] = rng.randint(3, 8)
         if family == "momentum":
-            parameters["top_k"] = rng.randint(1, 3)
-            parameters["cash_if_negative"] = True
+            prior_parameters = prior_strategy.get("parameters", {})
+            parameters["top_k"] = (
+                prior_parameters.get("top_k", 1)
+                if family == prior_family and decision in {"keep", "investigate"}
+                else rng.randint(1, 3)
+            )
+            parameters["cash_if_negative"] = prior_parameters.get("cash_if_negative", True)
         strategy = {"family": family, "parameters": parameters}
         if family == "momentum":
             hypothesis = (
@@ -96,7 +121,10 @@ class MockProvider:
             hypothesis = "A simple equal-weight buy-and-hold remains a useful control."
         return Proposal(
             hypothesis=hypothesis,
-            rationale="Deterministic Mock proposal; it is orchestration test data, not AI research.",
+            rationale=(
+                f"Deterministic Mock proposal following {decision or 'initial'} feedback; "
+                "it is orchestration test data, not AI research."
+            ),
             strategy=strategy,
             usage=_zero_usage(),
         )
@@ -113,7 +141,7 @@ class MockProvider:
             source = prior_strategy.get("source", "")
             if prior_strategy.get("family") == "python" and isinstance(source, str):
                 prior_direction = 0 if "scores = []" in source else 1
-                if last.get("decision") == "keep":
+                if last.get("decision") in {"keep", "investigate"}:
                     direction = prior_direction
                     lookback = 4 if "iloc[-3" in source else 3
                 else:

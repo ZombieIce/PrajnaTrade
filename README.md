@@ -10,6 +10,9 @@ CSV and Parquet inputs use one row per symbol and date with these columns:
 use the documented `total_return` adjustment basis, and every row must declare
 that basis so the loader can reject mixed or mismatched data. Missing opens or
 closes are retained and reported rather than silently filled.
+Timezone-aware timestamps are converted to Asia/Shanghai before extracting the
+trading date; timezone-naive dates are used as supplied. Calendar dates follow
+the same rule.
 
 ## First workflow
 
@@ -61,6 +64,10 @@ must be recreated rather than resumed or validated.
 ## Research, validation, and reports
 
 Mock campaigns are deterministic orchestration checks, not AI research. They
+use recorded decisions to refine a retained or investigated direction or
+switch after a rejection or branch. The unparameterized equal-weight control
+can only be retested, not tuned. Mock proposals remain limited to the supported
+declarative strategy families unless trusted-local Python is enabled. Campaigns
 split the ordered sessions into discovery, validation, and a final holdout
 (60% / 20% / remainder). Campaigns require at least five distinct sessions and
 retain every attempt in SQLite:
@@ -81,7 +88,8 @@ workers on the same campaign are not supported. The campaign time budget is
 checked between attempts; it does not interrupt an attempt already in progress.
 
 Freeze a successful experiment before evaluating it on the independent
-validation interval. The final holdout can be consumed only once, after
+validation interval. Each campaign permits at most three frozen candidates.
+The final holdout can be consumed only once, after
 validation and an explicit confirmation. Both evaluations require the original
 campaign dataset, price basis, and data-kind label; the frozen dataset
 fingerprint is checked before evaluation:
@@ -105,6 +113,12 @@ prajnatrade research report \
   --db research.sqlite --campaign-id <campaign-id> \
   --output report.html
 ```
+
+Reports include the recorded source path, full dataset date range and row count.
+Older campaigns that did not persist the latter fields report them as
+unavailable; reporting does not reread the source file. Evaluation `data_hash`
+identifies the evaluated interval, while `source_data_hash` identifies the full
+dataset.
 
 For an OpenAI-compatible provider, configure `PRAJNATRADE_OPENAI_ENDPOINT`,
 `PRAJNATRADE_OPENAI_MODEL`, and the environment variable named by

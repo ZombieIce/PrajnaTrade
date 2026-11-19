@@ -198,6 +198,29 @@ def test_data_validate_reads_parquet_bars(tmp_path: Path) -> None:
     assert json.loads(completed.stdout)["rows"] == 14
 
 
+@pytest.mark.parametrize("file_type", ["csv", "parquet"])
+def test_data_validate_preserves_exchange_dates_for_aware_timestamps(
+    tmp_path: Path, file_type: str
+) -> None:
+    source = tmp_path / "source.csv"
+    _write_bars(source)
+    frame = pd.read_csv(source, dtype={"symbol": str})
+    frame["date"] = pd.to_datetime(frame["date"]).dt.tz_localize("Asia/Shanghai")
+    bars = tmp_path / f"bars.{file_type}"
+    if file_type == "csv":
+        frame.to_csv(bars, index=False)
+    else:
+        frame.to_parquet(bars, index=False)
+    completed = _run_cli(
+        "data", "validate", "--data", str(bars), "--price-basis", "total_return",
+        "--data-kind", "synthetic",
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert (result["start_date"], result["end_date"]) == ("2024-01-02", "2024-01-04")
+    assert result["calendar_validation"]["missing_dates"] == []
+
+
 def test_data_validate_rejects_duplicate_and_invalid_ohlc_rows(
     tmp_path: Path,
 ) -> None:

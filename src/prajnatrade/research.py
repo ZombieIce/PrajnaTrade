@@ -96,7 +96,12 @@ def start_campaign(
             "slippage_bps": slippage_bps,
             "token_budget": token_budget,
             "cost_budget_usd": cost_budget_usd,
-            "baseline_json": baseline.to_dict(data_kind),
+            "baseline_json": {
+                **baseline.to_dict(data_kind),
+                "data_provenance": {
+                    key: dataset.report[key] for key in ("start_date", "end_date", "rows")
+                },
+            },
             "split_json": split,
         }
     )
