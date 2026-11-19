@@ -45,7 +45,7 @@ def freeze_candidate(
     fingerprint = strategy_fingerprint(strategy)
     if fingerprint != experiment["strategy_hash"]:
         raise ValueError("Experiment strategy fingerprint does not match its stored strategy.")
-    robustness_plan = _make_robustness_plan(strategy)
+    robustness_plan = _make_robustness_plan(strategy, campaign["max_drawdown_limit"])
     candidate_hash = _candidate_fingerprint(
         fingerprint,
         campaign["data_hash"],
@@ -344,6 +344,11 @@ def _parameter_robustness(
 ) -> dict[str, Any]:
     strategy = candidate["strategy"]
     plan = candidate.get("robustness_plan")
+    risk_limit = plan.get("hard_risk_limit") if plan else None
+    original_risk_breach = (
+        abs(original_metrics["max_drawdown"]) > risk_limit["max_drawdown"]
+        if risk_limit is not None else None
+    )
     if plan is None or plan["status"] in {
         "missing_parameter_schema", "unsupported_non_numeric_parameters"
     }:
@@ -352,9 +357,13 @@ def _parameter_robustness(
             "status": "inconclusive",
             "variants": [],
             "reason": plan["status"] if plan else "missing_parameter_schema",
+            "risk_limit_breach": original_risk_breach,
         }
     if plan["status"] == "not_applicable":
-        return {"applicable": False, "status": "not_applicable", "variants": [], "plan": plan}
+        return {
+            "applicable": False, "status": "not_applicable", "variants": [], "plan": plan,
+            "risk_limit_breach": original_risk_breach,
+        }
     variants = []
     original_sharpe = original_metrics["sharpe"]
     original_drawdown = abs(original_metrics["max_drawdown"])
@@ -380,6 +389,10 @@ def _parameter_robustness(
             else:
                 metrics = result.metrics
                 variant["metrics"] = metrics
+                variant["risk_limit_breach"] = (
+                    abs(metrics["max_drawdown"]) > risk_limit["max_drawdown"]
+                    if risk_limit is not None else None
+                )
                 if original_sharpe is None or metrics["sharpe"] is None:
                     variant["status"] = "not_evaluable"
                     variant["reason"] = "sharpe_unavailable"
@@ -399,7 +412,6 @@ def _parameter_robustness(
                     variant.update(
                         status="evaluated", outcome="degraded" if degraded else "stable",
                         sharpe_drop=sharpe_drop, drawdown_increase=drawdown_increase,
-                        risk_limit_breach=False,
                     )
         variants.append(variant)
     evaluated = [item for item in variants if item["status"] == "evaluated"]
@@ -423,15 +435,21 @@ def _parameter_robustness(
         "variants": variants,
         "coverage": len(evaluated) / len(variants) if variants else 0.0,
         "stable_fraction": stable / len(evaluated) if evaluated else None,
+        "risk_limit_breach": original_risk_breach,
     }
 
 
-def _make_robustness_plan(strategy: dict[str, Any]) -> dict[str, Any]:
+def _make_robustness_plan(
+    strategy: dict[str, Any], max_drawdown_limit: float | None,
+) -> dict[str, Any]:
     params = strategy["parameters"]
+    risk_limit = (
+        {"max_drawdown": max_drawdown_limit} if max_drawdown_limit is not None else None
+    )
     if strategy["family"] == "python":
         schema = strategy.get("parameter_schema")
         if schema is None:
-            return {"status": "missing_parameter_schema"}
+            return {"status": "missing_parameter_schema", "hard_risk_limit": risk_limit}
     else:
         definitions = {}
         if "lookback" in params:
@@ -446,8 +464,11 @@ def _make_robustness_plan(strategy: dict[str, Any]) -> dict[str, Any]:
     names = sorted(schema["parameters"])
     if not names:
         if params:
-            return {"status": "unsupported_non_numeric_parameters", "schema": schema}
-        return {"status": "not_applicable", "schema": schema}
+            return {
+                "status": "unsupported_non_numeric_parameters", "schema": schema,
+                "hard_risk_limit": risk_limit,
+            }
+        return {"status": "not_applicable", "schema": schema, "hard_risk_limit": risk_limit}
     plan = {
         "status": "planned",
         "schema": schema,
@@ -459,8 +480,9 @@ def _make_robustness_plan(strategy: dict[str, Any]) -> dict[str, Any]:
             "drawdown_absolute": 0.03, "drawdown_relative": 0.25,
             "coverage": 0.8, "stable_fraction": 0.8,
         },
-        "hard_risk_limit": None,
+        "hard_risk_limit": risk_limit,
     }
+    singles = {}
     for name in names:
         definition = schema["parameters"][name]
         original = Decimal(str(params[name]))
@@ -484,15 +506,8 @@ def _make_robustness_plan(strategy: dict[str, Any]) -> dict[str, Any]:
                 "requested_delta": float(abs(original) * Decimal("0.1")),
                 "applied_delta": float(delta),
             })
-        legal = [entry for entry in options if entry["reason"] is None]
-        selected = legal if legal else options
-        if legal:
-            plan["excluded"].extend(entry for entry in options if entry["reason"] is not None)
-        remaining = max(0, 10 - len(plan["variants"]))
-        plan["variants"].extend(selected[:remaining])
-        plan["excluded"].extend(
-            {**entry, "reason": "plan_limit"} for entry in selected[remaining:]
-        )
+        singles[name] = options
+    joints = []
     for joint in schema.get("joint_variants", []):
         names_changed = sorted(joint["parameters"])
         varied = {**params, **joint["parameters"]}
@@ -515,14 +530,40 @@ def _make_robustness_plan(strategy: dict[str, Any]) -> dict[str, Any]:
             "changed_parameters": names_changed, "parameters": varied,
             "reason": reason, "selection_reason": joint["reason"],
         }
+        joints.append(entry)
+
+    def select(entry: dict[str, Any]) -> None:
         counts = {
             name: sum(name in item["changed_parameters"] for item in plan["variants"])
-            for name in names_changed
+            for name in entry["changed_parameters"]
         }
         if len(plan["variants"]) >= 10 or any(count >= 2 for count in counts.values()):
-            plan["excluded"].append({**entry, "reason": "plan_limit"})
+            plan["excluded"].append({**entry, "exclusion_reason": "plan_limit"})
         else:
             plan["variants"].append(entry)
+
+    for name in names:
+        legal = [entry for entry in singles[name] if entry["reason"] is None]
+        if legal:
+            select(legal[0])
+    for entry in joints:
+        if entry["reason"] is None:
+            select(entry)
+    for name in names:
+        legal = [entry for entry in singles[name] if entry["reason"] is None]
+        for entry in legal[1:]:
+            select(entry)
+    for name in names:
+        invalid = [entry for entry in singles[name] if entry["reason"] is not None]
+        covered = any(name in entry["changed_parameters"] for entry in plan["variants"])
+        if covered:
+            plan["excluded"].extend(invalid)
+        else:
+            for entry in invalid:
+                select(entry)
+    for entry in joints:
+        if entry["reason"] is not None:
+            select(entry)
     return plan
 
 
@@ -601,6 +642,13 @@ def _verify_candidate_freeze(
         raise ValueError("Frozen candidate data fingerprint differs from its campaign.")
     if candidate["split"] != campaign["split"]:
         raise ValueError("Frozen candidate split differs from its campaign.")
+    if candidate["robustness_plan"] is not None:
+        expected_limit = (
+            {"max_drawdown": campaign["max_drawdown_limit"]}
+            if campaign["max_drawdown_limit"] is not None else None
+        )
+        if candidate["robustness_plan"].get("hard_risk_limit") != expected_limit:
+            raise ValueError("Frozen risk limit differs from its campaign.")
     expected_hash = _candidate_fingerprint(
         candidate["strategy_hash"],
         candidate["data_hash"],

@@ -67,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--slippage-bps", type=float, default=0.0)
     run.add_argument("--token-budget", type=int, default=12_000)
     run.add_argument("--cost-budget-usd", type=float, default=2.0)
+    run.add_argument(
+        "--max-drawdown-limit", type=float,
+        help="optional hard maximum drawdown as a positive proportion (0 to 1)",
+    )
     _add_budget_mode_arguments(run, default="strict")
     _add_trusted_python_argument(run)
 
@@ -190,6 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     holdout_end=args.holdout_end,
                     provider_config=provider_config,
                     trusted_local_python=trusted_local_python,
+                    max_drawdown_limit=args.max_drawdown_limit,
                 )
             elif args.research_command == "resume":
                 campaign = SQLiteStore(args.db).get_campaign(args.campaign_id)

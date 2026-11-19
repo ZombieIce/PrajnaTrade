@@ -195,6 +195,9 @@ of planned variants to be evaluable and each declared parameter to be covered;
 at least 80% of evaluable variants must be stable to pass. Invalid, failed, and
 non-evaluable variants are retained. The plan is diagnostic only and does not
 replace independent out-of-sample evaluation or significance testing.
+An optional `research run --max-drawdown-limit 0.2` freezes a hard limit as a
+positive proportion; the original and perturbation results record breaches.
+No hard risk limit is assumed when the flag is omitted.
 
 The Mock provider can emit deterministic Python when opted in, but a Mock
 campaign is never evidence of model novelty or investable performance. Results

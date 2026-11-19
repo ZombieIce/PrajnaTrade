@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import prajnatrade.research as research
 import pytest
 from prajnatrade.data import load_bars
-from prajnatrade.providers import MockProvider, Proposal, ProviderError, Reflection
+from prajnatrade.providers import MockProvider, Proposal, ProviderBudgetExceeded, ProviderError, Reflection
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
 from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import make_strategy
@@ -489,6 +489,30 @@ def test_generated_python_requires_explicit_opt_in_before_execution(tmp_path: Pa
     assert strategy(None, {}) == {"CASH": 1.0}
 
 
+def test_exhausted_reflection_budget_retains_newly_completed_backtest(tmp_path: Path) -> None:
+    class BudgetProvider(MockProvider):
+        def reflect(self, proposal, result, context):
+            raise ProviderBudgetExceeded("token_budget", "No reflection budget remains.")
+
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    _write_bars(bars, day_count=20)
+    started = start_campaign(
+        database=database, dataset=load_bars(bars, "total_return"), data_path=bars,
+        data_kind="synthetic", provider=BudgetProvider(1), seed=1,
+        experiment_budget=1, max_consecutive_failures=1, max_seconds=60,
+        initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
+        token_budget=5000, cost_budget_usd=1, steps=None,
+        holdout_start="2025-01-01", holdout_end="2025-01-31",
+    )
+    experiment = campaign_status(database, started["campaign_id"])["experiments"][0]
+    assert started["stop_reason"] == "token_budget"
+    assert experiment["status"] == "succeeded"
+    assert experiment["metrics"] is not None
+    assert "Reflection not completed" in experiment["reflection"]
+    freeze_candidate(database, started["campaign_id"], experiment["experiment_id"], "candidate", "Frozen")
+
+
 def test_generated_strategy_cannot_declare_non_numeric_parameters_absent() -> None:
     with pytest.raises(ValueError, match="no_tunable_parameters"):
         make_strategy({
@@ -534,14 +558,22 @@ def test_generated_strategy_freezes_and_evaluates_declared_parameter_plan(
     bars = tmp_path / "bars.csv"
     database = tmp_path / "research.sqlite"
     _write_bars(bars, day_count=40)
+    lines = bars.read_text(encoding="utf-8").splitlines()
+    shock = (date(2024, 1, 1) + timedelta(days=35)).isoformat()
+    for index, line in enumerate(lines):
+        if line.startswith(shock):
+            fields = line.split(",")
+            fields[2:6] = [str(float(value) * 0.5) for value in fields[2:6]]
+            lines[index] = ",".join(fields)
+    bars.write_text("\n".join(lines) + "\n", encoding="utf-8")
     started = start_campaign(
         database=database, dataset=load_bars(bars, "total_return"), data_path=bars,
         data_kind="synthetic", provider=ParameterProvider(1), seed=1,
         experiment_budget=1, max_consecutive_failures=1, max_seconds=60,
-        initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
+        initial_cash=10_000, transaction_cost_bps=5, slippage_bps=0,
         token_budget=5000, cost_budget_usd=1, steps=None,
         holdout_start="2025-01-01", holdout_end="2025-01-31",
-        trusted_local_python=True,
+        trusted_local_python=True, max_drawdown_limit=0.0,
     )
     experiment = campaign_status(database, started["campaign_id"])["experiments"][0]
     frozen = freeze_candidate(database, started["campaign_id"], experiment["experiment_id"],
@@ -550,6 +582,7 @@ def test_generated_strategy_freezes_and_evaluates_declared_parameter_plan(
         database, frozen["candidate_id"], bars, "synthetic", "total_return",
         trusted_local_python=True,
     )["result"]["parameter_robustness"]
+    assert frozen["robustness_plan"]["hard_risk_limit"] == {"max_drawdown": 0.0}
     assert [item["parameters"]["window"] for item in result["variants"]] == (
         [11] if minimum == 10 else [9, 11]
     )
@@ -562,9 +595,13 @@ def test_generated_strategy_freezes_and_evaluates_declared_parameter_plan(
     else:
         assert all(item["status"] == "evaluated" for item in result["variants"])
         assert result["status"] in {"passed", "failed"}
+        assert all(item["risk_limit_breach"] for item in result["variants"])
 
 
-def test_joint_parameter_perturbation_is_frozen_before_validation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("operator", ["<=", "=="])
+def test_joint_parameter_perturbation_is_frozen_before_validation(
+    tmp_path: Path, operator: str,
+) -> None:
     class JointProvider(MockProvider):
         def propose(self, iteration, context):
             return Proposal(
@@ -577,7 +614,7 @@ def test_joint_parameter_perturbation_is_frozen_before_validation(tmp_path: Path
                             name: {"type": "integer", "default": 10, "min": 2, "max": 20, "step": 1}
                             for name in ("fast", "slow")
                         },
-                        "constraints": [{"left": "fast", "op": "<=", "right": "slow"}],
+                        "constraints": [{"left": "fast", "op": operator, "right": "slow"}],
                         "joint_variants": [
                             {"parameters": {"fast": 11, "slow": 11}, "reason": "Preserve ordering"}
                         ],
@@ -615,7 +652,53 @@ def test_joint_parameter_perturbation_is_frozen_before_validation(tmp_path: Path
         trusted_local_python=True,
     )["result"]["parameter_robustness"]
     assert result["plan"] == plan
-    assert len(result["variants"]) == 3
+    assert len(result["variants"]) == (3 if operator == "<=" else 1)
+
+
+def test_frozen_plan_covers_all_six_parameters_before_second_perturbations(tmp_path: Path) -> None:
+    class SixParameterProvider(MockProvider):
+        def propose(self, iteration, context):
+            names = [f"p{i}" for i in range(6)]
+            return Proposal(
+                hypothesis="Six parameters", rationale="Cover each first",
+                strategy={
+                    "family": "python",
+                    "parameters": {name: 10 for name in names},
+                    "parameter_schema": {
+                        "parameters": {
+                            name: {"type": "integer", "default": 10, "min": 2, "max": 20, "step": 1}
+                            for name in names
+                        },
+                        "constraints": [],
+                    },
+                    "source": (
+                        "def strategy(history, state):\n"
+                        "    return {ETF_SYMBOLS[sum(parameters.values()) % 5]: 1.0}\n"
+                    ),
+                },
+                usage={"total_tokens": 0, "estimated_cost_usd": 0, "requests": 0},
+            )
+
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    _write_bars(bars, day_count=40)
+    started = start_campaign(
+        database=database, dataset=load_bars(bars, "total_return"), data_path=bars,
+        data_kind="synthetic", provider=SixParameterProvider(1), seed=1,
+        experiment_budget=1, max_consecutive_failures=1, max_seconds=60,
+        initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
+        token_budget=5000, cost_budget_usd=1, steps=None,
+        holdout_start="2025-01-01", holdout_end="2025-01-31",
+        trusted_local_python=True,
+    )
+    experiment = campaign_status(database, started["campaign_id"])["experiments"][0]
+    plan = freeze_candidate(
+        database, started["campaign_id"], experiment["experiment_id"], "candidate", "Frozen",
+    )["robustness_plan"]
+    assert len(plan["variants"]) == 10
+    assert {name for item in plan["variants"] for name in item["changed_parameters"]} == {
+        f"p{i}" for i in range(6)
+    }
 
 
 def test_mock_generated_revision_uses_recorded_feedback() -> None:

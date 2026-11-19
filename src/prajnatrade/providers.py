@@ -483,7 +483,7 @@ class OpenAICompatibleProvider:
         }
         request_id = (
             self._budget_store.reserve_provider_request(
-                self._budget_campaign_id, stage, reserved_usage
+                self._budget_campaign_id, stage, int(context["experiment_ordinal"]), reserved_usage
             )
             if self._budget_store is not None and self._budget_campaign_id is not None
             else None

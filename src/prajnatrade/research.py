@@ -54,6 +54,7 @@ def start_campaign(
     holdout_end: str,
     provider_config: dict[str, Any] | None = None,
     trusted_local_python: bool = False,
+    max_drawdown_limit: float | None = None,
 ) -> dict[str, Any]:
     _validate_campaign_limits(
         experiment_budget,
@@ -63,6 +64,12 @@ def start_campaign(
         cost_budget_usd,
         steps,
     )
+    if max_drawdown_limit is not None and (
+        isinstance(max_drawdown_limit, bool)
+        or not math.isfinite(max_drawdown_limit)
+        or not 0 <= max_drawdown_limit <= 1
+    ):
+        raise ValueError("Maximum drawdown limit must be a finite proportion between 0 and 1.")
     store = SQLiteStore(database)
     campaign_id = str(uuid.uuid4())
     now = _now()
@@ -100,6 +107,7 @@ def start_campaign(
             "slippage_bps": slippage_bps,
             "token_budget": token_budget,
             "cost_budget_usd": cost_budget_usd,
+            "max_drawdown_limit": max_drawdown_limit,
             "baseline_json": {
                 **baseline.to_dict(data_kind),
                 "data_provenance": {
@@ -215,6 +223,7 @@ def advance_campaign(
         ordinal = len(experiments) + 1
         context = {
             "campaign_id": campaign_id,
+            "experiment_ordinal": ordinal,
             "data_kind": campaign["data_kind"],
             "data_hash": campaign["data_hash"],
             "baseline": campaign["baseline"]["metrics"],
@@ -332,6 +341,7 @@ def advance_campaign(
                 metrics_json=metrics,
                 error=outcome["error"],
             )
+            pending = store.get_experiment(campaign_id, pending["experiment_id"])
             _save_progress(store, campaign_id, prior_elapsed, started)
 
         reflection_context = dict(context)
@@ -395,7 +405,11 @@ def advance_campaign(
         if attempt_failed and consecutive_failures >= campaign["max_consecutive_failures"]:
             decision = "stop"
         strategy_hash = _strategy_hash(strategy_spec)
-        provider_usage = combine_usage(proposal.usage, reflection_usage)
+        provider_usage = (
+            store.experiment_request_usage(campaign_id, ordinal)
+            if isinstance(provider, OpenAICompatibleProvider)
+            else combine_usage(proposal.usage, reflection_usage)
+        )
         if outcome["status"] == "failed":
             experiment = _failed_experiment(
                 campaign_id,
@@ -455,6 +469,26 @@ def advance_campaign(
             )
             break
 
+    if (
+        pending is not None
+        and stop_reason in {"time_budget", "token_budget", "cost_budget"}
+        and (pending["metrics"] is not None or pending["error"] is not None)
+    ):
+        usage = (
+            store.experiment_request_usage(campaign_id, pending["ordinal"])
+            if isinstance(provider, OpenAICompatibleProvider)
+            else pending["provider_usage"]
+        )
+        store.update_experiment(
+            pending["experiment_id"],
+            status="failed" if pending["error"] else "succeeded",
+            decision="stop",
+            reflection=f"Reflection not completed: {stop_reason}.",
+            provider_usage_json=usage,
+        )
+        experiments.append(store.get_experiment(campaign_id, pending["experiment_id"]))
+        pending = None
+
     elapsed = prior_elapsed + time.monotonic() - started
     if stop_reason is None:
         if len(experiments) >= campaign["experiment_budget"]:
@@ -463,14 +497,9 @@ def advance_campaign(
             stop_reason = "consecutive_failures"
         elif elapsed >= campaign["max_seconds"]:
             stop_reason = "time_budget"
-        elif sum(
-            int(item["provider_usage"].get("total_tokens", 0)) for item in experiments
-        ) >= campaign["token_budget"]:
+        elif token_usage >= campaign["token_budget"]:
             stop_reason = "token_budget"
-        elif sum(
-            float(item["provider_usage"].get("estimated_cost_usd", 0.0))
-            for item in experiments
-        ) >= campaign["cost_budget_usd"]:
+        elif cost_usage >= campaign["cost_budget_usd"]:
             stop_reason = "cost_budget"
 
     if stop_reason:

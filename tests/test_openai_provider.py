@@ -18,6 +18,7 @@ from prajnatrade.providers import (
 )
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
 from prajnatrade.store import SQLiteStore
+from prajnatrade.validation import freeze_candidate
 
 
 class _ResponseHandler(BaseHTTPRequestHandler):
@@ -202,6 +203,138 @@ def test_interrupted_provider_request_keeps_reservation_and_blocks_retry(
         stopped = resume_campaign(database=database, campaign_id=campaign_id, provider=provider)
         assert stopped["stop_reason"] == "cost_budget"
         assert len(server.requests) == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("actual_cost", [0.04, 1.01])
+def test_reconciled_reflection_usage_stays_with_completed_experiment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actual_cost: float,
+) -> None:
+    import prajnatrade.providers as providers_module
+
+    proposal = json.dumps({
+        "schema_version": "1", "hypothesis": "Control", "rationale": "Reference",
+        "strategy": {"family": "equal_weight", "parameters": {}},
+    })
+    reflection = json.dumps({
+        "schema_version": "1", "decision": "keep", "reflection": "Retain control.",
+    })
+    server, thread = _start_server([
+        _chat_response(proposal), _chat_response(reflection), _chat_response(proposal),
+        _chat_response(reflection), _chat_response(reflection),
+    ])
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
+    for index in range(6):
+        day = (date(2024, 1, 1) + timedelta(days=index)).isoformat()
+        for symbol in ETF_SYMBOLS:
+            lines.append(f"{day},{symbol},100,101,100,101,1000,total_return")
+    bars.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    provider = _best_effort_provider(
+        endpoint=f"http://127.0.0.1:{server.server_port}/v1", model="test-model",
+        api_key="local-test-secret", input_cost_per_1k_tokens=0.1,
+        output_cost_per_1k_tokens=0.2,
+    )
+    original = providers_module.urlopen
+
+    def interrupt_reflection(request, *, timeout):
+        response = original(request, timeout=timeout)
+        if len(server.requests) == 4:
+            with response:
+                response.read()
+            raise KeyboardInterrupt
+        return response
+
+    try:
+        started = start_campaign(
+            database=database, dataset=load_bars(bars, "total_return"),
+            data_path=bars, data_kind="synthetic", provider=provider, seed=1,
+            experiment_budget=2, max_consecutive_failures=2, max_seconds=60,
+            initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
+            token_budget=5000, cost_budget_usd=1, steps=1,
+            holdout_start="2025-01-01", holdout_end="2025-01-31",
+        )
+        campaign_id = started["campaign_id"]
+        monkeypatch.setattr(providers_module, "urlopen", interrupt_reflection)
+        with pytest.raises(KeyboardInterrupt):
+            resume_campaign(database=database, campaign_id=campaign_id, provider=provider)
+        request = campaign_status(database, campaign_id)["provider_requests"][-1]
+        assert main([
+            "research", "reconcile-request", "--db", str(database),
+            "--campaign-id", campaign_id, "--request-id", request["request_id"],
+            "--prompt-tokens", "200", "--completion-tokens", "100",
+            "--actual-cost-usd", str(actual_cost), "--evidence", "Provider invoice",
+        ]) == 0
+        monkeypatch.setattr(providers_module, "urlopen", original)
+        resumed = resume_campaign(database=database, campaign_id=campaign_id, provider=provider)
+        experiment = campaign_status(database, campaign_id)["experiments"][1]
+        assert experiment["status"] == "succeeded"
+        assert experiment["provider_usage"]["actual_cost_usd"] == actual_cost
+        if actual_cost > 1:
+            assert resumed["stop_reason"] == "cost_budget"
+            assert experiment["provider_usage"]["total_tokens"] == 450
+            assert experiment["provider_usage"]["requests"] == 2
+            assert len(server.requests) == 4
+            freeze_candidate(database, campaign_id, experiment["experiment_id"], "candidate", "Frozen")
+        else:
+            assert experiment["provider_usage"]["total_tokens"] == 600
+            assert experiment["provider_usage"]["requests"] == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_reconciled_cost_is_used_when_step_limited_campaign_pauses(tmp_path: Path) -> None:
+    proposal = json.dumps({
+        "schema_version": "1", "hypothesis": "Control", "rationale": "Reference",
+        "strategy": {"family": "equal_weight", "parameters": {}},
+    })
+    reflection = json.dumps({
+        "schema_version": "1", "decision": "keep", "reflection": "Retain control.",
+    })
+    replies = [_chat_response(proposal), _chat_response(reflection)] * 2
+    for response in replies:
+        response["usage"] = {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500}
+    server, thread = _start_server(replies)
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    lines = ["date,symbol,open,high,low,close,volume,price_basis"]
+    for index in range(6):
+        day = (date(2024, 1, 1) + timedelta(days=index)).isoformat()
+        for symbol in ETF_SYMBOLS:
+            lines.append(f"{day},{symbol},100,101,100,101,1000,total_return")
+    bars.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    provider = _best_effort_provider(
+        endpoint=f"http://127.0.0.1:{server.server_port}/v1", model="test-model",
+        api_key="local-test-secret", input_cost_per_1k_tokens=0.1,
+        output_cost_per_1k_tokens=0.2,
+    )
+    try:
+        started = start_campaign(
+            database=database, dataset=load_bars(bars, "total_return"),
+            data_path=bars, data_kind="synthetic", provider=provider, seed=1,
+            experiment_budget=3, max_consecutive_failures=2, max_seconds=60,
+            initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
+            token_budget=10_000, cost_budget_usd=0.6, steps=1,
+            holdout_start="2025-01-01", holdout_end="2025-01-31",
+        )
+        campaign_id = started["campaign_id"]
+        for request in campaign_status(database, campaign_id)["provider_requests"]:
+            assert main([
+                "research", "reconcile-request", "--db", str(database),
+                "--campaign-id", campaign_id, "--request-id", request["request_id"],
+                "--prompt-tokens", "1000", "--completion-tokens", "500",
+                "--actual-cost-usd", "0", "--evidence", "Provider credits",
+            ]) == 0
+        result = resume_campaign(database=database, campaign_id=campaign_id, provider=provider, steps=1)
+        assert result["status"] == "paused"
+        assert result["stop_reason"] == "step_limit"
+        assert len(server.requests) == 4
     finally:
         server.shutdown()
         server.server_close()

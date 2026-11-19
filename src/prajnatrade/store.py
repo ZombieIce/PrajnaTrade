@@ -56,6 +56,7 @@ class SQLiteStore:
                     slippage_bps REAL NOT NULL,
                     token_budget INTEGER NOT NULL,
                     cost_budget_usd REAL NOT NULL,
+                    max_drawdown_limit REAL,
                     baseline_json TEXT NOT NULL,
                     split_json TEXT NOT NULL DEFAULT '{}'
                 );
@@ -118,6 +119,7 @@ class SQLiteStore:
                     request_id TEXT PRIMARY KEY,
                     campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
                     stage TEXT NOT NULL,
+                    experiment_ordinal INTEGER,
                     status TEXT NOT NULL,
                     usage_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
@@ -136,6 +138,8 @@ class SQLiteStore:
                 connection.execute(
                     "ALTER TABLE campaigns ADD COLUMN objective TEXT NOT NULL DEFAULT 'Reproducibly investigate ETF strategy hypotheses against an equal-weight benchmark.'"
                 )
+            if "max_drawdown_limit" not in campaign_columns:
+                connection.execute("ALTER TABLE campaigns ADD COLUMN max_drawdown_limit REAL")
             experiment_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(experiments)").fetchall()
@@ -158,6 +162,11 @@ class SQLiteStore:
                     connection.execute(
                         f"ALTER TABLE candidates ADD COLUMN {column} {declaration}"
                     )
+            request_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(provider_requests)")
+            }
+            if "experiment_ordinal" not in request_columns:
+                connection.execute("ALTER TABLE provider_requests ADD COLUMN experiment_ordinal INTEGER")
             connection.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -227,7 +236,7 @@ class SQLiteStore:
             connection.commit()
 
     def reserve_provider_request(
-        self, campaign_id: str, stage: str, usage: dict[str, Any]
+        self, campaign_id: str, stage: str, ordinal: int, usage: dict[str, Any]
     ) -> str:
         request_id = str(uuid.uuid4())
         with closing(self._connect()) as connection:
@@ -241,11 +250,11 @@ class SQLiteStore:
             connection.execute(
                 """
                 INSERT INTO provider_requests
-                (request_id, campaign_id, stage, status, usage_json, created_at)
-                VALUES (?, ?, ?, 'reserved', ?, ?)
+                (request_id, campaign_id, stage, experiment_ordinal, status, usage_json, created_at)
+                VALUES (?, ?, ?, ?, 'reserved', ?, ?)
                 """,
                 (
-                    request_id, campaign_id, stage, _json_dump(usage),
+                    request_id, campaign_id, stage, ordinal, _json_dump(usage),
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
@@ -307,6 +316,16 @@ class SQLiteStore:
                 "UPDATE provider_requests SET status = 'reconciled', usage_json = ? WHERE request_id = ?",
                 (_json_dump(usage), request_id),
             )
+            if row["experiment_ordinal"] is not None:
+                rows = connection.execute(
+                    "SELECT usage_json FROM provider_requests WHERE campaign_id = ? AND experiment_ordinal = ?",
+                    (campaign_id, row["experiment_ordinal"]),
+                ).fetchall()
+                combined = _combine_request_usage([json.loads(item["usage_json"]) for item in rows])
+                connection.execute(
+                    "UPDATE experiments SET provider_usage_json = ? WHERE campaign_id = ? AND ordinal = ?",
+                    (_json_dump(combined), campaign_id, row["experiment_ordinal"]),
+                )
             connection.commit()
         return {"request_id": request_id, "status": "reconciled", "usage": usage}
 
@@ -322,6 +341,12 @@ class SQLiteStore:
             request["usage"] = json.loads(request.pop("usage_json"))
             requests.append(request)
         return requests
+
+    def experiment_request_usage(self, campaign_id: str, ordinal: int) -> dict[str, Any]:
+        requests = self.list_provider_requests(campaign_id)
+        return _combine_request_usage([
+            request["usage"] for request in requests if request["experiment_ordinal"] == ordinal
+        ])
 
     def update_experiment(self, experiment_id: str, **updates: Any) -> None:
         allowed = {
@@ -524,6 +549,18 @@ class SQLiteStore:
 
 def _json_dump(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _combine_request_usage(usages: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "prompt_tokens": sum(int(item.get("prompt_tokens", 0)) for item in usages),
+        "completion_tokens": sum(int(item.get("completion_tokens", 0)) for item in usages),
+        "total_tokens": sum(int(item.get("total_tokens", 0)) for item in usages),
+        "estimated_cost_usd": sum(float(item.get("estimated_cost_usd", 0.0)) for item in usages),
+        "actual_cost_usd": sum(float(item.get("actual_cost_usd", 0.0)) for item in usages),
+        "requests": len(usages),
+        "usage_estimated": any(bool(item.get("usage_estimated")) for item in usages),
+    }
 
 
 def _decode_row(row: sqlite3.Row, json_columns: set[str]) -> dict[str, Any]:
