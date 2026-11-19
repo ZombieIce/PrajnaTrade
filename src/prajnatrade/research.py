@@ -180,10 +180,7 @@ def advance_campaign(
     checkpoint = campaign["active_checkpoint_at"]
     if campaign["status"] == "running":
         if checkpoint is None:
-            raise ValueError(
-                "Interrupted campaign has no recoverable time checkpoint; "
-                "start a new campaign rather than resetting its time budget."
-            )
+            checkpoint = campaign["updated_at"]
         try:
             checkpoint_time = datetime.fromisoformat(checkpoint)
             recovery_seconds = (datetime.now(timezone.utc) - checkpoint_time).total_seconds()
@@ -211,11 +208,13 @@ def advance_campaign(
         return result
     finally:
         if not finished:
-            store.update_campaign(
-                campaign_id, updated_at=_now(),
-                elapsed_seconds=prior_elapsed + time.monotonic() - started,
-                active_checkpoint_at=None, status="paused", stop_reason="interrupted",
-            )
+            current = store.get_campaign(campaign_id)
+            if current["status"] == "running" and current["active_checkpoint_at"] is not None:
+                store.update_campaign(
+                    campaign_id, updated_at=_now(),
+                    elapsed_seconds=prior_elapsed + time.monotonic() - started,
+                    active_checkpoint_at=None, status="paused", stop_reason="interrupted",
+                )
 
 
 def _advance_active_campaign(
@@ -350,6 +349,12 @@ def _advance_active_campaign(
                 usage=pending["provider_usage"],
             )
 
+        if (
+            pending["metrics"] is None and pending["error"] is None
+            and prior_elapsed + time.monotonic() - started >= campaign["max_seconds"]
+        ):
+            stop_reason = "time_budget"
+            break
         if pending["metrics"] is not None or pending["error"] is not None:
             strategy_spec = pending["strategy"]
             metrics = pending["metrics"]

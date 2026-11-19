@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -435,6 +435,30 @@ resume_campaign(database=sys.argv[1], campaign_id=sys.argv[2], provider=WaitingP
             process.wait(timeout=5)
 
 
+def test_legacy_running_campaign_recovers_from_last_update_time(tmp_path: Path) -> None:
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    _write_bars(bars, day_count=24)
+    started = _run_cli(
+        "research", "run", "--db", str(database), "--data", str(bars),
+        "--price-basis", "total_return", "--data-kind", "synthetic",
+        "--provider", "mock", "--seed", "1", "--experiments", "2", "--steps", "1",
+        "--holdout-start", "2025-01-01", "--holdout-end", "2025-01-31",
+    )
+    assert started.returncode == 0, started.stderr
+    campaign_id = json.loads(started.stdout)["campaign_id"]
+    before = campaign_status(database, campaign_id)["campaign"]["elapsed_seconds"]
+    SQLiteStore(database).update_campaign(
+        campaign_id, status="running", active_checkpoint_at=None,
+        updated_at=(datetime.now(timezone.utc) - timedelta(seconds=3)).isoformat(),
+    )
+    resumed = _run_cli(
+        "research", "resume", "--db", str(database), "--campaign-id", campaign_id,
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    assert json.loads(resumed.stdout)["elapsed_seconds"] >= before + 3
+
+
 def test_repeated_reflection_failures_stop_at_consecutive_failure_budget(
     tmp_path: Path,
 ) -> None:
@@ -543,6 +567,43 @@ def test_time_budget_stops_between_attempts(tmp_path: Path, monkeypatch) -> None
 
     assert result["stop_reason"] == "time_budget"
     assert len(campaign_status(database, result["campaign_id"])["experiments"]) == 1
+
+
+def test_time_budget_is_checked_before_backtest(tmp_path: Path) -> None:
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    marker = tmp_path / "backtest-started"
+    _write_bars(bars)
+
+    class SlowProposal(MockProvider):
+        def propose(self, iteration, context):
+            time.sleep(0.15)
+            return Proposal(
+                hypothesis="Time-limited proposal", rationale="Do not run past deadline",
+                strategy={
+                    "family": "python", "parameters": {},
+                    "source": (
+                        f"open({str(marker)!r}, 'w').write('started')\n"
+                        "def strategy(history, state):\n    return {CASH: 1.0}\n"
+                    ),
+                },
+                usage={"requests": 0, "total_tokens": 0, "estimated_cost_usd": 0},
+            )
+
+    result = start_campaign(
+        database=database, dataset=load_bars(bars, "total_return"), data_path=bars,
+        data_kind="synthetic", provider=SlowProposal(1), seed=1,
+        experiment_budget=1, max_consecutive_failures=1, max_seconds=0.1,
+        initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
+        token_budget=100, cost_budget_usd=1, steps=None,
+        holdout_start="2025-01-01", holdout_end="2025-01-31",
+        trusted_local_python=True,
+    )
+    experiment = campaign_status(database, result["campaign_id"])["experiments"][0]
+    assert result["stop_reason"] == "time_budget"
+    assert not marker.exists()
+    assert experiment["status"] == "failed"
+    assert experiment["error"] == "Backtest not completed: time_budget."
 
 
 def test_generated_python_requires_explicit_opt_in_before_execution(tmp_path: Path) -> None:

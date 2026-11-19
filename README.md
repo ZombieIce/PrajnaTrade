@@ -90,8 +90,8 @@ workers on the same campaign are not supported. Time spent before a handled
 interruption is recorded. After an abrupt termination, the time since the last
 checkpoint is conservatively charged on resume, including downtime; a missing
 or invalid checkpoint or a backwards system clock prevents unsafe recovery.
-Older `running` campaigns without a checkpoint must be recreated. The campaign
-time budget is checked between stages; it does not interrupt a backtest already
+Older `running` campaigns use their last update time as the checkpoint. The
+campaign time budget is checked between stages; it does not interrupt a backtest already
 in progress. If provider token or cost budget is exhausted after a proposal is
 saved, its pending backtest may finish without another provider call; if the
 time budget is exhausted before that backtest, the attempt is marked failed.
