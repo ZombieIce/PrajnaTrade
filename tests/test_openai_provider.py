@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import prajnatrade.isolation as isolation
 from prajnatrade.data import ETF_SYMBOLS, load_bars
 from prajnatrade.cli import main
 from prajnatrade.providers import (
@@ -19,6 +20,15 @@ from prajnatrade.providers import (
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
 from prajnatrade.store import SQLiteStore
 from prajnatrade.validation import freeze_candidate
+
+
+@pytest.fixture(autouse=True)
+def use_test_only_memory_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        isolation,
+        "DEFAULT_ISOLATION_LIMITS",
+        isolation.IsolationLimits(address_space_bytes=1_000_000_000_000_000),
+    )
 
 
 class _ResponseHandler(BaseHTTPRequestHandler):
@@ -471,7 +481,7 @@ def test_openai_provider_can_propose_python_when_trusted_local_enabled() -> None
         )
         generated = provider.propose(
             1, {
-                "trusted_local_python": True,
+                "isolated_generated_python": True,
                 "limits": {"remaining_tokens": 2000, "remaining_cost_usd": 1.0},
             }
         )
@@ -605,7 +615,7 @@ def test_openai_provider_rejects_python_without_trusted_local_opt_in() -> None:
             input_cost_per_1k_tokens=1.0,
             output_cost_per_1k_tokens=2.0,
         )
-        with pytest.raises(ProviderError, match="trusted-local opt-in"):
+        with pytest.raises(ProviderError, match="explicit OS isolation"):
             provider.propose(
                 1, {"limits": {"remaining_tokens": 2000, "remaining_cost_usd": 1.0}}
             )
@@ -716,7 +726,7 @@ def test_campaign_records_provider_usage_without_persisting_api_credentials(
             steps=None,
             holdout_start="2025-01-01",
             holdout_end="2025-01-31",
-            trusted_local_python=generated_python,
+            isolated_python=generated_python,
             provider_config={
                 "endpoint": endpoint,
                 "api_key_env": "TEST_PROVIDER_KEY",

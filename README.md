@@ -294,7 +294,7 @@ Mock campaigns are deterministic orchestration checks, not AI research. They
 use recorded decisions to refine a retained or investigated direction or
 switch after a rejection or branch. The unparameterized equal-weight control
 can only be retested, not tuned. Mock proposals remain limited to the supported
-declarative strategy families unless trusted-local Python is enabled. Campaigns
+declarative strategy families unless isolated generated Python is requested. Campaigns
 split the supplied development sessions into discovery and validation (75% /
 25%). The separately stored final holdout interval is fixed at campaign start.
 Campaigns require at least five development sessions and retain every attempt
@@ -394,18 +394,30 @@ subsequent requests are blocked when recorded costs or tokens exhaust the budget
 
 By default, strategies are declarative specifications (`equal_weight`,
 `momentum`, `trend_filter`, and `inverse_volatility`); generated Python is not
-executed. To allow generated Python, explicitly pass
-`--trusted-local-generated-python` to each `research run`, `resume`, `validate`,
-or `holdout` command that executes it. The generated source and parameters are
-retained with the experiment. Source defines `strategy(history, state)` and may
-use the globals `ETF_SYMBOLS`, `CASH`, and `parameters`.
+executed. To request generated Python, explicitly pass
+`--isolated-generated-python` to each Discovery `research run` or `resume`
+command that executes it. Generated Python validation and holdout are refused
+by the public CLI until their detailed results can be kept outside the research
+side. The generated source and parameters are retained with the experiment.
+Source defines `strategy(history, state)` and may use the globals
+`ETF_SYMBOLS`, `CASH`, and `parameters`.
 
-**This is not a sandbox.** Generated Python runs with the full privileges of
-the local process: it can access files, credentials and the network, and can
-interfere with the research engine. Keep holdout data outside the process's
-access until confirmation; the CLI cannot enforce filesystem or network
-isolation. Only enable generated Python for code you trust; do not use it for
-unattended execution of untrusted model output.
+Generated Python runs only in the supported macOS sandbox worker. Its
+preflight verifies denial of protected-file reads and writes, network access,
+and process creation; it also applies the configured resource and I/O limits.
+The worker shares the caller's OS UID, so this is a macOS sandbox-policy
+boundary, not a separate-account or container boundary. Campaign status and
+reports retain per-run IDs, identity, sandbox-policy hash, configured limits,
+measured wall/input/output usage, start state, protected-input status, and
+output destination. CPU time and peak resident memory are not measured yet.
+Raw logs and per-invocation weights remain in the trusted controller, while
+Discovery metrics follow the research feedback contract.
+Unsupported platforms or unavailable limits stop execution before strategy
+code runs. There is no trusted-local fallback. The current 2 GiB address-space
+limit is not enforceable on every macOS setup, including the environment used
+to validate this release; generated execution is refused there. These checks
+are not a claim of isolation on other operating systems or deployment
+boundaries.
 
 Generated proposals must declare each numeric parameter in `parameter_schema`:
 `{"parameters":{"window":{"type":"integer","default":10,"min":2,"max":20,"step":1}},"constraints":[]}`.
@@ -415,7 +427,7 @@ number or another parameter using `<`, `<=`, `==`, `>=`, or `>`, for example
 `{"parameters":{},"constraints":[],"no_tunable_parameters":true}` only for a
 strategy with no parameters. A strategy with only non-numeric parameters is
 inconclusive. This declaration cannot prove that
-trusted source has no hidden tuning knobs; review the source. Legacy Python
+generated source has no hidden tuning knobs; review the source. Legacy Python
 strategies without a schema are inconclusive, not robust by default.
 
 At freeze, the application records the schema, legal one-at-a-time ±10%

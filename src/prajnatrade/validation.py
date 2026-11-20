@@ -13,6 +13,7 @@ import pandas as pd
 
 from prajnatrade.backtest import equal_weight_buy_and_hold, run_backtest
 from prajnatrade.data import ValidatedData, fingerprint_bars, load_bars
+from prajnatrade.isolation import probe_isolation
 from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import (
     make_strategy,
@@ -89,7 +90,7 @@ def validate_candidate(
     data_kind: str,
     price_basis: str,
     *,
-    trusted_local_python: bool = False,
+    isolated_python: bool = False,
 ) -> dict[str, Any]:
     store = SQLiteStore(database)
     candidate = store.get_candidate(candidate_id)
@@ -106,7 +107,7 @@ def validate_candidate(
 
     candidate_result = run_backtest(
         dataset,
-        make_strategy(candidate["strategy"], trusted_local_python=trusted_local_python),
+        make_strategy(candidate["strategy"], isolated_python=isolated_python),
         initial_cash=campaign["initial_cash"],
         transaction_cost_bps=campaign["transaction_cost_bps"],
         slippage_bps=campaign["slippage_bps"],
@@ -129,7 +130,7 @@ def validate_candidate(
     )
     cost_sensitive_result = run_backtest(
         dataset,
-        make_strategy(candidate["strategy"], trusted_local_python=trusted_local_python),
+        make_strategy(candidate["strategy"], isolated_python=isolated_python),
         initial_cash=campaign["initial_cash"],
         transaction_cost_bps=sensitivity_bps,
         slippage_bps=campaign["slippage_bps"],
@@ -138,7 +139,7 @@ def validate_candidate(
     )
     robustness = _parameter_robustness(
         candidate, campaign, dataset, start_date, end_date, candidate_result.metrics,
-        trusted_local_python=trusted_local_python,
+        isolated_python=isolated_python,
     )
     candidate_output = candidate_result.to_dict(data_kind)
     baseline_output = baseline_result.to_dict(data_kind)
@@ -198,7 +199,7 @@ def run_holdout(
     price_basis: str,
     confirmation: str,
     *,
-    trusted_local_python: bool = False,
+    isolated_python: bool = False,
 ) -> dict[str, Any]:
     if confirmation != HOLDOUT_CONFIRMATION:
         raise ValueError(
@@ -210,8 +211,10 @@ def run_holdout(
     campaign = store.get_campaign(candidate["campaign_id"])
     _verify_candidate_freeze(candidate, campaign)
     require_execution_permission(
-        candidate["strategy"], trusted_local_python=trusted_local_python
+        candidate["strategy"], isolated_python=isolated_python
     )
+    if candidate["strategy"]["family"] == "python":
+        probe_isolation()
     if store.get_holdout_receipt(candidate["campaign_id"]) is not None:
         raise ValueError(
             f"Final holdout for campaign {candidate['campaign_id']} was already consumed."
@@ -262,7 +265,7 @@ def run_holdout(
     try:
         candidate_result = run_backtest(
             dataset,
-            make_strategy(candidate["strategy"], trusted_local_python=trusted_local_python),
+            make_strategy(candidate["strategy"], isolated_python=isolated_python),
             initial_cash=campaign["initial_cash"],
             transaction_cost_bps=campaign["transaction_cost_bps"],
             slippage_bps=campaign["slippage_bps"],
@@ -340,7 +343,7 @@ def _parameter_robustness(
     end_date: str,
     original_metrics: dict[str, Any],
     *,
-    trusted_local_python: bool,
+    isolated_python: bool,
 ) -> dict[str, Any]:
     strategy = candidate["strategy"]
     plan = candidate.get("robustness_plan")
@@ -377,7 +380,7 @@ def _parameter_robustness(
             try:
                 result = run_backtest(
                     dataset,
-                    make_strategy(varied, trusted_local_python=trusted_local_python),
+                    make_strategy(varied, isolated_python=isolated_python),
                     initial_cash=campaign["initial_cash"],
                     transaction_cost_bps=campaign["transaction_cost_bps"],
                     slippage_bps=campaign["slippage_bps"],

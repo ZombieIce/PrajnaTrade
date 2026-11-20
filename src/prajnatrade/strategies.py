@@ -3,14 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from decimal import Decimal
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from prajnatrade.backtest import Strategy, equal_weight_buy_and_hold
 from prajnatrade.data import CASH, ETF_SYMBOLS
+from prajnatrade.isolation import IsolationLimits, run_isolated_strategy
 
 STRATEGY_FAMILIES = (
     "equal_weight",
@@ -193,36 +195,37 @@ def strategy_fingerprint(spec: Mapping[str, object]) -> str:
 
 
 def require_execution_permission(
-    spec: Mapping[str, object], *, trusted_local_python: bool
+    spec: Mapping[str, object], *, isolated_python: bool
 ) -> None:
-    if spec.get("family") == "python" and not trusted_local_python:
+    if spec.get("family") == "python" and not isolated_python:
         raise ValueError(
-            "Generated Python requires explicit trusted-local opt-in; it is not sandboxed."
+            "Generated Python requires --isolated-generated-python; local execution is disabled."
         )
 
 
 def make_strategy(
-    spec: Mapping[str, object], *, trusted_local_python: bool = False
+    spec: Mapping[str, object],
+    *,
+    isolated_python: bool = False,
+    isolation_limits: IsolationLimits | None = None,
+    evidence_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> Strategy:
     normalized = normalize_strategy_spec(spec)
     family = normalized["family"]
     params = normalized["parameters"]
     if family == "python":
-        require_execution_permission(normalized, trusted_local_python=trusted_local_python)
-        namespace = {"ETF_SYMBOLS": ETF_SYMBOLS, "CASH": CASH, "parameters": params}
-        try:
-            exec(compile(normalized["source"], "<generated-strategy>", "exec"), namespace)
-        except Exception as error:
-            raise ValueError(f"Generated strategy initialization failed: {error}") from error
-        generated = namespace.get("strategy")
-        if not callable(generated):
-            raise ValueError("Generated Python must define strategy(history, state).")
+        require_execution_permission(normalized, isolated_python=isolated_python)
 
         def strategy(history: pd.DataFrame, state: Mapping[str, object]):
-            try:
-                return generated(history, state)
-            except Exception as error:
-                raise ValueError(f"Generated strategy failed: {error}") from error
+            return run_isolated_strategy(
+                str(normalized["source"]),
+                dict(params),
+                history,
+                dict(state),
+                symbols=ETF_SYMBOLS,
+                limits=isolation_limits,
+                evidence_callback=evidence_callback,
+            )
 
         return strategy
     if family == "equal_weight":
