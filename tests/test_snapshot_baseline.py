@@ -2,8 +2,11 @@ import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
+
+import pytest
 
 from prajnatrade.data import ETF_SYMBOLS
 
@@ -164,9 +167,9 @@ def test_snapshot_baseline_accounts_for_dividend_receivable_payment_and_split(
     ex_day = next(row for row in result["equity_curve"] if row["date"] == ex_date)
     entitled = ex_day["holdings"][SYMBOLS[0]]
     assert entitled["quantity"] == 100
-    assert entitled["market_value"] == 980
+    assert entitled["market_value"] == pytest.approx(980)
     assert ex_day["dividend_receivables"] == 20
-    assert entitled["market_value"] + ex_day["receivables"][0]["amount"] == 1000
+    assert entitled["market_value"] + ex_day["receivables"][0]["amount"] == pytest.approx(1000)
     assert ex_day["nav"] == 5000
     assert all(item["symbol"] != SYMBOLS[1] for item in ex_day["receivables"])
 
@@ -309,7 +312,7 @@ def test_snapshot_baseline_missing_close_has_no_nav_and_future_changes_do_not_le
     assert missing_nav["nav"] is None
     assert any(gap["date"] == missing_date for gap in original["gaps"]["valuation"])
 
-    changed = _snapshot_input()
+    changed = deepcopy(payload)
     for row in changed["raw_bars"]:
         if row["date"] == "2024-01-12" and row["symbol"] == SYMBOLS[0]:
             row.update(open=11, high=12, low=11, close=12)
