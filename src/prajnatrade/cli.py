@@ -194,6 +194,12 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_update.add_argument("--data", required=True, type=Path)
     shadow_update.add_argument("--date", required=True)
     shadow_update.add_argument(
+        "--corrections-store",
+        type=Path,
+        help="trusted snapshot store whose verified dividend-correction journal is applied; "
+        "without it no correction is applied",
+    )
+    shadow_update.add_argument(
         "--release-id",
         action="append",
         dest="release_ids",
@@ -752,6 +758,7 @@ def _shadow_command(args: argparse.Namespace) -> int:
                 args.data,
                 args.date,
                 getattr(args, "release_ids", None),
+                corrections_store=getattr(args, "corrections_store", None),
             )
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 2 if blocked else 0

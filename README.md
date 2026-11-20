@@ -1076,6 +1076,7 @@ Shadow Live state can flow back to a research Agent.
 ```text
 prajnatrade shadow update --ledger /trusted/shadow-ledger \
   --store /trusted/evaluations --data synthetic-feed.json --date 2030-01-07 \
+  [--corrections-store /trusted/snapshots] \
   [--release-id <exact-release-id> ...]
 prajnatrade shadow report --ledger /trusted/shadow-ledger \
   --version <exact-release-id> --output ledger-report.json
@@ -1161,11 +1162,13 @@ The ledger is a SQLite database outside Git and outside the research project:
 The minimum transaction boundary is **version × trading session**. Before
 anything is computed, the complete per-version/per-session input snapshot
 (the release's frozen execution settings, its state at that session's signal
-point, the day's raw/derived/action rows, and the prior account state including
+point, the day's raw/derived/action rows, the applicable verified
+dividend-correction set (see below), and the prior account state including
 pending orders) is written and content-addressed. An input is frozen **only
 when every required input is present**; a missing held close, unavailable or
-suspended held input, unresolved held corporate-action terms or missing signal
-input blocks that version before anything is written.
+suspended held input, unresolved held corporate-action terms, missing signal
+input, or a correction whose `old_amount` does not match the booked amount
+blocks that version before anything is written.
 
 The day commit is one atomic `BEGIN IMMEDIATE` transaction: the order terminal
 states, fills, cash, positions, fees, slippage, dividend entitlements/payments,
@@ -1212,6 +1215,8 @@ For every session the day transaction is:
    *after* the open settlement, so unpaid dividends are part of NAV but can
    never fund an opening trade, and the transfer itself never changes NAV. No
    entitlement is duplicated: it exists either as a receivable or as cash.
+   The frozen applicable dividend-correction deltas are then applied, still
+   before the open (see subsection 6).
 2. **Settle the previous session's pending orders at the unadjusted open**, in
    the deterministic frozen order *sells before buys, then by symbol*. Every
    order receives exactly one terminal state: `filled`, `missing_open`,
@@ -1261,7 +1266,7 @@ For every session the day transaction is:
 | status | meaning |
 | --- | --- |
 | `committed` | the target day is committed with every order terminal and nothing anomalous |
-| `committed_with_anomalies` | the target day is committed, but an evidenced non-fill (missing open, missed deadline, insufficient cash/shares) or a non-blocking anomaly was recorded |
+| `committed_with_anomalies` | the target day is committed, but an evidenced non-fill (missing open, missed deadline, insufficient cash/shares), a correction-caused cash deficit or another non-blocking anomaly was recorded |
 | `already_committed` | the target day was already committed; the stored result hash is returned and nothing is regenerated or re-filled |
 | `blocked` | that version wrote no day row and did not advance; `reason`/`reason_code` say why (e.g. `missing_close`, `missing_action_terms`, `missing_signal_input`, `frozen_input_changed`, `ledger_integrity_failed`, `release_integrity_failed`) |
 | `not_started` | the release is approved but not enabled at/before the target (`NOT_ENABLED`), or is first tracked after it (`ENABLED_AFTER_TARGET`) |
@@ -1302,16 +1307,109 @@ committed history.
 (`kind: shadow_live_ledger_report`, `scope: synthetic`) containing the
 progress row, an integrity block, a summary (days, first/last committed date,
 ending NAV, total return, fees, slippage, dividends, fills, unfilled orders,
-anomalies) and every committed day record with its input hash, result hash,
-`committed_at`, `status` and full result. It only reads committed records and
-never re-runs a strategy.
+anomalies, ending cash, every applied correction, the separate
+`correction_impact_total`, and every correction-caused cash deficit) and every
+committed day record with its input hash, result hash, `committed_at`,
+`status` and full result. It only reads committed records and never re-runs a
+strategy.
 
-#### 6. Hooks for #33 and #34, and limits
+#### 6. Dividend corrections in the Shadow Live ledger (#33, synthetic only)
 
-- The day result is an extensible structured object; `corrections: []` is
-  reserved for the #33 dividend-correction deltas, and the module exposes
+A verified official revision can change a dividend amount *after* the ex-date
+was already booked. Re-running or rewriting the historical day would launder a
+correction into the strategy's P&L, so Shadow Live instead appends **exactly
+one net delta** `(new_amount - old_amount) × qualified_shares` on a later
+session and reports it separately. `--corrections-store <snapshot-store>` opts a
+run into corrections; without the flag no correction is ever applied, even when
+the journal is present. The flag points at the trusted snapshot store that owns
+the write-once revision journal; this is independent of `--store` (the release
+store).
+
+**Reading the journal only.** Revisions are taken exclusively from
+`<snapshot-store>/.dividend-corrections/revision-<revision-id>.json` via
+`dividend.load_verified_revision`, which requires `status: "verified"` and
+`sha256(revision) == revision_id`. The loader is deduplicated by
+`revision_id`; a proposal, an unverified observation, a tampered record or a
+missing file is never evidence and is reported as an ignored entry with a stable
+code (`REVISION_NOT_FOUND` / `REVISION_NOT_VERIFIED` / `REVISION_INVALID`) in
+the update output's `corrections.ignored` list. Loading a journal never opens a
+sealed `validation`/`final_holdout` partition payload and never debits
+`queries.sqlite` — the command works after those payloads have been removed.
+Only an unavailable corrections store is a request rejection
+(`CORRECTIONS_STORE_UNAVAILABLE`, exit 2, nothing frozen or committed).
+
+**Applicability.** For a version and session, a verified revision applies only
+when all of these hold:
+
+1. it is filed by the session's **15:00 Asia/Shanghai after-close cutoff**
+   (`revision.filed_at <= session 15:00+08:00`). A correction filed after the
+   cutoff waits for the next session whose input is not yet frozen; an already
+   committed day is never reopened or adjusted retroactively;
+2. its `ex_date` is at or before the session;
+3. the ledger booked an entitlement for that symbol/ex-date, i.e. the version
+   held shares through the ex-date (an unheld action gets no correction);
+4. it has not already been applied for `(version_id, action_id, revision_id)` in
+   any committed day — the dedupe key is persisted in the booked dividend and
+   scanned across the ledger, so duplicate notices, a crash before the commit
+   and a rerun after it never apply a second delta;
+5. its `old_amount` equals the currently booked per-share amount — the original
+   ex-date `cash_per_share` plus every prior applied delta for that
+   entitlement. A mismatch is a per-version block
+   (`CORRECTION_AMOUNT_MISMATCH`, no day row, no progress advance), never a
+   guessed delta. Chained revisions are applied in filed order as long as each
+   one's `old_amount` matches the then-booked amount.
+
+The applicable set is fixed **inside the frozen per-day input snapshot before
+computation**. A crash after the input was frozen reuses exactly that decision
+(a revision filed after the freeze waits for the next uncommitted session),
+and a rerun after the commit returns `already_committed` with the stored delta.
+
+**Receivable versus cash.** Corrections are applied before the day's open and
+payment processing:
+
+- if the entitlement is still an **unpaid receivable**, the receivable is
+  adjusted by the delta; a payment on or after that day transfers only the
+  adjusted amount, so the amount is never deducted twice;
+- if the entitlement was **already paid**, cash is adjusted by the delta. The
+  historical payment and every earlier day's cash/NAV stay byte-identical.
+
+**Deficits, not financing.** A paid-entitlement correction can push cash below
+zero. That balance is recorded honestly in the day result as `cash_deficit`
+(`{amount, caused_by: "dividend_correction", revision_ids, financed: false,
+forced_sale: false}`) plus a `cash_deficit` anomaly; the version's day still
+commits (`committed_with_anomalies`) and later buys fail normally with
+`insufficient_cash` against the real balance. There is **no financing, no
+forced sale, no cash invention, no leverage and no retroactive rewrite** of
+signals, orders, fills, cash or NAV, and the account stays negative until
+trading actually replenishes it.
+
+**Reporting.** Each committed day carries
+`corrections: [{revision_id, action_id, symbol, ex_date, pay_date, quantity,
+booked_cash_per_share, old_amount, new_amount, delta, target:
+"receivable"|"cash", status, amount, action_reference}]` and
+`correction_impact` (the signed total delta for that day). `amount` is the signed
+money delta, `delta` the per-share change, and `action_reference` points at the
+original ex-date entitlement, whose stored `cash_per_share`/`amount` are never
+rewritten. The update output summarises each version's corrections and impact,
+and `shadow report` lists every correction, the separate
+`correction_impact_total` and every cash deficit; the delta is **not** described
+as strategy trading P&L (`total_return` is still NAV-based, with the separate
+correction impact shown next to it). The correction day commits the event, the
+adjusted balance and the resulting NAV in the same version × session
+transaction.
+
+**Synthetic scope.** This remains a synthetic mechanism test: synthetic
+snapshot/journal, synthetic prices and a synthetic feed, with no real notice,
+real market data, broker or network. It demonstrates the accounting and
+idempotency rules of #16/#33; it is not evidence of real forward performance and
+does not complete the real-chain acceptance of #35.
+
+#### 7. Hooks for #34, and limits
+
+- The day result is an extensible structured object with the `corrections`
+  records above, and the module exposes
   `shadow.iter_committed_days(ledger, version_id=None)` yielding verified day
-  records for the #33/#34 read side. The update loop is version-independent:
+  records for the #34 read side. The update loop is version-independent:
   every version has fully independent cash, positions, orders, fees, dividends
   and NAV.
 - No multi-version comparison command is implemented (#34); only the
