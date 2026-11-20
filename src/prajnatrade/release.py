@@ -20,7 +20,8 @@ Store layout (the same trusted store used by ``protected_eval``)::
 
     <store>/releases/<release_id>/artifact.json                  # immutable (0444)
     <store>/releases/<release_id>/events/<seq>.json              # append-only (0444)
-    <store>/releases/<release_id>/dispositions/<revision_id>.json  # #31 (immutable)
+    <store>/releases/<release_id>/dispositions/<revision_id>.json           # #30 direct (immutable)
+    <store>/releases/<release_id>/dispositions/<revision-id>-<seq>-<id>.json  # #31 write-once
     <store>/audit/<audit_id>.json                                # refused approvals/events
 
 ``release_id = sha256(canonical_json({"candidate_hash", "plan_hash",
@@ -37,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from prajnatrade import protected_eval, snapshot
+from prajnatrade import dividend, protected_eval, snapshot
 
 
 SCHEMA_VERSION = 1
@@ -62,7 +63,22 @@ ALLOWED_FROM = {
     "retire": frozenset({"published", "enabled", "paused"}),
 }
 INVALIDATING_IMPACTS = frozenset({"pending_review", "no_longer_supported"})
-DISPOSITION_IMPACTS = frozenset({"sustained", *INVALIDATING_IMPACTS})
+NOT_APPLICABLE_IMPACT = "not_applicable"
+DISPOSITION_IMPACTS = frozenset(
+    {"sustained", NOT_APPLICABLE_IMPACT, *INVALIDATING_IMPACTS}
+)
+#: The impacts an operator may record explicitly; ``not_applicable`` is derived
+#: from the release's artifact, never hand-entered.
+DISPOSITION_CHOICES = ("sustained", "pending_review", "no_longer_supported")
+DISPOSITION_KIND = "immutable_impact_disposition"
+DISPOSITION_RESULT_KIND = "release_impact_disposition_result"
+DISPOSITION_VERSION = "impact-disposition-v1"
+IMPLICATION_FOR_IMPACT = {
+    "sustained": "evidence_still_supported",
+    "pending_review": "pending_review_pause_required",
+    "no_longer_supported": "no_longer_supported_cannot_resume",
+    NOT_APPLICABLE_IMPACT: "release_not_exposed_no_action",
+}
 
 ADMISSION_STATEMENT = (
     "This artifact is the human admission decision for this frozen candidate and "
@@ -1110,54 +1126,172 @@ def _as_of_date(value: object) -> str:
 # ---------------------------------------------------------------------------
 
 
+_DISPOSITION_REVISION = re.compile(r"[0-9a-f]{64}")
+
+
+def _disposition_order(entry: dict[str, Any]) -> tuple[Any, int, str]:
+    """Deterministic latest-wins order: recorded instant, then sequence."""
+    recorded_at = entry.get("recorded_at")
+    try:
+        instant = (
+            snapshot._instant(recorded_at, "recorded_at")
+            if isinstance(recorded_at, str)
+            else None
+        )
+    except ValueError:
+        instant = None
+    if instant is None:
+        instant = datetime.min.replace(tzinfo=timezone.utc)
+    sequence = entry.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        sequence = 0
+    return (instant, sequence, str(entry.get("disposition_id") or ""))
+
+
+def _stem_revision(path: Path) -> str:
+    """Recover a revision ID from a disposition filename when it is visible."""
+    stem = path.stem
+    if _DISPOSITION_REVISION.fullmatch(stem):
+        return stem
+    head = stem.split("-", 1)[0]
+    return head if _DISPOSITION_REVISION.fullmatch(head) else stem
+
+
+def _invalid_disposition(path: Path, reason: str) -> dict[str, Any]:
+    return {
+        "revision_id": _stem_revision(path),
+        "impact": "pending_review",
+        "valid": False,
+        "reason": reason,
+        "reviewer": None,
+        "decided_at": None,
+        "evidence_reason": None,
+        "recorded_at": None,
+        "sequence": None,
+        "disposition_id": None,
+        "classification": None,
+        "source": "unknown",
+    }
+
+
+def _legacy_disposition(
+    path: Path, payload: dict[str, Any], release_id: str
+) -> dict[str, Any]:
+    """A #30 direct ``dispositions/<revision-id>.json`` record."""
+    impact = payload.get("impact")
+    valid = impact in DISPOSITION_IMPACTS and (
+        payload.get("release_id") in (None, release_id)
+    )
+    recorded_at = payload.get("recorded_at")
+    return {
+        "revision_id": payload.get("revision_id", path.stem),
+        "impact": impact if valid else "pending_review",
+        "valid": valid,
+        "reason": (
+            None
+            if valid
+            else "the disposition is not bound to this release or impact"
+        ),
+        "reviewer": payload.get("reviewer"),
+        "decided_at": recorded_at,
+        "evidence_reason": payload.get("reason"),
+        "recorded_at": recorded_at,
+        "sequence": None,
+        "disposition_id": None,
+        "classification": None,
+        "source": "legacy",
+    }
+
+
+def _verified_disposition(
+    path: Path, payload: dict[str, Any], release_id: str
+) -> dict[str, Any]:
+    """A #31 write-once impact-disposition record (content-addressed)."""
+    revision_id = payload.get("revision_id")
+    reason = None
+    if payload.get("kind") != DISPOSITION_KIND:
+        reason = "the disposition is not an impact-disposition record"
+    elif not isinstance(payload.get("disposition_id"), str) or payload[
+        "disposition_id"
+    ] != _hash(
+        {key: value for key, value in payload.items() if key != "disposition_id"}
+    ):
+        reason = "the disposition failed its content-address check"
+    elif payload.get("release_id") != release_id:
+        reason = "the disposition is bound to another release"
+    elif not isinstance(revision_id, str) or not _DISPOSITION_REVISION.fullmatch(
+        revision_id
+    ):
+        reason = "the disposition does not reference a valid revision"
+    elif payload.get("impact") not in DISPOSITION_IMPACTS:
+        reason = "the disposition records an unknown impact"
+    else:
+        try:
+            snapshot._instant(payload.get("recorded_at"), "recorded_at")
+        except ValueError as error:
+            reason = f"the disposition has an invalid recorded_at: {error}"
+    valid = reason is None
+    impact = payload.get("impact")
+    return {
+        "revision_id": revision_id if isinstance(revision_id, str) else _stem_revision(path),
+        "impact": impact if valid else "pending_review",
+        "valid": valid,
+        "reason": reason,
+        "reviewer": payload.get("reviewer"),
+        "decided_at": payload.get("recorded_at"),
+        "evidence_reason": payload.get("reason"),
+        "recorded_at": payload.get("recorded_at"),
+        "sequence": payload.get("sequence"),
+        "disposition_id": payload.get("disposition_id"),
+        "classification": payload.get("classification"),
+        "source": "record",
+    }
+
+
 def _dispositions(store: Path, release_id: str) -> list[dict[str, Any]]:
+    """Resolve every stored impact disposition to one record per revision.
+
+    A revision can receive several write-once dispositions over time.  The
+    latest by ``recorded_at``/``sequence`` wins, except that once any
+    ``no_longer_supported`` record exists for the revision it is final and a
+    later ``sustained`` record can never clear it.  An unreadable or unbindable
+    record is conservatively invalidating, and the #30 direct-file layout
+    (``dispositions/<revision-id>.json``) is still read.
+    """
     directory = _release_dir(store, release_id) / "dispositions"
     if not directory.is_dir():
         return []
-    records = []
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for path in sorted(directory.glob("*.json")):
         try:
             payload = snapshot._read_json(path)
         except (OSError, UnicodeError, ValueError) as error:
-            records.append(
-                {
-                    "revision_id": path.stem,
-                    "impact": "pending_review",
-                    "valid": False,
-                    "reason": f"unreadable disposition: {error}",
-                }
-            )
+            entry = _invalid_disposition(path, f"unreadable disposition: {error}")
+        else:
+            if not isinstance(payload, dict):
+                entry = _invalid_disposition(path, "a disposition must be an object")
+            elif payload.get("kind") == DISPOSITION_KIND or "disposition_id" in payload:
+                entry = _verified_disposition(path, payload, release_id)
+            else:
+                entry = _legacy_disposition(path, payload, release_id)
+        grouped.setdefault(entry["revision_id"], []).append(entry)
+    resolved = []
+    for revision_id in sorted(grouped):
+        entries = grouped[revision_id]
+        invalid = [entry for entry in entries if entry["valid"] is not True]
+        valid = [entry for entry in entries if entry["valid"] is True]
+        if invalid:
+            resolved.append(invalid[0])
             continue
-        if not isinstance(payload, dict):
-            records.append(
-                {
-                    "revision_id": path.stem,
-                    "impact": "pending_review",
-                    "valid": False,
-                    "reason": "a disposition must be an object",
-                }
-            )
+        if not valid:
             continue
-        impact = payload.get("impact")
-        valid = impact in DISPOSITION_IMPACTS and (
-            payload.get("release_id") in (None, release_id)
+        final = [
+            entry for entry in valid if entry["impact"] == "no_longer_supported"
+        ]
+        resolved.append(
+            max(final or valid, key=_disposition_order)
         )
-        records.append(
-            {
-                "revision_id": payload.get("revision_id", path.stem),
-                "impact": impact if valid else "pending_review",
-                "valid": valid,
-                "reason": (
-                    None
-                    if valid
-                    else "the disposition is not bound to this release or impact"
-                ),
-                "reviewer": payload.get("reviewer"),
-                "decided_at": payload.get("recorded_at"),
-                "evidence_reason": payload.get("reason"),
-            }
-        )
-    return records
+    return resolved
 
 
 def _admission(
@@ -1202,11 +1336,479 @@ def admission_state(store: str | Path, release_id: str) -> dict[str, Any]:
 
     Valid unless the release is retired or any stored impact disposition is
     ``pending_review`` / ``no_longer_supported`` (an unreadable or unbound
-    disposition is treated conservatively as invalidating).
+    disposition is treated conservatively as invalidating).  Several immutable
+    dispositions for one revision resolve latest-wins; a
+    ``no_longer_supported`` record for the revision is final.
     """
     eval_store = _store(store)
     _verified_artifact(_artifact_location(eval_store, release_id), release_id)
     return _admission(eval_store, release_id, _timeline(eval_store, release_id))
+
+
+# ---------------------------------------------------------------------------
+# Dividend-correction impact re-review (#31)
+# ---------------------------------------------------------------------------
+
+
+def _bound_plan(store: Path, artifact: dict[str, Any]) -> dict[str, Any]:
+    """Re-verify that the artifact's frozen plan is the one that used the snapshot."""
+    try:
+        plan = protected_eval._load_plan(store, artifact.get("plan_id"))
+    except protected_eval.EvaluationRejection as error:
+        raise _phase_rejection(error, "disposition") from error
+    if (
+        plan.get("candidate_hash") != artifact.get("candidate_hash")
+        or plan.get("snapshot_id") != artifact.get("snapshot_id")
+        or plan.get("partitions") != artifact.get("partition_fingerprints")
+    ):
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "disposition",
+            "inspect",
+            "The frozen plan no longer matches the release artifact's candidate, "
+            "snapshot and evaluated partition descriptors.",
+        )
+    return plan
+
+
+def _plan_freeze(plan: dict[str, Any], artifact: dict[str, Any]) -> tuple[str, Any]:
+    """The evidence-freeze instant: the plan's ``frozen_at``, never approval time."""
+    frozen_at = plan.get("frozen_at")
+    if not isinstance(frozen_at, str) or artifact.get("plan_frozen_at") != frozen_at:
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "disposition",
+            "inspect",
+            "The artifact's frozen plan timestamp does not match the stored plan; "
+            "the evidence-freeze instant cannot be established.",
+        )
+    try:
+        return frozen_at, snapshot._instant(frozen_at, "plan frozen_at")
+    except ValueError as error:
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "disposition",
+            "inspect",
+            f"The frozen plan's timestamp is invalid: {error}",
+        ) from error
+
+
+def _exposed_stages(
+    partition_fingerprints: object, ex_date: str
+) -> list[str]:
+    """Stages whose evaluated protected range contains the revision's ex-date."""
+    if not isinstance(partition_fingerprints, dict):
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "disposition",
+            "inspect",
+            "The release artifact has no evaluated partition descriptors.",
+        )
+    exposed = []
+    for stage in STAGES:
+        descriptor = partition_fingerprints.get(stage)
+        if not isinstance(descriptor, dict):
+            raise _reject(
+                "RELEASE_INTEGRITY_FAILED",
+                "disposition",
+                "inspect",
+                f"The release artifact has no {stage} partition descriptor.",
+            )
+        try:
+            start = snapshot._date(descriptor.get("start"))
+            end = snapshot._date(descriptor.get("end"))
+        except ValueError as error:
+            raise _reject(
+                "RELEASE_INTEGRITY_FAILED",
+                "disposition",
+                "inspect",
+                f"The release artifact's {stage} range is invalid: {error}",
+            ) from error
+        if start > end:
+            raise _reject(
+                "RELEASE_INTEGRITY_FAILED",
+                "disposition",
+                "inspect",
+                f"The release artifact's {stage} range ends before it starts.",
+            )
+        if start <= ex_date <= end:
+            exposed.append(stage)
+    return exposed
+
+
+def _classification(
+    revision: dict[str, Any],
+    frozen_at: str,
+    exposed_stages: list[str],
+    explicit_impact: str | None,
+) -> dict[str, Any]:
+    """Record why (and on what basis) the impact value was chosen."""
+    try:
+        official = snapshot._instant(
+            revision.get("official_available_at"), "official_available_at"
+        )
+    except ValueError as error:  # pragma: no cover - validated by the journal loader
+        raise _reject(
+            "REVISION_INVALID", "disposition", "inspect", str(error)
+        ) from error
+    frozen = snapshot._instant(frozen_at, "plan frozen_at")
+    timing_impact = "pending_review" if official <= frozen else "sustained"
+    if not exposed_stages:
+        if explicit_impact in INVALIDATING_IMPACTS:
+            raise _reject(
+                "IMPACT_NOT_APPLICABLE",
+                "disposition",
+                "correct",
+                "The revision's ex-date is outside both evaluated protected ranges, "
+                "so this release cannot have used that input; an unaffected release "
+                "is never paused or invalidated.",
+            )
+        recorded = "sustained" if explicit_impact == "sustained" else NOT_APPLICABLE_IMPACT
+        method = (
+            "operator_override" if explicit_impact else "excluded_from_evaluated_ranges"
+        )
+        basis = (
+            "The revision's ex-date is outside both evaluated protected ranges, so "
+            "this release's evidence could not include that corporate action."
+        )
+        if explicit_impact == "sustained":
+            basis += " The operator recorded that the original evidence still holds."
+    else:
+        recorded = explicit_impact or timing_impact
+        method = (
+            "operator_override" if explicit_impact else "official_availability_vs_plan_freeze"
+        )
+        if recorded == "pending_review":
+            basis = (
+                "The official amount was available at or before the evidence-freeze "
+                "time, so the sealed evaluation may have used an amount that was "
+                "already officially wrong at freeze time; admission is pending review."
+            )
+        elif recorded == "no_longer_supported":
+            basis = (
+                "The evidence is no longer supported: the revision affected an "
+                "evaluated protected range and the operator confirmed the frozen "
+                "judgement cannot stand. This release can never resume."
+            )
+        else:
+            basis = (
+                "The official correction became available after the plan was "
+                "frozen, so the stored report and approval keep their then-evidence "
+                "validity."
+            )
+        if explicit_impact and explicit_impact != timing_impact:
+            basis += f" The operator recorded {explicit_impact} explicitly."
+    return {
+        "method": method,
+        "exposure": "evaluated" if exposed_stages else "not_applicable",
+        "exposed_stages": exposed_stages,
+        "official_available_at": revision.get("official_available_at"),
+        "plan_frozen_at": frozen_at,
+        "timing_impact": timing_impact,
+        "recorded_impact": recorded,
+        "official_available_before_or_at_freeze": official <= frozen,
+        "basis": basis,
+    }
+
+
+def _next_disposition_sequence(store: Path, release_id: str) -> int:
+    directory = _release_dir(store, release_id) / "dispositions"
+    if not directory.is_dir():
+        return 1
+    sequences = []
+    for path in directory.glob("*.json"):
+        try:
+            payload = snapshot._read_json(path)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        sequence = payload.get("sequence") if isinstance(payload, dict) else None
+        if isinstance(sequence, int) and not isinstance(sequence, bool):
+            sequences.append(sequence)
+    return max(sequences, default=0) + 1
+
+
+def disposition(
+    store: str | Path,
+    snapshot_store: str | Path,
+    release_id: str,
+    revision_id: str,
+    reviewer: str,
+    reason: str,
+    *,
+    impact: str | None = None,
+    ledger: str | Path | None = None,
+    data: str | Path | None = None,
+    effective_signal_date: str | None = None,
+) -> dict[str, Any]:
+    """Record a verified dividend-correction impact and pause new signals (#31).
+
+    Inputs come from the snapshot-store revision journal and the release
+    artifact only: no sealed partition payload is opened and the query ledger is
+    never debited.  Exposure is the revision's ex-date falling inside an
+    evaluated protected range in the artifact; the default classification then
+    compares the official availability instant with the *plan's* evidence-freeze
+    instant.  An exposed ``pending_review`` / ``no_longer_supported`` release
+    that is currently enabled is paused at the first not-yet-committed after-close
+    signal point (from the Shadow Live ledger when supplied, otherwise an
+    explicit ``--effective-signal-date``).  Unaffected releases are never paused.
+    """
+    eval_store = _store(store)
+    reviewer = reviewer.strip() if isinstance(reviewer, str) else ""
+    reason = reason.strip() if isinstance(reason, str) else ""
+    if not reviewer or not reason:
+        raise ValueError("A disposition requires a non-empty reviewer and reason.")
+    if impact is not None and impact not in DISPOSITION_CHOICES:
+        raise ValueError(
+            "--impact must be one of " + ", ".join(DISPOSITION_CHOICES) + "."
+        )
+    if (ledger is None) != (data is None):
+        raise ValueError(
+            "--ledger and --data must be supplied together to derive the first "
+            "uncommitted after-close signal point."
+        )
+    explicit_date: str | None = None
+    if effective_signal_date is not None:
+        try:
+            explicit_date = snapshot._date(effective_signal_date)
+        except ValueError as error:
+            raise ValueError(
+                f"--effective-signal-date must be an ISO trading date: {error}"
+            ) from error
+
+    context: dict[str, Any] = {"release_id": release_id, "revision_id": revision_id}
+    try:
+        artifact = _verified_artifact(
+            _artifact_location(eval_store, release_id), release_id
+        )
+    except ReleaseRejection as error:
+        raise _refusal(
+            eval_store, context, error, command="release disposition"
+        ) from error
+    context = {
+        **context,
+        "candidate_id": artifact.get("candidate_id"),
+        "candidate_hash": artifact.get("candidate_hash"),
+        "plan_id": artifact.get("plan_id"),
+        "snapshot_id": artifact.get("snapshot_id"),
+    }
+
+    try:
+        revision_record = dividend.load_verified_revision(snapshot_store, revision_id)
+    except dividend.RevisionError as error:
+        raise _refusal(
+            eval_store,
+            context,
+            _reject(error.code, "disposition", "inspect", str(error)),
+            command="release disposition",
+        ) from error
+    revision = revision_record["revision"]
+
+    try:
+        plan = _bound_plan(eval_store, artifact)
+    except ReleaseRejection as error:
+        raise _refusal(
+            eval_store, context, error, command="release disposition"
+        ) from error
+    try:
+        frozen_at, _ = _plan_freeze(plan, artifact)
+    except ReleaseRejection as error:
+        raise _refusal(
+            eval_store, context, error, command="release disposition"
+        ) from error
+    try:
+        exposed_stages = _exposed_stages(
+            artifact.get("partition_fingerprints"), revision["ex_date"]
+        )
+        classification = _classification(
+            revision, frozen_at, exposed_stages, impact
+        )
+    except ReleaseRejection as error:
+        raise _refusal(
+            eval_store, context, error, command="release disposition"
+        ) from error
+    recorded_impact = classification["recorded_impact"]
+    invalidating = recorded_impact in INVALIDATING_IMPACTS
+
+    events = _timeline(eval_store, release_id)
+    state = _current_state(events)
+    pause_date: str | None = None
+    if invalidating and state == "enabled":
+        last_signal_date = events[-1]["effective_signal_date"]
+        if explicit_date is not None:
+            pause_date = explicit_date
+        elif ledger is not None and data is not None:
+            from prajnatrade import shadow  # deferred: shadow imports this module
+
+            try:
+                pause_date = shadow.first_uncommitted_signal_date(
+                    ledger,
+                    data,
+                    release_id,
+                    not_before=last_signal_date,
+                    after=revision_record["filed_at"],
+                )
+            except shadow.ShadowRejection as error:
+                raise _refusal(
+                    eval_store,
+                    context,
+                    _reject(
+                        error.details["code"],
+                        "disposition",
+                        error.details["next_action"],
+                        error.details["message"],
+                    ),
+                    command="release disposition",
+                ) from error
+            if pause_date is None:
+                raise _refusal(
+                    eval_store,
+                    context,
+                    _reject(
+                        "NO_UNCOMMITTED_SIGNAL_POINT",
+                        "disposition",
+                        "inspect",
+                        "Every session in the supplied feed is already committed; "
+                        "there is no uncommitted after-close signal point to pause at.",
+                    ),
+                    command="release disposition",
+                )
+        else:
+            raise _refusal(
+                eval_store,
+                context,
+                _reject(
+                    "EFFECTIVE_SIGNAL_DATE_REQUIRED",
+                    "disposition",
+                    "correct",
+                    "An exposed invalidating disposition on an enabled release "
+                    "requires --effective-signal-date, or --ledger and --data to "
+                    "derive the first uncommitted after-close signal point.",
+                ),
+                command="release disposition",
+            )
+        if pause_date < last_signal_date:
+            raise _refusal(
+                eval_store,
+                context,
+                _reject(
+                    "ILLEGAL_PAUSE",
+                    "disposition",
+                    "correct",
+                    f"The pause effective date {pause_date} precedes the last "
+                    f"registered signal date {last_signal_date}; the release "
+                    "timeline never moves backwards.",
+                ),
+                command="release disposition",
+            )
+
+    recorded_at = _now()
+    sequence = _next_disposition_sequence(eval_store, release_id)
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "scope": SCOPE,
+        "kind": DISPOSITION_KIND,
+        "disposition_version": DISPOSITION_VERSION,
+        "sequence": sequence,
+        "release_id": release_id,
+        "revision_id": revision_id,
+        "revision": {
+            key: revision.get(key)
+            for key in (
+                "symbol",
+                "ex_date",
+                "old_amount",
+                "new_amount",
+                "currency",
+                "official_available_at",
+            )
+        },
+        "revision_filed_at": revision_record["filed_at"],
+        "candidate_id": artifact.get("candidate_id"),
+        "candidate_hash": artifact.get("candidate_hash"),
+        "plan_id": artifact.get("plan_id"),
+        "plan_frozen_at": frozen_at,
+        "snapshot_id": artifact.get("snapshot_id"),
+        "impact": recorded_impact,
+        "implication": IMPLICATION_FOR_IMPACT[recorded_impact],
+        "classification": classification,
+        "reviewer": reviewer,
+        "reason": reason,
+        "recorded_at": recorded_at,
+        "pause_required": bool(invalidating and state == "enabled"),
+        "pause_effective_signal_date": pause_date,
+    }
+    disposition_id = _hash(body)
+    record = {**body, "disposition_id": disposition_id}
+    disposition_dir = _release_dir(eval_store, release_id) / "dispositions"
+    path = disposition_dir / f"{revision_id}-{sequence:04d}-{disposition_id}.json"
+    if not _write_immutable(path, record):
+        raise _refusal(
+            eval_store,
+            context,
+            _reject(
+                "DISPOSITION_CONFLICT",
+                "disposition",
+                "inspect",
+                "A concurrent disposition won this write-once slot; re-read the "
+                "release status and retry.",
+            ),
+            command="release disposition",
+        )
+
+    paused_event = None
+    if pause_date is not None:
+        try:
+            pause_response = _append_event(
+                "pause",
+                eval_store,
+                release_id,
+                pause_date,
+                f"Dividend correction {revision_id} recorded as {recorded_impact}; "
+                "pause new signals.",
+            )
+        except ReleaseRejection as error:
+            # The disposition (the conservative record) is already written; the
+            # timeline conflict is surfaced instead of silently inventing a pause.
+            raise ReleaseRejection(
+                error.details["code"],
+                error.details["phase"],
+                error.details["next_action"],
+                error.details["message"],
+                context={
+                    **error.context,
+                    "disposition_id": disposition_id,
+                    "disposition_recorded": True,
+                },
+            ) from error
+        paused_event = pause_response["event"]
+
+    events_after = _timeline(eval_store, release_id)
+    admission = _admission(eval_store, release_id, events_after)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "recorded",
+        "scope": SCOPE,
+        "kind": DISPOSITION_RESULT_KIND,
+        "release_id": release_id,
+        "revision_id": revision_id,
+        "impact": recorded_impact,
+        "implication": IMPLICATION_FOR_IMPACT[recorded_impact],
+        "classification": classification,
+        "reason": classification["basis"],
+        "reviewer": reviewer,
+        "disposition": record,
+        "disposition_path": str(path),
+        "paused_event": paused_event,
+        "state": _current_state(events_after),
+        "admission": admission,
+        "unchanged": {
+            "query_ledger": True,
+            "sealed_reads": False,
+            "artifact": True,
+            "evaluation_records": True,
+            "snapshot_partitions": True,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1376,15 +1978,18 @@ def _append_event(
             "effective_signal_date must not decrease across the release timeline.",
             next_action="correct",
         )
-    if action == "resume":
+    if action in ("enable", "resume"):
         admission = _admission(eval_store, release_id, events)
         if admission["valid"] is not True:
             refuse(
                 "ADMISSION_INVALID",
-                f"Resume requires a currently valid admission; it is "
-                f"{admission['reason']!r}.",
+                f"{action.capitalize()} requires a currently valid admission; it is "
+                f"{admission['reason']!r}. An invalidated evidence set can only be "
+                "replaced by a new frozen candidate, unseen range, approval and "
+                "release ID.",
                 next_action="stop",
             )
+    if action == "resume":
         try:
             _verify_bindings(eval_store, artifact)
         except ReleaseRejection as error:

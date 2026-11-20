@@ -715,6 +715,80 @@ def iter_committed_days(
     return Ledger(ledger).iter_days(version_id)
 
 
+def first_uncommitted_signal_date(
+    ledger: str | Path,
+    data: str | Path,
+    version_id: str,
+    *,
+    not_before: str | None = None,
+    after: str | None = None,
+) -> str | None:
+    """First feed session whose after-close signal point is not committed (#31).
+
+    The disposition workflow derives its pause point from this hook instead of
+    duplicating the day engine.  With history it is the feed session after the
+    version's last committed session; without history it is the first session
+    whose after-close point follows ``after`` (the revision filing instant) or
+    now, whichever is later.  ``not_before`` (a pre-registered enable/resume
+    date) skips sessions that would move the release timeline backwards.
+    Returns ``None`` when no session qualifies.  The ledger is never created:
+    an absent ledger is simply no history.
+    """
+    if not isinstance(version_id, str) or not _RELEASE_ID.fullmatch(version_id):
+        raise _reject(
+            "INVALID_RELEASE_ID",
+            "disposition",
+            "correct",
+            "Release IDs are 64-character lowercase hexadecimal content addresses.",
+        )
+    feed = load_feed(data)
+    bound: str | None = None
+    if not_before is not None:
+        try:
+            bound = snapshot._date(not_before)
+        except ValueError as error:
+            raise _reject(
+                "INVALID_DATE", "disposition", "correct", str(error)
+            ) from error
+    progress = None
+    if (Path(ledger) / "shadow.sqlite").is_file():
+        progress = Ledger(ledger).get_progress(version_id)
+    last = progress.get("last_committed_date") if progress is not None else None
+    if isinstance(last, str) and last:
+        if last not in feed.index:
+            raise _reject(
+                "FEED_CALENDAR_MISMATCH",
+                "disposition",
+                "inspect",
+                f"The last committed session {last} is not in this feed's calendar; "
+                "refusing to guess the next session.",
+            )
+        start = feed.index[last] + 1
+    else:
+        reference = datetime.now(timezone.utc)
+        if after is not None:
+            try:
+                filed = snapshot._instant(after, "filed_at")
+            except ValueError as error:
+                raise _reject(
+                    "INVALID_DATE", "disposition", "correct", str(error)
+                ) from error
+            reference = max(reference, filed)
+        start = next(
+            (
+                index
+                for index, session in enumerate(feed.sessions)
+                if _session_close(session) > reference
+            ),
+            len(feed.sessions),
+        )
+    for session in feed.sessions[start:]:
+        if bound is not None and session < bound:
+            continue
+        return session
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------

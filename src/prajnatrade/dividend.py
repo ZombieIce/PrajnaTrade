@@ -12,6 +12,14 @@ from prajnatrade import snapshot
 from prajnatrade.data import ETF_SYMBOLS
 
 
+class RevisionError(ValueError):
+    """A stored dividend revision cannot be used as trusted evidence (#31)."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def _object(value: object, fields: str) -> dict:
     if not isinstance(value, dict) or set(value) != set(fields.split()):
         raise ValueError(f"Expected fields: {fields}.")
@@ -147,6 +155,71 @@ def verify(source: Path, store: Path, proposal_id: str) -> dict:
     _file_once(_journal(store, "notice", evidence_id),
                {"revision_id": revision_id, "evidence": notice, "filed_at": now.isoformat()})
     return filed
+
+
+def load_verified_revision(store: str | Path, revision_id: str) -> dict:
+    """Load one verified revision journal record for trusted impact review (#31).
+
+    The journal entry is written once by :func:`verify` and is usable only while
+    it is ``verified`` and ``sha256(revision)`` equals the requested revision ID.
+    A proposal, an unverified observation or a tampered record is never evidence.
+    Reading the journal never opens a sealed partition and never debits a query.
+    """
+    if not isinstance(revision_id, str) or not re.fullmatch(r"[0-9a-f]{64}", revision_id):
+        raise ValueError(
+            "Invalid revision ID; revision IDs are 64-character lowercase "
+            "hexadecimal content addresses."
+        )
+    store_path = snapshot._store_path(Path(store))
+    path = _journal(store_path, "revision", revision_id)
+    if not path.is_file():
+        raise RevisionError(
+            "REVISION_NOT_FOUND",
+            f"No verified revision {revision_id} is stored in the snapshot-store journal.",
+        )
+    try:
+        record = snapshot._read_json(path)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise RevisionError(
+            "REVISION_INVALID", f"The stored revision is unreadable: {error}"
+        ) from error
+    if not isinstance(record, dict):
+        raise RevisionError(
+            "REVISION_INVALID", "The stored revision journal record is not an object."
+        )
+    if record.get("status") != "verified":
+        raise RevisionError(
+            "REVISION_NOT_VERIFIED",
+            "The stored revision is not verified; only a verified official revision "
+            "can be reviewed for impact.",
+        )
+    revision = record.get("revision")
+    if not isinstance(revision, dict) or snapshot._hash(revision) != revision_id:
+        raise RevisionError(
+            "REVISION_INVALID",
+            "The stored revision failed its content-address check.",
+        )
+    if record.get("revision_id") != revision_id:
+        raise RevisionError(
+            "REVISION_INVALID",
+            "The stored revision is bound to a different revision ID.",
+        )
+    try:
+        if revision.get("symbol") not in ETF_SYMBOLS:
+            raise ValueError("The revision is not one of the five ETF symbols.")
+        snapshot._date(revision.get("ex_date"))
+        for field in ("old_amount", "new_amount"):
+            _amount(revision.get(field))
+        if revision.get("old_amount") == revision.get("new_amount"):
+            raise ValueError("The old and new amounts must differ.")
+        snapshot._instant(revision.get("official_available_at"), "official_available_at")
+        snapshot._instant(record.get("filed_at"), "filed_at")
+    except ValueError as error:
+        raise RevisionError(
+            "REVISION_INVALID",
+            f"The stored revision is incomplete or invalid: {error}",
+        ) from error
+    return record
 
 
 def successor(store: Path, proposal_id: str, revision_id: str) -> dict:
