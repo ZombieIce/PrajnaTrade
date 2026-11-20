@@ -473,16 +473,17 @@ The Mock provider can emit deterministic Python when opted in, but a Mock
 campaign is never evidence of model novelty or investable performance. Results
 are research evidence, not investment advice or a guarantee of future returns.
 
-### Protected Validation (MVP-10, synthetic only)
+### Protected Validation and Final Holdout (MVP-10/MVP-11, synthetic only)
 
 `prajnatrade evaluation ...` performs one preregistered, human-authorized,
-OS-isolated Validation evaluation of a frozen candidate against a sealed
-synthetic Validation partition. **This is synthetic engineering evidence only.**
-It does not consume real market data, does not validate a real strategy, does
-not prove independent out-of-sample evidence for real markets, and does not
-grant admission, approve a release, or replace human review. Final Holdout
-authorization and the controlled report belong to later tickets; this workflow
-fixes the two-stage plan but only executes Validation.
+OS-isolated evaluation of a frozen candidate against sealed synthetic
+Validation **and** Final Holdout partitions, each debited once. Validation and
+Final Holdout have separate human authorizations; Final Holdout is only
+authorized after the same frozen plan's Validation passed, and the controlled
+report is rendered from the immutable records. **This is synthetic engineering
+evidence only.** It does not consume real market data, does not validate a real
+strategy, does not prove independent out-of-sample evidence for real markets,
+and does not grant admission, approve a release, or replace human review.
 
 The trusted store is one directory outside Git (the same store is reused by
 later release/Shadow Live workflows). The evaluation ledger in
@@ -492,13 +493,19 @@ ledger.
 
 ```text
 <store>/
-  plans/<plan_id>.json                                   # frozen plan (0400)
-  authorizations/<plan_id>/validation-<auth_id>.json     # one authorization
-  authorizations/<plan_id>/validation.authorized.json    # which one is used
-  audit/<audit_id>.json                                  # rejected requests
-  queries.sqlite                                         # debit ledger
-  records/<evaluation_id>/record.json                    # trusted record
+  plans/<plan_id>.json                                        # frozen plan (0400)
+  authorizations/<plan_id>/validation-<auth_id>.json           # one Validation authorization
+  authorizations/<plan_id>/validation.authorized.json          # which one is used
+  authorizations/<plan_id>/final_holdout-<auth_id>.json        # one separate Holdout authorization
+  authorizations/<plan_id>/final_holdout.authorized.json       # which one is used
+  audit/<audit_id>.json                                       # rejected requests
+  queries.sqlite                                              # debit ledger
+  records/<evaluation_id>/record.json                         # trusted record (0400)
 ```
+
+Both partitions are fixed in the plan and are separate global one-use
+budgets: the debit keys are `("validation", content_hash)` and
+`("final_holdout", content_hash)`.
 
 #### 1. Freeze the plan before reading anything
 
@@ -556,8 +563,7 @@ prajnatrade evaluation authorize --store /trusted/evaluations \
 The authorization is an immutable record bound to the plan, candidate hash,
 snapshot, stage, and Validation partition fingerprint. A second authorization
 for the same stage is a conflict: the first is the one used, and
-`evaluation status` shows it. Final Holdout authorization is deliberately not
-implemented here.
+`evaluation status` shows it. Final Holdout needs its own authorization (below).
 
 #### 3. Run the one debited Validation evaluation
 
@@ -627,16 +633,76 @@ sample counts below the frozen minimum, or an unavailable threshold metric mean
 `passed`. The parameter neighbourhood is diagnostic, not a hard threshold, and
 no plan can add a generic return threshold after the fact.
 
-#### 4. What the research side may see
+#### 4. Authorize Final Holdout separately
 
-The research-side command is read-only and cannot plan, authorize, or run:
+```sh
+prajnatrade evaluation authorize --store /trusted/evaluations \
+  --plan-id <plan-id> --stage final_holdout \
+  --reviewer "reviewer name" --reason "Validation passed; one Holdout read cleared"
+```
+
+The authorization is refused unless the **same** frozen plan already has a
+completed Validation evaluation whose record is bound to this plan, candidate,
+snapshot and Validation partition fingerprint and whose `outcome` is `passed`
+with `scoring: true` (an aborted or insufficient Validation is never a pass).
+A second Holdout authorization is a conflict. Refusals happen before any debit
+or sealed read: they write an `audit/<audit_id>.json` with
+`opened_protected_source: false` and `query_debited: false`, exit non-zero, and
+the authorization record itself carries the Validation evaluation id, record
+hash and export hash it was granted against.
+
+#### 5. Run the one debited Final Holdout evaluation
+
+```sh
+prajnatrade evaluation run --store /trusted/evaluations \
+  --snapshot-store /trusted/snapshots --plan-id <plan-id> \
+  --stage final_holdout --project ./strategy-A
+```
+
+This repeats every Validation gate (plan/candidate/runtime/manifest/descriptor
+fingerprints, project binding, authorization, verified OS isolation probe),
+re-verifies that the Validation evidence the authorization was granted against
+is still intact and passing, and only then atomically debits
+`("final_holdout", content_hash)` before the sealed Holdout read. Evaluation is
+the same candidate + equal-weight baseline matrix at base and stress costs with
+the frozen thresholds, minimum samples, parameter neighbourhood and point-in-time
+regimes.
+
+**Warm-up history without a second sealed read.** Holdout signals need trailing
+total-return values from earlier partitions. The Holdout prior is Discovery
+(research-visible) plus a derived export written into the Validation record
+(`prior_export_for_holdout`: the tail of Validation sessions needed by the
+frozen signal window and regime lookback, bound to the Validation evaluation id,
+plan, candidate, snapshot and partition hash). The Holdout run loads that export
+from the stored Validation record and verifies its hash; it never re-opens the
+sealed Validation payload. A Validation record that predates the export (or a
+changed record) is rejected with `VALIDATION_EVIDENCE_INVALID` rather than
+silently re-reading Validation. Both records also carry a `record_hash`
+content address that later workflows verify.
+
+The same global rules apply: a replay of the same plan/candidate/stage returns
+the stored record without a second debit or read; a different plan or candidate
+using the same sealed Holdout content hash is rejected
+(`QUERY_ALREADY_CONSUMED`) before reading. An abort after the Holdout read keeps
+the debit, writes `scoring: false`, no metrics and no retry/refund; the
+`PRAJNATRADE_TEST_FAILPOINT=evaluation_after_read` hook exercises that path for
+either stage.
+
+#### 6. What the research side may see for both stages
+
+The research-side command is read-only and cannot plan, authorize, run or
+report:
 
 ```sh
 prajnatrade-agent evaluation status --project ./strategy-A --candidate-id <id>
 ```
 
-Its `validation` value is either `{"status": "pending"}` or exactly this
-coarse receipt:
+It returns exactly
+`{"schema_version": 1, "candidate_id": ..., "validation": <coarse receipt or
+{"status": "pending"}>, "final_holdout": <constant>}` and nothing else. The
+`validation` value is either `{"status": "pending"}` or exactly this coarse
+receipt (the latest completed evaluation of that frozen plan; replaying in the
+same trusted store returns the same payload):
 
 ```json
 {"schema_version": 1, "stage": "validation",
@@ -646,13 +712,65 @@ coarse receipt:
 ```
 
 It contains no numbers, dates, metrics, fills, curves, variants, logs,
-durations, or admission state (a passing receipt has `reason: null`). A
-rejected **request**
-(permissions, budget, fingerprint, isolation) is not a strategy failure and
-publishes no strategy receipt. The coarse receipt reflects the latest completed
-evaluation of that frozen plan; deterministic replay in the same trusted store
-returns the same payload.
+durations, or admission state (a passing receipt has `reason: null`). The Final
+Holdout value is the constant, outcome-independent document:
+
+```json
+{"schema_version": 1, "stage": "final_holdout",
+ "status": "accepted", "message": "Request received."}
+```
+
+It is byte-identical for completed, rejected, aborted, unauthorized and
+re-submitted requests: no timestamps, IDs, durations, counts, diagnostics,
+admission state or anything from the trusted Holdout record is exposed.
+
+The Validation `validation` value contains no numbers, dates, metrics, fills,
+curves, variants, logs, durations, or admission state (a passing receipt has
+`reason: null`). A rejected **request** (permissions, budget, fingerprint,
+isolation) is not a strategy failure and publishes no strategy receipt.
+
+#### 7. Controlled report (operator only)
+
+```sh
+prajnatrade evaluation report --store /trusted/evaluations \
+  --plan-id <plan-id> --output report.html   # or report.json
+```
+
+The report is rendered **only** from the frozen plan, the stored
+authorizations, the query ledger, rejected-request audits and the immutable
+evaluation records; it never re-runs an evaluation, opens a sealed partition or
+debits a query. A changed or missing record is an explicit error
+(`RECORD_INTEGRITY_FAILED`), not a fallback. It shows the candidate / plan /
+snapshot / partition fingerprints, both authorizations and query receipts
+(including rejected and aborted requests), coverage gaps, every preregistered
+threshold with actual value and verdict, base-vs-stress candidate and
+equal-weight baseline results, the legal parameter neighbourhood with
+exclusions, point-in-time market regimes with sample counts, and inline SVG NAV
+and drawdown curves for candidate and baseline at both cost scenarios. Missing
+evidence is rendered as *not approved / incomplete*; the report always states
+that it does not grant admission. `.html` and `.json` contain the same
+report data and are deterministic for the same stored records (the report has a
+content hash and no wall-clock timestamps).
 
 The operator view is `prajnatrade evaluation status --store <store>
---plan-id <plan-id>`: the frozen plan, authorizations, query ledger state, and
-each stage's evaluation summary.
+--plan-id <plan-id>`: the frozen plan, both authorizations, per-stage query
+debit state, evaluation outcome/`scoring` and the record path.
+
+**Implementation decisions for the strict reading of #12/#13/#29:**
+
+- The Validation record keeps only the derived-row tail needed by the frozen
+  signal window and regime lookback (`prior_export_for_holdout`), not the whole
+  sealed partition. A Validation record without that export, or with a changed
+  hash, is rejected (`VALIDATION_EVIDENCE_INVALID`) instead of re-reading
+  Validation or recomputing the export from sealed data.
+- The Holdout run re-verifies the Validation evaluation id and record hash that
+  are bound into its authorization, so a later change to the Validation
+  evidence is `AUTHORIZATION_REQUIRED`, never a silent pass.
+- Trusted records carry a `record_hash` content address; replay, operator
+  status and the report verify it (`RECORD_INTEGRITY_FAILED` on mismatch).
+- The controlled report is written to the operator-selected `--output` path
+  rather than copied into the trusted store; it is still derived only from the
+  immutable plan/records/ledger/audit files.
+- The constant Holdout receipt is stored in the trusted record's
+  `research_receipt` field and in `evaluation_receipts(plan_id,
+  'final_holdout')` for audit, but it is never derived from the outcome.

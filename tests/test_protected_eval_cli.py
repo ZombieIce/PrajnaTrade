@@ -78,6 +78,7 @@ def synthetic_snapshot(
     *,
     missing_close: tuple[str, str] | None = None,
     discovery_marker: str | None = None,
+    derived_range: tuple[str, str] | None = None,
 ) -> dict:
     """Constant-price synthetic sessions with a Discovery-only dividend.
 
@@ -87,6 +88,10 @@ def synthetic_snapshot(
     inside the protected range.  `discovery_marker` perturbs only Discovery
     derived values, which changes the snapshot ID but preserves the Validation
     and Final Holdout payload hashes (used for the repackaging test).
+    `derived_range` perturbs derived values only inside an inclusive date range,
+    which changes one partition's content hash while leaving the others intact
+    (used by #29 to make the Validation range new but keep the same sealed
+    Holdout content).
     """
 
     days = [date(2024, 1, 1) + timedelta(days=index) for index in range(day_count)]
@@ -115,6 +120,11 @@ def synthetic_snapshot(
             )
             value = 10.0
             if discovery_marker is not None and day.isoformat() <= discovery_marker:
+                value = 10.5
+            if (
+                derived_range is not None
+                and derived_range[0] <= day.isoformat() <= derived_range[1]
+            ):
                 value = 10.5
             derived.append(
                 {"date": day.isoformat(), "symbol": symbol, "value": value, **EVIDENCE}
@@ -882,6 +892,15 @@ def test_authorized_validation_records_full_trusted_evidence_and_coarse_receipt(
         for variant in neighbourhood["variants"]
     )
     assert neighbourhood["excluded"]
+    # Each variant must be evaluated with the signal window implied by its own
+    # parameters, not the original candidate's window (momentum: lookback + 1).
+    windows = {
+        tuple(variant["changed_parameters"]): variant["signal_window_sessions"]
+        for variant in neighbourhood["variants"]
+    }
+    assert windows[("lookback",)] == 4
+    assert windows[("top_k",)] == 3
+    assert record["execution"]["signal_window_sessions"] == 3
 
     regimes = record["regimes"]
     assert regimes["definition"]["method"] == "trailing_volatility"
@@ -945,8 +964,19 @@ def test_authorized_validation_records_full_trusted_evidence_and_coarse_receipt(
             agent=True,
         )
     )
-    assert set(agent) == {"schema_version", "candidate_id", "validation"}
+    assert set(agent) == {
+        "schema_version",
+        "candidate_id",
+        "validation",
+        "final_holdout",
+    }
     assert agent["validation"] == receipt
+    assert agent["final_holdout"] == {
+        "schema_version": 1,
+        "stage": "final_holdout",
+        "status": "accepted",
+        "message": "Request received.",
+    }
 
 
 def test_replay_reuses_the_record_without_a_second_debit_and_other_candidates_are_blocked(
@@ -1327,8 +1357,19 @@ def test_agent_surface_only_reads_coarse_receipts(base: dict) -> None:
             agent=True,
         )
     )
-    assert set(status) == {"schema_version", "candidate_id", "validation"}
+    assert set(status) == {
+        "schema_version",
+        "candidate_id",
+        "validation",
+        "final_holdout",
+    }
     assert status["validation"] == {"status": "pending"}
+    assert status["final_holdout"] == {
+        "schema_version": 1,
+        "stage": "final_holdout",
+        "status": "accepted",
+        "message": "Request received.",
+    }
     ok(authorize(store, plan["plan_id"]))
 
 

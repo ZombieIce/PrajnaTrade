@@ -1,4 +1,4 @@
-"""Protected Validation over sealed synthetic snapshot partitions (MVP-10).
+"""Protected Validation and Final Holdout over sealed synthetic snapshots.
 
 The workflow freezes a candidate, both protected partition fingerprints, the
 execution rules, costs, thresholds, minimum samples, regimes and parameter
@@ -6,6 +6,13 @@ neighbourhood **before** opening Validation; requires a matching human
 authorization and a verified OS-isolation probe; debits the sealed range in an
 atomic SQLite ledger **before** the read; records the trusted evidence in an
 immutable record; and publishes only a coarse receipt to the research project.
+
+Final Holdout requires a *second*, separate human authorization that is only
+granted after the same frozen plan's Validation evaluation passed.  Its warm-up
+history comes from Discovery (research-visible) plus a derived export stored in
+the Validation record, so the sealed Validation payload is never read twice.
+The research-side receipt for Holdout is a constant, outcome-independent
+document.
 
 Everything in this module is synthetic engineering evidence.  It does not grant
 strategy admission and does not validate real market data.
@@ -77,6 +84,16 @@ NOT_ADMISSION_STATEMENT = (
     "This synthetic trusted record is engineering evidence only; it does not "
     "grant admission, approve a release, or prove real-market performance."
 )
+
+#: The research side learns exactly one thing about Final Holdout: the request
+#: was received.  It is identical for completed, rejected, aborted, unauthorized
+#: and re-submitted requests, and contains no outcome, timing or diagnostics.
+HOLDOUT_RECEIPT = {
+    "schema_version": SCHEMA_VERSION,
+    "stage": HOLDOUT_STAGE,
+    "status": "accepted",
+    "message": "Request received.",
+}
 
 _QUERIES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS consumed_queries (
@@ -178,6 +195,218 @@ def _file_once(path: Path, record: dict) -> dict:
             value = snapshot._read_json(path)
             return value if isinstance(value, dict) else {}
     return record
+
+
+# ---------------------------------------------------------------------------
+# Immutable record integrity
+# ---------------------------------------------------------------------------
+
+
+def _record_hash(record: dict[str, Any]) -> str:
+    """Content address of a trusted record (the hash field itself excluded)."""
+    return _hash({key: value for key, value in record.items() if key != "record_hash"})
+
+
+def _verify_record(record: object) -> dict[str, Any]:
+    """Verify a trusted record's content address; never fall back to a re-run."""
+    if not isinstance(record, dict):
+        raise ValueError("The stored evaluation record is not an object.")
+    stored = record.get("record_hash")
+    if not isinstance(stored, str) or stored != _record_hash(record):
+        raise ValueError(
+            "The stored evaluation record failed its integrity check "
+            "(record_hash missing or mismatched)."
+        )
+    return record
+
+
+def _record_matches(record: dict[str, Any], plan: dict[str, Any], stage: str) -> bool:
+    fingerprints = record.get("fingerprints")
+    if not isinstance(fingerprints, dict):
+        return False
+    partitions = fingerprints.get("partitions")
+    expected = plan["partitions"][stage]["content_hash"]
+    evaluated = fingerprints.get("evaluated_partition")
+    if evaluated is None:
+        # Aborted records never opened a scored partition descriptor; the
+        # planned partition fingerprint is still bound in ``partitions``.
+        staged = record.get("partitions")
+        evaluated = (
+            staged.get(stage, {}).get("content_hash")
+            if isinstance(staged, dict) and isinstance(staged.get(stage), dict)
+            else None
+        )
+    return (
+        record.get("plan_id") == plan["plan_id"]
+        and record.get("candidate_hash") == plan["candidate_hash"]
+        and record.get("snapshot_id") == plan["snapshot_id"]
+        and record.get("stage") == stage
+        and record.get("partition") == stage
+        and evaluated == expected
+        and isinstance(partitions, dict)
+        and partitions.get(VALIDATION_STAGE)
+        == plan["partitions"][VALIDATION_STAGE]["content_hash"]
+        and partitions.get(HOLDOUT_STAGE)
+        == plan["partitions"][HOLDOUT_STAGE]["content_hash"]
+        and record.get("schema_version") == SCHEMA_VERSION
+    )
+
+
+class _EvidenceProblem(Exception):
+    """A validation-evidence problem with a stable public error code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _read_ledger_row(
+    store: Path, partition: str, content_hash: str
+) -> dict[str, Any] | None:
+    """Read one consumed-query row without creating or modifying the ledger."""
+    database = store / "queries.sqlite"
+    if not database.is_file():
+        return None
+    connection = sqlite3.connect(database, timeout=30)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT * FROM consumed_queries "
+            "WHERE partition_name = ? AND partition_content_hash = ?",
+            (partition, content_hash),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        connection.close()
+    return None if row is None else dict(row)
+
+
+def _load_stored_record(store: Path, evaluation_id: str) -> dict[str, Any]:
+    path = store / "records" / evaluation_id / "record.json"
+    if not path.is_file():
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The stored Validation evaluation record is missing.",
+        )
+    try:
+        record = snapshot._read_json(path)
+        return _verify_record(record)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            f"The stored Validation evaluation record is unusable: {error}",
+        ) from error
+
+
+def _validation_prior_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    """Load and verify the Validation record that unlocks Final Holdout.
+
+    This reads only the trusted Validation *record* (which carries the derived
+    prior export for Holdout); it never opens the sealed Validation payload.
+    """
+    content_hash = plan["partitions"][VALIDATION_STAGE]["content_hash"]
+    row = _read_ledger_row(store, VALIDATION_STAGE, content_hash)
+    if row is None:
+        raise _EvidenceProblem(
+            "VALIDATION_NOT_PASSED",
+            "No completed Validation evaluation exists for this frozen plan; "
+            "Final Holdout cannot be authorized.",
+        )
+    if (
+        row.get("plan_id") != plan["plan_id"]
+        or row.get("candidate_hash") != plan["candidate_hash"]
+        or row.get("stage") != VALIDATION_STAGE
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_NOT_PASSED",
+            "The Validation evaluation for this sealed range belongs to another "
+            "frozen plan or candidate.",
+        )
+    if row.get("status") != "completed":
+        raise _EvidenceProblem(
+            "VALIDATION_NOT_PASSED",
+            "The Validation evaluation did not complete; it can never authorize "
+            "Final Holdout.",
+        )
+    evaluation_id = row.get("evaluation_id")
+    if not isinstance(evaluation_id, str) or not evaluation_id:
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation ledger row does not reference an evaluation record.",
+        )
+    record = _load_stored_record(store, evaluation_id)
+    if record.get("evaluation_id") != evaluation_id or not _record_matches(
+        record, plan, VALIDATION_STAGE
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The stored Validation record is not bound to this frozen plan, "
+            "candidate, snapshot and partition fingerprint.",
+        )
+    if (
+        record.get("outcome") != "passed"
+        or record.get("scoring") is not True
+        or record.get("aborted") is not False
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_NOT_PASSED",
+            "Only a passed, fully scored Validation evaluation can authorize "
+            "Final Holdout.",
+        )
+    export = record.get("prior_export_for_holdout")
+    if not isinstance(export, dict):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The stored Validation record predates the derived prior export "
+            "required by Final Holdout; it is rejected rather than re-reading the "
+            "sealed Validation payload.",
+        )
+    body = {key: value for key, value in export.items() if key != "export_hash"}
+    if export.get("export_hash") != _hash(body):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation prior export failed its integrity check.",
+        )
+    if (
+        export.get("source_stage") != VALIDATION_STAGE
+        or export.get("evaluation_id") != evaluation_id
+        or export.get("plan_id") != plan["plan_id"]
+        or export.get("candidate_hash") != plan["candidate_hash"]
+        or export.get("snapshot_id") != plan["snapshot_id"]
+        or export.get("partition_content_hash") != content_hash
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation prior export is not bound to this frozen plan and "
+            "sealed Validation range.",
+        )
+    sessions = export.get("sessions")
+    derived = export.get("derived")
+    if (
+        not isinstance(sessions, list)
+        or not sessions
+        or not all(isinstance(day, str) for day in sessions)
+        or sessions != sorted(set(sessions))
+        or not isinstance(derived, list)
+        or not derived
+        or export.get("signal_window_sessions") != plan["signal_window_sessions"]
+        or export.get("regime_lookback") != plan["regimes"]["lookback"]
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation prior export is incomplete for this plan's signal "
+            "window and regime lookback.",
+        )
+    return {
+        "evaluation_id": evaluation_id,
+        "record_hash": record["record_hash"],
+        "export": export,
+        "export_hash": export["export_hash"],
+        "partition_content_hash": content_hash,
+        "record": record,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -341,10 +570,14 @@ def _read_plan_input(source: Path) -> object:
         raise _invalid(f"Plan input could not be read: {error}") from error
 
 
-def _signal_window(candidate: dict[str, Any]) -> int:
-    family = candidate["strategy"]["family"]
-    lookback = int(candidate["parameters"].get("lookback", 1))
+def _signal_window_for(family: str, parameters: dict[str, Any]) -> int:
+    """Trailing sessions needed to fill a signal window for these parameters."""
+    lookback = int(parameters.get("lookback", 1))
     return lookback + 1 if family in {"momentum", "inverse_volatility"} else lookback
+
+
+def _signal_window(candidate: dict[str, Any]) -> int:
+    return _signal_window_for(candidate["strategy"]["family"], candidate["parameters"])
 
 
 def _neighbourhood(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -627,7 +860,13 @@ def authorize(
     reviewer: str,
     reason: str,
 ) -> dict[str, Any]:
-    """Freeze one immutable Validation authorization after the plan is frozen."""
+    """Freeze one immutable stage authorization.
+
+    Validation may be authorized any time after the plan is frozen.  Final
+    Holdout additionally requires the same plan's completed, fully scored and
+    **passed** Validation record, and refuses a second Holdout authorization.
+    A rejected or insufficient Validation never authorizes Holdout.
+    """
     if stage not in STAGES:
         raise _reject("UNSUPPORTED_STAGE", "authorization", "correct", "Unknown stage.")
     reviewer = reviewer.strip()
@@ -641,14 +880,78 @@ def authorize(
         )
     eval_store = _store(store)
     plan = _load_plan(eval_store, plan_id)
-    if stage != VALIDATION_STAGE:
-        raise _reject(
+    directory = eval_store / "authorizations" / plan_id
+    context = {
+        "plan_id": plan_id,
+        "stage": stage,
+        "candidate_id": plan.get("candidate_id"),
+        "candidate_hash": plan.get("candidate_hash"),
+        "snapshot_id": plan.get("snapshot_id"),
+        "partition": stage,
+        "partition_content_hash": plan["partitions"][stage]["content_hash"],
+    }
+
+    def reject(
+        code: str, message: str, *, next_action: str = "inspect"
+    ) -> None:
+        audit_id = _audit(
+            eval_store,
+            context,
+            code,
+            message,
+            command="evaluation authorize",
+            phase="authorization",
+        )
+        raise EvaluationRejection(
+            code,
+            "authorization",
+            next_action,
+            message,
+            context={
+                "audit_id": audit_id,
+                "opened_protected_source": False,
+                "query_debited": False,
+            },
+        )
+
+    if stage == HOLDOUT_STAGE and plan.get("stages") != list(STAGES):
+        reject(
             "UNSUPPORTED_STAGE",
+            "The frozen plan does not fix the Final Holdout stage.",
+            next_action="stop",
+        )
+    marker = directory / f"{stage}.authorized.json"
+    if marker.is_file() or _authorization_files(directory, stage):
+        raise _reject(
+            "AUTHORIZATION_CONFLICT",
             "authorization",
             "stop",
-            "Final Holdout authorization belongs to a separate ticket.",
+            "This stage already has an authorization; the first one is the one used.",
         )
-    directory = eval_store / "authorizations" / plan_id
+
+    validation_binding = None
+    if stage == HOLDOUT_STAGE:
+        try:
+            evidence = _validation_prior_evidence(eval_store, plan)
+        except _EvidenceProblem as problem:
+            reject(
+                problem.code,
+                problem.message,
+                next_action=(
+                    "run-validation"
+                    if problem.code == "VALIDATION_NOT_PASSED"
+                    else "inspect"
+                ),
+            )
+        validation_binding = {
+            "evaluation_id": evidence["evaluation_id"],
+            "record_hash": evidence["record_hash"],
+            "outcome": "passed",
+            "partition": VALIDATION_STAGE,
+            "partition_content_hash": evidence["partition_content_hash"],
+            "export_hash": evidence["export_hash"],
+        }
+
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     body = {
         "schema_version": SCHEMA_VERSION,
@@ -665,6 +968,8 @@ def authorize(
         "reason": reason,
         "authorized_at": _now(),
     }
+    if validation_binding is not None:
+        body["validation"] = validation_binding
     auth_id = _hash(body)
     record = {**body, "auth_id": auth_id}
     name = f"{stage}-{auth_id}.json"
@@ -710,7 +1015,7 @@ def authorize(
 def _authorization_matches(
     record: dict[str, Any], plan: dict[str, Any], stage: str
 ) -> bool:
-    return (
+    matched = (
         record.get("plan_id") == plan["plan_id"]
         and record.get("plan_hash") == plan["plan_id"]
         and record.get("candidate_id") == plan["candidate_id"]
@@ -719,6 +1024,16 @@ def _authorization_matches(
         and record.get("stage") == stage
         and record.get("partition_content_hash")
         == plan["partitions"][stage]["content_hash"]
+    )
+    if not matched or stage != HOLDOUT_STAGE:
+        return matched
+    binding = record.get("validation")
+    return (
+        isinstance(binding, dict)
+        and binding.get("outcome") == "passed"
+        and binding.get("partition") == VALIDATION_STAGE
+        and binding.get("partition_content_hash")
+        == plan["partitions"][VALIDATION_STAGE]["content_hash"]
     )
 
 
@@ -895,6 +1210,19 @@ def _coarse_receipt(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _receipt_for_record(record: dict[str, Any]) -> dict[str, Any]:
+    """The research-side receipt for one trusted record.
+
+    Validation publishes its coarse, outcome-bearing receipt.  Final Holdout
+    publishes the same constant document for every outcome, so the research side
+    cannot distinguish completed, rejected, aborted, unauthorized or replayed
+    requests.
+    """
+    if record.get("stage") == HOLDOUT_STAGE:
+        return dict(HOLDOUT_RECEIPT)
+    return _coarse_receipt(record)
+
+
 def _project_database(project: Path) -> sqlite3.Connection:
     database = Path(project) / ".prajnatrade" / "project.sqlite"
     connection = sqlite3.connect(database, timeout=30)
@@ -934,8 +1262,13 @@ def _publish_receipt(
     return json.loads(row[0]) if row else payload
 
 
-def agent_validation_status(project: str | Path, candidate_id: str) -> dict[str, Any]:
-    """Research-side view: a coarse Validation receipt or pending. Nothing else."""
+def agent_evaluation_status(project: str | Path, candidate_id: str) -> dict[str, Any]:
+    """Research-side view: a coarse Validation receipt and a constant Holdout receipt.
+
+    Nothing from a trusted record is exposed here.  The Final Holdout value is
+    the same four-key document for pending, authorized, completed, rejected,
+    aborted and re-submitted requests.
+    """
     project = Path(project)
     project_status(project)
     validation: dict[str, Any] = {"status": "pending"}
@@ -956,7 +1289,12 @@ def agent_validation_status(project: str | Path, candidate_id: str) -> dict[str,
         "schema_version": SCHEMA_VERSION,
         "candidate_id": candidate_id,
         "validation": validation,
+        "final_holdout": dict(HOLDOUT_RECEIPT),
     }
+
+
+#: Backwards-compatible name for the MVP-10 caller.
+agent_validation_status = agent_evaluation_status
 
 
 def evaluation_status(store: str | Path, plan_id: str) -> dict[str, Any]:
@@ -990,8 +1328,16 @@ def evaluation_status(store: str | Path, plan_id: str) -> dict[str, Any]:
             (plan_id,),
         ):
             record = None
+            integrity = "unavailable"
             if row["record_path"] and Path(row["record_path"]).is_file():
-                record = snapshot._read_json(Path(row["record_path"]))
+                try:
+                    record = _verify_record(
+                        snapshot._read_json(Path(row["record_path"]))
+                    )
+                    integrity = "valid"
+                except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                    record = None
+                    integrity = "invalid"
             evaluations.append(
                 {
                     "evaluation_id": row["evaluation_id"],
@@ -1001,6 +1347,10 @@ def evaluation_status(store: str | Path, plan_id: str) -> dict[str, Any]:
                     "created_at": row["created_at"],
                     "completed_at": row["completed_at"],
                     "scoring": record.get("scoring") if isinstance(record, dict) else None,
+                    "record_hash": (
+                        record.get("record_hash") if isinstance(record, dict) else None
+                    ),
+                    "record_integrity": integrity,
                 }
             )
     finally:
@@ -1020,6 +1370,11 @@ def evaluation_status(store: str | Path, plan_id: str) -> dict[str, Any]:
             "authorization": stage_authorization,
             "query": stage_query,
             "evaluation": stage_evaluation,
+            "authorized": stage_authorization is not None,
+            "query_debited": stage_query is not None,
+            "record_path": (
+                stage_evaluation["record_path"] if stage_evaluation else None
+            ),
         }
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1043,16 +1398,19 @@ def _audit(
     context: dict[str, Any],
     code: str,
     message: str,
+    *,
+    command: str = "evaluation run",
+    phase: str = "run",
 ) -> str | None:
     body = {
         "schema_version": SCHEMA_VERSION,
         "scope": SCOPE,
         "received_at": _now(),
-        "command": "evaluation run",
+        "command": command,
         **context,
         "error": {
             "code": code,
-            "phase": "run",
+            "phase": phase,
             "next_action": "inspect",
             "message": message,
         },
@@ -1094,7 +1452,7 @@ def _prior_discovery(
     snapshot_store: Path,
     plan: dict[str, Any],
     reject,
-) -> tuple[list[str], list[dict]]:
+) -> tuple[list[str], list[dict], str]:
     rule = plan["prior_history"][VALIDATION_STAGE]
     try:
         receipt = snapshot.read_discovery(
@@ -1115,7 +1473,75 @@ def _prior_discovery(
             "The frozen Discovery prior history differs from the sealed snapshot.",
         )
     sessions = sorted({row["date"] for row in receipt["data"]["calendar"]})
-    return sessions, receipt["data"]["derived"]
+    return sessions, receipt["data"]["derived"], content_hash
+
+
+def _validation_export(
+    plan: dict[str, Any], protected: dict[str, Any], evaluation_id: str
+) -> dict[str, Any]:
+    """Derived Validation rows needed later as Holdout warm-up.
+
+    Only the tail required by the frozen signal window and regime lookback is
+    kept.  This export lives in the trusted Validation record so the Holdout run
+    never has to re-open the sealed Validation payload.
+    """
+    data = protected["data"]
+    sessions = sorted({row["date"] for row in data["calendar"]})
+    needed = max(
+        int(plan["signal_window_sessions"]), int(plan["regimes"]["lookback"]) + 1, 1
+    )
+    export_sessions = sessions[-needed:]
+    keep = set(export_sessions)
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "source_stage": VALIDATION_STAGE,
+        "evaluation_id": evaluation_id,
+        "plan_id": plan["plan_id"],
+        "candidate_hash": plan["candidate_hash"],
+        "snapshot_id": plan["snapshot_id"],
+        "partition": VALIDATION_STAGE,
+        "partition_content_hash": protected["content_hash"],
+        "sessions": export_sessions,
+        "derived": [row for row in data["derived"] if row["date"] in keep],
+        "signal_window_sessions": plan["signal_window_sessions"],
+        "regime_lookback": plan["regimes"]["lookback"],
+    }
+    return {**body, "export_hash": _hash(body)}
+
+
+def _prior_holdout(
+    snapshot_store: Path,
+    plan: dict[str, Any],
+    evidence: dict[str, Any],
+    descriptor: dict[str, Any],
+    reject,
+) -> tuple[tuple[list[str], list[dict]], dict[str, Any]]:
+    """Discovery (research-visible) plus the stored Validation export as prior."""
+    discovery_sessions, discovery_rows, discovery_hash = _prior_discovery(
+        snapshot_store, plan, reject
+    )
+    export = evidence["export"]
+    previous = export["sessions"]
+    if previous[-1] >= descriptor["start"]:
+        reject(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation prior export overlaps the sealed Holdout range.",
+        )
+    sessions = [*discovery_sessions, *previous]
+    rows = [*discovery_rows, *export["derived"]]
+    prior_evidence = {
+        "partitions": list(plan["prior_history"][HOLDOUT_STAGE]["partitions"]),
+        "discovery_content_hash": discovery_hash,
+        "validation": {
+            "evaluation_id": evidence["evaluation_id"],
+            "record_hash": evidence["record_hash"],
+            "partition_content_hash": evidence["partition_content_hash"],
+            "export_hash": evidence["export_hash"],
+            "sessions": len(previous),
+            "derived_rows": len(export["derived"]),
+        },
+    }
+    return (sessions, rows), prior_evidence
 
 
 def _equal_weight_run(
@@ -1161,17 +1587,25 @@ def _candidate_run(
     parameters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     candidate = plan["candidate"]
-    spec = {
-        "family": candidate["strategy"]["family"],
-        "parameters": candidate["parameters"] if parameters is None else parameters,
-    }
+    family = candidate["strategy"]["family"]
+    variant_parameters = (
+        candidate["parameters"] if parameters is None else parameters
+    )
+    spec = {"family": family, "parameters": variant_parameters}
+    # The frozen original candidate keeps the plan's window; a neighbourhood
+    # variant must use the window implied by its own parameters.
+    window = (
+        plan["signal_window_sessions"]
+        if parameters is None
+        else _signal_window_for(family, parameters)
+    )
     return run_partition_strategy(
         data,
         plan["snapshot_id"],
         content_hash,
         make_strategy(spec),
         partition_name=stage,
-        signal_window_sessions=plan["signal_window_sessions"],
+        signal_window_sessions=window,
         prior_history=prior,
         initial_cash=plan["initial_cash"],
         transaction_cost_bps=costs["transaction_cost_bps"],
@@ -1343,6 +1777,9 @@ def _neighbourhood_result(
             variant.update(status="invalid_config", reason=entry["reason"])
             variants.append(variant)
             continue
+        variant["signal_window_sessions"] = _signal_window_for(
+            plan["candidate"]["strategy"]["family"], entry["parameters"]
+        )
         try:
             run = _candidate_run(
                 data,
@@ -1542,6 +1979,7 @@ def _evaluation_record(
     stage: str,
     protected: dict[str, Any],
     prior: tuple[list[str], list[dict]],
+    prior_evidence: dict[str, Any],
     isolation: dict[str, Any],
     authorization: dict[str, Any],
     metadata: dict[str, Any],
@@ -1617,6 +2055,11 @@ def _evaluation_record(
         runs["base"]["candidate"]["equity_curve"],
         runs["base"]["baseline"]["equity_curve"],
     )
+    prior_export = (
+        _validation_export(plan, protected, evaluation_id)
+        if stage == VALIDATION_STAGE
+        else None
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "scope": SCOPE,
@@ -1651,6 +2094,12 @@ def _evaluation_record(
         },
         "partition_descriptor": descriptor,
         "lineage": protected["lineage"],
+        "prior_evidence": prior_evidence,
+        **(
+            {"prior_export_for_holdout": prior_export}
+            if prior_export is not None
+            else {}
+        ),
         "authorization": authorization,
         "query_receipt": {
             "partition": stage,
@@ -1783,6 +2232,7 @@ def _aborted_record(
     opened: bool | str,
     debited_at: str,
     error: BaseException,
+    prior_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     message = COARSE_MESSAGES[REASON_EVIDENCE]
     return {
@@ -1817,6 +2267,7 @@ def _aborted_record(
             protected["descriptor"] if protected is not None else None
         ),
         "lineage": protected["lineage"] if protected is not None else None,
+        "prior_evidence": prior_evidence,
         "authorization": authorization,
         "query_receipt": {
             "partition": stage,
@@ -1870,9 +2321,14 @@ def _aborted_record(
 
 
 def _write_record(store: Path, evaluation_id: str, record: dict[str, Any]) -> Path:
+    """Write the trusted record once, binding its content address."""
+    record["record_hash"] = _record_hash(record)
     path = store / "records" / evaluation_id / "record.json"
     stored = _file_once(path, record)
-    if stored.get("evaluation_id") != evaluation_id:
+    if (
+        stored.get("evaluation_id") != evaluation_id
+        or stored.get("record_hash") != _record_hash(stored)
+    ):
         raise ValueError("Existing evaluation record integrity check failed.")
     return path
 
@@ -1934,12 +2390,13 @@ def run_evaluation(
     plan_id: str,
     stage: str = VALIDATION_STAGE,
 ) -> dict[str, Any]:
-    """Run one authorized, isolated, debited Validation evaluation."""
+    """Run one authorized, isolated, debited Validation or Final Holdout evaluation."""
     eval_store = _store(store)
     snapshot_store = Path(snapshot_store)
     project = Path(project)
     project_id = str(project_status(project)["project_id"])
     plan = _load_plan(eval_store, plan_id)
+    label = "Validation" if stage == VALIDATION_STAGE else "Final Holdout"
     context = {
         "plan_id": plan.get("plan_id"),
         "stage": stage,
@@ -1977,14 +2434,12 @@ def run_evaluation(
             },
         )
 
-    if stage != VALIDATION_STAGE:
-        reject(
-            "UNSUPPORTED_STAGE",
-            "Only the Validation stage is implemented by this workflow.",
-            next_action="stop",
-        )
+    if stage not in STAGES:
+        reject("UNSUPPORTED_STAGE", "Unknown evaluation stage.", next_action="correct")
     if plan.get("scope") != SCOPE or plan.get("data_kind") != SCOPE:
         reject("FINGERPRINT_MISMATCH", "The plan is not bound to synthetic data.")
+    if plan.get("stages") != list(STAGES):
+        reject("FINGERPRINT_MISMATCH", "The frozen plan does not fix both protected stages.")
     if plan.get("project_id") != project_id:
         reject("FINGERPRINT_MISMATCH", "The frozen plan is bound to another project.")
     if _plan_mapping(project, plan_id) != plan["candidate_id"]:
@@ -2034,10 +2489,41 @@ def run_evaluation(
     ):
         reject(
             "AUTHORIZATION_REQUIRED",
-            "A matching Validation authorization is required before opening the sealed partition.",
+            f"A matching {label} authorization is required before opening the "
+            "sealed partition.",
             next_action="authorize",
         )
     authorization = authorizations[0]
+
+    validation_evidence: dict[str, Any] | None = None
+    if stage == HOLDOUT_STAGE:
+        # The authorization is only valid while the Validation evidence it was
+        # granted against still exists and still passes.  This reads the trusted
+        # Validation record, never the sealed Validation payload.
+        try:
+            validation_evidence = _validation_prior_evidence(eval_store, plan)
+        except _EvidenceProblem as problem:
+            reject(
+                problem.code,
+                problem.message,
+                next_action=(
+                    "run-validation"
+                    if problem.code == "VALIDATION_NOT_PASSED"
+                    else "inspect"
+                ),
+            )
+        binding = authorization.get("validation")
+        if (
+            not isinstance(binding, dict)
+            or binding.get("evaluation_id") != validation_evidence["evaluation_id"]
+            or binding.get("record_hash") != validation_evidence["record_hash"]
+        ):
+            reject(
+                "AUTHORIZATION_REQUIRED",
+                "The stored Final Holdout authorization does not match the "
+                "completed Validation record; authorize again after inspecting.",
+                next_action="authorize",
+            )
 
     isolation = probe_isolation_evidence()
     if isolation.get("verified") is not True:
@@ -2050,25 +2536,51 @@ def run_evaluation(
             details={"isolation": _isolation_evidence_summary(isolation)},
         )
 
-    prior = _prior_discovery(snapshot_store, plan, reject)
+    if stage == VALIDATION_STAGE:
+        discovery_sessions, discovery_rows, discovery_hash = _prior_discovery(
+            snapshot_store, plan, reject
+        )
+        prior = (discovery_sessions, discovery_rows)
+        prior_evidence = {
+            "partitions": list(plan["prior_history"][VALIDATION_STAGE]["partitions"]),
+            "discovery_content_hash": discovery_hash,
+        }
+    else:
+        prior, prior_evidence = _prior_holdout(
+            snapshot_store,
+            plan,
+            validation_evidence,
+            descriptors[HOLDOUT_STAGE],
+            reject,
+        )
 
     claim = _claim_partition(eval_store, plan, stage, authorization)
     if claim["state"] == "consumed":
         reject(
             "QUERY_ALREADY_CONSUMED",
-            "This sealed Validation range was already consumed by another frozen plan or candidate.",
+            f"This sealed {label} range was already consumed by another frozen "
+            "plan or candidate.",
             next_action="stop",
         )
     if claim["state"] in {"in_progress", "unrecorded"}:
         reject(
             "EVALUATION_IN_PROGRESS",
-            "This sealed Validation range is already reserved; no second read is allowed.",
+            f"This sealed {label} range is already reserved; no second read is allowed.",
             next_action="inspect",
         )
     if claim["state"] == "reuse":
         record = claim["record"]
+        try:
+            _verify_record(record)
+            if not _record_matches(record, plan, stage):
+                raise ValueError(
+                    "The stored evaluation record is not bound to this frozen plan, "
+                    "candidate, snapshot and partition fingerprint."
+                )
+        except ValueError as error:
+            reject("RECORD_INTEGRITY_FAILED", str(error), next_action="inspect")
         receipt = _publish_receipt(
-            project, plan, _coarse_receipt(record)
+            project, plan, _receipt_for_record(record)
         )
         _mark_state(
             eval_store,
@@ -2097,6 +2609,7 @@ def run_evaluation(
             stage=stage,
             protected=protected,
             prior=prior,
+            prior_evidence=prior_evidence,
             isolation=isolation,
             authorization=authorization,
             metadata=metadata,
@@ -2104,7 +2617,7 @@ def run_evaluation(
             evaluation_id=evaluation_id,
             debited_at=claim["debited_at"],
         )
-        record["research_receipt"] = _coarse_receipt(record)
+        record["research_receipt"] = _receipt_for_record(record)
         record_path = _write_record(eval_store, evaluation_id, record)
         ledger_status = "completed"
     except Exception as error:  # noqa: BLE001 - abort after read must never score
@@ -2119,8 +2632,9 @@ def run_evaluation(
             opened=opened,
             debited_at=claim["debited_at"],
             error=error,
+            prior_evidence=prior_evidence,
         )
-        record["research_receipt"] = _coarse_receipt(record)
+        record["research_receipt"] = _receipt_for_record(record)
         record_path = _write_record(eval_store, evaluation_id, record)
         ledger_status = "aborted"
 
