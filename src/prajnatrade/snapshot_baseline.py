@@ -6,6 +6,7 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 
 from prajnatrade.backtest import (
@@ -35,15 +36,61 @@ def run_discovery_strategy(
     slippage_bps: float = 0.0,
 ) -> dict[str, Any]:
     """Run a strategy with point-in-time signals and formal Discovery accounting."""
+    return run_partition_strategy(
+        data,
+        snapshot_id,
+        partition_content_hash,
+        strategy,
+        partition_name="discovery",
+        signal_window_sessions=signal_window_sessions,
+        prior_history=None,
+        initial_cash=initial_cash,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
+    )
+
+
+def run_partition_strategy(
+    data: dict[str, list[dict]],
+    snapshot_id: str,
+    partition_content_hash: str,
+    strategy: Strategy,
+    *,
+    partition_name: str,
+    signal_window_sessions: int,
+    prior_history: tuple[list[str], list[dict]] | None = None,
+    initial_cash: float = 100_000.0,
+    transaction_cost_bps: float = 5.0,
+    slippage_bps: float = 0.0,
+) -> dict[str, Any]:
+    """Run a strategy over one sealed partition with formal accounting.
+
+    Accounting and NAV cover only the partition's own calendar sessions, starting
+    from ``initial_cash`` with no holdings.  ``prior_history`` (session dates and
+    derived rows from earlier partitions) may only extend the trailing signal
+    window; point-in-time availability is still enforced against the target
+    session's 09:30 cutoff.
+    """
     _validate_parameters(initial_cash, transaction_cost_bps, slippage_bps)
     if signal_window_sessions <= 0:
         raise ValueError("signal_window_sessions must be positive.")
+    if not isinstance(partition_name, str) or not partition_name.strip():
+        raise ValueError("partition_name must be a nonempty string.")
     sessions = sorted({row["date"] for row in data["calendar"]})
     if not sessions:
-        raise ValueError("The Discovery partition has no trading sessions.")
+        raise ValueError(f"The {partition_name} partition has no trading sessions.")
 
     raw_bars = _index_rows(data["raw_bars"], "raw_bars")
     derived = _index_rows(data["derived"], "derived")
+    prior_sessions, prior_rows = prior_history if prior_history is not None else ([], [])
+    history_sessions = sorted({
+        *[day for day in prior_sessions if day < sessions[0]],
+        *sessions,
+    })
+    history_derived = _index_rows(list(prior_rows), "derived")
+    history_derived.update(derived)
+    positions = {day: index for index, day in enumerate(history_sessions)}
+
     actions = _index_actions(data["corporate_actions"])
     shares = {symbol: 0.0 for symbol in ETF_SYMBOLS}
     cash = float(initial_cash)
@@ -145,17 +192,17 @@ def run_discovery_strategy(
             time(9, 30),
             tzinfo=_CN_TZ,
         )
-        window_start = day_index - signal_window_sessions + 1
+        window_start = positions[day] - signal_window_sessions + 1
         if window_start < 0:
             continue
-        window_days = sessions[window_start : day_index + 1]
+        window_days = history_sessions[window_start : positions[day] + 1]
         missing: dict[str, set[str]] = {}
         history_rows: list[dict[str, Any]] = []
         latest_values: dict[str, float] = {}
         for history_day in window_days:
             day_values = {}
             for symbol in ETF_SYMBOLS:
-                row = derived.get((history_day, symbol))
+                row = history_derived.get((history_day, symbol))
                 if row is None or row.get("value") is None or not _available_by(row, cutoff):
                     missing.setdefault(history_day, set()).add(symbol)
                 else:
@@ -195,30 +242,86 @@ def run_discovery_strategy(
             signals.append(signal)
             pending = (signal, normalized)
 
-    final_nav = equity_curve[-1]["nav"]
-    total_return = final_nav / initial_cash - 1.0 if final_nav is not None else None
+    metrics = _metrics(
+        sessions,
+        equity_curve,
+        initial_cash=initial_cash,
+        fees_paid=fees_paid,
+        slippage_paid=slippage_paid,
+        fills=fills,
+        order_attempts=order_attempts,
+        signal_gaps=signal_gaps,
+        valuation_gaps=valuation_gaps,
+    )
     return {
         "snapshot_id": snapshot_id,
+        "partition_name": partition_name,
         "partition_content_hash": partition_content_hash,
         "start_date": sessions[0],
         "end_date": sessions[-1],
         "initial_cash": initial_cash,
-        "ending_equity": final_nav,
+        "ending_equity": equity_curve[-1]["nav"] if equity_curve else None,
         "signals": signals,
         "signal_gaps": signal_gaps,
         "order_attempts": order_attempts,
         "fills": fills,
         "equity_curve": equity_curve,
-        "metrics": {
-            "total_return": total_return,
-            "fees_paid": fees_paid,
-            "slippage_paid": slippage_paid,
-        },
+        "metrics": metrics,
         "gaps": {
             "raw_bars": _data_gaps(sessions, raw_bars, "raw_bars"),
             "derived": _data_gaps(sessions, derived, "derived"),
             "valuation": valuation_gaps,
         },
+    }
+
+
+def _metrics(
+    sessions: list[str],
+    equity_curve: list[dict[str, Any]],
+    *,
+    initial_cash: float,
+    fees_paid: float,
+    slippage_paid: float,
+    fills: list[dict[str, Any]],
+    order_attempts: list[dict[str, Any]],
+    signal_gaps: list[dict[str, Any]],
+    valuation_gaps: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Partition metrics; unavailable values are ``None`` rather than fabricated."""
+    valued = [float(point["nav"]) for point in equity_curve if point["nav"] is not None]
+    ending_equity = equity_curve[-1]["nav"] if equity_curve else None
+    total_return = ending_equity / initial_cash - 1.0 if ending_equity is not None else None
+    max_drawdown = None
+    sharpe = None
+    if len(valued) >= 2:
+        returns = np.asarray(
+            [right / left - 1.0 for left, right in zip(valued, valued[1:])],
+            dtype=float,
+        )
+        std = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+        if std > 0:
+            sharpe = float(np.mean(returns) / std * math.sqrt(252.0))
+    if valued:
+        drawdowns = np.asarray(valued) / np.maximum.accumulate(np.asarray(valued)) - 1.0
+        max_drawdown = float(np.min(drawdowns))
+    return {
+        "sessions": len(sessions),
+        "valued_sessions": len(valued),
+        "total_return": total_return,
+        "max_drawdown": max_drawdown,
+        "sharpe": sharpe,
+        "fees_paid": fees_paid,
+        "slippage_paid": slippage_paid,
+        "ending_equity": ending_equity,
+        "fills": len(fills),
+        "orders_filled": sum(
+            1 for attempt in order_attempts if attempt.get("status") == "filled"
+        ),
+        "orders_unfilled": sum(
+            1 for attempt in order_attempts if attempt.get("status") != "filled"
+        ),
+        "signal_gaps": len(signal_gaps),
+        "valuation_gaps": len(valuation_gaps),
     }
 
 

@@ -5,6 +5,7 @@ import math
 import hashlib
 import os
 import platform
+import re
 import selectors
 import socket
 import subprocess
@@ -97,6 +98,7 @@ def main():
     symbols = tuple(request["symbols"])
     limits = request["limits"]
     protocol_token = request["protocol_token"]
+    enforce_memory_limit = bool(request.get("enforce_memory_limit", True))
 
     required = ("RLIMIT_CPU", "RLIMIT_AS", "RLIMIT_FSIZE", "RLIMIT_CORE", "RLIMIT_NOFILE")
     if any(not hasattr(resource, name) for name in required):
@@ -161,6 +163,7 @@ def main():
         "protected_write_denied": write_denied,
         "network_denied": network_denied,
         "process_creation_denied": process_denied,
+        "memory_limit_enforced": False,
         "strategy_started": False,
         "sandbox_preflight_verified": False,
     }
@@ -170,11 +173,13 @@ def main():
     )):
         emit({"ok": False, "reason": "sandbox_preflight_failed", "evidence": evidence})
         return
-    try:
-        set_hard_limit(resource.RLIMIT_AS, limits["address_space_bytes"])
-    except (OSError, ValueError):
-        emit({"ok": False, "reason": "memory_limit_unavailable", "evidence": evidence})
-        return
+    if enforce_memory_limit:
+        try:
+            set_hard_limit(resource.RLIMIT_AS, limits["address_space_bytes"])
+        except (OSError, ValueError):
+            emit({"ok": False, "reason": "memory_limit_unavailable", "evidence": evidence})
+            return
+        evidence["memory_limit_enforced"] = True
     try:
         import pandas as pd
 
@@ -192,6 +197,7 @@ def main():
         "protected_write_denied": write_denied,
         "network_denied": network_denied,
         "process_creation_denied": process_denied,
+        "memory_limit_enforced": evidence["memory_limit_enforced"],
         "strategy_started": False,
     }
     sys.__stdout__.buffer.write(
@@ -254,8 +260,11 @@ def run_isolated_strategy(
     symbols: tuple[str, ...],
     limits: IsolationLimits | None = None,
     evidence_callback: Callable[[dict[str, Any]], None] | None = None,
+    enforce_memory_limit: bool = True,
 ) -> dict[str, float] | None:
     limits = limits or DEFAULT_ISOLATION_LIMITS
+    if not isinstance(enforce_memory_limit, bool):
+        raise ValueError("enforce_memory_limit must be a boolean.")
     if limits.wall_seconds <= 0 or limits.cpu_seconds <= 0:
         raise ValueError("Isolation time limits must be greater than zero.")
     if min(limits.address_space_bytes, limits.input_bytes, limits.output_bytes) <= 0:
@@ -275,6 +284,7 @@ def run_isolated_strategy(
             "input_bytes": limits.input_bytes,
             "output_bytes": limits.output_bytes,
         },
+        "memory_limit_enforced": None,
         "strategy_started": False,
         "opened_protected_input": False,
         "output_destination": "unavailable",
@@ -322,6 +332,7 @@ def run_isolated_strategy(
                 "canary": str(canary),
                 "port": listener.getsockname()[1],
                 "protocol_token": protocol_token,
+                "enforce_memory_limit": enforce_memory_limit,
                 "limits": {
                     "cpu_seconds": limits.cpu_seconds,
                     "address_space_bytes": limits.address_space_bytes,
@@ -408,20 +419,125 @@ def run_isolated_strategy(
     return result["weights"]
 
 
-def probe_isolation(limits: IsolationLimits | None = None) -> None:
+_PROBE_SOURCE = "def strategy(history, state):\n    return {CASH: 1.0}\n"
+
+
+def probe_isolation_evidence(limits: IsolationLimits | None = None) -> dict[str, Any]:
+    """Probe the sandbox boundary used by protected trusted evaluation.
+
+    Protected Validation evaluates declarative strategies in the trusted
+    controller and never executes untrusted Python, so the boundary probe does
+    not require the generated-Python address-space limit.  The full probe is
+    attempted first.  Only when it fails solely with
+    ``memory_limit_unavailable`` does the probe retry the boundary without
+    RLIMIT_AS and report ``verified: true`` with ``memory_limit_enforced: false``
+    and the retained failure reason.  Any sandbox or preflight failure keeps
+    ``verified: false``.
+
+    A passing result is sandbox-boundary evidence for protected evaluation; it
+    is **not** evidence that generated-Python memory isolation works.  That
+    claim remains blocked and the generated-Python gate below still refuses to
+    run without the memory limit.
+    """
+    evidence = _probe_isolation(limits, enforce_memory_limit=True)
+    if evidence["verified"]:
+        return evidence
+    if evidence.get("failure_reason") != "memory_limit_unavailable":
+        return evidence
+    retried = _probe_isolation(limits, enforce_memory_limit=False)
+    if retried["verified"]:
+        retried["failure_reason"] = "memory_limit_unavailable"
+        retried["memory_limit_enforced"] = False
+    return retried
+
+
+def _probe_isolation(
+    limits: IsolationLimits | None, *, enforce_memory_limit: bool
+) -> dict[str, Any]:
     limits = limits or DEFAULT_ISOLATION_LIMITS
     import pandas as pd
 
     from prajnatrade.data import ETF_SYMBOLS
 
-    run_isolated_strategy(
-        "def strategy(history, state):\n    return {CASH: 1.0}\n",
-        {},
-        pd.DataFrame(columns=("date", "symbol", "close")),
-        {},
-        symbols=ETF_SYMBOLS,
-        limits=limits,
-    )
+    captured: dict[str, Any] = {}
+
+    def capture(evidence: dict[str, Any]) -> None:
+        captured.update(evidence)
+
+    base: dict[str, Any] = {
+        "probe": "generated_python_worker_sandbox",
+        "runtime": "macOS sandbox_init" if sys.platform == "darwin" else "unavailable",
+        "os_version": platform.mac_ver()[0] or platform.system(),
+        "python_version": platform.python_version(),
+        "uid": os.geteuid() if hasattr(os, "geteuid") else None,
+        "limits": {
+            "wall_seconds": limits.wall_seconds,
+            "cpu_seconds": limits.cpu_seconds,
+            "address_space_bytes": limits.address_space_bytes,
+            "input_bytes": limits.input_bytes,
+            "output_bytes": limits.output_bytes,
+        },
+        "memory_limit_enforced": False if not enforce_memory_limit else None,
+    }
+    try:
+        run_isolated_strategy(
+            _PROBE_SOURCE,
+            {},
+            pd.DataFrame(columns=("date", "symbol", "close")),
+            {},
+            symbols=ETF_SYMBOLS,
+            limits=limits,
+            evidence_callback=capture,
+            enforce_memory_limit=enforce_memory_limit,
+        )
+    except KeyboardInterrupt:
+        raise
+    except IsolationError as error:
+        evidence = {**base, **(error.evidence or captured)}
+        return {
+            **evidence,
+            "verified": False,
+            "failure_reason": _isolation_failure_reason(error),
+        }
+    except Exception as error:  # noqa: BLE001 - evidence must survive any failure
+        return {
+            **base,
+            **captured,
+            "verified": False,
+            "failure_reason": f"{type(error).__name__}: {error}",
+        }
+    evidence = {**base, **captured}
+    verified = all(
+        evidence.get(key) is True
+        for key in (
+            "sandbox_preflight_verified",
+            "strategy_started",
+            "protected_read_denied",
+            "protected_write_denied",
+            "network_denied",
+            "process_creation_denied",
+        )
+    ) and evidence.get("opened_protected_input") is False
+    return {
+        **evidence,
+        "verified": verified,
+        "failure_reason": None if verified else "sandbox_preflight_unverified",
+    }
+
+
+def _isolation_failure_reason(error: IsolationError) -> str:
+    match = re.search(r"aborted: ([a-z_]+)", str(error))
+    return match.group(1) if match else "isolation_unavailable"
+
+
+def probe_isolation(limits: IsolationLimits | None = None) -> None:
+    """Full generated-Python probe; still refuses when the memory limit is absent."""
+    evidence = _probe_isolation(limits, enforce_memory_limit=True)
+    if not evidence["verified"]:
+        raise IsolationError(
+            f"OS isolation unavailable: {evidence['failure_reason']}.",
+            evidence=evidence,
+        )
 
 
 def _records(history: Any) -> list[dict[str, Any]]:

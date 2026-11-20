@@ -384,6 +384,90 @@ def _discovery_view(base: dict, revisions: list[dict], cutoff: datetime | None =
     return data
 
 
+PROTECTED_PARTITIONS = ("validation", "final_holdout")
+
+
+def partition_descriptor(metadata: dict, partition: str) -> dict:
+    """Return the frozen descriptor for one partition of a sealed manifest."""
+    if partition not in ("discovery", *PROTECTED_PARTITIONS):
+        raise ValueError(f"Unknown snapshot partition: {partition!r}.")
+    matches = [
+        item for item in metadata.get("partitions", [])
+        if isinstance(item, dict) and item.get("name") == partition
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Missing or duplicate {partition} partition descriptor.")
+    descriptor = matches[0]
+    fields = ("start", "end", "sessions", "content_hash")
+    if any(field not in descriptor for field in fields):
+        raise ValueError(f"Incomplete {partition} partition descriptor.")
+    _date(descriptor["start"])
+    _date(descriptor["end"])
+    if type(descriptor["sessions"]) is not int or descriptor["sessions"] < 1:
+        raise ValueError(f"Invalid {partition} partition session count.")
+    if not isinstance(descriptor["content_hash"], str) or not re.fullmatch(
+        r"[0-9a-f]{64}", descriptor["content_hash"]
+    ):
+        raise ValueError(f"Invalid {partition} partition content hash.")
+    return {
+        "name": partition,
+        "start": descriptor["start"],
+        "end": descriptor["end"],
+        "sessions": descriptor["sessions"],
+        "content_hash": descriptor["content_hash"],
+    }
+
+
+def read_protected(store: Path, snapshot_id: str, partition: str) -> dict:
+    """Trusted read of a sealed Validation or Final Holdout partition.
+
+    Research-side access stays limited to Discovery; this reader is only called by
+    the trusted evaluation workflow after authorization, isolation and a ledger
+    debit.  Dividend-successor manifests inherit protected payloads, so the reader
+    walks ``lineage.predecessor_id`` until the payload is found and always verifies
+    it against the descriptor of the manifest that was *requested*.
+    """
+    if partition not in PROTECTED_PARTITIONS:
+        raise ValueError(
+            "Protected access is limited to Validation and Final Holdout."
+        )
+    store = _store_path(store)
+    metadata = _manifest(store, snapshot_id)
+    descriptor = partition_descriptor(metadata, partition)
+    lineage: list[str] = []
+    current = snapshot_id
+    payload = None
+    while True:
+        lineage.append(current)
+        path = store / current / f"{partition}.json"
+        if path.is_file():
+            payload = _read_json(path)
+            break
+        current_metadata = metadata if current == snapshot_id else _manifest(store, current)
+        lineage_meta = current_metadata.get("lineage")
+        if not isinstance(lineage_meta, dict) or not lineage_meta.get(
+            "protected_partitions_inherited"
+        ):
+            raise ValueError(f"The {partition} partition payload is missing.")
+        predecessor = lineage_meta.get("predecessor_id")
+        if not isinstance(predecessor, str) or predecessor in lineage:
+            raise ValueError(f"The {partition} partition lineage is invalid.")
+        current = predecessor
+    if _hash(payload) != descriptor["content_hash"]:
+        raise ValueError(f"{partition} partition integrity check failed.")
+    return {
+        "schema_version": 1,
+        "snapshot_id": snapshot_id,
+        "partition": partition,
+        "content_hash": descriptor["content_hash"],
+        "data": payload,
+        "descriptor": {key: descriptor[key] for key in (
+            "start", "end", "sessions", "content_hash"
+        )},
+        "lineage": lineage,
+    }
+
+
 def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | None = None) -> dict:
     if partition != "discovery":
         raise ValueError("Research access is limited to Discovery.")
