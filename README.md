@@ -63,6 +63,61 @@ must be recreated rather than resumed or validated.
 
 ## Research, validation, and reports
 
+### External Discovery experiment protocol (synthetic only)
+
+The operator initializes a project and creates a Campaign. The input must be
+synthetic Discovery data only; `--data-kind synthetic` is an operator assertion,
+not proof of provenance. Each Campaign stores its own snapshot, evaluation
+configuration, runtime fingerprints and attempt/time budgets in the project's
+`.prajnatrade` directory. Move that directory with the project to preserve its
+identity; `--project` is just its location.
+
+```sh
+prajnatrade project init --project ./strategy-A
+prajnatrade campaign create --project ./strategy-A --data discovery.csv \
+  --data-kind synthetic --attempts 20 --max-seconds 3600
+prajnatrade experiment submit --project ./strategy-A --input first.json
+prajnatrade experiment status --project ./strategy-A \
+  --campaign-id <campaign-id> --submission-id first
+```
+
+`first.json` contains:
+
+```json
+{
+  "schema_version": 1,
+  "campaign_id": "<campaign-id>",
+  "submission_id": "first",
+  "hypothesis": "Equal weights match the Discovery benchmark.",
+  "strategy": {"family": "equal_weight"},
+  "parameters": {}
+}
+```
+
+Supported declarative families are `equal_weight`, `momentum`, `trend_filter`
+and `inverse_volatility`; parameters follow the existing research strategy
+definitions. A follow-up uses a fresh `submission_id` and may include a
+`parent_experiment_id` from the same Campaign. Submissions cannot override
+Campaign settings. Submit/status print versioned JSON on stdout; rejected and
+failed requests return a nonzero exit code with a stable error and next action.
+Results include only Discovery metrics and an equal-weight benchmark using
+the same snapshot and evaluation settings.
+
+The same Campaign/submission ID and normalized content reuse one experiment;
+changed content conflicts, and invalid or conflicting requests do not consume
+an attempt. Accepted failures do consume one. Campaign execution is serialized
+and limited by the shared execution time budget. A process killed during
+execution is recorded as interrupted when next inspected or submitted; time
+through that inspection is conservatively charged. This ticket does not
+provide experiment resume. If runtime implementation or dependency fingerprints
+change, new execution fails rather than silently changing the Campaign.
+
+This synthetic protocol is separate from the existing `research` registry and
+does not yet connect its experiments to `research freeze`. Project files and
+operator commands are not an OS-enforced authorization or isolation boundary;
+do not use this workflow for sealed data, untrusted Python, or real-data
+security claims.
+
 Mock campaigns are deterministic orchestration checks, not AI research. They
 use recorded decisions to refine a retained or investigated direction or
 switch after a rejection or branch. The unparameterized equal-weight control
