@@ -17,6 +17,7 @@ from prajnatrade.data import CASH, DataValidationError, load_bars, validate_cale
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
+from prajnatrade import snapshot
 from prajnatrade.store import SQLiteStore
 from prajnatrade.validation import freeze_candidate, run_holdout, validate_candidate
 
@@ -30,6 +31,19 @@ def build_parser() -> argparse.ArgumentParser:
     validate = data_commands.add_parser("validate", help="validate CSV or Parquet bars")
     _add_data_arguments(validate)
     validate.add_argument("--calendar", type=Path, help="CSV of expected trading dates")
+
+    snapshots = commands.add_parser("snapshot", help="seal and inspect synthetic snapshots")
+    snapshot_commands = snapshots.add_subparsers(dest="snapshot_command", required=True)
+    seal = snapshot_commands.add_parser("seal", help="seal synthetic inputs in a trusted store")
+    seal.add_argument("--input", required=True, type=Path)
+    seal.add_argument("--store", required=True, type=Path)
+    manifest = snapshot_commands.add_parser("manifest", help="inspect a snapshot manifest")
+    manifest.add_argument("--store", required=True, type=Path)
+    manifest.add_argument("--id", required=True)
+    read = snapshot_commands.add_parser("read", help="read the approved Discovery partition")
+    read.add_argument("--store", required=True, type=Path)
+    read.add_argument("--id", required=True)
+    read.add_argument("--partition", required=True)
 
     baseline = commands.add_parser("baseline", help="run the equal-weight buy-and-hold benchmark")
     _add_data_arguments(baseline)
@@ -158,6 +172,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "snapshot":
+            if args.snapshot_command == "seal":
+                result = snapshot.seal(args.input, args.store)
+            elif args.snapshot_command == "manifest":
+                result = snapshot.manifest(args.store, args.id)
+            else:
+                result = snapshot.read_discovery(args.store, args.id, args.partition)
+            print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+            return 0
         if args.command == "research":
             trusted_local_python = getattr(args, "trusted_local_generated_python", False)
             if trusted_local_python:
