@@ -1551,3 +1551,48 @@ common committed real forward sessions).
   enforced by the day computation and covered by the public-CLI tests. This
   remains synthetic mechanism evidence: no real broker, no real orders, no real
   market data and no end-to-end acceptance claim.
+
+## End-to-end acceptance (#35, synthetic tooling only — not passed)
+
+`prajnatrade acceptance report` is the operator-only acceptance checklist for
+issue #17. It validates one strict evidence manifest and renders a deterministic
+Markdown or JSON report from that manifest alone — no trusted store, ledger,
+sealed partition or evaluation is read and nothing is re-run:
+
+```sh
+prajnatrade acceptance report \
+  --input docs/acceptance/issue-17-manifest.json \
+  --output docs/acceptance/issue-17-report.md   # or report.json
+```
+
+The version-1 manifest has exactly `delivery`, the six required scenarios and
+`real_chain`; unknown fields are rejected so sealed diagnostics or credentials
+cannot be smuggled into the public checklist. Each scenario records status
+(`verified`, `blocked`, `failed`, `not_run`), scope (synthetic/real, Mock/real
+Agent, historical/forward), expected/observed, evidence references and
+missing/unblock blockers. A `verified` scenario needs evidence and non-empty
+findings, a `blocked` one needs blockers with missing/unblock, and a `failed`
+one needs evidence plus a recorded deviation.
+
+The verdict cannot over-claim. `end_to_end_passed` requires all six scenarios
+verified **and** a real chain from at least one real-Agent candidate through
+experiment → freeze → both protected stages → human approval → immutable release
+→ real forward ledger, with at least two real independently validated,
+human-approved releases and at least two consecutive, common, committed real
+forward trading days. Synthetic-only evidence marks a scenario verified only for
+its synthetic scope and never satisfies the real-chain gate; scenarios 2–6 must
+carry real-scope evidence. Anything short of the full gate is reported as
+`failed`, `blocked` or `not_run`, with explicit blockers and a plain statement
+that the six-scenario rule was not met. The command is operator-only:
+`prajnatrade-agent` has no `acceptance` command.
+
+**Checked-in state: end-to-end MVP is NOT accepted.** The checked-in manifest and
+its CLI-generated report (`docs/acceptance/issue-17-manifest.json`,
+`docs/acceptance/issue-17-report.md`) mark scenario 1 (tests and CLI) `verified`
+in synthetic scope and scenarios 2–6 `blocked`. No real five-ETF snapshot, real
+model access, verified deployment isolation, real protected pass, real approved
+release or real forward trading day exists in this delivery; `real_chain` is
+empty, the six-scenario rule is not met and the overall verdict is `blocked` /
+not passed. The report lists the exact missing prerequisites and unblock
+conditions from #24/#26/#27 and this handoff. It is a checklist conclusion, not
+an investment, performance or real-execution claim.
