@@ -15,8 +15,8 @@ from prajnatrade.backtest import (
 )
 from prajnatrade.data import CASH, DataValidationError, load_bars, validate_calendar
 from prajnatrade.experiment import (
-    ProtocolError, campaign_create, error_context, experiment_status, experiment_submit,
-    project_init, project_status,
+    ProtocolError, campaign_create, error_context, experiment_resume, experiment_status,
+    experiment_submit, project_init, project_status,
 )
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
@@ -27,15 +27,28 @@ from prajnatrade.store import SQLiteStore
 from prajnatrade.validation import freeze_candidate, run_holdout, validate_candidate
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="prajnatrade")
+def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="prajnatrade-agent" if agent_only else "prajnatrade")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    project = commands.add_parser("project", help="initialize or inspect a project")
+    project = commands.add_parser("project", help="inspect a project" if agent_only else "initialize or inspect a project")
     project_commands = project.add_subparsers(dest="project_command", required=True)
-    for action in ("init", "status"):
+    for action in (("status",) if agent_only else ("init", "status")):
         project_action = project_commands.add_parser(action)
         project_action.add_argument("--project", required=True, type=Path)
+
+    experiment = commands.add_parser("experiment", help="submit, inspect, and resume Discovery experiments")
+    experiment_commands = experiment.add_subparsers(dest="experiment_command", required=True)
+    submit = experiment_commands.add_parser("submit")
+    submit.add_argument("--project", required=True, type=Path)
+    submit.add_argument("--input", required=True, type=Path)
+    for action in ("status", "resume"):
+        lookup = experiment_commands.add_parser(action)
+        lookup.add_argument("--project", required=True, type=Path)
+        lookup.add_argument("--campaign-id", required=True)
+        lookup.add_argument("--submission-id", required=True)
+    if agent_only:
+        return parser
 
     campaign = commands.add_parser("campaign", help="operator campaign setup")
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
@@ -48,16 +61,6 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--initial-cash", type=float, default=100_000.0)
     create.add_argument("--transaction-cost-bps", type=float, default=5.0)
     create.add_argument("--slippage-bps", type=float, default=0.0)
-
-    experiment = commands.add_parser("experiment", help="submit and inspect Discovery experiments")
-    experiment_commands = experiment.add_subparsers(dest="experiment_command", required=True)
-    submit = experiment_commands.add_parser("submit")
-    submit.add_argument("--project", required=True, type=Path)
-    submit.add_argument("--input", required=True, type=Path)
-    experiment_status_parser = experiment_commands.add_parser("status")
-    experiment_status_parser.add_argument("--project", required=True, type=Path)
-    experiment_status_parser.add_argument("--campaign-id", required=True)
-    experiment_status_parser.add_argument("--submission-id", required=True)
 
     data = commands.add_parser("data", help="inspect and validate local datasets")
     data_commands = data.add_subparsers(dest="data_command", required=True)
@@ -206,7 +209,15 @@ def _add_budget_mode_arguments(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
+    return _main(argv, agent_only=False)
+
+
+def agent_main(argv: Sequence[str] | None = None) -> int:
+    return _main(argv, agent_only=True)
+
+
+def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
+    parser = build_parser(agent_only=agent_only)
     args = parser.parse_args(argv)
     if args.command == "experiment":
         request = None
@@ -219,11 +230,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "INVALID_SUBMISSION", "admission", "correct", str(error),
                     ) from error
                 result = experiment_submit(args.project, request)
-            else:
+            elif args.experiment_command == "status":
                 result = experiment_status(args.project, args.campaign_id, args.submission_id)
+            else:
+                result = experiment_resume(args.project, args.campaign_id, args.submission_id)
         except ProtocolError as error:
             result = {"schema_version": 1, "status": "rejected", "error": error.details}
-            if args.experiment_command == "status":
+            if args.experiment_command != "submit":
                 campaign_id, submission_id = args.campaign_id, args.submission_id
             elif isinstance(request, dict):
                 campaign_id, submission_id = request.get("campaign_id"), request.get("submission_id")
