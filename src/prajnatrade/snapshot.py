@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from prajnatrade.data import ETF_SYMBOLS
@@ -38,6 +38,18 @@ def _date(value: object) -> str:
     if parsed.isoformat() != value:
         raise ValueError(f"Invalid trading date: {value!r}.")
     return value
+
+
+def _instant(value: object, key: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"Missing or invalid {key}; expected an ISO timestamp.")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"Invalid {key}.") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{key} must include a timezone.")
+    return parsed
 
 
 def _evidence(record: object, *, allow_unknown: bool = False) -> None:
@@ -267,14 +279,18 @@ def _manifest(store: Path, snapshot_id: str) -> dict:
 def seal(source: Path, store: Path) -> dict:
     store = _store_path(store)
     manifest, partitions = _prepare(_read_json(source))
+    return _publish(store, manifest, partitions)
+
+
+def _publish(store: Path, manifest: dict, partitions: dict) -> dict:
     snapshot_id = _hash(manifest)
     store.mkdir(parents=True, exist_ok=True)
     target = store / snapshot_id
     if target.exists():
         if _manifest(store, snapshot_id) != manifest:
             raise ValueError("Existing snapshot manifest differs.")
-        for part in manifest["partitions"]:
-            if _hash(_read_json(target / f'{part["name"]}.json')) != part["content_hash"]:
+        for name, value in partitions.items():
+            if _hash(_read_json(target / f"{name}.json")) != _hash(value):
                 raise ValueError("Existing snapshot partition integrity check failed.")
     else:
         staging = Path(tempfile.mkdtemp(prefix=".snapshot-", dir=store))
@@ -299,16 +315,92 @@ def manifest(store: Path, snapshot_id: str) -> dict:
     return {"snapshot_id": snapshot_id, **_manifest(_store_path(store), snapshot_id)}
 
 
-def read_discovery(store: Path, snapshot_id: str, partition: str) -> dict:
+def _discovery_descriptor(metadata: dict) -> dict:
+    return next(p for p in metadata["partitions"] if p["name"] == "discovery")
+
+
+def _discovery_history(store: Path, snapshot_id: str, metadata: dict) -> tuple[dict, list[dict]]:
+    revisions = []
+    while "lineage" in metadata:
+        if "discovery_dividend" in metadata:
+            revisions.append(metadata["discovery_dividend"])
+        snapshot_id = metadata["lineage"]["predecessor_id"]
+        metadata = _manifest(store, snapshot_id)
+    content = _read_json(store / snapshot_id / "discovery.json")
+    if _hash(content) != _discovery_descriptor(metadata)["content_hash"]:
+        raise ValueError("Discovery partition integrity check failed.")
+    return content, list(reversed(revisions))
+
+
+def _dividend_index(data: dict, symbol: str, ex_date: str) -> int:
+    matches = [
+        i for i, row in enumerate(data["corporate_actions"])
+        if row["type"] == "cash_dividend" and row["symbol"] == symbol and row["date"] == ex_date
+    ]
+    if len(matches) != 1:
+        raise ValueError("Expected exactly one cash dividend for this ETF and ex-date.")
+    return matches[0]
+
+
+def _known_at(row: dict, cutoff: datetime) -> bool:
+    return (
+        row["available_at"] is not None and row["availability_evidence"] is not None
+        and _instant(row["available_at"], "available_at") <= cutoff
+    )
+
+
+def _discovery_view(base: dict, revisions: list[dict], cutoff: datetime | None = None) -> dict:
+    data = {kind: list(rows) for kind, rows in base.items()}
+    affected = set()
+    for rev in revisions:
+        available = _instant(rev["official_available_at"], "official_available_at")
+        if cutoff is not None and available > cutoff:
+            continue
+        idx = _dividend_index(data, rev["symbol"], rev["ex_date"])
+        action = data["corporate_actions"][idx]
+        if action["cash_per_share"] != rev["old_amount"]:
+            raise ValueError("The old amount does not match the predecessor's cash dividend.")
+        original = base["corporate_actions"][idx]
+        if cutoff is not None and not _known_at(original, cutoff):
+            original = {"date": action["date"], "symbol": action["symbol"], "type": "cash_dividend",
+                        "pay_date": None, "terms_evidence": None}
+        data["corporate_actions"][idx] = {
+            **original, "cash_per_share": rev["new_amount"],
+            "available_at": rev["official_available_at"], "collected_at": rev["collected_at"],
+            "availability_evidence": rev["url"],
+        }
+        affected.add(rev["symbol"])
+    # No point-in-time derivation engine is attached to these snapshots.
+    data["derived"] = [
+        {**row, "value": None} if row["symbol"] in affected else row for row in data["derived"]
+    ]
+    if cutoff is not None:
+        local_day = cutoff.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+        data = {
+            kind: [row for row in rows
+                   if row["date"] <= local_day and _known_at(row, cutoff)]
+            for kind, rows in data.items()
+        }
+    return data
+
+
+def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | None = None) -> dict:
     if partition != "discovery":
         raise ValueError("Research access is limited to Discovery.")
     store = _store_path(store)
     metadata = _manifest(store, snapshot_id)
-    description = next(p for p in metadata["partitions"] if p["name"] == "discovery")
-    content = _read_json(store / snapshot_id / "discovery.json")
-    if _hash(content) != description["content_hash"]:
+    if "lineage" in metadata and as_of is None:
+        raise ValueError("Successor Discovery reads require --as-of.")
+    cutoff = _instant(as_of, "--as-of") if as_of is not None else None
+    base, revisions = _discovery_history(store, snapshot_id, metadata)
+    fingerprint = _discovery_descriptor(metadata)["content_hash"]
+    latest = _discovery_view(base, revisions) if revisions else base
+    if _hash(latest) != fingerprint:
         raise ValueError("Discovery partition integrity check failed.")
+    content = latest if cutoff is None else _discovery_view(base, revisions, cutoff)
     return {
         "schema_version": 1, "snapshot_id": snapshot_id, "partition": partition,
-        "content_hash": description["content_hash"], "data": content,
+        "content_hash": _hash(content), "data": content,
+        **({"as_of": cutoff.isoformat(), "partition_content_hash": fingerprint}
+           if cutoff is not None else {}),
     }
