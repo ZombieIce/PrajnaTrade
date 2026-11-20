@@ -24,7 +24,7 @@ source .venv/bin/activate
 python -m pip install -e ".[test]"
 ```
 
-Validate a dataset before running a baseline:
+Validate a legacy CSV/Parquet dataset before running that baseline mode:
 
 ```sh
 prajnatrade data validate \
@@ -35,6 +35,9 @@ prajnatrade baseline \
   --initial-cash 100000 --transaction-cost-bps 5 --slippage-bps 0 \
   --output results/baseline.json
 ```
+
+The `--data` form is the legacy CSV/Parquet baseline. It retains the behavior
+described below and does not read sealed snapshots.
 
 `--data-kind` is required so synthetic fixtures cannot be mistaken for real
 market evidence. The baseline uses equal initial weights and then holds. A
@@ -118,10 +121,41 @@ canonical manifest, including all three partition fingerprints, not paths.
 Changing fixed content produces a new ID; repeat sealing verifies existing
 content rather than overwriting it.
 
-The legacy `research`, `baseline`, and validation commands described below do
-not consume this sealed snapshot interface and do not inherit its checks.
-Campaigns created before this change may have an incompatible fingerprint and
-must be recreated rather than resumed or validated.
+### Discovery snapshot equal-weight baseline (MVP-04)
+
+The snapshot baseline reads only the sealed Discovery partition. It treats
+`derived.value` as the total-return signal series, raw unadjusted opens as
+execution prices, and raw unadjusted closes as NAV marks. A signal is emitted
+on the first Discovery session with all five derived values available before
+the next session's open; it
+attempts the equal-weight buy once at the next session's open. If any ETF has a
+missing, unconfirmed, or not-yet-available-by-09:30 open, the entire attempt
+is recorded as not filled and is never deferred. Fees and slippage are fixed
+basis-point inputs.
+
+```sh
+prajnatrade baseline \
+  --store /trusted/snapshots --snapshot-id <snapshot-id> \
+  --initial-cash 100000 --transaction-cost-bps 5 --slippage-bps 0 \
+  --output results/snapshot-baseline.json
+```
+
+NAV uses unadjusted closes, cash, and dividend receivables. Cash dividends
+accrue only for shares held through the ex-date and transfer to cash on the
+declared pay date; dividend terms and share-adjustment ratios must be evidenced
+by the ex-date open. Share-adjustment ratios change held quantities before
+trading on their effective dates. A missing, unconfirmed, unavailable-by-end-
+of-day, or non-trading close for a held ETF, or unresolved held corporate
+action terms, makes that day's NAV unknown and is listed as a gap rather than
+filled from a stale price or guessed terms. The output records the snapshot
+and Discovery content hashes, price roles, signal/fill details, costs, and
+gaps for reproducibility. This interface currently accepts synthetic sealed
+snapshots only; it is not evidence of real-data correctness or OS isolation.
+
+The legacy `research` and validation commands do not consume sealed snapshots
+or inherit their checks. Campaigns created before this change may have an
+incompatible fingerprint and must be recreated rather than resumed or
+validated.
 
 ## Research, validation, and reports
 

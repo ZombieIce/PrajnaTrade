@@ -22,6 +22,7 @@ from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, Resear
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
 from prajnatrade import snapshot
+from prajnatrade.snapshot_baseline import run_discovery_baseline
 from prajnatrade.store import SQLiteStore
 from prajnatrade.validation import freeze_candidate, run_holdout, validate_candidate
 
@@ -78,7 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("--partition", required=True)
 
     baseline = commands.add_parser("baseline", help="run the equal-weight buy-and-hold benchmark")
-    _add_data_arguments(baseline)
+    baseline.add_argument("--data", type=Path, help="legacy CSV/Parquet total-return bars")
+    baseline.add_argument("--price-basis", choices=["total_return"])
+    baseline.add_argument("--data-kind", choices=["real", "synthetic"])
+    baseline.add_argument("--store", type=Path, help="trusted sealed snapshot store")
+    baseline.add_argument("--snapshot-id", help="content-addressed snapshot ID")
     baseline.add_argument("--output", required=True, type=Path)
     baseline.add_argument("--initial-cash", type=float, default=100_000.0)
     baseline.add_argument("--transaction-cost-bps", type=float, default=5.0)
@@ -358,6 +363,60 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 0
 
+        if args.command == "baseline":
+            if args.store is not None or args.snapshot_id is not None:
+                if args.store is None or args.snapshot_id is None or args.data is not None:
+                    raise ValueError(
+                        "Snapshot baseline requires --store and --snapshot-id, and cannot use --data."
+                    )
+                result = run_discovery_baseline(
+                    args.store,
+                    args.snapshot_id,
+                    initial_cash=args.initial_cash,
+                    transaction_cost_bps=args.transaction_cost_bps,
+                    slippage_bps=args.slippage_bps,
+                )
+            else:
+                if args.data is None or args.price_basis is None or args.data_kind is None:
+                    raise ValueError(
+                        "CSV/Parquet baseline requires --data, --price-basis, and --data-kind; "
+                        "use --store and --snapshot-id for a sealed Discovery snapshot."
+                    )
+                dataset = load_bars(args.data, args.price_basis)
+                backtest = run_backtest(
+                    dataset,
+                    equal_weight_buy_and_hold,
+                    initial_cash=args.initial_cash,
+                    transaction_cost_bps=args.transaction_cost_bps,
+                    slippage_bps=args.slippage_bps,
+                )
+                cash_benchmark = run_backtest(
+                    dataset,
+                    lambda history, state: {CASH: 1.0},
+                    initial_cash=args.initial_cash,
+                    transaction_cost_bps=args.transaction_cost_bps,
+                    slippage_bps=args.slippage_bps,
+                )
+                result = backtest.to_dict(args.data_kind)
+                result["relative_benchmark"] = CASH
+                result["relative_returns"] = benchmark_relative_returns(
+                    backtest, cash_benchmark
+                )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            print(json.dumps(
+                {
+                    "data_kind": result["data_kind"],
+                    "ending_equity": result["ending_equity"],
+                    "output": str(args.output),
+                },
+                sort_keys=True,
+            ))
+            return 0
+
         dataset = load_bars(args.data, args.price_basis)
         if args.command == "data":
             result = {
@@ -369,41 +428,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 0
 
-        backtest = run_backtest(
-            dataset,
-            equal_weight_buy_and_hold,
-            initial_cash=args.initial_cash,
-            transaction_cost_bps=args.transaction_cost_bps,
-            slippage_bps=args.slippage_bps,
-        )
-        cash_benchmark = run_backtest(
-            dataset,
-            lambda history, state: {CASH: 1.0},
-            initial_cash=args.initial_cash,
-            transaction_cost_bps=args.transaction_cost_bps,
-            slippage_bps=args.slippage_bps,
-        )
-        result = backtest.to_dict(args.data_kind)
-        result["relative_benchmark"] = CASH
-        result["relative_returns"] = benchmark_relative_returns(
-            backtest, cash_benchmark
-        )
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(
-            json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
-        print(
-            json.dumps(
-                {
-                    "data_kind": args.data_kind,
-                    "ending_equity": backtest.ending_equity,
-                    "output": str(args.output),
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
+        parser.error(f"unsupported command {args.command!r}")
     except (DataValidationError, OSError, sqlite3.Error, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
