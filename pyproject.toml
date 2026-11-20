@@ -19,6 +19,7 @@ test = ["pytest>=8.0"]
 
 [project.scripts]
 prajnatrade = "prajnatrade.cli:main"
+prajnatrade-agent = "prajnatrade.cli:agent_main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

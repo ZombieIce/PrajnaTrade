@@ -75,7 +75,7 @@ class MockProvider:
         self.seed = seed
 
     def propose(self, iteration: int, context: Mapping[str, Any]) -> Proposal:
-        if context.get("trusted_local_python"):
+        if context.get("isolated_generated_python"):
             return self._propose_python(iteration, context)
         rng = random.Random(self.seed + iteration)
         family = STRATEGY_FAMILIES[(self.seed + iteration - 1) % len(STRATEGY_FAMILIES)]
@@ -318,7 +318,7 @@ class OpenAICompatibleProvider:
         self._budget_campaign_id = campaign_id
 
     def propose(self, iteration: int, context: Mapping[str, Any]) -> Proposal:
-        trusted_local_python = bool(context.get("trusted_local_python"))
+        isolated_python = bool(context.get("isolated_generated_python"))
         prompt = {
             "task": "Propose one falsifiable ETF strategy research experiment.",
             "iteration": iteration,
@@ -326,13 +326,13 @@ class OpenAICompatibleProvider:
                 "Research only the five ETF universe and cash. Generate a Python "
                 "strategy(history, state) function. ETF_SYMBOLS, CASH and parameters "
                 "are provided as globals. Return ETF/cash weights or None. "
-                "This runs only with explicit trusted-local opt-in, without isolation."
-                if trusted_local_python
+                "This runs only in an explicitly requested OS-isolated worker."
+                if isolated_python
                 else "Research only the five ETF universe and cash. Return a declarative "
                 "strategy specification; do not return Python or executable code."
             ),
             "allowed_strategy_families": (
-                ["python"] if trusted_local_python else list(STRATEGY_FAMILIES)
+                ["python"] if isolated_python else list(STRATEGY_FAMILIES)
             ),
             "context": _safe_context(context),
             "response_contract": {
@@ -340,7 +340,7 @@ class OpenAICompatibleProvider:
                 "hypothesis": "string",
                 "rationale": "string",
                 "strategy": {
-                    "family": "python" if trusted_local_python else "one allowed family",
+                    "family": "python" if isolated_python else "one allowed family",
                     "parameters": "JSON object",
                     **({
                         "source": "Python source defining strategy(history, state)",
@@ -357,7 +357,7 @@ class OpenAICompatibleProvider:
                             "no_tunable_parameters": "true only when no parameters exist; otherwise omit",
                             "joint_variants": "optional list of {parameters: {name: value}, reason: string}",
                         },
-                    } if trusted_local_python else {}),
+                    } if isolated_python else {}),
                 },
             },
         }
@@ -367,7 +367,7 @@ class OpenAICompatibleProvider:
             if _contains_credential(parsed, self._api_key):
                 raise ProviderError("Provider response contains the configured credential.")
             proposal = validate_proposal_response(
-                parsed, trusted_local_python=trusted_local_python
+                parsed, isolated_python=isolated_python
             )
         except ProviderError as error:
             raise ProviderError(str(error), usage=usage) from error
@@ -434,7 +434,7 @@ class OpenAICompatibleProvider:
                         "response contract. Never include credentials. "
                         + (
                             "Python source is permitted only as requested in the contract."
-                            if context.get("trusted_local_python")
+                            if context.get("isolated_generated_python")
                             else "Never include executable Python."
                         )
                     ),
@@ -602,7 +602,7 @@ def parse_structured_response(content: str, expected_version: str = "1") -> dict
 
 
 def validate_proposal_response(
-    response: Mapping[str, Any], *, trusted_local_python: bool = False
+    response: Mapping[str, Any], *, isolated_python: bool = False
 ) -> Proposal:
     if set(response) != {"schema_version", "hypothesis", "rationale", "strategy"}:
         raise ProviderError("Provider proposal does not match the versioned response contract.")
@@ -616,14 +616,14 @@ def validate_proposal_response(
     if not isinstance(strategy, dict):
         raise ProviderError("Provider strategy must be a JSON object.")
     family = strategy.get("family")
-    if trusted_local_python:
+    if isolated_python:
         if family != "python":
-            raise ProviderError("Provider strategy must be Python when trusted-local opt-in is enabled.")
+            raise ProviderError("Provider strategy must be Python when OS isolation is enabled.")
         expected_strategy_fields = {"family", "parameters", "source", "parameter_schema"}
     else:
         if family not in STRATEGY_FAMILIES:
             raise ProviderError(
-                "Provider strategy family is unsupported; generated Python requires trusted-local opt-in."
+                "Provider strategy family is unsupported; generated Python requires explicit OS isolation."
             )
         expected_strategy_fields = {"family", "parameters"}
     if set(strategy) != expected_strategy_fields:
