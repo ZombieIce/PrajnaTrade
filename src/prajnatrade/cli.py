@@ -20,8 +20,9 @@ from prajnatrade.experiment import (
     experiment_resume, experiment_status, experiment_submit,
     freeze_experiment_candidate, project_init, project_status,
 )
+from prajnatrade.evaluation_report import write_evaluation_report
 from prajnatrade.protected_eval import (
-    EvaluationRejection, agent_validation_status, authorize, create_plan,
+    EvaluationRejection, agent_evaluation_status, authorize, create_plan,
     evaluation_status, run_evaluation,
 )
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
@@ -56,8 +57,8 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
 
     evaluation = commands.add_parser(
         "evaluation",
-        help="inspect coarse Validation receipts" if agent_only
-        else "freeze, authorize, and run protected Validation",
+        help="inspect coarse evaluation receipts" if agent_only
+        else "freeze, authorize, run, and report protected evaluations",
     )
     evaluation_commands = evaluation.add_subparsers(
         dest="evaluation_command", required=True
@@ -78,21 +79,25 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     evaluation_plan.add_argument("--input", required=True, type=Path)
 
     evaluation_authorize = evaluation_commands.add_parser(
-        "authorize", help="record the single human Validation authorization"
+        "authorize", help="record the single human Validation or Final Holdout authorization"
     )
     evaluation_authorize.add_argument("--store", required=True, type=Path)
     evaluation_authorize.add_argument("--plan-id", required=True)
-    evaluation_authorize.add_argument("--stage", required=True, choices=["validation"])
+    evaluation_authorize.add_argument(
+        "--stage", required=True, choices=["validation", "final_holdout"]
+    )
     evaluation_authorize.add_argument("--reviewer", required=True)
     evaluation_authorize.add_argument("--reason", required=True)
 
     evaluation_run = evaluation_commands.add_parser(
-        "run", help="run one authorized, isolated, debited Validation evaluation"
+        "run", help="run one authorized, isolated, debited protected evaluation"
     )
     evaluation_run.add_argument("--store", required=True, type=Path)
     evaluation_run.add_argument("--snapshot-store", required=True, type=Path)
     evaluation_run.add_argument("--plan-id", required=True)
-    evaluation_run.add_argument("--stage", required=True, choices=["validation"])
+    evaluation_run.add_argument(
+        "--stage", required=True, choices=["validation", "final_holdout"]
+    )
     evaluation_run.add_argument("--project", required=True, type=Path)
 
     evaluation_status_parser = evaluation_commands.add_parser(
@@ -100,6 +105,13 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     )
     evaluation_status_parser.add_argument("--store", required=True, type=Path)
     evaluation_status_parser.add_argument("--plan-id", required=True)
+
+    evaluation_report = evaluation_commands.add_parser(
+        "report", help="render the controlled evaluation report from stored records"
+    )
+    evaluation_report.add_argument("--store", required=True, type=Path)
+    evaluation_report.add_argument("--plan-id", required=True)
+    evaluation_report.add_argument("--output", required=True, type=Path)
 
     campaign = commands.add_parser("campaign", help="operator campaign setup")
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
@@ -551,7 +563,7 @@ def _evaluation_command(args: argparse.Namespace, *, agent_only: bool) -> int:
     try:
         if args.evaluation_command == "status":
             if agent_only:
-                result = agent_validation_status(args.project, args.candidate_id)
+                result = agent_evaluation_status(args.project, args.candidate_id)
             else:
                 result = evaluation_status(args.store, args.plan_id)
         elif args.evaluation_command == "plan":
@@ -562,6 +574,10 @@ def _evaluation_command(args: argparse.Namespace, *, agent_only: bool) -> int:
         elif args.evaluation_command == "authorize":
             result = authorize(
                 args.store, args.plan_id, args.stage, args.reviewer, args.reason
+            )
+        elif args.evaluation_command == "report":
+            result = write_evaluation_report(
+                args.store, args.plan_id, args.output
             )
         else:
             result = run_evaluation(
