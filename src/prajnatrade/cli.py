@@ -142,6 +142,30 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         "--as-of", help="derive the tracked state at this after-close signal date"
     )
 
+    release_disposition = release_commands.add_parser(
+        "disposition",
+        help="record a verified dividend-correction impact and pause new signals",
+    )
+    release_disposition.add_argument("--store", required=True, type=Path)
+    release_disposition.add_argument("--snapshot-store", required=True, type=Path)
+    release_disposition.add_argument("--release-id", required=True)
+    release_disposition.add_argument("--revision-id", required=True)
+    release_disposition.add_argument("--reviewer", required=True)
+    release_disposition.add_argument("--reason", required=True)
+    release_disposition.add_argument(
+        "--impact", choices=["sustained", "pending_review", "no_longer_supported"]
+    )
+    release_disposition.add_argument(
+        "--ledger", type=Path, help="Shadow Live ledger used to derive the pause point"
+    )
+    release_disposition.add_argument(
+        "--data", type=Path, help="synthetic Shadow Live feed used to derive the pause point"
+    )
+    release_disposition.add_argument(
+        "--effective-signal-date",
+        help="explicit first not-yet-committed after-close signal date",
+    )
+
     for action, description in (
         ("enable", "start tracking at a pre-registered after-close signal date"),
         ("pause", "stop new signals at a pre-registered after-close signal date"),
@@ -683,6 +707,19 @@ def _release_command(args: argparse.Namespace) -> int:
             result = release.fetch(args.store, args.release_id)
         elif args.release_command == "status":
             result = release.status(args.store, args.release_id, args.as_of)
+        elif args.release_command == "disposition":
+            result = release.disposition(
+                args.store,
+                args.snapshot_store,
+                args.release_id,
+                args.revision_id,
+                args.reviewer,
+                args.reason,
+                impact=args.impact,
+                ledger=args.ledger,
+                data=args.data,
+                effective_signal_date=args.effective_signal_date,
+            )
         else:
             result = getattr(release, args.release_command)(
                 args.store,

@@ -794,7 +794,8 @@ The release objects live in the same trusted store as the evaluation evidence
 <store>/
   releases/<release_id>/artifact.json                     # immutable release (0444)
   releases/<release_id>/events/<seq>.json                 # append-only lifecycle events (0444)
-  releases/<release_id>/dispositions/<revision_id>.json   # #31 impact dispositions (immutable)
+  releases/<release_id>/dispositions/<revision-id>.json   # #30 direct impact disposition (immutable)
+  releases/<release_id>/dispositions/<revision-id>-<seq>-<id>.json  # #31 write-once dispositions
   audit/<audit_id>.json                                  # refused approvals/events
 ```
 
@@ -938,13 +939,13 @@ event → `published`. `active` is true only when that state is `enabled`.
 Shadow Live (#32) uses these hooks: `release.fetch`, `release.state_at(store,
 release_id, signal_date)`, `release.releases_active_at(store, signal_date)`,
 `release.list_releases(store)` and `release.admission_state(store, release_id)`.
-`admission_state` is the #31 hook: valid unless the release is retired or a
-stored disposition has `impact` `pending_review` or `no_longer_supported`
-(unreadable or unbound dispositions are treated conservatively as
-invalidating). No dispositions exist yet; #31 writes
-`releases/<id>/dispositions/<revision_id>.json`. `releases_active_at` returns
-only IDs, fingerprints and bindings — the caller fetches each artifact by exact
-ID and verifies it again.
+`admission_state` resolves the stored impact dispositions of the release (see
+the dividend-correction section below): valid unless the release is retired or
+the resolved disposition of any revision is `pending_review` /
+`no_longer_supported` (unreadable or unbound dispositions are treated
+conservatively as invalidating). `releases_active_at` returns only IDs,
+fingerprints and bindings — the caller fetches each artifact by exact ID and
+verifies it again.
 
 **Implementation decisions and limits for #30:**
 
@@ -958,6 +959,105 @@ ID and verifies it again.
   below is engineering evidence only.
 - The store's `queries.sqlite` budget boundary is unchanged: approval, fetch,
   lifecycle and status never read a sealed partition and never debit a query.
+
+#### 5. Dividend-correction impact re-review (#31, synthetic only)
+
+A supplier can silently change an amount, and a trusted operator can verify the
+change against an exchange/fund-manager notice. `prajnatrade release
+disposition` records what that verified revision means for one already-approved
+release version **without re-running, rewriting or re-approving anything**:
+
+```sh
+prajnatrade release disposition --store /trusted/evaluations \
+  --snapshot-store /trusted/snapshots \
+  --release-id <release_id> --revision-id <revision_id> \
+  --reviewer "reviewer name" --reason "why this impact was recorded" \
+  [--impact sustained|pending_review|no_longer_supported] \
+  [--ledger /trusted/shadow --data synthetic-feed.json] \
+  [--effective-signal-date 2030-03-05]
+```
+
+The revision is read from the snapshot store's write-once journal
+(`<snapshot-store>/.dividend-corrections/revision-<revision-id>.json`) and must
+still be `status: "verified"` with `sha256(revision) == revision_id`; a
+proposal, an unverified observation or a tampered record is refused
+(`REVISION_NOT_FOUND` / `REVISION_NOT_VERIFIED` / `REVISION_INVALID`). No sealed
+partition payload is opened and `queries.sqlite` is never debited — the command
+also succeeds after the sealed `validation.json` / `final_holdout.json`
+payloads have been removed.
+
+**Exposure and the default classification.** Exposure comes from the release
+artifact only: the revision's `ex_date` must fall inside the `validation` or
+`final_holdout` range stored in the artifact's `partition_fingerprints` (the
+frozen plan bound to the artifact is re-verified). If it falls outside both
+evaluated ranges the release could not have used that input: the recorded
+impact is `not_applicable` (or, if the operator explicitly passes `sustained`,
+`sustained`) and the release is never paused or invalidated. An invalidating
+explicit impact for an out-of-range revision is refused
+(`IMPACT_NOT_APPLICABLE`).
+
+For an exposed release the classification compares
+`official_available_at` with the **plan's `frozen_at`** — the moment the
+evidence was fixed *before* the first protected read. Approval time is never
+used (it is always "now"). The two evidence cases are:
+
+| evidence | default impact | meaning |
+| --- | --- | --- |
+| official availability **after** the plan freeze | `sustained` | the report and approval keep their then-evidence validity: the old evaluation did not have the corrected amount at freeze time |
+| official availability **at/before** the plan freeze | `pending_review` | the sealed evaluation may have used an amount that was already officially wrong when the evidence was frozen; admission needs a re-review |
+
+A later verified re-review can record `sustained` for the same revision and
+clear a `pending_review`. `no_longer_supported` is **final**: no later
+`sustained` record can clear it, the release can never resume (nor be enabled),
+and a replacement needs a new frozen candidate, a qualified unseen protected
+range, fresh approval and a **new release ID**. The consumed sealed range is
+never re-issued (`QUERY_ALREADY_CONSUMED`).
+
+**Pause point.** An exposed `pending_review` / `no_longer_supported` release
+that is currently `enabled` gets a real append-only `pause` lifecycle event at
+the first not-yet-committed after-close signal point following the disposition:
+with `--ledger` + `--data` it is the feed session after the version's last
+committed session (or, with no ledger history, the first session whose
+after-close point follows the revision filing/now); otherwise an explicit
+`--effective-signal-date` is required. The date must not precede the last
+registered signal date (`ILLEGAL_PAUSE`), and a release that is not currently
+enabled (`published`, `paused`, `retired`) gets the disposition only — no
+invented event. A refused input writes no disposition and no event. Pending
+orders submitted before the pause keep their fill eligibility, positions and
+NAV keep settling in Shadow Live, and the version generates no new
+signals/orders while paused; unaffected versions keep running. Resume reuses
+the same ID at a pre-registered date and never backfills the paused window.
+The one-time accounting delta for the corrected amount itself is **#33**; #31
+deliberately changes no booked cash, receivable or NAV.
+
+**Disposition records and resolution.** Every disposition is one write-once,
+content-addressed file under
+`releases/<release_id>/dispositions/<revision-id>-<seq>-<id>.json` (`0444`,
+write-temp + `os.link`), carrying the release/revision/candidate/plan/snapshot
+IDs, the frozen plan timestamp, the impact, the classification method/basis,
+the reviewer, the operator reason, `recorded_at`, and the planned pause point.
+Repeating a disposition appends a new record; the old bytes are never rewritten.
+For admission, the records of one revision resolve **latest-wins** by
+`recorded_at`/`sequence`, except that a `no_longer_supported` record is final;
+an unreadable or unbound record is conservatively invalidating. The #30 direct
+file `dispositions/<revision-id>.json` is still read. Both `resume` and `enable`
+refuse while the resolved admission is invalid (`ADMISSION_INVALID`).
+
+Command output is versioned JSON:
+`{schema_version, status: "recorded", release_id, revision_id, impact,
+implication, classification, admission, paused_event|null, disposition,
+disposition_path, unchanged:{query_ledger, sealed_reads: false, artifact,
+evaluation_records, snapshot_partitions}}`; the `unchanged` block records that
+the artifact, both evaluation records, the sealed partitions and the query
+ledger were not modified. The research side (`prajnatrade-agent`) has no
+`release`/`disposition`/admission command at all, so disposition details never
+flow back to a research Agent.
+
+*Limitation:* the revision journal does not store its predecessor snapshot ID,
+so exposure is conservatively derived from the release artifact's evaluated
+ranges (its pre-registered input scope) rather than by walking snapshot
+lineage. If lineage later proves the action never entered the evaluated
+evidence, an operator records `sustained` for that revision.
 
 ### Shadow Live one-day ledger (MVP-13, synthetic only)
 
