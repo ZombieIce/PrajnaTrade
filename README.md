@@ -774,3 +774,185 @@ debit state, evaluation outcome/`scoring` and the record path.
 - The constant Holdout receipt is stored in the trusted record's
   `research_receipt` field and in `evaluation_receipts(plan_id,
   'final_holdout')` for audit, but it is never derived from the outcome.
+
+### Immutable release and lifecycle (MVP-12, synthetic only)
+
+`prajnatrade release ...` turns an explicitly human-approved frozen candidate
+into a uniquely identified, immutable release version and lets an operator
+enable, pause, resume and retire tracking of that version at pre-registered
+after-close signal dates. **This is synthetic mechanism evidence only.** It does
+not approve a real strategy, does not prove real-market performance, does not
+read real market data, and does not implement Shadow Live (#32). The research
+side (`prajnatrade-agent`) has no release, admission or lifecycle command at
+all, so admission state cannot flow back to a research Agent.
+
+The release objects live in the same trusted store as the evaluation evidence
+(outside Git and outside the research project):
+
+```text
+<store>/
+  releases/<release_id>/artifact.json                     # immutable release (0444)
+  releases/<release_id>/events/<seq>.json                 # append-only lifecycle events (0444)
+  releases/<release_id>/dispositions/<revision_id>.json   # #31 impact dispositions (immutable)
+  audit/<audit_id>.json                                  # refused approvals/events
+```
+
+`release_id = sha256(canonical JSON {"candidate_hash", "plan_hash",
+"release": "release-v1"})`. The artifact stores `artifact_hash`, the SHA-256 of
+the artifact without that field, and every fetch re-computes it.
+
+#### 1. Approve a frozen candidate (the only admission path)
+
+```sh
+prajnatrade release approve --store /trusted/evaluations \
+  --plan-id <plan-id> --reviewer "reviewer name" \
+  --reason "why this evidence is sufficient for admission"
+```
+
+Approval re-loads the frozen plan and both protected-evaluation records from the
+trusted store and refuses (exit 2, stable `error.code`, `releases/` untouched,
+`audit/<audit_id>.json` with `release_created: false`) unless all of the
+following hold for the **same** frozen plan, candidate, snapshot and the two
+partition descriptors:
+
+- both stages have a `completed` query-ledger row and a stored record whose
+  `record_hash` verifies and whose `_record_matches` binding is intact
+  (`EVIDENCE_INVALID` otherwise; missing rows/records are `EVIDENCE_MISSING`);
+- both records are scored and not aborted (`EVIDENCE_INCOMPLETE`);
+- both `outcome` values are `passed` (`NOT_PASSED`); a rejected or
+  insufficient stage can never be approved and there is no override flag;
+- every preregistered hard threshold is `passed` (`THRESHOLD_NOT_MET` for a
+  failed one, `EVIDENCE_INVALID` for a missing or unavailable one — no
+  threshold is exempt and no post-hoc threshold is added);
+- coverage/minimum samples are complete (`COVERAGE_INCOMPLETE`) and the
+  record's `isolation_verified` evidence is true (`ISOLATION_UNVERIFIED`);
+- the stored authorizations match the plan and the ledger rows were run under
+  exactly those authorizations (`AUTHORIZATION_REQUIRED` /
+  `AUTHORIZATION_INVALID`); the Final Holdout authorization must be bound to the
+  stored Validation record hash and export hash, and the Holdout record's
+  `prior_evidence` must point at the same Validation evaluation;
+- both records' execution settings (rules, initial cash, costs, signal window)
+  equal the frozen plan (`EVIDENCE_INVALID`);
+- the frozen candidate JSON still hashes to `candidate_hash` and is bound to the
+  plan's snapshot.
+
+On success the artifact is written once (`0444`, write-temp + `os.link`) and
+binds the candidate JSON/hash, `plan_hash`, project and snapshot IDs, both
+partition descriptors, both evaluation IDs with their record hashes, outcomes
+and authorization IDs, the approval reviewer/time/decision/reason, and the exact
+execution settings (strategy family, parameters, initial cash,
+`transaction_cost_bps`, `slippage_bps`, base and stress costs,
+`signal_window_sessions`, execution rules, baseline definition). The artifact
+**is** the admission decision record: its `admission.statement` says that
+approval is separate from evidence performance and never enables tracking
+automatically (`admission.automatic_enable: false`). The controlled evaluation
+report remains a readable presentation and never grants admission itself.
+
+Approval is idempotent for one `(candidate, plan)` pair: a repeat — even with a
+different reviewer or reason — still verifies the frozen plan and the existing
+artifact's content address, then returns that artifact unchanged with
+`reused: true` and the original approval (it does not re-derive the evidence);
+the file is never rewritten and no second ID exists. A candidate whose parameters change is a different frozen
+candidate and needs its own plan, evidence, approval and release ID; old
+releases are never replaced.
+
+#### 2. Fetch by exact ID
+
+```sh
+prajnatrade release fetch --store /trusted/evaluations --release-id <release_id>
+```
+
+Fetch verifies the stored `artifact_hash`, the `release_id` binding and the
+content-address derivation from `candidate_hash` + `plan_hash`. A missing or
+tampered artifact fails explicitly (`RELEASE_NOT_FOUND` /
+`RELEASE_INTEGRITY_FAILED`); there is no fallback to the workspace, the
+project, another version or "latest".
+
+#### 3. Lifecycle events at pre-registered signal dates
+
+```sh
+prajnatrade release enable  --store ... --release-id <id> \
+  --effective-signal-date 2030-01-02 --reason "..."
+prajnatrade release pause   --store ... --release-id <id> \
+  --effective-signal-date 2030-02-05 --reason "..."
+prajnatrade release resume  --store ... --release-id <id> \
+  --effective-signal-date 2030-02-10 --reason "..."
+prajnatrade release retire  --store ... --release-id <id> \
+  --effective-signal-date 2030-02-15 --reason "..."
+```
+
+Approval writes **no** event: a freshly approved release is `published` and
+inactive at every date. Each lifecycle event is one immutable
+`events/<seq>.json`:
+
+```json
+{"schema_version": 1, "scope": "synthetic", "release_id": "...", "seq": 1,
+ "action": "enable", "effective_signal_date": "2030-01-02",
+ "recorded_at": "2030-01-01T03:00:00+00:00", "reason": "...",
+ "prev_event_hash": null, "state_before": "published",
+ "state_after": "enabled", "event_hash": "..."}
+```
+
+`event_hash` is the SHA-256 of the event without that field and
+`prev_event_hash` chains to the previous event, so removing a middle event or
+editing any field is detected (`RELEASE_INTEGRITY_FAILED`) by `status`, the
+hooks, and every later lifecycle command. (Truncating only the newest event
+needs an external anchor; the Shadow Live ledger in #32 supplies it.)
+`effective_signal_date` is an ISO date and must not decrease across the
+timeline; it is the pre-registered after-close signal point, not the approval or
+run time, so a historical replay sees the version and state registered for that
+date. Trading-session validation of the date belongs to the Shadow Live feed
+(#32); the release store deliberately does not open a sealed snapshot.
+
+Allowed transitions, and nothing else (`INVALID_TRANSITION`, terminal
+retirement, exit 2 with an audit record):
+
+| action | allowed from | resulting state |
+| --- | --- | --- |
+| `enable` | `published` (never enabled) | `enabled` |
+| `pause` | `enabled` | `paused` |
+| `resume` | `paused` with valid admission + intact artifact/records | `enabled` |
+| `retire` | `published`, `enabled` or `paused` | `retired` (terminal) |
+
+Pause stops new signals from its effective signal date and never alters or
+deletes the artifact or earlier events. Resume reuses the same ID and does not
+backfill the paused window. An invalidated admission (`ADMISSION_INVALID`) or a
+deleted/tampered bound record (`EVIDENCE_MISSING` / `EVIDENCE_INVALID`) blocks
+resume; a retired release can never be enabled or resumed again.
+
+#### 4. Operator status and the Shadow Live hooks
+
+```sh
+prajnatrade release status --store /trusted/evaluations \
+  --release-id <release_id> [--as-of 2030-02-05]
+```
+
+The status prints the artifact fingerprints, approval, admission state, the
+full hash-chained timeline and the state derived at `--as-of` (or the current
+state): the last event with `effective_signal_date <= as-of`, mapping
+`enable`/`resume` → `enabled`, `pause` → `paused`, `retire` → `retired`, and no
+event → `published`. `active` is true only when that state is `enabled`.
+
+For #32 the module exports `release.fetch`, `release.state_at(store,
+release_id, signal_date)`, `release.releases_active_at(store, signal_date)`,
+`release.list_releases(store)` and `release.admission_state(store, release_id)`.
+`admission_state` is the #31 hook: valid unless the release is retired or a
+stored disposition has `impact` `pending_review` or `no_longer_supported`
+(unreadable or unbound dispositions are treated conservatively as
+invalidating). No dispositions exist yet; #31 writes
+`releases/<id>/dispositions/<revision_id>.json`. `releases_active_at` returns
+only IDs, fingerprints and bindings — the caller fetches each artifact by exact
+ID and verifies it again.
+
+**Implementation decisions and limits for #30:**
+
+- Only an explicit `approve` creates a release. "Human rejection" is expressed
+  as not approving: this ticket adds no separate rejection-decision record and
+  no override flag. A refused approval is still auditable and can never produce
+  a runnable version.
+- The release artifact is the admission record; the evaluation report remains a
+  non-admission presentation. Admission of a *real* strategy and any Shadow
+  Live tracking remain blocked (#12/#18/#27/#32); this is synthetic mechanism
+  evidence.
+- The store's `queries.sqlite` budget boundary is unchanged: approval, fetch,
+  lifecycle and status never read a sealed partition and never debit a query.
