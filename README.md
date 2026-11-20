@@ -782,9 +782,10 @@ into a uniquely identified, immutable release version and lets an operator
 enable, pause, resume and retire tracking of that version at pre-registered
 after-close signal dates. **This is synthetic mechanism evidence only.** It does
 not approve a real strategy, does not prove real-market performance, does not
-read real market data, and does not implement Shadow Live (#32). The research
-side (`prajnatrade-agent`) has no release, admission or lifecycle command at
-all, so admission state cannot flow back to a research Agent.
+read real market data. Shadow Live accounting is built on top of these
+artifacts (see the next section). The research side (`prajnatrade-agent`) has
+no release, admission or lifecycle command at all, so admission state cannot
+flow back to a research Agent.
 
 The release objects live in the same trusted store as the evaluation evidence
 (outside Git and outside the research project):
@@ -897,7 +898,8 @@ inactive at every date. Each lifecycle event is one immutable
 `prev_event_hash` chains to the previous event, so removing a middle event or
 editing any field is detected (`RELEASE_INTEGRITY_FAILED`) by `status`, the
 hooks, and every later lifecycle command. (Truncating only the newest event
-needs an external anchor; the Shadow Live ledger in #32 supplies it.)
+needs an external anchor; the Shadow Live ledger supplies one for a tracked
+version.)
 `effective_signal_date` is an ISO date and must not decrease across the
 timeline; it is the pre-registered after-close signal point, not the approval or
 run time, so a historical replay sees the version and state registered for that
@@ -933,7 +935,7 @@ state): the last event with `effective_signal_date <= as-of`, mapping
 `enable`/`resume` → `enabled`, `pause` → `paused`, `retire` → `retired`, and no
 event → `published`. `active` is true only when that state is `enabled`.
 
-For #32 the module exports `release.fetch`, `release.state_at(store,
+Shadow Live (#32) uses these hooks: `release.fetch`, `release.state_at(store,
 release_id, signal_date)`, `release.releases_active_at(store, signal_date)`,
 `release.list_releases(store)` and `release.admission_state(store, release_id)`.
 `admission_state` is the #31 hook: valid unless the release is retired or a
@@ -951,8 +953,284 @@ ID and verifies it again.
   no override flag. A refused approval is still auditable and can never produce
   a runnable version.
 - The release artifact is the admission record; the evaluation report remains a
-  non-admission presentation. Admission of a *real* strategy and any Shadow
-  Live tracking remain blocked (#12/#18/#27/#32); this is synthetic mechanism
-  evidence.
+  non-admission presentation. Admission of a *real* strategy and real forward
+  tracking remain blocked (#12/#18/#27); the synthetic Shadow Live mechanism
+  below is engineering evidence only.
 - The store's `queries.sqlite` budget boundary is unchanged: approval, fetch,
   lifecycle and status never read a sealed partition and never debit a query.
+
+### Shadow Live one-day ledger (MVP-13, synthetic only)
+
+`prajnatrade shadow update` accounts **one manually triggered synthetic trading
+day** for every tracked immutable release version, and `prajnatrade shadow
+report` dumps the committed ledger for trusted audit. Shadow Live is **virtual
+accounting only**: it never connects to a broker, never sends or simulates a
+real order, never reads real market data and never uses the network. Every
+number below is synthetic engineering evidence, not a strategy result.
+
+A release ID is the account boundary. Each version keeps its own cash,
+positions, orders, fees, slippage, dividends and NAV; prices may be shared,
+money never is. `prajnatrade-agent` has no `shadow` command at all, so no
+Shadow Live state can flow back to a research Agent.
+
+```text
+prajnatrade shadow update --ledger /trusted/shadow-ledger \
+  --store /trusted/evaluations --data synthetic-feed.json --date 2030-01-07 \
+  [--release-id <exact-release-id> ...]
+prajnatrade shadow report --ledger /trusted/shadow-ledger \
+  --version <exact-release-id> --output ledger-report.json
+```
+
+#### 1. The synthetic feed (`--data`)
+
+The feed is versioned synthetic JSON. Every row carries a timezone-aware
+`available_at` and a non-empty `availability_evidence`; a missing price is an
+explicit `null`, never a fabricated value.
+
+```json
+{"schema_version": 1, "data_kind": "synthetic",
+ "symbols": ["511260", "518880", "515080", "513300", "159612"],
+ "calendar": [{"date": "2030-01-02",
+               "available_at": "2030-01-02T08:00:00+08:00",
+               "availability_evidence": "synthetic calendar"},
+              {"date": "2030-01-07",
+               "available_at": "2030-01-07T08:00:00+08:00",
+               "availability_evidence": "synthetic calendar"}],
+ "raw_bars": [{"date": "2030-01-02", "symbol": "511260",
+               "open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0,
+               "volume": 1000, "trading_status": "trading",
+               "available_at": "2030-01-02T09:00:00+08:00",
+               "availability_evidence": "synthetic bars"}],
+ "derived": [{"date": "2030-01-02", "symbol": "511260", "value": 10.0,
+              "available_at": "2030-01-02T15:00:00+08:00",
+              "availability_evidence": "synthetic total-return value"}],
+ "corporate_actions": [{"action_id": "cash_dividend:511260:2030-01-07",
+   "date": "2030-01-07", "symbol": "511260", "type": "cash_dividend",
+   "cash_per_share": 0.2, "pay_date": "2030-01-09",
+   "terms_evidence": "synthetic terms",
+   "available_at": "2030-01-07T08:00:00+08:00",
+   "availability_evidence": "synthetic notice"}]}
+```
+
+Validation is strict and a malformed feed is rejected with exit 2,
+`{"schema_version":1,"status":"rejected","error":{"code":"INVALID_FEED", ...}}`
+and a stable `error.phase:"feed"`; nothing is frozen and no ledger day is
+written. The rules:
+
+- `schema_version` is 1, `data_kind` is `synthetic`, and `symbols` is exactly
+  the five ETFs.
+- `calendar`, `raw_bars` and `derived` are non-empty; calendar dates are unique
+  and strictly increasing; every row date is in the calendar.
+- `raw_bars` OHLC prices are finite and positive (or `null`), `volume` is
+  finite and nonnegative (or `null`), `trading_status` is
+  `trading|suspended|unknown`, and `high >= max(open, close)`,
+  `low <= min(open, close)`.
+- `derived.value` is finite and positive (or `null`).
+- A corporate action is `cash_dividend` (`cash_per_share` + `pay_date`) or
+  `share_adjustment` (`ratio`); numeric terms are finite and positive when
+  present, `terms_evidence` may be `null` for genuinely unresolved terms, and
+  `pay_date >= ex-date`. `action_id` is optional and derived as
+  `cash_dividend:<symbol>:<ex-date>` or `share_adjustment:<symbol>:<ex-date>`;
+  IDs are unique.
+- Duplicate `(date, symbol)` rows, duplicate calendar dates, non-ISO dates,
+  naive timestamps, empty evidence and out-of-calendar dates are invalid.
+  A target `--date` outside the calendar is `NOT_A_SESSION` (exit 2); a
+  non-session is never invented as a trading day.
+
+Point-in-time cutoffs are enforced in Asia/Shanghai (`+08:00`): execution
+prices must be available by the execution session's **09:30 open**; signals,
+unadjusted closes and corporate-action terms must be available by the
+session's **15:00 close** (terms by the ex-date open so they can be applied
+before trading). A row published after its cutoff is treated as unavailable —
+it is never substituted with a stale or later value.
+
+#### 2. The ledger (`--ledger`)
+
+The ledger is a SQLite database outside Git and outside the research project:
+
+```text
+<ledger>/shadow.sqlite
+  input_snapshots(version_id, date, input_json, input_hash, frozen_at,
+                  PRIMARY KEY(version_id, date))
+  days(version_id, date, result_json, result_hash, committed_at, status,
+       PRIMARY KEY(version_id, date))
+  progress(version_id PRIMARY KEY, release_id, start_date,
+           last_committed_date, state)
+```
+
+The minimum transaction boundary is **version × trading session**. Before
+anything is computed, the complete per-version/per-session input snapshot
+(the release's frozen execution settings, its state at that session's signal
+point, the day's raw/derived/action rows, and the prior account state including
+pending orders) is written and content-addressed. An input is frozen **only
+when every required input is present**; a missing held close, unavailable or
+suspended held input, unresolved held corporate-action terms or missing signal
+input blocks that version before anything is written.
+
+The day commit is one atomic `BEGIN IMMEDIATE` transaction: the order terminal
+states, fills, cash, positions, fees, slippage, dividend entitlements/payments,
+NAV, the new signal, the next session's orders, progress and anomalies are
+written together with the result hash, or nothing is. `committed_at` records
+the actual posting time; each order records its pre-registered `submitted_at`
+signal point. `progress.last_committed_date` can only advance to the immediate
+next feed session; a transaction that would skip or rewrite a session is
+refused (`PROGRESS_CONFLICT`).
+
+#### 3. What one `shadow update` does per version
+
+Approval alone never starts tracking. Without `--release-id` the command
+selects every release that is *tracked* at the target date:
+
+| release state at the target date | processed automatically? |
+| --- | --- |
+| `enabled` | yes |
+| `paused` / `retired`, with a ledger history | yes (settles/values, no new signals) |
+| `paused` / `retired`, no ledger history | no (explicit `--release-id` reports `retired`) |
+| `published` (approved but never enabled) | no (explicit `--release-id` reports `not_started`) |
+
+An explicit `--release-id` (repeatable) processes exactly that release and
+fetches its artifact by exact ID with the full hash verification; there is no
+`latest`, no workspace copy and no fallback. A missing or tampered artifact
+blocks that version (`RELEASE_NOT_FOUND` / `RELEASE_INTEGRITY_FAILED`) and never
+substitutes another one.
+
+The release's state is derived from its lifecycle event timeline **at each
+session's after-close signal point**, not from today's state. The first run
+backfills from the first feed session whose state is not `published` (the first
+session at/after the pre-registered enable date); later runs resume at the
+session after `last_committed_date`. Each skipped session is processed one at a
+time, so a historical signal only ever uses data that was available at its own
+signal time and a missed open is recorded instead of being filled
+retroactively.
+
+For every session the day transaction is:
+
+1. **Corporate actions before the open.** Share adjustments are applied first
+   to start-of-day holdings; then cash-dividend entitlements for start-of-day
+   holdings on the ex-date become receivables (`quantity × cash_per_share`,
+   payable on `pay_date`). A pay-date transfer moves the receivable into cash
+   *after* the open settlement, so unpaid dividends are part of NAV but can
+   never fund an opening trade, and the transfer itself never changes NAV. No
+   entitlement is duplicated: it exists either as a receivable or as cash.
+2. **Settle the previous session's pending orders at the unadjusted open**, in
+   the deterministic frozen order *sells before buys, then by symbol*. Every
+   order receives exactly one terminal state: `filled`, `missing_open`,
+   `missed_deadline`, `insufficient_cash` or `insufficient_shares`. A confirmed
+   missing/unusable open (explicit `null`, `suspended`/`unknown` status, zero
+   volume or a late row) expires only that order; the others still settle. Buy
+   cost is checked against available cash at the fill price including fees, and
+   sell quantity against the holdings at settlement. There is **no resize, no
+   short, no leverage and no retroactive fill**: an unaffordable buy or an
+   oversized sell is terminal and leaves the account untouched.
+   Only orders whose recorded `submitted_at` (the pre-registered after-close
+   signal point) precedes the execution session's 09:30 Asia/Shanghai deadline
+   **and** whose day transaction was durably committed before that deadline in
+   real wall-clock time (`persisted_before_deadline`, fixed when the order is
+   committed) are fill-eligible. A backfill persisted after a past open is
+   `missed_deadline`; a later signal creates a brand-new order with a new
+   stable ID instead of retrying the expired one.
+3. **Value at the unadjusted close** plus cash plus unpaid receivables. A
+   missing/unavailable/suspended close for a held symbol, unresolved held
+   action terms, or a missing after-close signal input blocks **that version
+   only** — no day row, no progress advance, and a precise `reason`/
+   `reason_code` in the output. A genuine evidenced non-fill is *not* a block.
+4. **Generate the next session's signal only when the release is still
+   `enabled` at that session's after-close signal point.** The frozen strategy
+   and its frozen `signal_window_sessions` run over the trailing window of
+   `derived` values available by the session's 15:00 close; target weights are
+   sized at the unadjusted close (buy quantities include the frozen fees and
+   slippage, and the buy side is budgeted at order-creation time from cash plus
+   the same signal's net sell proceeds, so a full switch is affordable at a
+   same-price open) and persisted as stable
+   `order_id`s with `submitted_at` = the session's pre-registered signal point
+   and `execution_date` = the next feed session. `paused`/`retired` versions
+   never create new orders, but their existing orders and positions keep
+   settling and valuing.
+
+#### 4. Update output, statuses and exit codes
+
+```json
+{"schema_version": 1, "scope": "synthetic", "target_date": "2030-01-07",
+ "completed_at": "2030-01-08T01:02:03+00:00",
+ "versions": [{"release_id": "...", "status": "committed", "reason": null,
+               "reason_code": null, "committed_date": "2030-01-07",
+               "last_committed_date": "2030-01-07", "result_hash": "...",
+               "anomalies": [], "unfilled_orders": []}]}
+```
+
+| status | meaning |
+| --- | --- |
+| `committed` | the target day is committed with every order terminal and nothing anomalous |
+| `committed_with_anomalies` | the target day is committed, but an evidenced non-fill (missing open, missed deadline, insufficient cash/shares) or a non-blocking anomaly was recorded |
+| `already_committed` | the target day was already committed; the stored result hash is returned and nothing is regenerated or re-filled |
+| `blocked` | that version wrote no day row and did not advance; `reason`/`reason_code` say why (e.g. `missing_close`, `missing_action_terms`, `missing_signal_input`, `frozen_input_changed`, `ledger_integrity_failed`, `release_integrity_failed`) |
+| `not_started` | the release is approved but not enabled at/before the target (`NOT_ENABLED`), or is first tracked after it (`ENABLED_AFTER_TARGET`) |
+| `retired` | the release is retired at the target with no ledger history to settle |
+
+The command exits `0` when no version is blocked, and `2` when at least one is.
+A blocked version never rolls back another version's committed days. Global
+operator errors (malformed feed, non-session target, malformed release ID) are
+rejected with the project's standard `{"status":"rejected","error":...}`
+document and exit 2. Argument misuse is a plain `ValueError` → exit 2.
+
+#### 5. Safe re-runs, interruptions and integrity
+
+The ledger is the only source of truth; `shadow update` never rewrites a
+committed history.
+
+- **Crash before the day commit**: the frozen input remains, no day row exists.
+  The rerun reuses that frozen snapshot and produces an item-identical day
+  (orders, fills, cash, positions, fees, dividends, NAV, signal and next orders
+  are all deterministic given the frozen input). Two documented fault
+  injection points exercise this in tests and have no effect when unset:
+  `PRAJNATRADE_TEST_FAILPOINT=shadow_after_fills` (raises after the fills,
+  before the commit) and `PRAJNATRADE_TEST_FAILPOINT=shadow_after_commit_before_report`
+  (raises after the commit, before the report).
+- **Crash after the day commit**: the rerun returns `already_committed` with
+  the stored result and does not regenerate a signal, an order or a fill;
+  report generation is read-only and can simply be repeated.
+- **Frozen input changed**: if a frozen input exists but the current feed or
+  prior account state would produce a different input hash, the version is
+  blocked with `FROZEN_INPUT_CHANGED` and both hashes; frozen and current
+  inputs are never mixed. Restoring the original feed lets the rerun proceed.
+- **Tampered ledger**: every committed day and every frozen input is verified
+  against its stored content address on reuse, on `already_committed` and in
+  `shadow report`. A mismatch is `LEDGER_INTEGRITY_FAILED` (update blocks that
+  version, report exits 2) instead of being silently accepted.
+
+`shadow report` writes a trusted audit document
+(`kind: shadow_live_ledger_report`, `scope: synthetic`) containing the
+progress row, an integrity block, a summary (days, first/last committed date,
+ending NAV, total return, fees, slippage, dividends, fills, unfilled orders,
+anomalies) and every committed day record with its input hash, result hash,
+`committed_at`, `status` and full result. It only reads committed records and
+never re-runs a strategy.
+
+#### 6. Hooks for #33 and #34, and limits
+
+- The day result is an extensible structured object; `corrections: []` is
+  reserved for the #33 dividend-correction deltas, and the module exposes
+  `shadow.iter_committed_days(ledger, version_id=None)` yielding verified day
+  records for the #33/#34 read side. The update loop is version-independent:
+  every version has fully independent cash, positions, orders, fees, dividends
+  and NAV.
+- No multi-version comparison command is implemented (#34); only the
+  per-version daily update and audit dump exist here.
+- Only the four declarative strategy families are executed. A release whose
+  frozen strategy family is generated Python is blocked
+  (`UNSUPPORTED_STRATEGY`): Shadow Live does not run generated Python locally.
+- The release artifact's evaluation-time `execution_rules` describe the sealed
+  runner (e.g. `missing_required_open: whole_rebalance_not_filled`). Shadow Live
+  follows #9/#32 instead: a confirmed missing open expires only that order, and
+  orders are concrete frozen quantities that are never resized at settlement.
+- Buy quantities account for the frozen fees and slippage at the signal close;
+  a price gap up can still make a frozen buy unaffordable, which is recorded as
+  `insufficient_cash` rather than resized. A share adjustment between signal
+  and open is applied to the holdings but never retroactively rescales the
+  frozen order, so a stale oversized sell becomes `insufficient_shares` rather
+  than a short.
+- Self-consistency checks (non-negative cash and positions, one terminal state
+  per order, no duplicate order IDs, no new signals while paused/retired) are
+  enforced by the day computation and covered by the public-CLI tests. This
+  remains synthetic mechanism evidence: no real broker, no real orders, no real
+  market data and no end-to-end acceptance claim.
