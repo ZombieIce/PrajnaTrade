@@ -215,17 +215,18 @@ inputs. `partition_content_hash` identifies the fixed Discovery descriptor;
 
 ### External Discovery experiment protocol (synthetic only)
 
-The operator initializes a project and creates a Campaign. The input must be
-synthetic Discovery data only; `--data-kind synthetic` is an operator assertion,
-not proof of provenance. Each Campaign stores its own snapshot, evaluation
-configuration, runtime fingerprints and attempt/time budgets in the project's
-`.prajnatrade` directory. Move that directory with the project to preserve its
-identity; `--project` is just its location.
+The operator seals a synthetic snapshot, initializes a project, and creates a
+Campaign against its Discovery partition. Campaign creation reads Discovery
+only, copies that partition into the project, and locks its snapshot ID,
+evaluation rules, runtime fingerprints, and attempt/time budgets in the
+project's `.prajnatrade` directory. Move that directory with the project to
+preserve its identity; `--project` is just its location.
 
 ```sh
+prajnatrade snapshot seal --input synthetic-snapshot.json --store ./sealed-data
 prajnatrade project init --project ./strategy-A
-prajnatrade campaign create --project ./strategy-A --data discovery.csv \
-  --data-kind synthetic --attempts 20 --max-seconds 3600
+prajnatrade campaign create --project ./strategy-A --store ./sealed-data \
+  --snapshot-id <snapshot-id> --attempts 20 --max-seconds 3600
 prajnatrade-agent project status --project ./strategy-A
 prajnatrade-agent experiment submit --project ./strategy-A --input first.json
 prajnatrade-agent experiment status --project ./strategy-A \
@@ -251,8 +252,14 @@ definitions. A follow-up uses a fresh `submission_id` and may include a
 `parent_experiment_id` from the same Campaign. Submissions cannot override
 Campaign settings. Submit/status/resume print versioned JSON on stdout; rejected and
 failed requests return a nonzero exit code with a stable error and next action.
-Results include only Discovery metrics and an equal-weight benchmark using
-the same snapshot and evaluation settings.
+Results include only Discovery. Signals use the sealed total-return series and
+must be available before the next open; execution uses unadjusted opens with a
+single all-or-none rebalance attempt, while NAV uses unadjusted closes, cash,
+and dividend receivables. Missing required inputs produce signal gaps,
+unfilled orders, or unavailable NAV rather than substituted prices. Each
+experiment includes fills, order attempts, the NAV curve, fingerprints, and an
+equal-weight buy-and-hold comparison over the same Discovery interval and
+evaluation settings.
 
 The same Campaign/submission ID and normalized content reuse one experiment;
 changed content conflicts, and invalid or conflicting requests do not consume
@@ -275,6 +282,21 @@ zero time remaining blocks all execution without discarding earlier receipts.
 Resume on a completed or terminally failed experiment returns its existing
 receipt. A runtime fingerprint change fails execution rather than changing the
 Campaign.
+
+Success does not automatically create a Candidate. The operator must explicitly
+freeze one successful experiment with its research conclusion:
+
+```sh
+prajnatrade candidate freeze --project ./strategy-A \
+  --campaign-id <campaign-id> --submission-id first \
+  --name candidate-1 --conclusion "Retain for independent review."
+prajnatrade candidate status --project ./strategy-A --candidate-id <candidate-id>
+```
+
+The frozen record has an independent Candidate ID and preserves the exact
+strategy, parameters, hypothesis, conclusion, snapshot/evaluation
+fingerprints, runtime dependencies, and execution rules. It is immutable;
+freezing is not validation, approval, or a release.
 
 Share [the `prajnatrade-research` Skill](.github/skills/prajnatrade-research/SKILL.md)
 with both clients (register that Skill directory in clients that do not
