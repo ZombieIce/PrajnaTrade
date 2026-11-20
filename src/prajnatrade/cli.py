@@ -20,6 +20,10 @@ from prajnatrade.experiment import (
     experiment_resume, experiment_status, experiment_submit,
     freeze_experiment_candidate, project_init, project_status,
 )
+from prajnatrade.protected_eval import (
+    EvaluationRejection, agent_validation_status, authorize, create_plan,
+    evaluation_status, run_evaluation,
+)
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
@@ -49,8 +53,53 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         lookup.add_argument("--project", required=True, type=Path)
         lookup.add_argument("--campaign-id", required=True)
         lookup.add_argument("--submission-id", required=True)
+
+    evaluation = commands.add_parser(
+        "evaluation",
+        help="inspect coarse Validation receipts" if agent_only
+        else "freeze, authorize, and run protected Validation",
+    )
+    evaluation_commands = evaluation.add_subparsers(
+        dest="evaluation_command", required=True
+    )
     if agent_only:
+        evaluation_lookup = evaluation_commands.add_parser("status")
+        evaluation_lookup.add_argument("--project", required=True, type=Path)
+        evaluation_lookup.add_argument("--candidate-id", required=True)
         return parser
+
+    evaluation_plan = evaluation_commands.add_parser(
+        "plan", help="freeze a candidate's protected evaluation plan"
+    )
+    evaluation_plan.add_argument("--store", required=True, type=Path)
+    evaluation_plan.add_argument("--snapshot-store", required=True, type=Path)
+    evaluation_plan.add_argument("--project", required=True, type=Path)
+    evaluation_plan.add_argument("--candidate-id", required=True)
+    evaluation_plan.add_argument("--input", required=True, type=Path)
+
+    evaluation_authorize = evaluation_commands.add_parser(
+        "authorize", help="record the single human Validation authorization"
+    )
+    evaluation_authorize.add_argument("--store", required=True, type=Path)
+    evaluation_authorize.add_argument("--plan-id", required=True)
+    evaluation_authorize.add_argument("--stage", required=True, choices=["validation"])
+    evaluation_authorize.add_argument("--reviewer", required=True)
+    evaluation_authorize.add_argument("--reason", required=True)
+
+    evaluation_run = evaluation_commands.add_parser(
+        "run", help="run one authorized, isolated, debited Validation evaluation"
+    )
+    evaluation_run.add_argument("--store", required=True, type=Path)
+    evaluation_run.add_argument("--snapshot-store", required=True, type=Path)
+    evaluation_run.add_argument("--plan-id", required=True)
+    evaluation_run.add_argument("--stage", required=True, choices=["validation"])
+    evaluation_run.add_argument("--project", required=True, type=Path)
+
+    evaluation_status_parser = evaluation_commands.add_parser(
+        "status", help="show the frozen plan, authorizations, ledger and records"
+    )
+    evaluation_status_parser.add_argument("--store", required=True, type=Path)
+    evaluation_status_parser.add_argument("--plan-id", required=True)
 
     campaign = commands.add_parser("campaign", help="operator campaign setup")
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
@@ -248,6 +297,8 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
 def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
     parser = build_parser(agent_only=agent_only)
     args = parser.parse_args(argv)
+    if args.command == "evaluation":
+        return _evaluation_command(args, agent_only=agent_only)
     if args.command == "experiment":
         request = None
         try:
@@ -494,6 +545,43 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
     except (DataValidationError, OSError, sqlite3.Error, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+
+
+def _evaluation_command(args: argparse.Namespace, *, agent_only: bool) -> int:
+    try:
+        if args.evaluation_command == "status":
+            if agent_only:
+                result = agent_validation_status(args.project, args.candidate_id)
+            else:
+                result = evaluation_status(args.store, args.plan_id)
+        elif args.evaluation_command == "plan":
+            result = create_plan(
+                args.store, args.snapshot_store, args.project,
+                args.candidate_id, args.input,
+            )
+        elif args.evaluation_command == "authorize":
+            result = authorize(
+                args.store, args.plan_id, args.stage, args.reviewer, args.reason
+            )
+        else:
+            result = run_evaluation(
+                args.store, args.snapshot_store, args.project,
+                args.plan_id, args.stage,
+            )
+    except EvaluationRejection as error:
+        result = {
+            "schema_version": 1,
+            "status": "rejected",
+            "error": error.details,
+            **error.context,
+        }
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 2
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 0
 
 
 def _make_provider(args: argparse.Namespace) -> tuple[ResearchProvider, dict[str, object]]:

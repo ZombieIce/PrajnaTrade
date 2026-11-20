@@ -472,3 +472,174 @@ No hard risk limit is assumed when the flag is omitted.
 The Mock provider can emit deterministic Python when opted in, but a Mock
 campaign is never evidence of model novelty or investable performance. Results
 are research evidence, not investment advice or a guarantee of future returns.
+
+### Protected Validation (MVP-10, synthetic only)
+
+`prajnatrade evaluation ...` performs one preregistered, human-authorized,
+OS-isolated Validation evaluation of a frozen candidate against a sealed
+synthetic Validation partition. **This is synthetic engineering evidence only.**
+It does not consume real market data, does not validate a real strategy, does
+not prove independent out-of-sample evidence for real markets, and does not
+grant admission, approve a release, or replace human review. Final Holdout
+authorization and the controlled report belong to later tickets; this workflow
+fixes the two-stage plan but only executes Validation.
+
+The trusted store is one directory outside Git (the same store is reused by
+later release/Shadow Live workflows). The evaluation ledger in
+`queries.sqlite` is the budget boundary: use one trusted store per project and
+operator, because a copy of the store is a separate deployment with its own
+ledger.
+
+```text
+<store>/
+  plans/<plan_id>.json                                   # frozen plan (0400)
+  authorizations/<plan_id>/validation-<auth_id>.json     # one authorization
+  authorizations/<plan_id>/validation.authorized.json    # which one is used
+  audit/<audit_id>.json                                  # rejected requests
+  queries.sqlite                                         # debit ledger
+  records/<evaluation_id>/record.json                    # trusted record
+```
+
+#### 1. Freeze the plan before reading anything
+
+```sh
+prajnatrade evaluation plan --store /trusted/evaluations \
+  --snapshot-store /trusted/snapshots --project ./strategy-A \
+  --candidate-id <candidate-id> --input plan-input.json
+```
+
+`plan-input.json` can only declare the preregistered decision rules:
+
+```json
+{
+  "schema_version": 1,
+  "minimum_samples": {"sessions": 3, "valued_sessions": 3},
+  "thresholds": [
+    {"id": "drawdown", "metric": "max_drawdown", "op": ">=", "value": -0.25},
+    {"id": "relative", "metric": "return_delta", "op": ">=", "value": 0.0}
+  ],
+  "stress_costs": {"transaction_cost_bps": 20, "slippage_bps": 10},
+  "regimes": {"method": "trailing_volatility", "lookback": 5,
+              "volatility_threshold": 0.02, "labels": ["calm", "volatile"]},
+  "stages": ["validation", "final_holdout"],
+  "reason": "why these thresholds and samples were fixed in advance"
+}
+```
+
+Base costs, initial cash, signal window, execution rules, candidate JSON and
+dependencies, project ID, snapshot ID, and both protected partition descriptors
+are copied from the frozen candidate and sealed manifest; the plan input may
+not restate them (`base_costs`, `candidate_hash` and other bound fields are
+rejected). Metrics are a fixed registry: `sessions`, `valued_sessions`,
+`total_return`, `max_drawdown`, `sharpe`, `return_delta`, `stress_total_return`,
+`stress_return_delta`, `fees_paid`, `slippage_paid`, `unfilled_orders`.
+Operators are `>=`, `<=`, `>`, `<`, `==`. Stress costs must be at least the
+frozen base costs, `minimum_samples.sessions >= 1`, and `stages` must be exactly
+`["validation", "final_holdout"]`. The parameter neighbourhood is the existing
+declarative robustness plan (or an explicit `no_tunable_parameters`), frozen
+with its variants, exclusions, and thresholds.
+
+`plan_id` is the SHA-256 of the canonical plan without `plan_id`/`frozen_at`.
+Re-planning the same candidate with different rules creates a new plan; the
+previous immutable plan remains. The mapping `(plan_id, candidate_id, plan_hash,
+created_at)` is also stored in the project database so the research-side command
+can resolve a candidate's receipt.
+
+#### 2. Record the single human Validation authorization
+
+```sh
+prajnatrade evaluation authorize --store /trusted/evaluations \
+  --plan-id <plan-id> --stage validation \
+  --reviewer "reviewer name" --reason "frozen plan reviewed before Validation"
+```
+
+The authorization is an immutable record bound to the plan, candidate hash,
+snapshot, stage, and Validation partition fingerprint. A second authorization
+for the same stage is a conflict: the first is the one used, and
+`evaluation status` shows it. Final Holdout authorization is deliberately not
+implemented here.
+
+#### 3. Run the one debited Validation evaluation
+
+```sh
+prajnatrade evaluation run --store /trusted/evaluations \
+  --snapshot-store /trusted/snapshots --plan-id <plan-id> \
+  --stage validation --project ./strategy-A
+```
+
+Checks run **before** the sealed read: the plan's content address, the frozen
+candidate (re-read and hash-checked from the project), the sealed manifest and
+both protected descriptors, the project binding, the matching authorization,
+and the real macOS isolation probe. On any failure the request is rejected with
+a stable `error.code` (`FINGERPRINT_MISMATCH`, `AUTHORIZATION_REQUIRED`,
+`ISOLATION_UNAVAILABLE`, ...), a matching `audit/<audit_id>.json` with
+`opened_protected_source: false`, and no debit. There is no fallback to local
+execution and no bypass flag.
+
+Only then is the debit written: one SQLite `BEGIN IMMEDIATE` inserts the
+`(partition_name, partition_content_hash)` row and the evaluation row, keyed by
+the **content hash**, not by project, candidate, operator, or snapshot
+identity. Consequently:
+
+- the same plan/stage re-run returns the stored record and receipt, with no
+  second debit and no second read;
+- another candidate or plan against the same Validation content hash is
+  rejected (`QUERY_ALREADY_CONSUMED`) before reading;
+- re-packaging the identical protected content under a new snapshot ID cannot
+  buy another read;
+- concurrent requests serialise on the ledger; a request that loses the race is
+  rejected (`EVALUATION_IN_PROGRESS`) and never double-evaluates.
+
+After a successful read the engine accounts only over the Validation calendar,
+starting from the frozen initial cash with no holdings. The candidate and the
+same-basis `equal_weight_buy_and_hold` baseline run at base and stress costs;
+each uses the same frozen signal window, with Discovery as prior history for the
+point-in-time signal window (still enforced against the next session's 09:30
+Asia/Shanghai availability cutoff). The record contains the fingerprints,
+authorization and query receipts, isolation evidence, opened-source flag,
+availability rules, coverage and valuation/signal gaps, per-item threshold
+verdicts, base vs stress results, parameter neighbourhood, point-in-time market
+regimes with sample counts, and candidate/baseline NAV and drawdown curves. It
+is written immutably and is sufficient for the later controlled report. Any
+abort after the read keeps the debit, scores nothing, writes an
+`insufficient_evidence` record with `scoring: false`, and never retries. A
+documented synthetic fault hook, `PRAJNATRADE_TEST_FAILPOINT=evaluation_after_read`,
+exercises that path and has no effect when unset.
+
+Thresholds are evaluated item by item (`passed`, `failed`, `unavailable`). A
+single failed hard threshold means `rejected` even if other evidence is
+incomplete. With no failure, missing coverage, valuation gaps, signal gaps,
+sample counts below the frozen minimum, or an unavailable threshold metric mean
+`insufficient_evidence`. Only complete evidence with every threshold met means
+`passed`. The parameter neighbourhood is diagnostic, not a hard threshold, and
+no plan can add a generic return threshold after the fact.
+
+#### 4. What the research side may see
+
+The research-side command is read-only and cannot plan, authorize, or run:
+
+```sh
+prajnatrade-agent evaluation status --project ./strategy-A --candidate-id <id>
+```
+
+Its `validation` value is either `{"status": "pending"}` or exactly this
+coarse receipt:
+
+```json
+{"schema_version": 1, "stage": "validation",
+ "status": "passed|rejected|insufficient_evidence",
+ "reason": "THRESHOLD_NOT_MET|COVERAGE_INSUFFICIENT|EVIDENCE_INCOMPLETE",
+ "message": "..."}
+```
+
+It contains no numbers, dates, metrics, fills, curves, variants, logs,
+durations, or admission state (a passing receipt has `reason: null`). A
+rejected **request**
+(permissions, budget, fingerprint, isolation) is not a strategy failure and
+publishes no strategy receipt. The coarse receipt reflects the latest completed
+evaluation of that frozen plan; deterministic replay in the same trusted store
+returns the same payload.
+
+The operator view is `prajnatrade evaluation status --store <store>
+--plan-id <plan-id>`: the frozen plan, authorizations, query ledger state, and
+each stage's evaluation summary.

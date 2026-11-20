@@ -5,6 +5,7 @@ import math
 import hashlib
 import os
 import platform
+import re
 import selectors
 import socket
 import subprocess
@@ -408,20 +409,98 @@ def run_isolated_strategy(
     return result["weights"]
 
 
-def probe_isolation(limits: IsolationLimits | None = None) -> None:
+_PROBE_SOURCE = "def strategy(history, state):\n    return {CASH: 1.0}\n"
+
+
+def probe_isolation_evidence(limits: IsolationLimits | None = None) -> dict[str, Any]:
+    """Probe the real sandbox boundary used for generated strategy Python.
+
+    Returns the evidence dictionary instead of raising so the trusted evaluation
+    workflow can record why it rejected a protected read.  There is deliberately no
+    bypass: a probe that cannot prove the sandbox preflight reports
+    ``verified: False`` with a failure reason.
+    """
     limits = limits or DEFAULT_ISOLATION_LIMITS
     import pandas as pd
 
     from prajnatrade.data import ETF_SYMBOLS
 
-    run_isolated_strategy(
-        "def strategy(history, state):\n    return {CASH: 1.0}\n",
-        {},
-        pd.DataFrame(columns=("date", "symbol", "close")),
-        {},
-        symbols=ETF_SYMBOLS,
-        limits=limits,
-    )
+    captured: dict[str, Any] = {}
+
+    def capture(evidence: dict[str, Any]) -> None:
+        captured.update(evidence)
+
+    base: dict[str, Any] = {
+        "probe": "generated_python_worker_sandbox",
+        "runtime": "macOS sandbox_init" if sys.platform == "darwin" else "unavailable",
+        "os_version": platform.mac_ver()[0] or platform.system(),
+        "python_version": platform.python_version(),
+        "uid": os.geteuid() if hasattr(os, "geteuid") else None,
+        "limits": {
+            "wall_seconds": limits.wall_seconds,
+            "cpu_seconds": limits.cpu_seconds,
+            "address_space_bytes": limits.address_space_bytes,
+            "input_bytes": limits.input_bytes,
+            "output_bytes": limits.output_bytes,
+        },
+    }
+    try:
+        run_isolated_strategy(
+            _PROBE_SOURCE,
+            {},
+            pd.DataFrame(columns=("date", "symbol", "close")),
+            {},
+            symbols=ETF_SYMBOLS,
+            limits=limits,
+            evidence_callback=capture,
+        )
+    except KeyboardInterrupt:
+        raise
+    except IsolationError as error:
+        evidence = {**base, **(error.evidence or captured)}
+        return {
+            **evidence,
+            "verified": False,
+            "failure_reason": _isolation_failure_reason(error),
+        }
+    except Exception as error:  # noqa: BLE001 - evidence must survive any failure
+        return {
+            **base,
+            **captured,
+            "verified": False,
+            "failure_reason": f"{type(error).__name__}: {error}",
+        }
+    evidence = {**base, **captured}
+    verified = all(
+        evidence.get(key) is True
+        for key in (
+            "sandbox_preflight_verified",
+            "strategy_started",
+            "protected_read_denied",
+            "protected_write_denied",
+            "network_denied",
+            "process_creation_denied",
+        )
+    ) and evidence.get("opened_protected_input") is False
+    return {
+        **evidence,
+        "verified": verified,
+        "failure_reason": None if verified else "sandbox_preflight_unverified",
+    }
+
+
+def _isolation_failure_reason(error: IsolationError) -> str:
+    match = re.search(r"aborted: ([a-z_]+)", str(error))
+    return match.group(1) if match else "isolation_unavailable"
+
+
+def probe_isolation(limits: IsolationLimits | None = None) -> None:
+    evidence = probe_isolation_evidence(limits)
+    if not evidence["verified"]:
+        raise IsolationError(
+            f"OS isolation unavailable: {evidence['failure_reason']}.",
+            evidence=evidence,
+        )
 
 
 def _records(history: Any) -> list[dict[str, Any]]:
