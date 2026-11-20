@@ -63,7 +63,12 @@ reported separately from strategy P&L and a correction-caused negative cash
 balance is recorded as a deficit (never financed, never force-sold).  Dedupe is
 by ``(version_id, action_id, revision_id)`` across committed days, so a crash
 before the commit and a rerun after it never double-apply a delta.
-#34 (the comparison command) is intentionally not implemented here.
+#34 adds ``shadow.compare(ledger, data, versions)``: a read-only comparison of
+the longest common, consecutive run of committed forward sessions.  It reads
+only verified committed ledger rows, never interpolates, never mixes backtest
+data, rebases every version to the run's first closing NAV and reports the run
+fees, dividends, unfilled orders, correction impact and cash deficits next to a
+``strategy_return`` that excludes the run's correction impact.
 """
 
 from __future__ import annotations
@@ -102,6 +107,7 @@ INPUT_KIND = "shadow_live_input"
 DAY_KIND = "shadow_live_day"
 REPORT_KIND = "shadow_live_ledger_report"
 REPORT_SCOPE = "synthetic"
+COMPARISON_KIND = "shadow_forward_comparison"
 ACTIONS = ("cash_dividend", "share_adjustment")
 TRADING_STATUSES = ("trading", "suspended", "unknown")
 ORDER_STATUSES = (
@@ -1060,6 +1066,296 @@ def _report_summary(
 
 
 # ---------------------------------------------------------------------------
+# Multi-version forward comparison (#34): committed rows only, no interpolation
+# ---------------------------------------------------------------------------
+
+
+def _comparison_versions(versions: object) -> list[str]:
+    """Normalise the requested version list; a comparison needs two distinct IDs."""
+    if isinstance(versions, str):
+        raw = versions.split(",")
+    elif isinstance(versions, (list, tuple)):
+        raw = list(versions)
+    else:
+        raise _reject(
+            "INVALID_VERSIONS",
+            "compare",
+            "correct",
+            "The compared versions must be a comma-separated list of release IDs.",
+        )
+    requested: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise _reject(
+                "INVALID_VERSIONS",
+                "compare",
+                "correct",
+                "The compared versions contain an empty release ID.",
+            )
+        requested.append(item.strip())
+    if len(requested) < 2:
+        raise _reject(
+            "INVALID_VERSIONS",
+            "compare",
+            "correct",
+            "A forward comparison needs at least two version IDs.",
+        )
+    if len(set(requested)) != len(requested):
+        raise _reject(
+            "INVALID_VERSIONS",
+            "compare",
+            "correct",
+            "Each compared version may be requested only once.",
+        )
+    for version_id in requested:
+        if not _RELEASE_ID.fullmatch(version_id):
+            raise _reject(
+                "INVALID_RELEASE_ID",
+                "compare",
+                "correct",
+                "Release IDs are 64-character lowercase hexadecimal content addresses.",
+            )
+    return requested
+
+
+def _consecutive_runs(sessions: list[str], feed: Feed) -> list[list[str]]:
+    """Split committed dates into maximal runs of adjacent feed sessions."""
+    runs: list[list[str]] = []
+    run: list[str] = []
+    previous: int | None = None
+    for session in sessions:
+        index = feed.index[session]
+        if previous is not None and index == previous + 1:
+            run.append(session)
+        else:
+            if run:
+                runs.append(run)
+            run = [session]
+        previous = index
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _max_drawdown(navs: list[float]) -> float:
+    """Maximum peak-to-trough drawdown over the run (negative, as backtest.py)."""
+    peak: float | None = None
+    worst = 0.0
+    for nav in navs:
+        peak = nav if peak is None else max(peak, nav)
+        worst = min(worst, nav / peak - 1.0)
+    return worst
+
+
+def _comparison_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run metrics for one version, computed only from its committed day rows."""
+    start_nav = results[0]["nav"]
+    end_nav = results[-1]["nav"]
+    if (
+        isinstance(start_nav, bool)
+        or not isinstance(start_nav, (int, float))
+        or not math.isfinite(start_nav)
+        or start_nav <= 0
+    ):
+        raise _reject(
+            "INVALID_COMPARISON_BASELINE",
+            "compare",
+            "inspect",
+            "A compared version has no positive finite starting NAV in the common "
+            "run; a return cannot be normalised against it.",
+        )
+    navs = [float(result["nav"]) for result in results]
+    fees_paid = math.fsum(float(result["fees"]["day"]) for result in results)
+    dividends_paid = math.fsum(
+        float(payment["amount"])
+        for result in results
+        for payment in result["dividends"]["payments"]
+    )
+    correction_impact = math.fsum(
+        float(result.get("correction_impact", 0.0)) for result in results
+    )
+    corrections = [
+        {"date": result["date"], **correction}
+        for result in results
+        for correction in result.get("corrections", [])
+    ]
+    cash_deficits = [
+        {"date": result["date"], **result["cash_deficit"]}
+        for result in results
+        if result.get("cash_deficit")
+    ]
+    unfilled_orders = [
+        {
+            "date": result["date"],
+            "order_id": order["order_id"],
+            "symbol": order["symbol"],
+            "side": order["side"],
+            "quantity": order["quantity"],
+            "status": order["status"],
+            "reason": order["reason"],
+        }
+        for result in results
+        for order in result["orders"]
+        if order["status"] != "filled"
+    ]
+    return {
+        "starting_nav": float(start_nav),
+        "ending_nav": float(end_nav),
+        "cumulative_return": float(end_nav) / float(start_nav) - 1.0,
+        "max_drawdown": _max_drawdown(navs),
+        "fees_paid": fees_paid,
+        "dividends_paid": dividends_paid,
+        "unfilled_order_count": len(unfilled_orders),
+        "unfilled_orders": unfilled_orders,
+        "correction_impact": correction_impact,
+        "corrections": corrections,
+        "cash_deficits": cash_deficits,
+        "cash_deficit_total": math.fsum(
+            float(deficit["amount"]) for deficit in cash_deficits
+        ),
+        "strategy_return": (
+            (float(end_nav) - correction_impact) / float(start_nav) - 1.0
+        ),
+    }
+
+
+def _coverage_entry(
+    version_id: str, days: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    dates = sorted(days)
+    return {
+        "release_id": version_id,
+        "committed_coverage": {
+            "dates": dates,
+            "sessions": len(dates),
+            "first_committed_date": dates[0] if dates else None,
+            "last_committed_date": dates[-1] if dates else None,
+        },
+    }
+
+
+def compare(
+    ledger: str | Path,
+    data: str | Path,
+    versions: str | list[str] | tuple[str, ...],
+    output: str | Path | None = None,
+) -> dict[str, Any]:
+    """Compare the longest common, consecutive committed forward interval.
+
+    Only verified committed day rows are read (:meth:`Ledger.iter_days`); a
+    tampered row raises ``LEDGER_INTEGRITY_FAILED`` and the comparison never
+    re-runs a version, interpolates a session or mixes backtest data.  Every
+    version is rebased to the first common session's closing NAV.  Fewer than
+    two common consecutive sessions makes the comparison ``comparable: false``
+    with a stable reason and each version's committed coverage.  All requested
+    versions must share the chosen run; a version with too little common
+    history is never silently dropped.
+    """
+    feed = load_feed(data)
+    requested = _comparison_versions(versions)
+    path = Path(ledger)
+    if not path.is_dir() or not (path / "shadow.sqlite").is_file():
+        raise _reject(
+            "LEDGER_NOT_FOUND",
+            "compare",
+            "correct",
+            f"The Shadow Live ledger {path} does not exist; a comparison only "
+            "reads committed rows and never creates or re-runs a ledger.",
+        )
+    database = Ledger(path)
+    coverage: dict[str, dict[str, dict[str, Any]]] = {}
+    for version_id in requested:
+        days = {day["date"]: day for day in database.iter_days(version_id)}
+        if not days and database.get_progress(version_id) is None:
+            raise _reject(
+                "VERSION_NOT_FOUND",
+                "compare",
+                "correct",
+                f"The ledger has no committed history or progress for version "
+                f"{version_id}; comparison never invents a version.",
+            )
+        outside = sorted(session for session in days if session not in feed.index)
+        if outside:
+            raise _reject(
+                "FEED_CALENDAR_MISMATCH",
+                "compare",
+                "inspect",
+                f"Committed session(s) {', '.join(outside)} are not in this feed's "
+                "calendar; a session is never interpolated or re-dated.",
+            )
+        coverage[version_id] = days
+
+    common = sorted(set.intersection(*(set(days) for days in coverage.values())))
+    runs = _consecutive_runs(common, feed)
+    chosen = max(runs, key=lambda run: (len(run), feed.index[run[-1]])) if runs else []
+    comparable = len(chosen) >= 2
+    reason = None if comparable else "INSUFFICIENT_COMMON_SESSIONS"
+
+    per_version: dict[str, dict[str, Any]] = {}
+    for version_id in requested:
+        days = coverage[version_id]
+        entry = _coverage_entry(version_id, days)
+        if comparable:
+            entry.update(
+                {
+                    "included": True,
+                    "date_range": {"start": chosen[0], "end": chosen[-1]},
+                    "sessions": len(chosen),
+                    **_comparison_metrics(
+                        [days[session]["result"] for session in chosen]
+                    ),
+                }
+            )
+        else:
+            entry.update(
+                {
+                    "included": False,
+                    "reason": reason,
+                    "date_range": {"start": None, "end": None},
+                    "sessions": 0,
+                    "starting_nav": None,
+                    "ending_nav": None,
+                    "cumulative_return": None,
+                    "max_drawdown": None,
+                    "fees_paid": None,
+                    "dividends_paid": None,
+                    "unfilled_order_count": None,
+                    "unfilled_orders": [],
+                    "correction_impact": None,
+                    "corrections": [],
+                    "cash_deficits": [],
+                    "cash_deficit_total": None,
+                    "strategy_return": None,
+                }
+            )
+        per_version[version_id] = entry
+
+    document: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": COMPARISON_KIND,
+        "scope": SCOPE,
+        "versions": requested,
+        "comparable": comparable,
+        "reason": reason,
+        "comparison": {"comparable": comparable, "reason": reason},
+        "common_interval": {
+            "start": chosen[0] if comparable else None,
+            "end": chosen[-1] if comparable else None,
+            "sessions": len(chosen) if comparable else 0,
+        },
+        "per_version": per_version,
+    }
+    if output is not None:
+        destination = Path(output)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+    return document
+
+
+# ---------------------------------------------------------------------------
 # Per-version processing
 # ---------------------------------------------------------------------------
 
@@ -1121,6 +1417,7 @@ def _version_result(
         return _version_entry(
             release_id,
             "blocked",
+            target_date=target,
             reason=error.reason,
             reason_code=error.code,
             committed_date=last,
@@ -1133,6 +1430,7 @@ def _version_result(
         return _version_entry(
             release_id,
             "blocked",
+            target_date=target,
             reason=error.details["message"],
             reason_code=error.details["code"],
             committed_date=last,
@@ -1151,6 +1449,8 @@ def _version_entry(
     release_id: str,
     status: str,
     *,
+    target_date: str | None = None,
+    committed_at: str | None = None,
     reason: str | None = None,
     reason_code: str | None = None,
     committed_date: str | None = None,
@@ -1166,6 +1466,8 @@ def _version_entry(
     return {
         "release_id": release_id,
         "status": status,
+        "target_date": target_date,
+        "committed_at": committed_at,
         "reason": reason,
         "reason_code": reason_code,
         "committed_date": committed_date,
@@ -1288,6 +1590,7 @@ def _run_version(
             return _version_entry(
                 release_id,
                 "not_started",
+                target_date=target,
                 reason=(
                     "the release has no enablement at or before the target date; "
                     "approval alone never starts tracking"
@@ -1298,6 +1601,7 @@ def _run_version(
             return _version_entry(
                 release_id,
                 "not_started",
+                target_date=target,
                 reason=(
                     f"the release is first tracked on {feed.sessions[start_index]}, "
                     f"after the target date {target}"
@@ -1308,6 +1612,7 @@ def _run_version(
             return _version_entry(
                 release_id,
                 "retired",
+                target_date=target,
                 reason=(
                     "the release is retired at the target date and has no ledger "
                     "history to settle"
@@ -1324,7 +1629,9 @@ def _run_version(
                     "PROGRESS_MISMATCH",
                     f"The ledger progress points at {target} but no committed day is stored.",
                 )
-            return _committed_entry(release_id, day, status="already_committed", reason=None)
+            return _committed_entry(
+                release_id, day, status="already_committed", reason=None, target_date=target
+            )
         if last not in feed.index:
             raise _Blocked(
                 "FEED_CALENDAR_MISMATCH",
@@ -1335,7 +1642,8 @@ def _run_version(
             day = database.verified_day(release_id, target)
             if day is not None:
                 return _committed_entry(
-                    release_id, day, status="already_committed", reason=None
+                    release_id, day, status="already_committed", reason=None,
+                    target_date=target,
                 )
             raise _Blocked(
                 "PROGRESS_MISMATCH",
@@ -1365,11 +1673,18 @@ def _run_version(
             "PROGRESS_MISMATCH",
             f"The backfill finished but no committed day is stored for {target}.",
         )
-    return _committed_entry(release_id, day, status=day["result"]["status"], reason=None)
+    return _committed_entry(
+        release_id, day, status=day["result"]["status"], reason=None, target_date=target
+    )
 
 
 def _committed_entry(
-    release_id: str, day: dict[str, Any], *, status: str, reason: str | None
+    release_id: str,
+    day: dict[str, Any],
+    *,
+    status: str,
+    reason: str | None,
+    target_date: str | None = None,
 ) -> dict[str, Any]:
     result = day["result"]
     unfilled = [
@@ -1387,6 +1702,8 @@ def _committed_entry(
     return _version_entry(
         release_id,
         status,
+        target_date=target_date,
+        committed_at=day["committed_at"],
         reason=reason,
         committed_date=day["date"],
         last_committed_date=day["date"],

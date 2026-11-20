@@ -49,7 +49,13 @@ MOMENTUM_SYMBOL = SYMBOLS[0]  # 511260
 # ---------------------------------------------------------------------------
 
 
-def _create_campaign(project: Path, snapshot_store: Path, snapshot_id: str) -> dict:
+def _create_campaign(
+    project: Path,
+    snapshot_store: Path,
+    snapshot_id: str,
+    *,
+    initial_cash: float = 100_000.0,
+) -> dict:
     return ok(
         cli(
             "campaign",
@@ -65,7 +71,7 @@ def _create_campaign(project: Path, snapshot_store: Path, snapshot_id: str) -> d
             "--max-seconds",
             "60",
             "--initial-cash",
-            "100000",
+            format(initial_cash, "g"),
             "--transaction-cost-bps",
             "5",
             "--slippage-bps",
@@ -80,13 +86,20 @@ def build_release(
     name: str,
     family: str,
     parameters: dict,
+    *,
+    initial_cash: float = 100_000.0,
 ) -> dict:
     """Seal a snapshot, run both protected stages and approve one release."""
     root.mkdir(parents=True, exist_ok=True)
     sealed = seal_snapshot(root, payload, f"snapshots-{name}")
     project = root / f"project-{name}"
     ok(cli("project", "init", "--project", str(project)))
-    campaign = _create_campaign(project, sealed["store"], sealed["snapshot_id"])
+    campaign = _create_campaign(
+        project,
+        sealed["store"],
+        sealed["snapshot_id"],
+        initial_cash=initial_cash,
+    )
     source = root / f"submission-{name}.json"
     submit_experiment(
         project,

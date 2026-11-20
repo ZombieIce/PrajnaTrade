@@ -1062,11 +1062,13 @@ evidence, an operator records `sustained` for that revision.
 ### Shadow Live one-day ledger (MVP-13, synthetic only)
 
 `prajnatrade shadow update` accounts **one manually triggered synthetic trading
-day** for every tracked immutable release version, and `prajnatrade shadow
-report` dumps the committed ledger for trusted audit. Shadow Live is **virtual
-accounting only**: it never connects to a broker, never sends or simulates a
-real order, never reads real market data and never uses the network. Every
-number below is synthetic engineering evidence, not a strategy result.
+day** for every tracked immutable release version, `prajnatrade shadow report`
+dumps one version's committed ledger for trusted audit, and `prajnatrade shadow
+compare` compares the common, consecutive committed forward interval of two or
+more versions. Shadow Live is **virtual accounting only**: it never connects to
+a broker, never sends or simulates a real order, never reads real market data
+and never uses the network. Every number below is synthetic engineering
+evidence, not a strategy result.
 
 A release ID is the account boundary. Each version keeps its own cash,
 positions, orders, fees, slippage, dividends and NAV; prices may be shared,
@@ -1080,6 +1082,10 @@ prajnatrade shadow update --ledger /trusted/shadow-ledger \
   [--release-id <exact-release-id> ...]
 prajnatrade shadow report --ledger /trusted/shadow-ledger \
   --version <exact-release-id> --output ledger-report.json
+prajnatrade shadow compare --ledger /trusted/shadow-ledger \
+  --data synthetic-feed.json \
+  --versions <release-id>,<release-id>[,<release-id>...] \
+  [--output comparison.json]
 ```
 
 #### 1. The synthetic feed (`--data`)
@@ -1257,11 +1263,21 @@ For every session the day transaction is:
 ```json
 {"schema_version": 1, "scope": "synthetic", "target_date": "2030-01-07",
  "completed_at": "2030-01-08T01:02:03+00:00",
- "versions": [{"release_id": "...", "status": "committed", "reason": null,
-               "reason_code": null, "committed_date": "2030-01-07",
+ "versions": [{"release_id": "...", "status": "committed",
+               "target_date": "2030-01-07",
+               "committed_at": "2030-01-08T01:02:03.123456+00:00",
+               "reason": null, "reason_code": null,
+               "committed_date": "2030-01-07",
                "last_committed_date": "2030-01-07", "result_hash": "...",
                "anomalies": [], "unfilled_orders": []}]}
 ```
+
+Every version entry carries the requested `target_date` and the **actual**
+`committed_at` posting timestamp read from its committed day row; `committed_at`
+is `null` for `blocked`, `not_started` and `retired` versions (a version that
+did not commit has no posting time), and `committed_date` /
+`last_committed_date` describe the last committed session. A blocked version
+writes no day row and does not advance; the other versions still commit.
 
 | status | meaning |
 | --- | --- |
@@ -1404,16 +1420,119 @@ real market data, broker or network. It demonstrates the accounting and
 idempotency rules of #16/#33; it is not evidence of real forward performance and
 does not complete the real-chain acceptance of #35.
 
-#### 7. Hooks for #34, and limits
+#### 7. Multi-version forward comparison (#34, synthetic only)
+
+`prajnatrade shadow compare` is a **read-only** comparison of the forward
+history in one ledger. It never runs a strategy, never fills an order, never
+creates a ledger and never reads a backtest result: it selects the committed
+rows of the requested versions and computes a small, deterministic report. It
+is operator-only — `prajnatrade-agent` has no `shadow` command at all.
+
+**Common interval.** Only dates committed for **every** requested version are
+candidates. They are split into maximal runs of *consecutive* sessions in the
+supplied synthetic feed calendar, and the longest run is chosen; ties go to the
+latest run. Fewer than two sessions in that run makes the comparison
+`comparable: false` with reason `INSUFFICIENT_COMMON_SESSIONS` and each
+version's committed coverage (`committed_coverage.dates/sessions/
+first_committed_date/last_committed_date`), but no metrics. All requested
+versions must cover the chosen run: a third version with too little common
+history makes the whole request incomparable rather than being silently
+dropped or replaced by a shorter pair. There is **no interpolation**, no
+re-dating and no mixing of backtest or synthetic-snapshot results; the only
+inputs are the ledger's verified committed day rows and the feed calendar. The
+document carries no generated timestamps, so identical inputs produce
+byte-identical output.
+
+**Normalisation.** Each version is rebased to the first session of the chosen
+run: `starting_nav` is that day's closing NAV, `ending_nav` the last day's
+closing NAV, `cumulative_return = ending_nav / starting_nav - 1`, and
+`max_drawdown` is the worst peak-to-trough drawdown of the run's NAV series
+(negative, as in `backtest.py`). The pre-run history is never used to
+normalise and the versions share no cash or positions.
+
+**Run cash flows.** `fees_paid` sums the run's `fees.day`, `dividends_paid` sums
+the run's `dividends.payments[].amount` (actual pay-date transfers), and
+`unfilled_orders` lists every non-`filled` terminal order in the run (with its
+`status` and `reason`, e.g. `missing_open`, `missed_deadline`,
+`insufficient_cash`, `insufficient_shares`) plus `unfilled_order_count`. A
+genuine evidenced non-fill is reported, not treated as a block.
+
+**Corrections are separate.** `correction_impact` is the run's signed sum of
+the day-level correction deltas, `corrections` lists the applied revision
+records, and `cash_deficits` / `cash_deficit_total` surface every
+correction-caused negative cash balance. The strategy result excludes the
+correction:
+
+```text
+strategy_return = (ending_nav - correction_impact) / starting_nav - 1
+```
+
+so a verified dividend revision is never laundered into strategy P&L; the
+NAV-based `cumulative_return` still includes it, and the two differ by exactly
+`-correction_impact / starting_nav`.
+
+**Output schema.** The command prints (and, with `--output`, writes the same
+bytes to) a deterministic document:
+
+```json
+{"schema_version": 1, "kind": "shadow_forward_comparison",
+ "scope": "synthetic",
+ "versions": ["<requested id>", "<requested id>"],
+ "comparable": true, "reason": null,
+ "comparison": {"comparable": true, "reason": null},
+ "common_interval": {"start": "2030-01-04", "end": "2030-01-09", "sessions": 4},
+ "per_version": {"<release id>": {
+   "release_id": "<release id>", "included": true,
+   "date_range": {"start": "2030-01-04", "end": "2030-01-09"},
+   "sessions": 4, "committed_coverage": {"dates": ["..."], "sessions": 6,
+   "first_committed_date": "2030-01-02",
+   "last_committed_date": "2030-01-09"},
+   "starting_nav": 100000.0, "ending_nav": 101234.5,
+   "cumulative_return": 0.012345, "max_drawdown": -0.004,
+   "fees_paid": 61.2, "dividends_paid": 399.7,
+   "unfilled_orders": [{"date": "2030-01-08", "order_id": "...",
+     "symbol": "518880", "side": "buy", "quantity": 10306.9,
+     "status": "missing_open", "reason": "..."}],
+   "unfilled_order_count": 1,
+   "correction_impact": -39.97, "corrections": [{"..." : "..."}],
+   "cash_deficits": [{"date": "2030-01-11", "amount": 12.5,
+     "caused_by": "dividend_correction", "financed": false,
+     "forced_sale": false, "revision_ids": ["..."]}],
+   "cash_deficit_total": 12.5,
+   "strategy_return": 0.012745}}}
+```
+
+The requested order is preserved in `versions`; `per_version` is a map keyed by
+the exact release ID and every entry also repeats `release_id` so the document
+survives `sort_keys` serialisation. When incomparable, `common_interval` is
+`{start: null, end: null, sessions: 0}`, every entry has `included: false`, the
+reason and its committed coverage, and the metric fields are `null`/empty.
+
+**Read-only integrity.** Comparison reads only committed, content-addressed
+ledger rows and their frozen inputs (the same verified reader as
+`shadow.iter_committed_days`). A tampered day or input is a hard
+`LEDGER_INTEGRITY_FAILED` rejection (exit 2, no output written); a missing
+ledger is `LEDGER_NOT_FOUND`; a version with no committed history is
+`VERSION_NOT_FOUND`; a committed date outside the comparison feed's calendar is
+`FEED_CALENDAR_MISMATCH`; malformed version lists are `INVALID_VERSIONS` /
+`INVALID_RELEASE_ID`; an unreadable feed is `INVALID_FEED`. Nothing is
+recomputed, re-filled or recovered by falling back to another ledger, feed or
+store.
+
+**Synthetic scope.** The comparison is synthetic engineering evidence: synthetic
+releases, synthetic feed and synthetic prices, with no real forward sessions,
+no broker and no network. It demonstrates the #9/#34 comparison rules; it is
+not evidence of real forward performance and does not satisfy the real-chain
+gate of #35 (two real independently validated releases over at least two
+common committed real forward sessions).
+
+**Other limits.**
 
 - The day result is an extensible structured object with the `corrections`
-  records above, and the module exposes
-  `shadow.iter_committed_days(ledger, version_id=None)` yielding verified day
-  records for the #34 read side. The update loop is version-independent:
-  every version has fully independent cash, positions, orders, fees, dividends
-  and NAV.
-- No multi-version comparison command is implemented (#34); only the
-  per-version daily update and audit dump exist here.
+  records above, and `shadow.iter_committed_days(ledger, version_id=None)`
+  yields the same verified day records used by the comparison. The update loop
+  is version-independent: every version has fully independent cash, positions,
+  orders, fees, dividends and NAV.
 - Only the four declarative strategy families are executed. A release whose
   frozen strategy family is generated Python is blocked
   (`UNSUPPORTED_STRATEGY`): Shadow Live does not run generated Python locally.

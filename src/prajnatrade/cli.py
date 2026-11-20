@@ -211,6 +211,22 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_report.add_argument("--ledger", required=True, type=Path)
     shadow_report.add_argument("--version", required=True)
     shadow_report.add_argument("--output", required=True, type=Path)
+    shadow_compare = shadow_commands.add_parser(
+        "compare",
+        help="compare the longest common committed forward interval of selected versions",
+    )
+    shadow_compare.add_argument("--ledger", required=True, type=Path)
+    shadow_compare.add_argument(
+        "--data", required=True, type=Path, help="synthetic Shadow Live feed calendar"
+    )
+    shadow_compare.add_argument(
+        "--versions",
+        required=True,
+        help="comma-separated release IDs; every requested version must share the run",
+    )
+    shadow_compare.add_argument(
+        "--output", type=Path, help="write the deterministic comparison document"
+    )
 
     campaign = commands.add_parser("campaign", help="operator campaign setup")
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
@@ -762,7 +778,12 @@ def _shadow_command(args: argparse.Namespace) -> int:
             )
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 2 if blocked else 0
-        result = shadow.write_report(args.ledger, args.version, args.output)
+        if args.shadow_command == "compare":
+            result = shadow.compare(
+                args.ledger, args.data, args.versions, args.output
+            )
+        else:
+            result = shadow.write_report(args.ledger, args.version, args.output)
     except shadow.ShadowRejection as error:
         result = {
             "schema_version": 1,
