@@ -14,6 +14,10 @@ from prajnatrade.backtest import (
     run_backtest,
 )
 from prajnatrade.data import CASH, DataValidationError, load_bars, validate_calendar
+from prajnatrade.experiment import (
+    ProtocolError, campaign_create, error_context, experiment_status, experiment_submit,
+    project_init, project_status,
+)
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
@@ -25,6 +29,34 @@ from prajnatrade.validation import freeze_candidate, run_holdout, validate_candi
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="prajnatrade")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    project = commands.add_parser("project", help="initialize or inspect a project")
+    project_commands = project.add_subparsers(dest="project_command", required=True)
+    for action in ("init", "status"):
+        project_action = project_commands.add_parser(action)
+        project_action.add_argument("--project", required=True, type=Path)
+
+    campaign = commands.add_parser("campaign", help="operator campaign setup")
+    campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
+    create = campaign_commands.add_parser("create")
+    create.add_argument("--project", required=True, type=Path)
+    create.add_argument("--data", required=True, type=Path, help="synthetic Discovery bars")
+    create.add_argument("--data-kind", required=True, choices=["synthetic"])
+    create.add_argument("--attempts", required=True, type=int)
+    create.add_argument("--max-seconds", required=True, type=float)
+    create.add_argument("--initial-cash", type=float, default=100_000.0)
+    create.add_argument("--transaction-cost-bps", type=float, default=5.0)
+    create.add_argument("--slippage-bps", type=float, default=0.0)
+
+    experiment = commands.add_parser("experiment", help="submit and inspect Discovery experiments")
+    experiment_commands = experiment.add_subparsers(dest="experiment_command", required=True)
+    submit = experiment_commands.add_parser("submit")
+    submit.add_argument("--project", required=True, type=Path)
+    submit.add_argument("--input", required=True, type=Path)
+    experiment_status_parser = experiment_commands.add_parser("status")
+    experiment_status_parser.add_argument("--project", required=True, type=Path)
+    experiment_status_parser.add_argument("--campaign-id", required=True)
+    experiment_status_parser.add_argument("--submission-id", required=True)
 
     data = commands.add_parser("data", help="inspect and validate local datasets")
     data_commands = data.add_subparsers(dest="data_command", required=True)
@@ -171,6 +203,38 @@ def _add_budget_mode_arguments(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "experiment":
+        request = None
+        try:
+            if args.experiment_command == "submit":
+                try:
+                    request = json.loads(args.input.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                    raise ProtocolError(
+                        "INVALID_SUBMISSION", "admission", "correct", str(error),
+                    ) from error
+                result = experiment_submit(args.project, request)
+            else:
+                result = experiment_status(args.project, args.campaign_id, args.submission_id)
+        except ProtocolError as error:
+            result = {"schema_version": 1, "status": "rejected", "error": error.details}
+            if args.experiment_command == "status":
+                campaign_id, submission_id = args.campaign_id, args.submission_id
+            elif isinstance(request, dict):
+                campaign_id, submission_id = request.get("campaign_id"), request.get("submission_id")
+            else:
+                campaign_id = submission_id = None
+            try:
+                result.update(error_context(args.project, campaign_id, submission_id))
+            except (OSError, sqlite3.Error, ValueError):
+                result["error"]["project_context"] = "unavailable"
+        except (OSError, sqlite3.Error, ValueError) as error:
+            result = {
+                "schema_version": 1, "status": "failed",
+                "error": {"code": "PROJECT_ERROR", "phase": "project", "next_action": "inspect", "message": str(error)},
+            }
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 2 if result["status"] in {"failed", "rejected"} else 0
     try:
         if args.command == "snapshot":
             if args.snapshot_command == "seal":
@@ -180,6 +244,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result = snapshot.read_discovery(args.store, args.id, args.partition)
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+            return 0
+        if args.command == "project":
+            result = (
+                project_init(args.project) if args.project_command == "init"
+                else project_status(args.project)
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        if args.command == "campaign":
+            result = campaign_create(
+                args.project, args.data, args.attempts, args.max_seconds,
+                args.initial_cash, args.transaction_cost_bps, args.slippage_bps,
+            )
+            print(json.dumps(result, sort_keys=True, allow_nan=False))
             return 0
         if args.command == "research":
             trusted_local_python = getattr(args, "trusted_local_generated_python", False)
