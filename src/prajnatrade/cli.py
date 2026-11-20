@@ -28,7 +28,7 @@ from prajnatrade.protected_eval import (
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
-from prajnatrade import dividend, release, snapshot
+from prajnatrade import dividend, release, shadow, snapshot
 from prajnatrade.snapshot_baseline import run_discovery_baseline
 from prajnatrade.store import SQLiteStore
 from prajnatrade.validation import freeze_candidate, run_holdout, validate_candidate
@@ -153,6 +153,34 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         lifecycle.add_argument("--release-id", required=True)
         lifecycle.add_argument("--effective-signal-date", required=True)
         lifecycle.add_argument("--reason", required=True)
+
+    shadow_parser = commands.add_parser(
+        "shadow",
+        help="account one synthetic Shadow Live trading day and audit the ledger",
+    )
+    shadow_commands = shadow_parser.add_subparsers(
+        dest="shadow_command", required=True
+    )
+    shadow_update = shadow_commands.add_parser(
+        "update",
+        help="backfill and atomically commit one trading day for every tracked version",
+    )
+    shadow_update.add_argument("--ledger", required=True, type=Path)
+    shadow_update.add_argument("--store", required=True, type=Path)
+    shadow_update.add_argument("--data", required=True, type=Path)
+    shadow_update.add_argument("--date", required=True)
+    shadow_update.add_argument(
+        "--release-id",
+        action="append",
+        dest="release_ids",
+        help="process this exact release ID (repeatable); default is every tracked version",
+    )
+    shadow_report = shadow_commands.add_parser(
+        "report", help="dump the committed day records for trusted audit"
+    )
+    shadow_report.add_argument("--ledger", required=True, type=Path)
+    shadow_report.add_argument("--version", required=True)
+    shadow_report.add_argument("--output", required=True, type=Path)
 
     campaign = commands.add_parser("campaign", help="operator campaign setup")
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
@@ -354,6 +382,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
         return _evaluation_command(args, agent_only=agent_only)
     if args.command == "release":
         return _release_command(args)
+    if args.command == "shadow":
+        return _shadow_command(args)
     if args.command == "experiment":
         request = None
         try:
@@ -661,6 +691,35 @@ def _release_command(args: argparse.Namespace) -> int:
                 args.reason,
             )
     except release.ReleaseRejection as error:
+        result = {
+            "schema_version": 1,
+            "status": "rejected",
+            "error": error.details,
+            **error.context,
+        }
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 2
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 0
+
+
+def _shadow_command(args: argparse.Namespace) -> int:
+    try:
+        if args.shadow_command == "update":
+            result, blocked = shadow.update(
+                args.ledger,
+                args.store,
+                args.data,
+                args.date,
+                getattr(args, "release_ids", None),
+            )
+            print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+            return 2 if blocked else 0
+        result = shadow.write_report(args.ledger, args.version, args.output)
+    except shadow.ShadowRejection as error:
         result = {
             "schema_version": 1,
             "status": "rejected",

@@ -1,0 +1,2060 @@
+"""Shadow Live: one atomically committed, safely rerunnable synthetic trading day (#32).
+
+Shadow Live is **virtual accounting only**.  It never connects to a broker,
+never sends a real order and never reads real market data.  A *version* is an
+immutable approved release ID from :mod:`prajnatrade.release`; every version has
+its own cash, positions, orders, fees, dividends and NAV.  Prices may be shared,
+money never is.
+
+The operator runs ``prajnatrade shadow update`` once per session after the
+close.  For every tracked version the command backfills the sessions after the
+last committed one, one session at a time:
+
+1. Freeze the *complete* per-version/per-day input snapshot in SQLite **before**
+   computing.  Nothing is frozen when a required input is missing; the version
+   is blocked instead (no partial day, no progress advance).
+2. Apply share adjustments before the open, then book cash-dividend
+   entitlements for start-of-day holdings as receivables (ex-date), then settle
+   the pending orders at the unadjusted open in the deterministic order sells
+   before buys, then symbol.  Every order receives exactly one terminal state.
+3. Value at the unadjusted close plus cash and unpaid receivables.  A missing
+   held close, unresolved held-corporate-action terms or missing signal input
+   blocks that version only.
+4. When the release is still enabled at the session's after-close signal point,
+   generate the next session's signal from data available by that session's
+   15:00 Asia/Shanghai close and persist stable order IDs with the
+   pre-registered submission time.
+5. Commit the whole day (orders, fills, cash, positions, fees, slippage,
+   dividends, NAV, signal, next orders, progress, anomalies) in one SQLite
+   transaction.
+
+A crash after the frozen input but before the day commit leaves no day row;
+a rerun reuses the frozen input and produces an item-identical day.  A crash
+after the commit yields ``already_committed`` on rerun and never regenerates a
+signal or a fill.
+
+Point-in-time execution rule: an order is fill-eligible only when its recorded
+``submitted_at`` (the pre-registered after-close signal point) precedes the
+execution session's 09:30 Asia/Shanghai deadline **and** the day transaction
+that durably persisted it committed before that deadline in real wall-clock
+time (``persisted_before_deadline``).  Historical catch-up therefore records
+``missed_deadline`` instead of filling retroactively.
+
+Fault injection (documented, no effect when unset)::
+
+    PRAJNATRADE_TEST_FAILPOINT=shadow_after_fills
+    PRAJNATRADE_TEST_FAILPOINT=shadow_after_commit_before_report
+
+Ledger layout (outside Git and outside the research project)::
+
+    <ledger>/shadow.sqlite
+        input_snapshots(version_id, date, input_json, input_hash, frozen_at)
+        days(version_id, date, result_json, result_hash, committed_at, status)
+        progress(version_id, release_id, start_date, last_committed_date, state)
+
+#33 extension hook: every day result carries ``corrections: []`` and the module
+exposes :func:`iter_committed_days`.  The update loop is version-independent.
+#34 (the comparison command) is intentionally not implemented here.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import sqlite3
+from datetime import date, datetime, time, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+import pandas as pd
+
+from prajnatrade import release, snapshot
+from prajnatrade.backtest import _validate_weights
+from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.snapshot_baseline import (
+    _CN_TZ,
+    _available_by,
+    _is_executable_open,
+    _valid_price,
+)
+from prajnatrade.strategies import (
+    STRATEGY_FAMILIES,
+    make_strategy,
+    normalize_strategy_spec,
+)
+
+
+SCHEMA_VERSION = 1
+SCOPE = "synthetic"
+DATA_KIND = "synthetic"
+INPUT_KIND = "shadow_live_input"
+DAY_KIND = "shadow_live_day"
+REPORT_KIND = "shadow_live_ledger_report"
+REPORT_SCOPE = "synthetic"
+ACTIONS = ("cash_dividend", "share_adjustment")
+TRADING_STATUSES = ("trading", "suspended", "unknown")
+ORDER_STATUSES = (
+    "filled",
+    "missing_open",
+    "missed_deadline",
+    "insufficient_cash",
+    "insufficient_shares",
+)
+FAILPOINTS = ("shadow_after_fills", "shadow_after_commit_before_report")
+
+_OPEN = time(9, 30)
+_CLOSE = time(15, 0)
+_EPSILON = 1e-9
+_RELEASE_ID = re.compile(r"[0-9a-f]{64}")
+
+
+
+class ShadowRejection(Exception):
+    """A machine-readable Shadow Live refusal (never a strategy failure)."""
+
+    def __init__(
+        self,
+        code: str,
+        phase: str,
+        next_action: str,
+        message: str,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.details = {
+            "code": code,
+            "phase": phase,
+            "next_action": next_action,
+            "message": message,
+        }
+        self.context = dict(context or {})
+
+
+class ShadowFaultInjection(RuntimeError):
+    """Deterministic test failpoint; never raised unless explicitly requested."""
+
+
+class _Blocked(Exception):
+    """A per-version block: the version writes no day row and does not advance."""
+
+    def __init__(self, code: str, reason: str, *, detail: dict[str, Any] | None = None):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+        self.detail = dict(detail or {})
+
+
+def _reject(code: str, phase: str, next_action: str, message: str) -> ShadowRejection:
+    return ShadowRejection(code, phase, next_action, message)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _hash(value: object) -> str:
+    return snapshot._hash(value)
+
+
+def _failpoint(name: str) -> None:
+    if os.environ.get("PRAJNATRADE_TEST_FAILPOINT") == name:
+        raise ShadowFaultInjection(f"shadow test failpoint reached: {name}")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic feed (strict validation, point-in-time evidence)
+# ---------------------------------------------------------------------------
+
+
+def _session_open(session: str) -> datetime:
+    return datetime.combine(
+        datetime.fromisoformat(session).date(), _OPEN, tzinfo=_CN_TZ
+    )
+
+
+def _session_close(session: str) -> datetime:
+    return datetime.combine(
+        datetime.fromisoformat(session).date(), _CLOSE, tzinfo=_CN_TZ
+    )
+
+
+def _signal_point(session: str) -> str:
+    return _session_close(session).isoformat()
+
+
+def _evidence(row: dict[str, Any], label: str) -> None:
+    snapshot._instant(row.get("available_at"), f"{label}.available_at")
+    evidence = row.get("availability_evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise ValueError(f"{label} requires nonempty availability_evidence.")
+
+
+def _optional_number(value: object, label: str, *, positive: bool) -> None:
+    if value is None:
+        return
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or (value <= 0 if positive else value < 0)
+    ):
+        raise ValueError(f"{label} must be a {'positive' if positive else 'nonnegative'} finite number or null.")
+
+
+class Feed:
+    """A validated synthetic Shadow Live feed."""
+
+    def __init__(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            raise ValueError("The Shadow Live feed must be a JSON object.")
+        if payload.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("The Shadow Live feed must declare schema_version 1.")
+        if payload.get("data_kind") != DATA_KIND:
+            raise ValueError("The Shadow Live feed must declare data_kind 'synthetic'.")
+        symbols = payload.get("symbols")
+        if (
+            not isinstance(symbols, list)
+            or len(symbols) != len(ETF_SYMBOLS)
+            or set(symbols) != set(ETF_SYMBOLS)
+            or any(not isinstance(symbol, str) for symbol in symbols)
+        ):
+            raise ValueError(
+                "The Shadow Live feed must declare exactly the five ETF symbols."
+            )
+        self.symbols = tuple(ETF_SYMBOLS)
+
+        calendar = payload.get("calendar")
+        if not isinstance(calendar, list) or not calendar:
+            raise ValueError("The Shadow Live feed requires a nonempty calendar.")
+        sessions: list[str] = []
+        self.calendar: dict[str, dict[str, Any]] = {}
+        for row in calendar:
+            if not isinstance(row, dict):
+                raise ValueError("Calendar rows must be objects.")
+            try:
+                session = snapshot._date(row.get("date"))
+            except ValueError as error:
+                raise ValueError(f"Invalid calendar row: {error}") from error
+            _evidence(row, f"calendar {session}")
+            if sessions and session <= sessions[-1]:
+                raise ValueError("Calendar sessions must be unique and strictly increasing.")
+            sessions.append(session)
+            self.calendar[session] = row
+        self.sessions = tuple(sessions)
+        self.index = {session: index for index, session in enumerate(sessions)}
+        session_set = set(sessions)
+
+        raw_rows = payload.get("raw_bars")
+        if not isinstance(raw_rows, list) or not raw_rows:
+            raise ValueError("The Shadow Live feed requires raw_bars.")
+        self.raw: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                raise ValueError("raw_bars rows must be objects.")
+            session = _row_date(row, session_set, "raw_bars")
+            symbol = _row_symbol(row, "raw_bars")
+            _evidence(row, f"raw_bars {session} {symbol}")
+            if row.get("trading_status") not in TRADING_STATUSES:
+                raise ValueError(
+                    f"Invalid trading_status in raw_bars for {session} {symbol}."
+                )
+            for field in ("open", "high", "low", "close"):
+                if field not in row:
+                    raise ValueError(
+                        f"raw_bars {session} {symbol} is missing {field}; use null for a gap."
+                    )
+                _optional_number(row[field], f"raw_bars {field} {session} {symbol}", positive=True)
+            if "volume" not in row:
+                raise ValueError(
+                    f"raw_bars {session} {symbol} is missing volume; use null for a gap."
+                )
+            _optional_number(row["volume"], f"raw_bars volume {session} {symbol}", positive=False)
+            prices = [value for value in (row["open"], row["close"]) if value is not None]
+            high, low = row["high"], row["low"]
+            if (
+                (high is not None and any(high < price for price in prices))
+                or (low is not None and any(low > price for price in prices))
+                or (high is not None and low is not None and high < low)
+            ):
+                raise ValueError(f"Invalid OHLC values in raw_bars for {session} {symbol}.")
+            key = (session, symbol)
+            if key in self.raw:
+                raise ValueError(f"Duplicate raw_bars row for {session} {symbol}.")
+            self.raw[key] = row
+
+        derived_rows = payload.get("derived")
+        if not isinstance(derived_rows, list) or not derived_rows:
+            raise ValueError("The Shadow Live feed requires derived rows.")
+        self.derived: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in derived_rows:
+            if not isinstance(row, dict):
+                raise ValueError("derived rows must be objects.")
+            session = _row_date(row, session_set, "derived")
+            symbol = _row_symbol(row, "derived")
+            _evidence(row, f"derived {session} {symbol}")
+            if "value" not in row:
+                raise ValueError(
+                    f"derived {session} {symbol} is missing value; use null for a gap."
+                )
+            _optional_number(row["value"], f"derived value {session} {symbol}", positive=True)
+            key = (session, symbol)
+            if key in self.derived:
+                raise ValueError(f"Duplicate derived row for {session} {symbol}.")
+            self.derived[key] = row
+
+        action_rows = payload.get("corporate_actions", [])
+        if not isinstance(action_rows, list):
+            raise ValueError("corporate_actions must be an array.")
+        actions: list[dict[str, Any]] = []
+        action_ids: set[str] = set()
+        for raw_action in action_rows:
+            if not isinstance(raw_action, dict):
+                raise ValueError("corporate_actions rows must be objects.")
+            session = _row_date(raw_action, session_set, "corporate_actions")
+            symbol = _row_symbol(raw_action, "corporate_actions")
+            kind = raw_action.get("type")
+            if kind not in ACTIONS:
+                raise ValueError(f"Invalid corporate action type for {session} {symbol}.")
+            _evidence(raw_action, f"corporate_actions {session} {symbol}")
+            action_id = raw_action.get("action_id")
+            if action_id is None:
+                action_id = f"{kind}:{symbol}:{session}"
+            if not isinstance(action_id, str) or not action_id.strip():
+                raise ValueError("action_id must be a nonempty string when supplied.")
+            if action_id in action_ids:
+                raise ValueError(f"Duplicate corporate action id {action_id!r}.")
+            action_ids.add(action_id)
+            action = dict(raw_action)
+            action["action_id"] = action_id
+            action["date"] = session
+            action["symbol"] = symbol
+            if kind == "cash_dividend":
+                if "cash_per_share" not in action:
+                    raise ValueError(f"{action_id} is missing cash_per_share; use null for unknown terms.")
+                _optional_number(action["cash_per_share"], f"{action_id} cash_per_share", positive=True)
+                if "pay_date" not in action:
+                    raise ValueError(f"{action_id} is missing pay_date; use null for unknown terms.")
+                pay_date = action.get("pay_date")
+                if pay_date is not None:
+                    pay_date = snapshot._date(pay_date)
+                    if pay_date < session:
+                        raise ValueError(f"{action_id} pay_date precedes its ex-date.")
+                    action["pay_date"] = pay_date
+            else:
+                if "ratio" not in action:
+                    raise ValueError(f"{action_id} is missing ratio; use null for unknown terms.")
+                _optional_number(action["ratio"], f"{action_id} ratio", positive=True)
+            evidence = action.get("terms_evidence")
+            if evidence is not None and (
+                not isinstance(evidence, str) or not evidence.strip()
+            ):
+                raise ValueError(f"{action_id} has invalid terms_evidence.")
+            actions.append(action)
+        actions.sort(key=lambda item: (item["date"], item["symbol"], item["type"], item["action_id"]))
+        self.actions = tuple(actions)
+        self.actions_by_date: dict[str, tuple[dict[str, Any], ...]] = {}
+        for action in actions:
+            self.actions_by_date.setdefault(action["date"], ())
+            self.actions_by_date[action["date"]] = (
+                *self.actions_by_date[action["date"]],
+                action,
+            )
+
+    def next_session(self, session: str) -> str | None:
+        index = self.index[session]
+        if index + 1 >= len(self.sessions):
+            return None
+        return self.sessions[index + 1]
+
+
+def _row_date(row: dict, sessions: set[str], kind: str) -> str:
+    try:
+        session = snapshot._date(row.get("date"))
+    except ValueError as error:
+        raise ValueError(f"Invalid {kind} row date: {error}") from error
+    if session not in sessions:
+        raise ValueError(f"{kind} row date {session} is outside the feed calendar.")
+    return session
+
+
+def _row_symbol(row: dict, kind: str) -> str:
+    symbol = row.get("symbol")
+    if symbol not in ETF_SYMBOLS:
+        raise ValueError(f"Invalid symbol in {kind}.")
+    return symbol
+
+
+def load_feed(path: str | Path) -> Feed:
+    try:
+        payload = snapshot._read_json(Path(path))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise _reject(
+            "INVALID_FEED",
+            "feed",
+            "correct",
+            f"The synthetic Shadow Live feed is unreadable: {error}",
+        ) from error
+    try:
+        return Feed(payload)
+    except ValueError as error:
+        raise _reject("INVALID_FEED", "feed", "correct", str(error)) from error
+
+
+def _valid_close(row: dict | None, cutoff: datetime) -> bool:
+    return (
+        row is not None
+        and row.get("trading_status") == "trading"
+        and _valid_price(row.get("close"))
+        and _available_by(row, cutoff)
+    )
+
+
+def _terms_available(action: dict, cutoff: datetime) -> bool:
+    return _available_by(action, cutoff)
+
+
+def _terms_valid(action: dict) -> bool:
+    evidence = action.get("terms_evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        return False
+    if action["type"] == "cash_dividend":
+        amount = action.get("cash_per_share")
+        pay_date = action.get("pay_date")
+        return (
+            _valid_price(amount)
+            and isinstance(pay_date, str)
+            and pay_date >= action["date"]
+        )
+    return _valid_price(action.get("ratio"))
+
+
+# ---------------------------------------------------------------------------
+# SQLite ledger
+# ---------------------------------------------------------------------------
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS input_snapshots (
+  version_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  input_json TEXT NOT NULL,
+  input_hash TEXT NOT NULL,
+  frozen_at TEXT NOT NULL,
+  PRIMARY KEY (version_id, date)
+);
+CREATE TABLE IF NOT EXISTS days (
+  version_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  result_hash TEXT NOT NULL,
+  committed_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  PRIMARY KEY (version_id, date)
+);
+CREATE TABLE IF NOT EXISTS progress (
+  version_id TEXT PRIMARY KEY,
+  release_id TEXT NOT NULL,
+  start_date TEXT,
+  last_committed_date TEXT,
+  state TEXT
+);
+"""
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+
+
+class Ledger:
+    """The per-version Shadow Live ledger; days are keyed by version and session."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.directory = Path(path)
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.database = self.directory / "shadow.sqlite"
+        self.connection = sqlite3.connect(
+            self.database, isolation_level=None, timeout=30.0
+        )
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA busy_timeout = 30000")
+        self.connection.executescript(_SCHEMA)
+
+    # -- reads ---------------------------------------------------------
+
+    def get_progress(self, version_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT version_id, release_id, start_date, last_committed_date, state "
+            "FROM progress WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_day_row(self, version_id: str, session: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT version_id, date, result_json, result_hash, committed_at, status "
+            "FROM days WHERE version_id = ? AND date = ?",
+            (version_id, session),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_input_row(self, version_id: str, session: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT version_id, date, input_json, input_hash, frozen_at "
+            "FROM input_snapshots WHERE version_id = ? AND date = ?",
+            (version_id, session),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def verified_input(self, version_id: str, session: str) -> dict[str, Any] | None:
+        row = self.get_input_row(version_id, session)
+        if row is None:
+            return None
+        try:
+            body = json.loads(row["input_json"])
+        except (TypeError, ValueError) as error:
+            raise _integrity(
+                f"The frozen Shadow Live input for {session} is unreadable: {error}"
+            ) from error
+        if not isinstance(body, dict) or _hash(body) != row["input_hash"]:
+            raise _integrity(
+                f"The frozen Shadow Live input for {session} failed its content-address check."
+            )
+        if body.get("version_id") != version_id or body.get("date") != session:
+            raise _integrity(
+                f"The frozen Shadow Live input for {session} is bound to another version or date."
+            )
+        return {
+            "version_id": version_id,
+            "date": session,
+            "input": body,
+            "input_hash": row["input_hash"],
+            "frozen_at": row["frozen_at"],
+        }
+
+    def verified_day(self, version_id: str, session: str) -> dict[str, Any] | None:
+        row = self.get_day_row(version_id, session)
+        if row is None:
+            return None
+        try:
+            body = json.loads(row["result_json"])
+        except (TypeError, ValueError) as error:
+            raise _integrity(
+                f"The committed Shadow Live day {session} is unreadable: {error}"
+            ) from error
+        if not isinstance(body, dict) or _hash(body) != row["result_hash"]:
+            raise _integrity(
+                f"The committed Shadow Live day {session} failed its content-address check."
+            )
+        if body.get("version_id") != version_id or body.get("date") != session:
+            raise _integrity(
+                f"The committed Shadow Live day {session} is bound to another version or date."
+            )
+        if body.get("status") != row["status"]:
+            raise _integrity(
+                f"The committed Shadow Live day {session} has an inconsistent status column."
+            )
+        frozen = self.verified_input(version_id, session)
+        if frozen is None:
+            raise _integrity(
+                f"The committed Shadow Live day {session} has no frozen input snapshot."
+            )
+        if body.get("input_hash") != frozen["input_hash"]:
+            raise _integrity(
+                f"The committed Shadow Live day {session} is not bound to its frozen input."
+            )
+        return {**row, "result": body}
+
+    # -- writes --------------------------------------------------------
+
+    def _begin(self) -> None:
+        self.connection.execute("BEGIN IMMEDIATE")
+
+    def _rollback(self) -> None:
+        try:
+            self.connection.execute("ROLLBACK")
+        except sqlite3.OperationalError:  # pragma: no cover - no transaction open
+            pass
+
+    def freeze_input(
+        self, version_id: str, session: str, body: dict[str, Any], input_hash: str
+    ) -> bool:
+        """Freeze one complete input snapshot before computing; never overwrite."""
+        self._begin()
+        try:
+            existing = self.connection.execute(
+                "SELECT input_hash FROM input_snapshots WHERE version_id = ? AND date = ?",
+                (version_id, session),
+            ).fetchone()
+            if existing is not None:
+                self.connection.execute("COMMIT")
+                return False
+            self.connection.execute(
+                "INSERT INTO input_snapshots "
+                "(version_id, date, input_json, input_hash, frozen_at) VALUES (?, ?, ?, ?, ?)",
+                (version_id, session, _canonical(body), input_hash, _now()),
+            )
+            self.connection.execute("COMMIT")
+            return True
+        except BaseException:
+            self._rollback()
+            raise
+
+    def delete_input(self, version_id: str, session: str) -> None:
+        """Remove a never-committed input snapshot after a compute-time block."""
+        self._begin()
+        try:
+            self.connection.execute(
+                "DELETE FROM input_snapshots WHERE version_id = ? AND date = ?",
+                (version_id, session),
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self._rollback()
+            raise
+
+    def commit_day(
+        self,
+        version_id: str,
+        release_id: str,
+        session: str,
+        result: dict[str, Any],
+        result_hash: str,
+        expected_previous: str | None,
+        start_date: str,
+        state: str,
+    ) -> None:
+        """Commit one whole day and its progress atomically."""
+        self._begin()
+        try:
+            existing = self.connection.execute(
+                "SELECT 1 FROM days WHERE version_id = ? AND date = ?",
+                (version_id, session),
+            ).fetchone()
+            if existing is not None:
+                raise _Blocked(
+                    "DAY_ALREADY_COMMITTED",
+                    f"{session} is already committed; a day transaction is never replaced.",
+                )
+            progress = self.connection.execute(
+                "SELECT last_committed_date FROM progress WHERE version_id = ?",
+                (version_id,),
+            ).fetchone()
+            current = progress["last_committed_date"] if progress is not None else None
+            if current != expected_previous:
+                raise _Blocked(
+                    "PROGRESS_CONFLICT",
+                    f"Progress for the version is {current!r}, not the expected "
+                    f"{expected_previous!r}; refusing to skip or rewrite a session.",
+                )
+            self.connection.execute(
+                "INSERT INTO days "
+                "(version_id, date, result_json, result_hash, committed_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    version_id,
+                    session,
+                    _canonical(result),
+                    result_hash,
+                    _now(),
+                    result["status"],
+                ),
+            )
+            if progress is None:
+                self.connection.execute(
+                    "INSERT INTO progress "
+                    "(version_id, release_id, start_date, last_committed_date, state) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (version_id, release_id, start_date, session, state),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE progress SET last_committed_date = ?, state = ? "
+                    "WHERE version_id = ?",
+                    (session, state, version_id),
+                )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self._rollback()
+            raise
+
+    # -- iteration -----------------------------------------------------
+
+    def iter_days(self, version_id: str | None = None) -> Iterator[dict[str, Any]]:
+        if version_id is None:
+            rows = self.connection.execute(
+                "SELECT version_id, date FROM days ORDER BY version_id, date"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT version_id, date FROM days WHERE version_id = ? ORDER BY date",
+                (version_id,),
+            ).fetchall()
+        for row in rows:
+            day = self.verified_day(row["version_id"], row["date"])
+            assert day is not None  # row was just read
+            yield day
+
+
+def _integrity(message: str) -> ShadowRejection:
+    return _reject(
+        "LEDGER_INTEGRITY_FAILED",
+        "ledger",
+        "inspect",
+        message,
+    )
+
+
+def iter_committed_days(
+    ledger: str | Path, version_id: str | None = None
+) -> Iterator[dict[str, Any]]:
+    """Yield verified committed day records (the #33/#34 read hook)."""
+    return Ledger(ledger).iter_days(version_id)
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
+
+def update(
+    ledger: str | Path,
+    store: str | Path,
+    data: str | Path,
+    target_date: str,
+    release_ids: list[str] | tuple[str, ...] | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Process every tracked version up to ``target_date``; return (report, blocked)."""
+    feed = load_feed(data)
+    try:
+        target = snapshot._date(target_date)
+    except ValueError as error:
+        raise _reject("INVALID_DATE", "select", "correct", str(error)) from error
+    if target not in feed.index:
+        raise _reject(
+            "NOT_A_SESSION",
+            "select",
+            "correct",
+            f"{target} is not a session in the synthetic Shadow Live feed; a "
+            "non-session is never invented as a trading day.",
+        )
+    store_path = Path(store)
+    if not store_path.is_dir():
+        raise _reject(
+            "RELEASE_STORE_UNAVAILABLE",
+            "select",
+            "correct",
+            f"The trusted release store {store_path} is not a directory; Shadow "
+            "Live never falls back to a workspace copy or another store.",
+        )
+    database = Ledger(ledger)
+    requested = list(release_ids or [])
+    if requested:
+        for release_id in requested:
+            if not isinstance(release_id, str) or not _RELEASE_ID.fullmatch(release_id):
+                raise _reject(
+                    "INVALID_RELEASE_ID",
+                    "select",
+                    "correct",
+                    "Release IDs are 64-character lowercase hexadecimal content addresses.",
+                )
+        candidates = requested
+    else:
+        candidates = _tracked_release_directories(database, store_path, target)
+    versions = [
+        _version_result(database, store_path, feed, target, release_id)
+        for release_id in candidates
+    ]
+    blocked = any(version["status"] == "blocked" for version in versions)
+    return (
+        {
+            "schema_version": SCHEMA_VERSION,
+            "scope": SCOPE,
+            "target_date": target,
+            "completed_at": _now(),
+            "versions": versions,
+        },
+        blocked,
+    )
+
+
+def write_report(
+    ledger: str | Path, version_id: str, output: str | Path
+) -> dict[str, Any]:
+    """Write the trusted audit dump of every committed day of one version."""
+    if not isinstance(version_id, str) or not _RELEASE_ID.fullmatch(version_id):
+        raise _reject(
+            "INVALID_RELEASE_ID",
+            "report",
+            "correct",
+            "Release IDs are 64-character lowercase hexadecimal content addresses.",
+        )
+    database = Ledger(ledger)
+    days = list(database.iter_days(version_id))
+    progress = database.get_progress(version_id)
+    entries = [
+        {
+            "date": day["date"],
+            "status": day["status"],
+            "committed_at": day["committed_at"],
+            "result_hash": day["result_hash"],
+            "input_hash": day["result"]["input_hash"],
+            "verified": True,
+            "result": day["result"],
+        }
+        for day in days
+    ]
+    summary = _report_summary(entries, progress)
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": REPORT_KIND,
+        "scope": REPORT_SCOPE,
+        "version_id": version_id,
+        "generated_at": _now(),
+        "integrity": {
+            "verified": True,
+            "days_checked": len(entries),
+            "violations": [],
+        },
+        "progress": progress,
+        "summary": summary,
+        "days": entries,
+    }
+    destination = Path(output)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "written",
+        "kind": REPORT_KIND,
+        "scope": REPORT_SCOPE,
+        "version_id": version_id,
+        "output": str(destination),
+        "days": summary["days"],
+        "first_committed_date": summary["first_committed_date"],
+        "last_committed_date": summary["last_committed_date"],
+        "ending_nav": summary["ending_nav"],
+        "integrity": {
+            "verified": True,
+            "days_checked": len(entries),
+            "violations": [],
+        },
+        "integrity_verified": True,
+    }
+
+
+def _report_summary(
+    entries: list[dict[str, Any]], progress: dict[str, Any] | None
+) -> dict[str, Any]:
+    first = entries[0]["result"] if entries else None
+    last = entries[-1]["result"] if entries else None
+    initial_cash = first["execution"]["initial_cash"] if first else None
+    ending_nav = last["nav"] if last else None
+    return {
+        "days": len(entries),
+        "first_committed_date": entries[0]["date"] if entries else None,
+        "last_committed_date": entries[-1]["date"] if entries else None,
+        "progress": progress,
+        "initial_cash": initial_cash,
+        "ending_nav": ending_nav,
+        "total_return": (
+            ending_nav / initial_cash - 1.0
+            if ending_nav is not None and initial_cash
+            else None
+        ),
+        "fees_total": last["fees"]["total"] if last else 0.0,
+        "slippage_total": last["slippage"]["total"] if last else 0.0,
+        "dividends_cash_total": last["dividends"]["cash_total"] if last else 0.0,
+        "fills": sum(len(entry["result"]["fills"]) for entry in entries),
+        "unfilled_orders": sum(
+            1
+            for entry in entries
+            for order in entry["result"]["orders"]
+            if order["status"] != "filled"
+        ),
+        "anomalies": sum(len(entry["result"]["anomalies"]) for entry in entries),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-version processing
+# ---------------------------------------------------------------------------
+
+
+def _release_directories(store: Path) -> list[str]:
+    directory = store / "releases"
+    if not directory.is_dir():
+        return []
+    release_ids: list[str] = []
+    for path in sorted(directory.iterdir()):
+        if not path.is_dir() or not _RELEASE_ID.fullmatch(path.name):
+            raise _reject(
+                "RELEASE_INTEGRITY_FAILED",
+                "select",
+                "inspect",
+                f"Unknown object in the release store: {path.name!r}.",
+            )
+        release_ids.append(path.name)
+    return release_ids
+
+
+def _tracked_release_directories(
+    database: Ledger, store: Path, target: str
+) -> list[str]:
+    """Release IDs tracked at ``target`` (enabled, or paused/retired with history).
+
+    Approval alone never starts tracking.  A version whose state cannot be
+    verified is selected anyway and then reported as blocked, never silently
+    skipped.
+    """
+    tracked: list[str] = []
+    for release_id in _release_directories(store):
+        try:
+            state = release.state_at(store, release_id, target)
+        except release.ReleaseRejection:
+            tracked.append(release_id)
+            continue
+        progress = database.get_progress(release_id)
+        if state == "enabled":
+            tracked.append(release_id)
+        elif state in ("paused", "retired") and progress is not None:
+            tracked.append(release_id)
+    return tracked
+
+
+def _version_result(
+    database: Ledger,
+    store: Path,
+    feed: Feed,
+    target: str,
+    release_id: str,
+) -> dict[str, Any]:
+    try:
+        return _run_version(database, store, feed, target, release_id)
+    except _Blocked as error:
+        progress = _progress_or_none(database, release_id)
+        last = progress["last_committed_date"] if progress else None
+        return _version_entry(
+            release_id,
+            "blocked",
+            reason=error.reason,
+            reason_code=error.code,
+            committed_date=last,
+            last_committed_date=last,
+            detail=error.detail,
+        )
+    except ShadowRejection as error:
+        progress = _progress_or_none(database, release_id)
+        last = progress["last_committed_date"] if progress else None
+        return _version_entry(
+            release_id,
+            "blocked",
+            reason=error.details["message"],
+            reason_code=error.details["code"],
+            committed_date=last,
+            last_committed_date=last,
+        )
+
+
+def _progress_or_none(database: Ledger, release_id: str) -> dict[str, Any] | None:
+    try:
+        return database.get_progress(release_id)
+    except sqlite3.Error:  # pragma: no cover - defensive
+        return None
+
+
+def _version_entry(
+    release_id: str,
+    status: str,
+    *,
+    reason: str | None = None,
+    reason_code: str | None = None,
+    committed_date: str | None = None,
+    last_committed_date: str | None = None,
+    anomalies: list[dict[str, Any]] | None = None,
+    unfilled_orders: list[dict[str, Any]] | None = None,
+    result_hash: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "release_id": release_id,
+        "status": status,
+        "reason": reason,
+        "reason_code": reason_code,
+        "committed_date": committed_date,
+        "last_committed_date": last_committed_date,
+        "result_hash": result_hash,
+        "anomalies": list(anomalies or []),
+        "unfilled_orders": list(unfilled_orders or []),
+        **({"detail": detail} if detail else {}),
+    }
+
+
+def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
+    execution = artifact.get("execution")
+    required = (
+        "strategy",
+        "parameters",
+        "initial_cash",
+        "transaction_cost_bps",
+        "slippage_bps",
+        "signal_window_sessions",
+        "execution_rules",
+    )
+    if not isinstance(execution, dict) or any(key not in execution for key in required):
+        raise _Blocked(
+            "RELEASE_INVALID",
+            "The release artifact's frozen execution settings are incomplete.",
+        )
+    strategy = execution["strategy"]
+    family = strategy.get("family") if isinstance(strategy, dict) else None
+    if family not in STRATEGY_FAMILIES:
+        raise _Blocked(
+            "UNSUPPORTED_STRATEGY",
+            "Shadow Live does not execute generated Python strategies locally; "
+            f"the release declares family {family!r}.",
+        )
+    parameters = execution["parameters"]
+    if not isinstance(parameters, dict):
+        raise _Blocked(
+            "RELEASE_INVALID", "The release artifact's strategy parameters are malformed."
+        )
+    for name in ("initial_cash", "transaction_cost_bps", "slippage_bps"):
+        value = execution[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise _Blocked(
+                "RELEASE_INVALID", f"The release artifact's {name} is invalid."
+            )
+    if execution["initial_cash"] <= 0:
+        raise _Blocked(
+            "RELEASE_INVALID", "The release artifact's initial cash must be positive."
+        )
+    if execution["transaction_cost_bps"] >= 10_000 or execution["slippage_bps"] >= 10_000:
+        raise _Blocked(
+            "RELEASE_INVALID", "The release artifact's costs must be below 10,000 bps."
+        )
+    window = execution["signal_window_sessions"]
+    if isinstance(window, bool) or not isinstance(window, int) or window < 1:
+        raise _Blocked(
+            "RELEASE_INVALID", "The release artifact's signal window must be a positive integer."
+        )
+    try:
+        normalize_strategy_spec({"family": family, "parameters": dict(parameters)})
+    except ValueError as error:
+        raise _Blocked(
+            "RELEASE_INVALID",
+            f"The release artifact's frozen strategy parameters are invalid: {error}",
+        ) from error
+    return {
+        "strategy": {"family": family, "parameters": dict(parameters)},
+        "parameters": dict(parameters),
+        "initial_cash": float(execution["initial_cash"]),
+        "transaction_cost_bps": float(execution["transaction_cost_bps"]),
+        "slippage_bps": float(execution["slippage_bps"]),
+        "signal_window_sessions": window,
+        "execution_rules": execution["execution_rules"],
+    }
+
+
+def _run_version(
+    database: Ledger,
+    store: Path,
+    feed: Feed,
+    target: str,
+    release_id: str,
+) -> dict[str, Any]:
+    try:
+        fetched = release.fetch(store, release_id)
+    except release.ReleaseRejection as error:
+        raise _Blocked(error.details["code"], error.details["message"])
+    artifact = fetched["artifact"]
+    execution = _execution_settings(artifact)
+    try:
+        states = {
+            session: release.state_at(store, release_id, session)
+            for session in feed.sessions
+        }
+    except release.ReleaseRejection as error:
+        raise _Blocked(error.details["code"], error.details["message"])
+    target_index = feed.index[target]
+    target_state = states[target]
+    progress = database.get_progress(release_id)
+    if progress is None:
+        start_index = next(
+            (
+                index
+                for index, session in enumerate(feed.sessions)
+                if states[session] != "published"
+            ),
+            None,
+        )
+        if start_index is None:
+            return _version_entry(
+                release_id,
+                "not_started",
+                reason=(
+                    "the release has no enablement at or before the target date; "
+                    "approval alone never starts tracking"
+                ),
+                reason_code="NOT_ENABLED",
+            )
+        if start_index > target_index:
+            return _version_entry(
+                release_id,
+                "not_started",
+                reason=(
+                    f"the release is first tracked on {feed.sessions[start_index]}, "
+                    f"after the target date {target}"
+                ),
+                reason_code="ENABLED_AFTER_TARGET",
+            )
+        if target_state == "retired":
+            return _version_entry(
+                release_id,
+                "retired",
+                reason=(
+                    "the release is retired at the target date and has no ledger "
+                    "history to settle"
+                ),
+                reason_code="RETIRED_WITHOUT_HISTORY",
+            )
+        prior = _initial_prior(execution)
+    else:
+        last = progress["last_committed_date"]
+        if last == target:
+            day = database.verified_day(release_id, target)
+            if day is None:
+                raise _Blocked(
+                    "PROGRESS_MISMATCH",
+                    f"The ledger progress points at {target} but no committed day is stored.",
+                )
+            return _committed_entry(release_id, day, status="already_committed", reason=None)
+        if last not in feed.index:
+            raise _Blocked(
+                "FEED_CALENDAR_MISMATCH",
+                f"The last committed session {last} is not in this feed's calendar; "
+                "refusing to guess the next session.",
+            )
+        if feed.index[last] > target_index:
+            day = database.verified_day(release_id, target)
+            if day is not None:
+                return _committed_entry(
+                    release_id, day, status="already_committed", reason=None
+                )
+            raise _Blocked(
+                "PROGRESS_MISMATCH",
+                f"The ledger already advanced past {target} but has no committed day for it.",
+            )
+        prior = _prior_from_ledger(database, release_id, last)
+        start_index = feed.index[last] + 1
+
+    for index in range(start_index, target_index + 1):
+        session = feed.sessions[index]
+        prior = _process_session(
+            database,
+            feed,
+            artifact,
+            execution,
+            release_id,
+            index,
+            session,
+            states[session],
+            prior,
+            target,
+        )
+    day = database.verified_day(release_id, target)
+    if day is None:
+        raise _Blocked(
+            "PROGRESS_MISMATCH",
+            f"The backfill finished but no committed day is stored for {target}.",
+        )
+    return _committed_entry(release_id, day, status=day["result"]["status"], reason=None)
+
+
+def _committed_entry(
+    release_id: str, day: dict[str, Any], *, status: str, reason: str | None
+) -> dict[str, Any]:
+    result = day["result"]
+    unfilled = [
+        {
+            "order_id": order["order_id"],
+            "symbol": order["symbol"],
+            "side": order["side"],
+            "quantity": order["quantity"],
+            "status": order["status"],
+            "reason": order["reason"],
+        }
+        for order in result["orders"]
+        if order["status"] != "filled"
+    ]
+    return _version_entry(
+        release_id,
+        status,
+        reason=reason,
+        committed_date=day["date"],
+        last_committed_date=day["date"],
+        anomalies=result["anomalies"],
+        unfilled_orders=unfilled,
+        result_hash=day["result_hash"],
+    )
+
+
+def _initial_prior(execution: dict[str, Any]) -> dict[str, Any]:
+    initial = float(execution["initial_cash"])
+    return {
+        "date": None,
+        "cash": initial,
+        "positions": {symbol: 0.0 for symbol in ETF_SYMBOLS},
+        "receivables": [],
+        "fees_total": 0.0,
+        "slippage_total": 0.0,
+        "dividend_entitled_total": 0.0,
+        "dividend_cash_total": 0.0,
+        "nav": initial,
+        "next_orders": [],
+        "start_date": None,
+        "last_committed_date": None,
+    }
+
+
+def _prior_from_ledger(
+    database: Ledger, release_id: str, session: str
+) -> dict[str, Any]:
+    day = database.verified_day(release_id, session)
+    if day is None:
+        raise _Blocked(
+            "PROGRESS_MISMATCH",
+            f"The ledger progress points at {session} but no committed day is stored.",
+        )
+    return _prior_from_result(day["result"])
+
+
+def _prior_from_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": result["date"],
+        "cash": float(result["cash"]),
+        "positions": {
+            symbol: float(result["positions"][symbol]["quantity"])
+            for symbol in ETF_SYMBOLS
+        },
+        "receivables": [dict(item) for item in result["dividends"]["receivables"]],
+        "fees_total": float(result["fees"]["total"]),
+        "slippage_total": float(result["slippage"]["total"]),
+        "dividend_entitled_total": float(result["dividends"]["entitled_total"]),
+        "dividend_cash_total": float(result["dividends"]["cash_total"]),
+        "nav": float(result["nav"]),
+        "next_orders": [dict(order) for order in result["next_orders"]],
+        "start_date": result["progress"]["start_date"],
+        "last_committed_date": result["date"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# One session: freeze input -> compute -> deterministic failpoints -> commit
+# ---------------------------------------------------------------------------
+
+
+def _process_session(
+    database: Ledger,
+    feed: Feed,
+    artifact: dict[str, Any],
+    execution: dict[str, Any],
+    release_id: str,
+    index: int,
+    session: str,
+    state: str,
+    prior: dict[str, Any],
+    target: str,
+) -> dict[str, Any]:
+    built, blockers, _ = _build_input(
+        feed, artifact, execution, release_id, index, prior, state
+    )
+    input_hash = _hash(built)
+    frozen = database.verified_input(release_id, session)
+    if frozen is not None:
+        if frozen["input_hash"] != input_hash:
+            raise _Blocked(
+                "FROZEN_INPUT_CHANGED",
+                f"The frozen input for {session} no longer matches the feed and "
+                f"prior account state (frozen {frozen['input_hash'][:12]}, current "
+                f"{input_hash[:12]}); refusing to mix frozen and current inputs.",
+                detail={
+                    "frozen_input_hash": frozen["input_hash"],
+                    "current_input_hash": input_hash,
+                },
+            )
+        body = frozen["input"]
+        frozen_now = False
+    else:
+        if blockers:
+            code, reason = blockers[0]
+            raise _Blocked(code, reason, detail={"blockers": [b[0] for b in blockers]})
+        body = built
+        frozen_now = database.freeze_input(release_id, session, body, input_hash)
+
+    now = datetime.now(timezone.utc)
+    try:
+        result = _compute_day(body, execution, now)
+    except _Blocked:
+        if frozen_now:
+            # The completeness pre-check missed a required input; remove the
+            # just-written snapshot so a fixed feed can retry instead of being
+            # stuck on an incomplete frozen input.  A block is never a day row.
+            database.delete_input(release_id, session)
+        raise
+    database.commit_day(
+        version_id=release_id,
+        release_id=release_id,
+        session=session,
+        result=result,
+        result_hash=_hash(result),
+        expected_previous=prior["last_committed_date"],
+        start_date=result["progress"]["start_date"],
+        state=state,
+    )
+    if session == target:
+        _failpoint("shadow_after_commit_before_report")
+    return _prior_from_result(result)
+
+
+def _build_input(
+    feed: Feed,
+    artifact: dict[str, Any],
+    execution: dict[str, Any],
+    release_id: str,
+    index: int,
+    prior: dict[str, Any],
+    state: str,
+) -> tuple[dict[str, Any], list[tuple[str, str]], list[dict[str, Any]]]:
+    """Assemble the complete deterministic input body and its completeness report."""
+    session = feed.sessions[index]
+    next_session = feed.next_session(session)
+    raw = {symbol: feed.raw.get((session, symbol)) for symbol in ETF_SYMBOLS}
+    actions = list(feed.actions_by_date.get(session, ()))
+    window_size = execution["signal_window_sessions"]
+    window_sessions = list(feed.sessions[max(0, index - window_size + 1) : index + 1])
+    derived_window = [
+        {"session": day, "symbol": symbol, "row": feed.derived.get((day, symbol))}
+        for day in window_sessions
+        for symbol in ETF_SYMBOLS
+    ]
+    open_cutoff = _session_open(session)
+    close_cutoff = _session_close(session)
+    held = {
+        symbol: quantity
+        for symbol, quantity in prior["positions"].items()
+        if quantity > _EPSILON
+    }
+    pending = [dict(order) for order in prior["next_orders"]]
+    buy_symbols = {
+        order["symbol"]
+        for order in pending
+        if order.get("side") == "buy" and order.get("symbol") in ETF_SYMBOLS
+    }
+    blockers: list[tuple[str, str]] = []
+    anomalies: list[dict[str, Any]] = []
+
+    for symbol in sorted(set(held) | buy_symbols):
+        if not _valid_close(raw.get(symbol), close_cutoff):
+            blockers.append(
+                (
+                    "missing_close",
+                    f"{symbol} has no confirmed unadjusted close available by "
+                    f"{close_cutoff.isoformat()}.",
+                )
+            )
+    for action in actions:
+        symbol = action["symbol"]
+        available = _terms_available(action, open_cutoff)
+        valid = _terms_valid(action)
+        if held.get(symbol, 0.0) <= _EPSILON:
+            if not available or not valid:
+                anomalies.append(
+                    {
+                        "code": "corporate_action_terms_unavailable",
+                        "symbol": symbol,
+                        "action_id": action["action_id"],
+                        "held": False,
+                    }
+                )
+            continue
+        if not available:
+            blockers.append(
+                (
+                    "missing_action_terms",
+                    f"{action['action_id']} terms are not available by the "
+                    f"{session} open cutoff.",
+                )
+            )
+        elif not valid:
+            blockers.append(
+                (
+                    "missing_action_terms",
+                    f"{action['action_id']} has unresolved or incomplete terms.",
+                )
+            )
+
+    signal_due = state == "enabled" and next_session is not None
+    if signal_due:
+        if len(window_sessions) < window_size:
+            anomalies.append(
+                {
+                    "code": "signal_window_incomplete",
+                    "date": session,
+                    "required_sessions": window_size,
+                    "available_sessions": len(window_sessions),
+                }
+            )
+        else:
+            signal_gap = False
+            for entry in derived_window:
+                row = entry["row"]
+                label = f"derived value for {entry['symbol']} on {entry['session']}"
+                if row is None or row.get("value") is None:
+                    blockers.append(("missing_signal_input", f"{label} is missing."))
+                    signal_gap = True
+                elif not _available_by(row, close_cutoff):
+                    blockers.append(
+                        (
+                            "missing_signal_input",
+                            f"{label} is not available by {close_cutoff.isoformat()}.",
+                        )
+                    )
+                    signal_gap = True
+            if not signal_gap:
+                history_rows = [
+                    {
+                        "date": entry["session"],
+                        "symbol": entry["symbol"],
+                        "close": float(entry["row"]["value"]),
+                    }
+                    for entry in derived_window
+                ]
+                sizing_symbols = _possible_target_symbols(
+                    execution, history_rows, prior, pending
+                )
+                for symbol in sorted(sizing_symbols - set(held) - buy_symbols):
+                    if not _valid_close(raw.get(symbol), close_cutoff):
+                        blockers.append(
+                            (
+                                "missing_close",
+                                f"{symbol} has no confirmed unadjusted close for the "
+                                f"signal's order sizing at {session}.",
+                            )
+                        )
+
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": INPUT_KIND,
+        "version_id": release_id,
+        "date": session,
+        "release": {
+            "release_id": release_id,
+            "artifact_hash": artifact["artifact_hash"],
+            "candidate_id": artifact.get("candidate_id"),
+            "candidate_hash": artifact.get("candidate_hash"),
+            "plan_id": artifact.get("plan_id"),
+            "snapshot_id": artifact.get("snapshot_id"),
+        },
+        "artifact_hash": artifact["artifact_hash"],
+        "execution": {
+            "strategy": execution["strategy"],
+            "parameters": execution["parameters"],
+            "initial_cash": execution["initial_cash"],
+            "transaction_cost_bps": execution["transaction_cost_bps"],
+            "slippage_bps": execution["slippage_bps"],
+            "signal_window_sessions": execution["signal_window_sessions"],
+            "execution_rules": execution["execution_rules"],
+        },
+        "release_state_at_signal_point": state,
+        "previous": prior,
+        "session": {
+            "date": session,
+            "next_session": next_session,
+            "calendar": feed.calendar[session],
+            "raw_bars": raw,
+            "corporate_actions": actions,
+            "derived_window": {
+                "sessions": window_sessions,
+                "rows": derived_window,
+            },
+        },
+        "anomalies": anomalies,
+    }
+    return body, blockers, anomalies
+
+
+def _possible_target_symbols(
+    execution: dict[str, Any],
+    history_rows: list[dict[str, Any]],
+    prior: dict[str, Any],
+    pending: list[dict[str, Any]],
+) -> set[str]:
+    """Symbols the frozen strategy could target, so their closes are required.
+
+    The strategy is deterministic; only the post-settlement account state is not
+    known before settlement.  Run it at the two extreme states (nothing fills /
+    every pending order fills) and require the union of target symbols.  All
+    four declarative families either ignore the account state or depend only on
+    whether a position is open, so this is exact for them and conservative for
+    an unknown (never generated) strategy.
+    """
+    try:
+        strategy = make_strategy(
+            {
+                "family": execution["strategy"]["family"],
+                "parameters": dict(execution["parameters"]),
+            }
+        )
+    except ValueError:
+        return set(ETF_SYMBOLS)
+    base_shares = {
+        symbol: float(prior["positions"].get(symbol, 0.0)) for symbol in ETF_SYMBOLS
+    }
+    filled_shares = dict(base_shares)
+    for order in pending:
+        symbol = order.get("symbol")
+        if symbol not in filled_shares:
+            return set(ETF_SYMBOLS)
+        quantity = float(order.get("quantity", 0.0))
+        if order.get("side") == "buy":
+            filled_shares[symbol] += quantity
+        else:
+            filled_shares[symbol] = max(0.0, filled_shares[symbol] - quantity)
+    states = (
+        {"cash": float(prior["cash"]), "shares": base_shares, "equity": float(prior["nav"])},
+        {
+            "cash": float(prior["cash"]),
+            "shares": filled_shares,
+            "equity": float(prior["nav"]),
+        },
+    )
+    targets: set[str] = set()
+    for state in states:
+        try:
+            weights = strategy(pd.DataFrame(history_rows), state)
+        except (ValueError, TypeError):
+            return set(ETF_SYMBOLS)
+        if weights is None:
+            continue
+        try:
+            normalized = _validate_weights(weights)
+        except ValueError:
+            return set(ETF_SYMBOLS)
+        targets.update(
+            symbol for symbol in ETF_SYMBOLS if normalized.get(symbol, 0.0) > _EPSILON
+        )
+    return targets
+
+
+def _cash_tolerance(cash: float) -> float:
+    return 1e-9 * max(1.0, abs(cash))
+
+
+def _compute_day(
+    body: dict[str, Any], execution: dict[str, Any], now: datetime
+) -> dict[str, Any]:
+    session = body["date"]
+    prior = body["previous"]
+    state = body["release_state_at_signal_point"]
+    next_session = body["session"]["next_session"]
+    raw = body["session"]["raw_bars"]
+    actions = list(body["session"]["corporate_actions"])
+    anomalies = [dict(item) for item in body.get("anomalies", [])]
+    fee_rate = float(execution["transaction_cost_bps"]) / 10_000.0
+    slippage_rate = float(execution["slippage_bps"]) / 10_000.0
+    open_cutoff = _session_open(session)
+    close_cutoff = _session_close(session)
+
+    cash = float(prior["cash"])
+    shares = {
+        symbol: float(prior["positions"].get(symbol, 0.0)) for symbol in ETF_SYMBOLS
+    }
+    receivables = [dict(item) for item in prior["receivables"]]
+    fees_total = float(prior["fees_total"])
+    slippage_total = float(prior["slippage_total"])
+    dividend_entitled_total = float(prior["dividend_entitled_total"])
+    dividend_cash_total = float(prior["dividend_cash_total"])
+    start_shares = dict(shares)
+
+    # (a) corporate actions: share adjustments first, then cash-dividend
+    # entitlements for start-of-day holdings on the ex-date.
+    applied: list[dict[str, Any]] = []
+    adjustments = sorted(
+        (action for action in actions if action["type"] == "share_adjustment"),
+        key=lambda action: (action["symbol"], action["action_id"]),
+    )
+    dividends = sorted(
+        (action for action in actions if action["type"] == "cash_dividend"),
+        key=lambda action: (action["symbol"], action["action_id"]),
+    )
+    for action in adjustments:
+        symbol = action["symbol"]
+        quantity = start_shares.get(symbol, 0.0)
+        if quantity <= _EPSILON:
+            applied.append(
+                {
+                    "action_id": action["action_id"],
+                    "type": action["type"],
+                    "symbol": symbol,
+                    "ex_date": session,
+                    "status": "ignored_not_held",
+                }
+            )
+            continue
+        if not _terms_available(action, open_cutoff) or not _terms_valid(action):
+            raise _Blocked(
+                "missing_action_terms",
+                f"{action['action_id']} has unresolved or unavailable terms.",
+            )
+        ratio = float(action["ratio"])
+        before = shares[symbol]
+        shares[symbol] = before * ratio
+        applied.append(
+            {
+                "action_id": action["action_id"],
+                "type": action["type"],
+                "symbol": symbol,
+                "ex_date": session,
+                "ratio": ratio,
+                "status": "applied",
+                "shares_before": before,
+                "shares_after": shares[symbol],
+            }
+        )
+    for action in dividends:
+        symbol = action["symbol"]
+        quantity = start_shares.get(symbol, 0.0)
+        if quantity <= _EPSILON:
+            applied.append(
+                {
+                    "action_id": action["action_id"],
+                    "type": action["type"],
+                    "symbol": symbol,
+                    "ex_date": session,
+                    "status": "ignored_not_held",
+                }
+            )
+            continue
+        if not _terms_available(action, open_cutoff) or not _terms_valid(action):
+            raise _Blocked(
+                "missing_action_terms",
+                f"{action['action_id']} has unresolved or unavailable terms.",
+            )
+        amount_per_share = float(action["cash_per_share"])
+        amount = quantity * amount_per_share
+        entitlement = {
+            "action_id": action["action_id"],
+            "symbol": symbol,
+            "ex_date": session,
+            "pay_date": action["pay_date"],
+            "quantity": quantity,
+            "cash_per_share": amount_per_share,
+            "amount": amount,
+        }
+        receivables.append(entitlement)
+        dividend_entitled_total += amount
+        applied.append({**entitlement, "type": action["type"], "status": "receivable"})
+
+    # (b) settle the previous session's pending orders at the unadjusted open,
+    # sells before buys and then by symbol; exactly one terminal state each.
+    pending = sorted(
+        prior["next_orders"],
+        key=lambda order: (
+            0 if order.get("side") == "sell" else 1,
+            order.get("symbol", ""),
+            order.get("order_id", ""),
+        ),
+    )
+    orders: list[dict[str, Any]] = []
+    fills: list[dict[str, Any]] = []
+    day_fees = 0.0
+    day_slippage = 0.0
+    for order in pending:
+        symbol = order["symbol"]
+        side = order["side"]
+        quantity = float(order["quantity"])
+        record = {
+            "order_id": order["order_id"],
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "signal_date": order.get("signal_date"),
+            "execution_date": order.get("execution_date"),
+            "submitted_at": order.get("submitted_at"),
+            "deadline": order.get("deadline"),
+            "persisted_before_deadline": order.get("persisted_before_deadline"),
+            "target_weight": order.get("target_weight"),
+            "date": session,
+            "status": None,
+            "reason": None,
+            "fill": None,
+        }
+        submitted_at = order.get("submitted_at")
+        try:
+            submitted = datetime.fromisoformat(submitted_at) if submitted_at else None
+        except (TypeError, ValueError):
+            submitted = None
+        if (
+            submitted is None
+            or submitted.tzinfo is None
+            or submitted >= open_cutoff
+            or order.get("persisted_before_deadline") is not True
+        ):
+            record["status"] = "missed_deadline"
+            record["reason"] = (
+                "the order was not durably submitted before the execution "
+                "session's 09:30 Asia/Shanghai deadline; it is never filled "
+                "retroactively"
+            )
+            orders.append(record)
+            continue
+        row = raw.get(symbol)
+        if not _is_executable_open(row, open_cutoff):
+            record["status"] = "missing_open"
+            record["reason"] = (
+                "no confirmed unadjusted open is available for this symbol; this "
+                "order expires without blocking the other orders"
+            )
+            orders.append(record)
+            continue
+        raw_open = float(row["open"])
+        if side == "buy":
+            price = raw_open * (1.0 + slippage_rate)
+            fee = quantity * price * fee_rate
+            cost = quantity * price + fee
+            if cost > cash + _cash_tolerance(cash):
+                record["status"] = "insufficient_cash"
+                record["reason"] = (
+                    "available cash at the open is below the frozen order cost; "
+                    "the order is never resized, levered or partially filled"
+                )
+                orders.append(record)
+                continue
+            cash -= cost
+            shares[symbol] += quantity
+            slippage = quantity * (price - raw_open)
+        else:
+            if quantity > shares[symbol] + _EPSILON:
+                record["status"] = "insufficient_shares"
+                record["reason"] = (
+                    "start-of-settlement holdings are below the frozen sell "
+                    "quantity; the order is never resized and shorting is refused"
+                )
+                orders.append(record)
+                continue
+            price = raw_open * (1.0 - slippage_rate)
+            fee = quantity * price * fee_rate
+            cash += quantity * price - fee
+            shares[symbol] -= quantity
+            if abs(shares[symbol]) <= _EPSILON:
+                shares[symbol] = 0.0
+            slippage = quantity * (raw_open - price)
+        fees_total += fee
+        slippage_total += slippage
+        day_fees += fee
+        day_slippage += slippage
+        fill = {
+            "date": session,
+            "order_id": order["order_id"],
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "raw_open": raw_open,
+            "price": price,
+            "price_basis": "unadjusted_open",
+            "notional": quantity * raw_open,
+            "fee": fee,
+            "slippage": slippage,
+        }
+        record["status"] = "filled"
+        record["fill"] = fill
+        orders.append(record)
+        fills.append(fill)
+    if abs(cash) <= _cash_tolerance(cash):
+        cash = 0.0
+
+    _failpoint("shadow_after_fills")
+
+    # (c) pay-date transfer from receivable to cash; NAV does not jump because
+    # the receivable is removed as the cash is added.
+    payments: list[dict[str, Any]] = []
+    for item in sorted(
+        list(receivables),
+        key=lambda entry: (
+            entry.get("pay_date") or "",
+            entry.get("action_id") or "",
+            entry.get("symbol") or "",
+        ),
+    ):
+        if item["pay_date"] <= session:
+            cash += item["amount"]
+            dividend_cash_total += item["amount"]
+            payments.append(
+                {
+                    "action_id": item["action_id"],
+                    "symbol": item["symbol"],
+                    "ex_date": item["ex_date"],
+                    "pay_date": item["pay_date"],
+                    "amount": item["amount"],
+                    "status": "paid",
+                }
+            )
+            receivables.remove(item)
+
+    # (d) value at the unadjusted close plus cash and unpaid receivables.
+    positions: dict[str, dict[str, Any]] = {}
+    market_value = 0.0
+    for symbol in ETF_SYMBOLS:
+        quantity = shares[symbol]
+        row = raw.get(symbol)
+        close: float | None = None
+        if quantity > _EPSILON and not _valid_close(row, close_cutoff):
+            raise _Blocked(
+                "missing_close",
+                f"{symbol} is held but has no confirmed unadjusted close "
+                f"available by {close_cutoff.isoformat()}.",
+            )
+        if _valid_close(row, close_cutoff):
+            close = float(row["close"])
+        value = quantity * close if quantity > _EPSILON and close is not None else 0.0
+        if quantity > _EPSILON and close is None:  # pragma: no cover - guarded above
+            raise _Blocked("missing_close", f"{symbol} cannot be valued.")
+        market_value += value
+        positions[symbol] = {
+            "quantity": quantity,
+            "close": close,
+            "market_value": value,
+        }
+    receivable_total = math.fsum(item["amount"] for item in receivables)
+    nav = cash + market_value + receivable_total
+
+    # (e) generate the next session's signal only when the release is enabled at
+    # this session's after-close signal point.
+    signal: dict[str, Any] | None = None
+    next_orders: list[dict[str, Any]] = []
+    if state == "enabled" and next_session is not None:
+        window = body["session"]["derived_window"]
+        if len(window["sessions"]) >= execution["signal_window_sessions"]:
+            history_rows: list[dict[str, Any]] = []
+            latest_values: dict[str, float] = {}
+            for entry in window["rows"]:
+                row = entry["row"]
+                value = None if row is None else row.get("value")
+                if value is None:
+                    raise _Blocked(
+                        "missing_signal_input",
+                        f"derived value for {entry['symbol']} on {entry['session']} is missing.",
+                    )
+                if not _available_by(row, close_cutoff):
+                    raise _Blocked(
+                        "missing_signal_input",
+                        f"derived value for {entry['symbol']} on {entry['session']} "
+                        f"is not available by {close_cutoff.isoformat()}.",
+                    )
+                history_rows.append(
+                    {
+                        "date": entry["session"],
+                        "symbol": entry["symbol"],
+                        "close": float(value),
+                    }
+                )
+                if entry["session"] == session:
+                    latest_values[entry["symbol"]] = float(value)
+            strategy = make_strategy(
+                {
+                    "family": execution["strategy"]["family"],
+                    "parameters": dict(execution["parameters"]),
+                }
+            )
+            try:
+                weights = strategy(
+                    pd.DataFrame(history_rows),
+                    {"cash": cash, "shares": dict(shares), "equity": nav},
+                )
+            except (ValueError, TypeError) as error:
+                raise _Blocked(
+                    "strategy_error",
+                    f"The frozen strategy failed on the after-close signal input: {error}",
+                ) from error
+            if weights is not None:
+                try:
+                    normalized = _validate_weights(weights)
+                except ValueError as error:
+                    raise _Blocked(
+                        "strategy_error",
+                        f"The frozen strategy returned invalid target weights: {error}",
+                    ) from error
+                signal = {
+                    "date": session,
+                    "execution_date": next_session,
+                    "target_weights": normalized,
+                    "total_return_values": latest_values,
+                    "window": list(window["sessions"]),
+                }
+                next_orders = _next_orders(
+                    body,
+                    normalized,
+                    shares,
+                    cash,
+                    cash + market_value,
+                    fee_rate,
+                    slippage_rate,
+                    now,
+                )
+
+    status = "committed"
+    if anomalies or any(order["status"] != "filled" for order in orders):
+        status = "committed_with_anomalies"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": DAY_KIND,
+        "scope": SCOPE,
+        "status": status,
+        "version_id": body["version_id"],
+        "date": session,
+        "release": body["release"],
+        "artifact_hash": body["artifact_hash"],
+        "input_hash": _hash(body),
+        "release_state_at_signal_point": state,
+        "execution": {
+            "strategy": body["execution"]["strategy"],
+            "parameters": body["execution"]["parameters"],
+            "initial_cash": body["execution"]["initial_cash"],
+            "transaction_cost_bps": body["execution"]["transaction_cost_bps"],
+            "slippage_bps": body["execution"]["slippage_bps"],
+            "signal_window_sessions": body["execution"]["signal_window_sessions"],
+        },
+        "previous": {"date": prior["date"], "nav": prior["nav"]},
+        "corporate_actions": applied,
+        "dividends": {
+            "entitlements": [
+                item for item in applied if item.get("status") == "receivable"
+            ],
+            "payments": payments,
+            "receivables": [dict(item) for item in receivables],
+            "entitled_total": dividend_entitled_total,
+            "cash_total": dividend_cash_total,
+        },
+        "orders": orders,
+        "fills": fills,
+        "cash": cash,
+        "positions": positions,
+        "market_value": market_value,
+        "dividend_receivables": receivable_total,
+        "nav": nav,
+        "fees": {"day": day_fees, "total": fees_total},
+        "slippage": {"day": day_slippage, "total": slippage_total},
+        "signal": signal,
+        "next_orders": next_orders,
+        "anomalies": anomalies,
+        "corrections": [],
+        "progress": {
+            "start_date": prior["start_date"] or session,
+            "last_committed_date": session,
+        },
+    }
+
+
+def _next_orders(
+    body: dict[str, Any],
+    weights: dict[str, float],
+    shares: dict[str, float],
+    cash: float,
+    close_equity: float,
+    fee_rate: float,
+    slippage_rate: float,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Size the next session's orders at the signal close and persist them.
+
+    Orders are concrete frozen quantities.  Buy quantities include the frozen
+    fees and slippage, and the whole buy side is scaled at *creation* time by
+    the post-cost budget (cash plus the same signal's net sell proceeds), so a
+    full rebalance does not systematically fail on costs.  Settlement never
+    resizes an order.
+    """
+    session = body["date"]
+    next_session = body["session"]["next_session"]
+    raw = body["session"]["raw_bars"]
+    deadline = _session_open(next_session)
+    submitted_at = _signal_point(session)
+    cost_multiplier = (1.0 + fee_rate) * (1.0 + slippage_rate)
+    close_cutoff = _session_close(session)
+    intents: list[dict[str, Any]] = []
+    sell_value = 0.0
+    buy_cost = 0.0
+    for symbol in ETF_SYMBOLS:
+        weight = float(weights.get(symbol, 0.0))
+        quantity_held = shares[symbol]
+        if weight <= _EPSILON and quantity_held <= _EPSILON:
+            continue
+        row = raw.get(symbol)
+        if not _valid_close(row, close_cutoff):
+            raise _Blocked(
+                "missing_close",
+                f"{symbol} has no confirmed unadjusted close for order sizing.",
+            )
+        close = float(row["close"])
+        current_value = quantity_held * close
+        target_value = close_equity * weight
+        if target_value < current_value:
+            quantity = (current_value - target_value) / close
+            if quantity <= _EPSILON:
+                continue
+            sell_value += current_value - target_value
+            intents.append(
+                {"symbol": symbol, "side": "sell", "quantity": quantity, "weight": weight}
+            )
+        else:
+            cost = target_value - current_value
+            if cost <= _EPSILON:
+                continue
+            buy_cost += cost
+            intents.append(
+                {"symbol": symbol, "side": "buy", "cost": cost, "weight": weight}
+            )
+    budget = cash + sell_value * (1.0 - slippage_rate) * (1.0 - fee_rate)
+    scale = min(1.0, budget / buy_cost) if buy_cost > 0 else 1.0
+    if scale < 0.0:
+        scale = 0.0
+    orders: list[dict[str, Any]] = []
+    for intent in intents:
+        symbol = intent["symbol"]
+        if intent["side"] == "sell":
+            quantity = intent["quantity"]
+        else:
+            close = float(raw[symbol]["close"])
+            quantity = intent["cost"] * scale / (close * cost_multiplier)
+        if quantity <= _EPSILON:
+            continue
+        identity = {
+            "version_id": body["version_id"],
+            "signal_date": session,
+            "symbol": symbol,
+            "side": intent["side"],
+            "quantity": quantity,
+            "target_weight": intent["weight"],
+        }
+        orders.append(
+            {
+                **identity,
+                "order_id": "ord-" + _hash(identity)[:32],
+                "execution_date": next_session,
+                "submitted_at": submitted_at,
+                "deadline": deadline.isoformat(),
+                "persisted_before_deadline": now < deadline,
+            }
+        )
+    return orders
