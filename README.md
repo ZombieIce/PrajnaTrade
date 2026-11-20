@@ -576,6 +576,19 @@ a stable `error.code` (`FINGERPRINT_MISMATCH`, `AUTHORIZATION_REQUIRED`,
 `opened_protected_source: false`, and no debit. There is no fallback to local
 execution and no bypass flag.
 
+Protected Validation checks the **macOS sandbox boundary only**: it evaluates
+declarative strategies in the trusted controller and never executes untrusted
+or generated Python. On a host where the generated-Python worker's 2 GiB
+address-space limit cannot be enforced, the probe retries the boundary without
+RLIMIT_AS and records `memory_limit_enforced: false` together with
+`failure_reason: "memory_limit_unavailable"`; `verified` still requires
+`sandbox_init`, protected read/write denial, network denial and process-creation
+denial to pass. A passed Validation therefore does **not** imply that
+generated-Python memory, time or process isolation is verified: that claim
+remains blocked by #12/#18/#27, and the generated-Python gate
+(`--isolated-generated-python`) still refuses to execute when the memory limit
+is unavailable.
+
 Only then is the debit written: one SQLite `BEGIN IMMEDIATE` inserts the
 `(partition_name, partition_content_hash)` row and the evaluation row, keyed by
 the **content hash**, not by project, candidate, operator, or snapshot

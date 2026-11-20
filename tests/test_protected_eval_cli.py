@@ -565,6 +565,7 @@ def test_unverified_isolation_rejects_before_the_debit_or_sealed_read(
         lambda limits=None: {
             "verified": False,
             "failure_reason": "sandbox_install_failed",
+            "memory_limit_enforced": False,
             "sandbox_preflight_verified": False,
             "opened_protected_input": False,
         },
@@ -581,6 +582,11 @@ def test_unverified_isolation_rejects_before_the_debit_or_sealed_read(
     assert error.value.details["phase"] == "run"
     assert error.value.context["opened_protected_source"] is False
     assert error.value.context["query_debited"] is False
+    assert error.value.context["isolation"] == {
+        "verified": False,
+        "memory_limit_enforced": False,
+        "failure_reason": "sandbox_install_failed",
+    }
     assert consumed_rows(store) == []
     assert evaluation_rows(store) == []
     audits = list((store / "audit").glob("*.json"))
@@ -589,6 +595,155 @@ def test_unverified_isolation_rejects_before_the_debit_or_sealed_read(
     assert audit["error"]["code"] == "ISOLATION_UNAVAILABLE"
     assert audit["opened_protected_source"] is False
     assert audit["query_debited"] is False
+    assert audit["isolation"] == {
+        "verified": False,
+        "memory_limit_enforced": False,
+        "failure_reason": "sandbox_install_failed",
+    }
+
+
+def _fake_probe_success(**overrides: object) -> dict:
+    evidence = {
+        "probe": "generated_python_worker_sandbox",
+        "runtime": "synthetic probe result",
+        "sandbox_preflight_verified": True,
+        "protected_read_denied": True,
+        "protected_write_denied": True,
+        "network_denied": True,
+        "process_creation_denied": True,
+        "strategy_started": True,
+        "opened_protected_input": False,
+        "memory_limit_enforced": False,
+        "failure_reason": "memory_limit_unavailable",
+        "uid": 501,
+        "profile_sha256": "0" * 64,
+        "limits": {"wall_seconds": 10.0},
+        "verified": True,
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+def test_boundary_probe_falls_back_when_only_the_memory_limit_is_unenforceable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from prajnatrade import isolation
+
+    attempts: list[bool] = []
+
+    def fake_runner(
+        source: str,
+        parameters: dict,
+        history: object,
+        state: dict,
+        *,
+        symbols: tuple[str, ...],
+        limits: object = None,
+        evidence_callback=None,
+        enforce_memory_limit: bool = True,
+    ) -> dict:
+        attempts.append(enforce_memory_limit)
+        if enforce_memory_limit:
+            raise isolation.IsolationError(
+                "OS-isolated strategy aborted: memory_limit_unavailable.",
+                evidence={
+                    "memory_limit_enforced": False,
+                    "sandbox_preflight_verified": False,
+                },
+            )
+        assert evidence_callback is not None
+        evidence_callback(
+            {
+                key: value
+                for key, value in _fake_probe_success().items()
+                if key not in {"verified", "failure_reason"}
+            }
+        )
+        return {"CASH": 1.0}
+
+    monkeypatch.setattr(isolation, "run_isolated_strategy", fake_runner)
+    evidence = isolation.probe_isolation_evidence()
+    assert attempts == [True, False]
+    assert evidence["verified"] is True
+    assert evidence["sandbox_preflight_verified"] is True
+    assert evidence["memory_limit_enforced"] is False
+    assert evidence["failure_reason"] == "memory_limit_unavailable"
+
+
+def test_boundary_probe_does_not_retry_after_a_sandbox_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from prajnatrade import isolation
+
+    attempts: list[bool] = []
+
+    def fake_runner(*args: object, **kwargs: object) -> dict:
+        attempts.append(bool(kwargs["enforce_memory_limit"]))
+        raise isolation.IsolationError(
+            "OS-isolated strategy aborted: sandbox_install_failed."
+        )
+
+    monkeypatch.setattr(isolation, "run_isolated_strategy", fake_runner)
+    evidence = isolation.probe_isolation_evidence()
+    assert attempts == [True]
+    assert evidence["verified"] is False
+    assert evidence["failure_reason"] == "sandbox_install_failed"
+
+
+def test_generated_python_gate_still_refuses_without_the_memory_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from prajnatrade import isolation
+
+    attempts: list[bool] = []
+
+    def fake_runner(*args: object, **kwargs: object) -> dict:
+        attempts.append(bool(kwargs["enforce_memory_limit"]))
+        raise isolation.IsolationError(
+            "OS-isolated strategy aborted: memory_limit_unavailable.",
+            evidence={"memory_limit_enforced": False},
+        )
+
+    monkeypatch.setattr(isolation, "run_isolated_strategy", fake_runner)
+    with pytest.raises(isolation.IsolationError) as error:
+        isolation.probe_isolation()
+    assert "memory_limit_unavailable" in str(error.value)
+    assert attempts == [True]
+
+
+def test_verified_boundary_without_memory_limit_passes_and_is_recorded(
+    base: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from prajnatrade import protected_eval
+
+    store = eval_store(base, "boundary-only")
+    plan = create_plan(
+        base, store, base["candidate_b"], plan_input(), name="plan-boundary-only"
+    )
+    ok(authorize(store, plan["plan_id"]))
+    monkeypatch.setattr(
+        protected_eval, "probe_isolation_evidence", lambda limits=None: _fake_probe_success()
+    )
+    result = protected_eval.run_evaluation(
+        store,
+        base["snapshot_store"],
+        base["project"],
+        plan["plan_id"],
+        "validation",
+    )
+    assert result["status"] == "completed"
+    assert result["outcome"] == "passed"
+    assert result["isolation"] == {
+        "verified": True,
+        "memory_limit_enforced": False,
+        "failure_reason": "memory_limit_unavailable",
+    }
+    record = result["record"]
+    assert record["isolation_verified"] is True
+    assert record["memory_limit_enforced"] is False
+    assert record["isolation_failure_reason"] == "memory_limit_unavailable"
+    assert record["scoring"] is True
+    assert record["outcome"] == "passed"
 
 
 def test_validation_authorization_is_single_and_bound_to_the_plan(base: dict) -> None:
@@ -669,6 +824,20 @@ def test_authorized_validation_records_full_trusted_evidence_and_coarse_receipt(
     assert isolation["profile_sha256"]
     assert isolation["uid"] is not None
     assert isinstance(isolation["limits"], dict)
+    assert isolation["memory_limit_enforced"] in {True, False}
+    if isolation["memory_limit_enforced"]:
+        assert isolation["failure_reason"] is None
+    else:
+        # The boundary is verified; generated-Python memory enforcement is not.
+        assert isolation["failure_reason"] == "memory_limit_unavailable"
+    assert record["isolation_verified"] is True
+    assert record["memory_limit_enforced"] == isolation["memory_limit_enforced"]
+    assert record["isolation_failure_reason"] == isolation["failure_reason"]
+    assert result["isolation"] == {
+        "verified": True,
+        "memory_limit_enforced": isolation["memory_limit_enforced"],
+        "failure_reason": isolation["failure_reason"],
+    }
 
     availability = record["availability"]
     assert availability["timezone"].startswith("Asia/Shanghai")

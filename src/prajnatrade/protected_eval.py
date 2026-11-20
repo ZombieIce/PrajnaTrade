@@ -1663,6 +1663,9 @@ def _evaluation_record(
             "status": "completed",
         },
         "isolation": isolation,
+        "isolation_verified": isolation.get("verified") is True,
+        "memory_limit_enforced": isolation.get("memory_limit_enforced"),
+        "isolation_failure_reason": isolation.get("failure_reason"),
         "opened_protected_source": True,
         "availability": {
             "timezone": "Asia/Shanghai (UTC+08:00)",
@@ -1826,6 +1829,9 @@ def _aborted_record(
             "status": "aborted",
         },
         "isolation": isolation,
+        "isolation_verified": isolation.get("verified") is True,
+        "memory_limit_enforced": isolation.get("memory_limit_enforced"),
+        "isolation_failure_reason": isolation.get("failure_reason"),
         "opened_protected_source": opened,
         "availability": {
             "timezone": "Asia/Shanghai (UTC+08:00)",
@@ -1871,6 +1877,31 @@ def _write_record(store: Path, evaluation_id: str, record: dict[str, Any]) -> Pa
     return path
 
 
+def _isolation_evidence_summary(isolation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "verified": isolation.get("verified") is True,
+        "memory_limit_enforced": isolation.get("memory_limit_enforced"),
+        "failure_reason": isolation.get("failure_reason"),
+    }
+
+
+def _isolation_summary(record: dict[str, Any]) -> dict[str, Any]:
+    isolation = record.get("isolation")
+    if not isinstance(isolation, dict):
+        isolation = {}
+    return {
+        "verified": (
+            record.get("isolation_verified", isolation.get("verified")) is True
+        ),
+        "memory_limit_enforced": record.get(
+            "memory_limit_enforced", isolation.get("memory_limit_enforced")
+        ),
+        "failure_reason": record.get(
+            "isolation_failure_reason", isolation.get("failure_reason")
+        ),
+    }
+
+
 def _run_response(
     store: Path, record: dict[str, Any], *, reused: bool
 ) -> dict[str, Any]:
@@ -1890,6 +1921,7 @@ def _run_response(
             "opened_protected_source": record.get("opened_protected_source") is True,
         },
         "receipt": record["research_receipt"],
+        "isolation": _isolation_summary(record),
         "record_path": str(store / "records" / record["evaluation_id"] / "record.json"),
         "record": record,
     }
@@ -1923,8 +1955,15 @@ def run_evaluation(
         ),
     }
 
-    def reject(code: str, message: str, *, next_action: str = "inspect") -> None:
-        audit_id = _audit(eval_store, context, code, message)
+    def reject(
+        code: str,
+        message: str,
+        *,
+        next_action: str = "inspect",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        extra = dict(details or {})
+        audit_id = _audit(eval_store, {**context, **extra}, code, message)
         raise EvaluationRejection(
             code,
             "run",
@@ -1934,6 +1973,7 @@ def run_evaluation(
                 "audit_id": audit_id,
                 "opened_protected_source": False,
                 "query_debited": False,
+                **extra,
             },
         )
 
@@ -2007,6 +2047,7 @@ def run_evaluation(
             + str(isolation.get("failure_reason"))
             + "); the sealed partition was not opened.",
             next_action="stop",
+            details={"isolation": _isolation_evidence_summary(isolation)},
         )
 
     prior = _prior_discovery(snapshot_store, plan, reject)
