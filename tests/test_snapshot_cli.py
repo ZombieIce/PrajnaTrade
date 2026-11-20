@@ -279,3 +279,26 @@ def test_corporate_action_unknown_terms_are_retained(tmp_path: Path) -> None:
     read = _cli(tmp_path, "snapshot", "read", "--store", str(store), "--id", snapshot_id,
                 "--partition", "discovery")
     assert json.loads(read.stdout)["data"]["corporate_actions"] == payload["corporate_actions"]
+
+
+def test_research_reads_do_not_open_holdout_content(tmp_path: Path) -> None:
+    source = tmp_path / "synthetic.json"
+    source.write_text(json.dumps(_fixture()), encoding="utf-8")
+    store = tmp_path / "store"
+    sealed = _cli(tmp_path, "snapshot", "seal", "--input", str(source), "--store", str(store))
+    assert sealed.returncode == 0, sealed.stderr
+    snapshot_id = json.loads(sealed.stdout)["snapshot_id"]
+    directory = store / snapshot_id
+    directory.chmod(0o755)
+    (directory / "final_holdout.json").unlink()
+    directory.chmod(0o555)
+    shown = _cli(tmp_path, "snapshot", "manifest", "--store", str(store), "--id", snapshot_id)
+    read = _cli(tmp_path, "snapshot", "read", "--store", str(store), "--id", snapshot_id,
+                "--partition", "discovery")
+    denied = _cli(tmp_path, "snapshot", "read", "--store", str(store), "--id", snapshot_id,
+                  "--partition", "final_holdout")
+    assert shown.returncode == 0, shown.stderr
+    assert read.returncode == 0, read.stderr
+    assert denied.returncode != 0 and not denied.stdout
+    reseal = _cli(tmp_path, "snapshot", "seal", "--input", str(source), "--store", str(store))
+    assert reseal.returncode != 0 and not reseal.stdout
