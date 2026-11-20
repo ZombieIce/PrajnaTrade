@@ -52,8 +52,17 @@ Ledger layout (outside Git and outside the research project)::
         days(version_id, date, result_json, result_hash, committed_at, status)
         progress(version_id, release_id, start_date, last_committed_date, state)
 
-#33 extension hook: every day result carries ``corrections: []`` and the module
-exposes :func:`iter_committed_days`.  The update loop is version-independent.
+#33 extension: ``shadow update --corrections-store <snapshot-store>`` loads the
+verified revisions from the snapshot store's dividend-correction journal
+(``dividend.load_verified_revision``; never a sealed partition and never a query
+debit).  For every tracked version the applicable revision set is fixed inside
+the frozen per-day input *before* the day is computed, then applied exactly once
+as ``(new_amount - old_amount) * qualified_shares``: an unpaid entitlement
+adjusts the receivable, an already-paid one adjusts cash.  Corrections are
+reported separately from strategy P&L and a correction-caused negative cash
+balance is recorded as a deficit (never financed, never force-sold).  Dedupe is
+by ``(version_id, action_id, revision_id)`` across committed days, so a crash
+before the commit and a rerun after it never double-apply a delta.
 #34 (the comparison command) is intentionally not implemented here.
 """
 
@@ -70,7 +79,7 @@ from typing import Any, Iterator
 
 import pandas as pd
 
-from prajnatrade import release, snapshot
+from prajnatrade import dividend, release, snapshot
 from prajnatrade.backtest import _validate_weights
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot_baseline import (
@@ -800,8 +809,17 @@ def update(
     data: str | Path,
     target_date: str,
     release_ids: list[str] | tuple[str, ...] | None = None,
+    *,
+    corrections_store: str | Path | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Process every tracked version up to ``target_date``; return (report, blocked)."""
+    """Process every tracked version up to ``target_date``; return (report, blocked).
+
+    ``corrections_store`` is the trusted snapshot store that owns the verified
+    dividend-correction journal.  Only ``.dividend-corrections/revision-*.json``
+    entries are read, through :func:`prajnatrade.dividend.load_verified_revision`;
+    no sealed partition payload is opened and no query is debited.  Without it,
+    no correction is ever applied.
+    """
     feed = load_feed(data)
     try:
         target = snapshot._date(target_date)
@@ -824,6 +842,11 @@ def update(
             f"The trusted release store {store_path} is not a directory; Shadow "
             "Live never falls back to a workspace copy or another store.",
         )
+    corrections = (
+        _corrections_context(corrections_store)
+        if corrections_store is not None
+        else {"enabled": False, "store": None, "revisions": (), "ignored": []}
+    )
     database = Ledger(ledger)
     requested = list(release_ids or [])
     if requested:
@@ -839,20 +862,81 @@ def update(
     else:
         candidates = _tracked_release_directories(database, store_path, target)
     versions = [
-        _version_result(database, store_path, feed, target, release_id)
+        _version_result(database, store_path, feed, target, release_id, corrections)
         for release_id in candidates
     ]
     blocked = any(version["status"] == "blocked" for version in versions)
-    return (
-        {
-            "schema_version": SCHEMA_VERSION,
-            "scope": SCOPE,
-            "target_date": target,
-            "completed_at": _now(),
-            "versions": versions,
-        },
-        blocked,
-    )
+    report: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "scope": SCOPE,
+        "target_date": target,
+        "completed_at": _now(),
+        "versions": versions,
+    }
+    if corrections["enabled"]:
+        report["corrections"] = {
+            "store": corrections["store"],
+            "revisions_loaded": len(corrections["revisions"]),
+            "ignored": corrections["ignored"],
+        }
+    return report, blocked
+
+
+def _corrections_context(store: str | Path) -> dict[str, Any]:
+    """Load verified revisions once per update; never a sealed read or debit.
+
+    ``dividend.load_verified_revision`` is the only reader: it verifies the
+    journal record's ``verified`` status and its revision content address.  An
+    unreadable, unverified or tampered journal entry is ignored with a stable
+    code in the report (it is never evidence and never blocks the ledger); only
+    an unavailable corrections store is a request rejection.
+    """
+    path = Path(store)
+    if not path.is_dir():
+        raise _reject(
+            "CORRECTIONS_STORE_UNAVAILABLE",
+            "corrections",
+            "correct",
+            f"The correction snapshot store {path} is not a directory; verified "
+            "revisions are never read from an unverifiable location.",
+        )
+    journal = path / ".dividend-corrections"
+    records: dict[str, dict[str, Any]] = {}
+    ignored: list[dict[str, str]] = []
+    if journal.is_dir():
+        for entry in sorted(journal.iterdir(), key=lambda item: item.name):
+            name = entry.name
+            if not name.startswith("revision-") or not name.endswith(".json"):
+                continue
+            token = name[len("revision-") : -len(".json")]
+            if not entry.is_file() or not re.fullmatch(r"[0-9a-f]{64}", token):
+                ignored.append(
+                    {
+                        "file": name,
+                        "code": "REVISION_INVALID",
+                        "message": "Revision journal names are revision-<64 hex>.json.",
+                    }
+                )
+                continue
+            try:
+                record = dividend.load_verified_revision(path, token)
+            except dividend.RevisionError as error:
+                ignored.append(
+                    {"file": name, "code": error.code, "message": str(error)}
+                )
+                continue
+            except ValueError as error:  # defensive: loader validates its inputs
+                ignored.append(
+                    {"file": name, "code": "REVISION_INVALID", "message": str(error)}
+                )
+                continue
+            records.setdefault(record["revision_id"], record)
+    return {
+        "enabled": True,
+        "store": str(path),
+        "revisions": tuple(records[key] for key in sorted(records)),
+        "ignored": ignored,
+    }
 
 
 def write_report(
@@ -914,6 +998,8 @@ def write_report(
         "first_committed_date": summary["first_committed_date"],
         "last_committed_date": summary["last_committed_date"],
         "ending_nav": summary["ending_nav"],
+        "corrections_total": summary["corrections_total"],
+        "correction_impact_total": summary["correction_impact_total"],
         "integrity": {
             "verified": True,
             "days_checked": len(entries),
@@ -930,6 +1016,16 @@ def _report_summary(
     last = entries[-1]["result"] if entries else None
     initial_cash = first["execution"]["initial_cash"] if first else None
     ending_nav = last["nav"] if last else None
+    corrections = [
+        {"date": entry["date"], **correction}
+        for entry in entries
+        for correction in entry["result"].get("corrections", [])
+    ]
+    cash_deficits = [
+        {"date": entry["date"], **entry["result"]["cash_deficit"]}
+        for entry in entries
+        if entry["result"].get("cash_deficit")
+    ]
     return {
         "days": len(entries),
         "first_committed_date": entries[0]["date"] if entries else None,
@@ -945,6 +1041,13 @@ def _report_summary(
         "fees_total": last["fees"]["total"] if last else 0.0,
         "slippage_total": last["slippage"]["total"] if last else 0.0,
         "dividends_cash_total": last["dividends"]["cash_total"] if last else 0.0,
+        "ending_cash": last["cash"] if last else None,
+        "corrections": corrections,
+        "corrections_total": len(corrections),
+        "correction_impact_total": math.fsum(
+            float(correction["amount"]) for correction in corrections
+        ),
+        "cash_deficits": cash_deficits,
         "fills": sum(len(entry["result"]["fills"]) for entry in entries),
         "unfilled_orders": sum(
             1
@@ -1008,9 +1111,10 @@ def _version_result(
     feed: Feed,
     target: str,
     release_id: str,
+    corrections: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
-        return _run_version(database, store, feed, target, release_id)
+        return _run_version(database, store, feed, target, release_id, corrections)
     except _Blocked as error:
         progress = _progress_or_none(database, release_id)
         last = progress["last_committed_date"] if progress else None
@@ -1054,6 +1158,9 @@ def _version_entry(
     anomalies: list[dict[str, Any]] | None = None,
     unfilled_orders: list[dict[str, Any]] | None = None,
     result_hash: str | None = None,
+    corrections: list[dict[str, Any]] | None = None,
+    correction_impact: float = 0.0,
+    cash_deficit: dict[str, Any] | None = None,
     detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -1066,6 +1173,9 @@ def _version_entry(
         "result_hash": result_hash,
         "anomalies": list(anomalies or []),
         "unfilled_orders": list(unfilled_orders or []),
+        "corrections": list(corrections or []),
+        "correction_impact": correction_impact,
+        "cash_deficit": cash_deficit,
         **({"detail": detail} if detail else {}),
     }
 
@@ -1147,6 +1257,7 @@ def _run_version(
     feed: Feed,
     target: str,
     release_id: str,
+    corrections: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         fetched = release.fetch(store, release_id)
@@ -1246,6 +1357,7 @@ def _run_version(
             states[session],
             prior,
             target,
+            corrections,
         )
     day = database.verified_day(release_id, target)
     if day is None:
@@ -1281,6 +1393,9 @@ def _committed_entry(
         anomalies=result["anomalies"],
         unfilled_orders=unfilled,
         result_hash=day["result_hash"],
+        corrections=result.get("corrections", []),
+        correction_impact=result.get("correction_impact", 0.0),
+        cash_deficit=result.get("cash_deficit"),
     )
 
 
@@ -1291,6 +1406,8 @@ def _initial_prior(execution: dict[str, Any]) -> dict[str, Any]:
         "cash": initial,
         "positions": {symbol: 0.0 for symbol in ETF_SYMBOLS},
         "receivables": [],
+        "booked_dividends": [],
+        "deficit_revision_ids": [],
         "fees_total": 0.0,
         "slippage_total": 0.0,
         "dividend_entitled_total": 0.0,
@@ -1323,6 +1440,12 @@ def _prior_from_result(result: dict[str, Any]) -> dict[str, Any]:
             for symbol in ETF_SYMBOLS
         },
         "receivables": [dict(item) for item in result["dividends"]["receivables"]],
+        "booked_dividends": [
+            dict(item) for item in result["dividends"].get("booked", [])
+        ],
+        "deficit_revision_ids": list(
+            (result.get("cash_deficit") or {}).get("revision_ids", [])
+        ),
         "fees_total": float(result["fees"]["total"]),
         "slippage_total": float(result["slippage"]["total"]),
         "dividend_entitled_total": float(result["dividends"]["entitled_total"]),
@@ -1350,12 +1473,24 @@ def _process_session(
     state: str,
     prior: dict[str, Any],
     target: str,
+    corrections: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    frozen = database.verified_input(release_id, session)
+    frozen_corrections = (
+        frozen["input"].get("corrections") if frozen is not None else None
+    )
     built, blockers, _ = _build_input(
-        feed, artifact, execution, release_id, index, prior, state
+        feed,
+        artifact,
+        execution,
+        release_id,
+        index,
+        prior,
+        state,
+        corrections=corrections,
+        frozen_corrections=frozen_corrections,
     )
     input_hash = _hash(built)
-    frozen = database.verified_input(release_id, session)
     if frozen is not None:
         if frozen["input_hash"] != input_hash:
             raise _Blocked(
@@ -1410,6 +1545,9 @@ def _build_input(
     index: int,
     prior: dict[str, Any],
     state: str,
+    *,
+    corrections: dict[str, Any] | None = None,
+    frozen_corrections: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[tuple[str, str]], list[dict[str, Any]]]:
     """Assemble the complete deterministic input body and its completeness report."""
     session = feed.sessions[index]
@@ -1438,6 +1576,17 @@ def _build_input(
     }
     blockers: list[tuple[str, str]] = []
     anomalies: list[dict[str, Any]] = []
+
+    # #33: fix the applicable correction set *before* computing, deciding only
+    # from the verified revisions and the already-committed ledger.  A frozen
+    # input is authoritative (a crash before the commit reuses the same set).
+    if frozen_corrections is not None:
+        correction_decisions = [dict(item) for item in frozen_corrections]
+    else:
+        correction_decisions, correction_blockers = _correction_decisions(
+            corrections, prior, session, close_cutoff
+        )
+        blockers.extend(correction_blockers)
 
     for symbol in sorted(set(held) | buy_symbols):
         if not _valid_close(raw.get(symbol), close_cutoff):
@@ -1565,8 +1714,150 @@ def _build_input(
             },
         },
         "anomalies": anomalies,
+        "corrections": correction_decisions,
     }
     return body, blockers, anomalies
+
+
+def _amounts_match(left: object, right: object) -> bool:
+    return math.isclose(float(left), float(right), rel_tol=1e-9, abs_tol=1e-9)
+
+
+def _correction_decisions(
+    corrections: dict[str, Any] | None,
+    prior: dict[str, Any],
+    session: str,
+    close_cutoff: datetime,
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """Resolve the verified revisions applicable to one version and session.
+
+    Applicable means: filed by the session's 15:00 Asia/Shanghai after-close cut,
+    ex-date not after the session, the ledger booked an entitlement for that
+    symbol/ex-date (held through the ex-date), not already applied for
+    ``(version_id, action_id, revision_id)``, and the revision's ``old_amount``
+    equals the currently booked per-share amount (original entitlement plus prior
+    applied deltas).  A mismatch is a version block, never a guessed delta.
+    """
+    if not corrections or not corrections.get("revisions"):
+        return [], []
+    booked = [dict(item) for item in prior.get("booked_dividends", [])]
+    candidates: list[dict[str, Any]] = []
+    filed_instants: dict[str, datetime] = {}
+    for record in corrections["revisions"]:
+        revision = record["revision"]
+        ex_date = revision["ex_date"]
+        if ex_date > session:
+            continue
+        try:
+            filed = snapshot._instant(record["filed_at"], "filed_at")
+        except ValueError:  # pragma: no cover - the loader already validated it
+            continue
+        if filed > close_cutoff:
+            continue
+        candidates.append(record)
+        filed_instants[record["revision_id"]] = filed
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    blockers: list[tuple[str, str]] = []
+    for record in candidates:
+        revision = record["revision"]
+        matches = [
+            entry
+            for entry in booked
+            if entry.get("symbol") == revision["symbol"]
+            and entry.get("ex_date") == revision["ex_date"]
+        ]
+        if not matches:
+            # No booked entitlement (not held through the ex-date): no correction.
+            continue
+        if len(matches) > 1:
+            blockers.append(
+                (
+                    "CORRECTION_AMBIGUOUS",
+                    f"Revision {record['revision_id']} matches more than one booked "
+                    f"entitlement for {revision['symbol']} on {revision['ex_date']}; "
+                    "refusing to guess which action to correct.",
+                )
+            )
+            continue
+        grouped.setdefault(matches[0]["action_id"], []).append(record)
+
+    decisions: list[dict[str, Any]] = []
+    for action_id in sorted(grouped):
+        entitlement = next(item for item in booked if item["action_id"] == action_id)
+        applied = set(entitlement.get("applied_revisions", []))
+        pending = sorted(
+            (record for record in grouped[action_id] if record["revision_id"] not in applied),
+            key=lambda record: (
+                filed_instants[record["revision_id"]],
+                record["revision_id"],
+            ),
+        )
+        booked_per_share = float(entitlement["booked_cash_per_share"])
+        while pending:
+            match = next(
+                (
+                    record
+                    for record in pending
+                    if _amounts_match(record["revision"]["old_amount"], booked_per_share)
+                ),
+                None,
+            )
+            if match is None:
+                first = pending[0]
+                blockers.append(
+                    (
+                        "CORRECTION_AMOUNT_MISMATCH",
+                        f"Revision {first['revision_id']} declares old_amount "
+                        f"{first['revision']['old_amount']} but the booked per-share "
+                        f"amount for {action_id} (ex-date {first['revision']['ex_date']}) "
+                        f"is {booked_per_share}; refusing to guess the delta.",
+                    )
+                )
+                break
+            revision = match["revision"]
+            decisions.append(_correction_decision(match, entitlement))
+            entitlement["booked_cash_per_share"] = float(revision["new_amount"])
+            booked_per_share = float(revision["new_amount"])
+            pending.remove(match)
+    return decisions, blockers
+
+
+def _correction_decision(
+    record: dict[str, Any], entitlement: dict[str, Any]
+) -> dict[str, Any]:
+    revision = record["revision"]
+    quantity = float(entitlement["quantity"])
+    booked_per_share = float(entitlement["booked_cash_per_share"])
+    delta = float(revision["new_amount"]) - booked_per_share
+    return {
+        "revision_id": record["revision_id"],
+        "action_id": entitlement["action_id"],
+        "symbol": entitlement["symbol"],
+        "ex_date": entitlement["ex_date"],
+        "pay_date": entitlement["pay_date"],
+        "quantity": quantity,
+        "booked_cash_per_share": booked_per_share,
+        "old_amount": float(revision["old_amount"]),
+        "new_amount": float(revision["new_amount"]),
+        "delta": delta,
+        "target": (
+            "receivable" if entitlement.get("status") == "receivable" else "cash"
+        ),
+        "status": "applicable",
+        "amount": delta * quantity,
+        "action_reference": {
+            "action_id": entitlement["action_id"],
+            "symbol": entitlement["symbol"],
+            "ex_date": entitlement["ex_date"],
+            "pay_date": entitlement["pay_date"],
+            "quantity": quantity,
+            "cash_per_share": float(entitlement["cash_per_share"]),
+            "amount": quantity * float(entitlement["cash_per_share"]),
+        },
+        "filed_at": record["filed_at"],
+        "official_available_at": revision["official_available_at"],
+    }
 
 
 def _possible_target_symbols(
@@ -1665,6 +1956,7 @@ def _compute_day(
     # (a) corporate actions: share adjustments first, then cash-dividend
     # entitlements for start-of-day holdings on the ex-date.
     applied: list[dict[str, Any]] = []
+    booked = [dict(item) for item in prior.get("booked_dividends", [])]
     adjustments = sorted(
         (action for action in actions if action["type"] == "share_adjustment"),
         key=lambda action: (action["symbol"], action["action_id"]),
@@ -1739,7 +2031,76 @@ def _compute_day(
         }
         receivables.append(entitlement)
         dividend_entitled_total += amount
+        booked.append(
+            {
+                "action_id": action["action_id"],
+                "symbol": symbol,
+                "ex_date": session,
+                "pay_date": action["pay_date"],
+                "quantity": quantity,
+                "cash_per_share": amount_per_share,
+                "booked_cash_per_share": amount_per_share,
+                "amount": amount,
+                "status": "receivable",
+                "applied_revisions": [],
+            }
+        )
         applied.append({**entitlement, "type": action["type"], "status": "receivable"})
+
+    # (a2) apply the frozen applicable correction set once, before the open:
+    # an unpaid entitlement adjusts its receivable, an already-paid one adjusts
+    # cash.  Balances and NAV are committed in the same day transaction.
+    corrections_applied: list[dict[str, Any]] = []
+    correction_impact = 0.0
+    for decision in body.get("corrections", []):
+        amount = float(decision["amount"])
+        revision_id = decision["revision_id"]
+        action_id = decision["action_id"]
+        entry = {**decision, "status": "applied"}
+        booked_entry = next(
+            (item for item in booked if item["action_id"] == action_id), None
+        )
+        if booked_entry is None:
+            raise _Blocked(
+                "CORRECTION_BOOKING_MISMATCH",
+                f"Revision {revision_id} targets {action_id} but the ledger has no "
+                "booked entitlement for it; refusing to apply a correction to an "
+                "unknown balance.",
+            )
+        if decision["target"] == "receivable":
+            receivable = next(
+                (
+                    item
+                    for item in receivables
+                    if item["action_id"] == action_id
+                    and item["ex_date"] == decision["ex_date"]
+                ),
+                None,
+            )
+            if receivable is None:
+                raise _Blocked(
+                    "CORRECTION_BOOKING_MISMATCH",
+                    f"Revision {revision_id} was frozen as a receivable correction "
+                    f"but the {action_id} receivable is no longer unpaid; the day is "
+                    "not committed partially.",
+                )
+            receivable["amount"] = float(receivable["quantity"]) * float(
+                decision["new_amount"]
+            )
+            booked_entry["amount"] = receivable["amount"]
+        else:
+            cash += amount
+            dividend_cash_total += amount
+            booked_entry["amount"] = float(booked_entry["quantity"]) * float(
+                decision["new_amount"]
+            )
+        booked_entry["booked_cash_per_share"] = float(decision["new_amount"])
+        booked_entry["applied_revisions"] = [
+            *booked_entry.get("applied_revisions", []),
+            revision_id,
+        ]
+        corrections_applied.append(entry)
+        correction_impact = math.fsum([correction_impact, amount])
 
     # (b) settle the previous session's pending orders at the unadjusted open,
     # sells before buys and then by symbol; exactly one terminal state each.
@@ -1886,6 +2247,46 @@ def _compute_day(
                 }
             )
             receivables.remove(item)
+            paid_entry = next(
+                (
+                    entry
+                    for entry in booked
+                    if entry["action_id"] == item["action_id"]
+                    and entry["ex_date"] == item["ex_date"]
+                ),
+                None,
+            )
+            if paid_entry is not None:
+                paid_entry["status"] = "paid"
+
+    # A correction can make cash negative (already-paid cash adjustment with
+    # insufficient available cash).  That is recorded honestly as a
+    # correction-caused deficit: no financing, no forced sale, no rewrite.
+    cash_deficit: dict[str, Any] | None = None
+    if cash < -_cash_tolerance(cash):
+        revision_ids = sorted(
+            {
+                entry["revision_id"]
+                for entry in corrections_applied
+                if entry["target"] == "cash" and entry["amount"] < 0
+            }
+            | set(prior.get("deficit_revision_ids", []))
+        )
+        cash_deficit = {
+            "amount": -cash,
+            "caused_by": "dividend_correction",
+            "revision_ids": revision_ids,
+            "financed": False,
+            "forced_sale": False,
+        }
+        anomalies.append(
+            {
+                "code": "cash_deficit",
+                "amount": -cash,
+                "caused_by": "dividend_correction",
+                "revision_ids": revision_ids,
+            }
+        )
 
     # (d) value at the unadjusted close plus cash and unpaid receivables.
     positions: dict[str, dict[str, Any]] = {}
@@ -2018,6 +2419,7 @@ def _compute_day(
             ],
             "payments": payments,
             "receivables": [dict(item) for item in receivables],
+            "booked": booked,
             "entitled_total": dividend_entitled_total,
             "cash_total": dividend_cash_total,
         },
@@ -2033,7 +2435,9 @@ def _compute_day(
         "signal": signal,
         "next_orders": next_orders,
         "anomalies": anomalies,
-        "corrections": [],
+        "corrections": corrections_applied,
+        "correction_impact": correction_impact,
+        "cash_deficit": cash_deficit,
         "progress": {
             "start_date": prior["start_date"] or session,
             "last_committed_date": session,
