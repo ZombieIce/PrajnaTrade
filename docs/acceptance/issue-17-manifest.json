@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "delivery": {
+    "version": "0.1.0 (MVP-18 acceptance tooling)",
+    "branch": "ticket-35-acceptance",
+    "tested_at": "2026-11-20T22:50:09+08:00",
+    "environment": "macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; offline; synthetic fixtures only. macOS sandbox-exec covers the synthetic isolation tests; no real deployment isolation is verified.",
+    "test_command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /Users/yibinzhang/go/src/copilot-worktrees/PrajnaTrade/zombieice-fluffy-giggle/.venv/bin/python -m pytest -q -p no:cacheprovider tests/",
+    "test_result": "241 passed in 665.02s (0:11:05), exit 0"
+  },
+  "scenarios": [
+    {
+      "id": "tests_and_cli",
+      "title": "Deterministic tests and public CLI",
+      "status": "verified",
+      "scope": {
+        "data": "synthetic",
+        "agent": "mock",
+        "period": "historical"
+      },
+      "expected": "The same delivery version runs the deterministic test suite and the public CLI workflows in a clean environment, with the operator/research split enforced and synthetic fixtures covering success, invalid input, replay, budget refusal, failure evidence and interrupted-resume paths.",
+      "observed": "The recorded full-suite command passes in this delivery. The operator-only acceptance report validates the strict manifest and renders deterministic Markdown/JSON; prajnatrade-agent rejects the acceptance command. Synthetic scope only: this proves the synthetic test/CLI path, not real market data, real model access, deployed OS isolation, protected real evaluations or real forward tracking.",
+      "evidence": [
+        {
+          "type": "test_suite",
+          "reference": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /Users/yibinzhang/go/src/copilot-worktrees/PrajnaTrade/zombieice-fluffy-giggle/.venv/bin/python -m pytest -q -p no:cacheprovider tests/",
+          "description": "Full deterministic suite, exit 0; machine result is recorded in delivery.test_result. Synthetic fixtures only, no network and no broker."
+        },
+        {
+          "type": "test_file",
+          "reference": "tests/test_acceptance_cli.py",
+          "description": "Public-CLI tests for strict manifest validation, stable rejection codes, verdict rules, deterministic rendering, no-store report generation and rejection of the operator command by prajnatrade-agent."
+        },
+        {
+          "type": "test_file",
+          "reference": "tests/test_experiment_cli.py, tests/test_research_cli.py, tests/test_protected_eval_cli.py, tests/test_holdout_report_cli.py, tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py",
+          "description": "Public-CLI workflow tests for the experiment protocol, protected evaluation, release lifecycle, Shadow Live and comparison, all subprocess-based on synthetic fixtures."
+        }
+      ],
+      "blockers": []
+    },
+    {
+      "id": "real_snapshot_baseline",
+      "title": "Real five-ETF snapshot and equal-weight baseline",
+      "status": "blocked",
+      "scope": {
+        "data": "synthetic",
+        "agent": "mock",
+        "period": "historical"
+      },
+      "expected": "A shared real snapshot for 511260, 518880, 515080, 513300 and 159612 with official exchange calendar, verified corporate actions and price basis, point-in-time availability evidence, frozen 60/20/20 partitions and a Discovery equal-weight baseline that a second researcher can reproduce from the same approved inputs.",
+      "observed": "Only the synthetic snapshot-sealing, partition and equal-weight baseline mechanisms have been exercised. No real five-ETF snapshot has been acquired, sealed, partitioned or independently recomputed in this delivery.",
+      "evidence": [
+        {
+          "type": "synthetic_mechanism",
+          "reference": "tests/test_snapshot_cli.py, tests/test_snapshot_baseline.py, tests/test_cli_baseline.py",
+          "description": "Synthetic mechanism coverage only: sealing, content fingerprints, Discovery-only reads, partition freezing and baseline reproduction on synthetic fixtures. This is not real market evidence."
+        }
+      ],
+      "blockers": [
+        {
+          "missing": "A real five-ETF snapshot (511260, 518880, 515080, 513300, 159612) with official exchange calendar, verified corporate actions/price basis and point-in-time availability evidence; no real data has been acquired or sealed.",
+          "unblock": "Acquire and seal the real shared snapshot with official calendars, corporate actions and point-in-time availability evidence, freeze the 60/20/20 partition fingerprints, and keep the sealed partitions outside the research project (issue #24)."
+        },
+        {
+          "missing": "A frozen Discovery content fingerprint and a second researcher's independent re-computation of the equal-weight baseline trades, fees and NAV on the same approved inputs.",
+          "unblock": "Publish the Discovery snapshot manifest and baseline configuration, then have an independent reviewer reproduce the Discovery equal-weight baseline from the same sealed inputs within the predeclared tolerance (issue #24)."
+        }
+      ]
+    },
+    {
+      "id": "real_data_mock",
+      "title": "Real-data bounded Mock campaign",
+      "status": "blocked",
+      "scope": {
+        "data": "synthetic",
+        "agent": "mock",
+        "period": "historical"
+      },
+      "expected": "A bounded fixed-Mock, fixed-config and fixed-seed campaign on the real Discovery partition with hypotheses, parent/child experiment IDs, receipt-driven iterations, deterministic diagnostics, failure and budget records, and an interrupted-then-resumed run that matches the uninterrupted run without duplicate attempts or lost records.",
+      "observed": "The experiment protocol, idempotent replay/resume and budget accounting are exercised only on synthetic fixtures. No bounded Mock campaign has run on a real Discovery partition, so real-data flow evidence is missing.",
+      "evidence": [
+        {
+          "type": "synthetic_mechanism",
+          "reference": "tests/test_experiment_cli.py, tests/test_research_cli.py",
+          "description": "Synthetic mechanism coverage only: Mock iterations, idempotent submission, resume, failure evidence and budget accounting. This proves the protocol, not real Discovery execution."
+        }
+      ],
+      "blockers": [
+        {
+          "missing": "The real Discovery partition from issue #24; no approved real snapshot exists for a bounded Mock campaign.",
+          "unblock": "After the real Discovery snapshot is sealed and partitioned, run the bounded fixed-Mock, fixed-config and fixed-seed campaign on it and reconcile attempts, budget, diagnostics and receipts (issue #26)."
+        },
+        {
+          "missing": "A real parent/child experiment trace and an interrupted-then-resumed comparison on real Discovery, including failure records and budget debit/refund accounting.",
+          "unblock": "Retain the real campaign's structured hypotheses, submissions, parent/child experiment IDs, deterministic diagnostics, failures and budget reconciliation, including the interrupted-run resume, for independent review (issue #26)."
+        }
+      ]
+    },
+    {
+      "id": "controlled_real_llm",
+      "title": "Controlled real external LLM iteration",
+      "status": "blocked",
+      "scope": {
+        "data": "synthetic",
+        "agent": "mock",
+        "period": "historical"
+      },
+      "expected": "One complete autonomous iteration by an authorized real external LLM on the real Discovery campaign under verified deployment isolation: a falsifiable first hypothesis and strategy, a real receipt read, a self-justified successor experiment, at least one executed model-generated or model-modified Python strategy, and attributable model request/session and usage references.",
+      "observed": "Only mock/stub providers, synthetic isolation probes and the disabled trusted-local path exist. No authorized real model access, real Discovery campaign or verified deployed OS isolation has been exercised, and no model-generated Python strategy has run.",
+      "evidence": [
+        {
+          "type": "synthetic_mechanism",
+          "reference": "tests/test_isolation.py, tests/test_openai_provider.py",
+          "description": "Synthetic isolation and provider-contract tests only: allow/deny/resource-abort mechanics and usage accounting against stubs. No real model was called and no deployment isolation was verified."
+        }
+      ],
+      "blockers": [
+        {
+          "missing": "Authorized real model access (endpoint, credentials and attributable usage records) and a real Discovery campaign whose receipts the model can read; the delivery has neither.",
+          "unblock": "Provide authorized real model access and the real Discovery campaign from issues #24/#26, then retain attributable model request/session references, the two linked submissions and separately accounted platform versus model usage (issue #27)."
+        },
+        {
+          "missing": "Verified OS-level deployment isolation for the actual deployment, with allowed, expected-rejection and resource-abort evidence and trusted-side receipts; synthetic probes and trusted-local execution do not count.",
+          "unblock": "Deploy the worker under the verified OS-isolated profile and record allowed, expected-rejection and resource-abort evidence before executing model-generated or model-modified Python in a real campaign (issues #12/#27)."
+        }
+      ]
+    },
+    {
+      "id": "independent_validation_reports",
+      "title": "Independent protected validation and controlled reports",
+      "status": "blocked",
+      "scope": {
+        "data": "synthetic",
+        "agent": "mock",
+        "period": "historical"
+      },
+      "expected": "Immutable frozen plan and candidate fingerprints, single human authorizations, debit-before-read, one quota per sealed partition, Validation and separately authorized Final Holdout passes for a real-Agent candidate on real data, and a controlled report whose allowed and rejected paths are independently reviewable.",
+      "observed": "Protected evaluation, authorization, debit, rejection and controlled-report mechanics pass only on synthetic snapshots. No real-Agent candidate has been validated on real data, no sealed real partition has been opened and no real restricted report exists.",
+      "evidence": [
+        {
+          "type": "synthetic_mechanism",
+          "reference": "tests/test_protected_eval_cli.py, tests/test_holdout_report_cli.py",
+          "description": "Synthetic mechanism coverage only: frozen plans, single-use authorization, debit-before-read, rejection without debit, sealed-partition isolation and controlled report rendering. This does not verify a real protected evaluation."
+        }
+      ],
+      "blockers": [
+        {
+          "missing": "A real protected Evaluation (Validation, then separately authorized Final Holdout) for a frozen real-Agent candidate on the real snapshot, with immutable plans, authorizations, query ledger and controlled report.",
+          "unblock": "Freeze the candidate and evaluation plan on the real snapshot, authorize and run Validation, obtain separate Final Holdout authorization and retain the immutable trusted records and controlled reports (issues #12/#13/#14)."
+        },
+        {
+          "missing": "Real independently validated candidate evidence: no real candidate has passed both protected stages, so there is no real controlled report to review.",
+          "unblock": "Run the real protected evaluation successfully and have an independent reviewer verify frozen inputs, authorization, debit-before-read, coverage gaps, baseline, cost stress, parameter neighbourhood, thresholds and the allowed/rejected paths in the controlled report (issue #13)."
+        }
+      ]
+    },
+    {
+      "id": "immutable_release_forward",
+      "title": "Immutable releases and multi-strategy Shadow Live",
+      "status": "blocked",
+      "scope": {
+        "data": "synthetic",
+        "agent": "mock",
+        "period": "historical"
+      },
+      "expected": "At least two real-data independently validated, human-approved immutable release versions, explicitly enabled at pre-registered after-close signal points, tracking at least two consecutive, common, committed real forward trading days, with one after-close signal submitted pre-open and reconciled to the next session's terminal order state, plus controlled synthetic boundary coverage.",
+      "observed": "Release approval/fetch/lifecycle, Shadow Live atomic day commits, one-time dividend corrections and multi-version comparison pass on synthetic fixtures. There is no real approved release, no real forward ledger and no real multi-version tracking.",
+      "evidence": [
+        {
+          "type": "synthetic_mechanism",
+          "reference": "tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py, tests/test_correction_delta_cli.py, tests/test_impact_cli.py",
+          "description": "Synthetic mechanism coverage only: immutable release identity, lifecycle, atomic Shadow Live days, reruns, missing-price and missed-deadline boundaries, corrections and common-interval comparison. Synthetic replay is not real forward evidence."
+        }
+      ],
+      "blockers": [
+        {
+          "missing": "At least two real candidates that independently passed real protected validation and received explicit human approval as immutable release versions; no real candidate has been approved.",
+          "unblock": "After the real protected evaluation evidence exists, obtain explicit human approval for two distinct real candidates and register their unique immutable release IDs and pre-registered enable times (issue #14)."
+        },
+        {
+          "missing": "At least two consecutive, common, committed real forward trading days in a Shadow Live ledger, including one after-close signal submitted pre-open and reconciled to the next session's terminal order state.",
+          "unblock": "Enable the approved releases after the pre-registered signal point, run trusted manual Shadow Live updates on at least two consecutive real sessions and reconcile the forward ledger without reusing synthetic or backtest data (issues #9/#14)."
+        }
+      ]
+    }
+  ],
+  "real_chain": {
+    "agent_candidate": null,
+    "approved_releases": [],
+    "forward_days": []
+  }
+}

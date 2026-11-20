@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from prajnatrade.acceptance import (
+    AcceptanceRejection,
+    write_acceptance_report,
+)
 from prajnatrade.backtest import (
     benchmark_relative_returns,
     equal_weight_buy_and_hold,
@@ -228,6 +232,20 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         "--output", type=Path, help="write the deterministic comparison document"
     )
 
+    acceptance = commands.add_parser(
+        "acceptance",
+        help="validate the six-scenario acceptance manifest and render its report",
+    )
+    acceptance_commands = acceptance.add_subparsers(
+        dest="acceptance_command", required=True
+    )
+    acceptance_report = acceptance_commands.add_parser(
+        "report",
+        help="render a deterministic Markdown or JSON report from an acceptance manifest",
+    )
+    acceptance_report.add_argument("--input", required=True, type=Path)
+    acceptance_report.add_argument("--output", required=True, type=Path)
+
     campaign = commands.add_parser("campaign", help="operator campaign setup")
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
     create = campaign_commands.add_parser("create")
@@ -430,6 +448,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
         return _release_command(args)
     if args.command == "shadow":
         return _shadow_command(args)
+    if args.command == "acceptance":
+        return _acceptance_command(args)
     if args.command == "experiment":
         request = None
         try:
@@ -794,6 +814,25 @@ def _shadow_command(args: argparse.Namespace) -> int:
         print(json.dumps(result, sort_keys=True, allow_nan=False))
         return 2
     except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 0
+
+
+def _acceptance_command(args: argparse.Namespace) -> int:
+    try:
+        result = write_acceptance_report(args.input, args.output)
+    except AcceptanceRejection as error:
+        result = {
+            "schema_version": 1,
+            "status": "rejected",
+            "error": error.details,
+            **error.context,
+        }
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 2
+    except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
