@@ -17,6 +17,7 @@ _EXPERIMENT_JSON_COLUMNS = {
     "strategy_json",
     "parameters_json",
     "metrics_json",
+    "execution_evidence_json",
     "provider_usage_json",
 }
 
@@ -76,6 +77,7 @@ class SQLiteStore:
                     decision TEXT NOT NULL,
                     reflection TEXT NOT NULL,
                     error TEXT,
+                    execution_evidence_json TEXT NOT NULL DEFAULT '[]',
                     provider_usage_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(campaign_id, ordinal)
@@ -150,6 +152,10 @@ class SQLiteStore:
             if "data_hash" not in experiment_columns:
                 connection.execute(
                     "ALTER TABLE experiments ADD COLUMN data_hash TEXT NOT NULL DEFAULT ''"
+                )
+            if "execution_evidence_json" not in experiment_columns:
+                connection.execute(
+                    "ALTER TABLE experiments ADD COLUMN execution_evidence_json TEXT NOT NULL DEFAULT '[]'"
                 )
             candidate_columns = {
                 row["name"]
@@ -355,7 +361,8 @@ class SQLiteStore:
     def update_experiment(self, experiment_id: str, **updates: Any) -> None:
         allowed = {
             "strategy_json", "strategy_hash", "parameters_json", "metrics_json",
-            "status", "decision", "reflection", "error", "provider_usage_json",
+            "execution_evidence_json", "status", "decision", "reflection", "error",
+            "provider_usage_json",
         }
         unknown = set(updates) - allowed
         if unknown:
@@ -570,8 +577,8 @@ def _combine_request_usage(usages: list[dict[str, Any]]) -> dict[str, Any]:
 def _decode_row(row: sqlite3.Row, json_columns: set[str]) -> dict[str, Any]:
     result = dict(row)
     for column in json_columns:
-        if column in result and result[column] is not None:
-            value = json.loads(result[column])
+        if column in result:
+            value = json.loads(result[column]) if result[column] is not None else None
             if column.endswith("_json"):
                 result[column.removesuffix("_json")] = value
                 del result[column]

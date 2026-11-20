@@ -14,6 +14,7 @@ from prajnatrade.backtest import (
     run_backtest,
 )
 from prajnatrade.data import CASH, DataValidationError, load_bars, validate_calendar
+from prajnatrade.isolation import probe_isolation
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
@@ -72,14 +73,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional hard maximum drawdown as a positive proportion (0 to 1)",
     )
     _add_budget_mode_arguments(run, default="strict")
-    _add_trusted_python_argument(run)
+    _add_isolated_python_argument(run)
 
     resume = research_commands.add_parser("resume", help="resume a paused campaign")
     resume.add_argument("--db", required=True, type=Path)
     resume.add_argument("--campaign-id", required=True)
     resume.add_argument("--steps", type=int)
     _add_budget_mode_arguments(resume, default=None)
-    _add_trusted_python_argument(resume)
+    _add_isolated_python_argument(resume)
 
     status = research_commands.add_parser("status", help="show campaign and experiment history")
     status.add_argument("--db", required=True, type=Path)
@@ -109,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--db", required=True, type=Path)
     validate.add_argument("--candidate-id", required=True)
     _add_data_arguments(validate)
-    _add_trusted_python_argument(validate)
+    _add_isolated_python_argument(validate)
 
     holdout = research_commands.add_parser(
         "holdout", help="consume the one-use final holdout after explicit confirmation"
@@ -118,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     holdout.add_argument("--candidate-id", required=True)
     _add_data_arguments(holdout)
     holdout.add_argument("--confirmation", required=True)
-    _add_trusted_python_argument(holdout)
+    _add_isolated_python_argument(holdout)
 
     report = research_commands.add_parser(
         "report", help="render a self-contained HTML campaign report"
@@ -135,11 +136,11 @@ def _add_data_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-kind", required=True, choices=["real", "synthetic"])
 
 
-def _add_trusted_python_argument(parser: argparse.ArgumentParser) -> None:
+def _add_isolated_python_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--trusted-local-generated-python",
+        "--isolated-generated-python",
         action="store_true",
-        help="execute generated Python locally without isolation; use only with trusted code",
+        help="allow generated Python only in the verified OS-isolated worker",
     )
 
 
@@ -159,13 +160,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "research":
-            trusted_local_python = getattr(args, "trusted_local_generated_python", False)
-            if trusted_local_python:
-                print(
-                    "warning: generated Python runs with full local process privileges; "
-                    "this is not a sandbox.",
-                    file=sys.stderr,
+            isolated_python = getattr(args, "isolated_generated_python", False)
+            if isolated_python and args.research_command in {"validate", "holdout"}:
+                raise ValueError(
+                    "Generated Python validation and holdout are disabled until results "
+                    "can be kept outside the research CLI."
                 )
+            if isolated_python and args.research_command in {"run", "resume"}:
+                probe_isolation()
             if args.research_command == "run":
                 if args.budget_mode == "best-effort" and args.accept_budget_overrun_risk:
                     print(
@@ -193,7 +195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     holdout_start=args.holdout_start,
                     holdout_end=args.holdout_end,
                     provider_config=provider_config,
-                    trusted_local_python=trusted_local_python,
+                    isolated_python=isolated_python,
                     max_drawdown_limit=args.max_drawdown_limit,
                 )
             elif args.research_command == "resume":
@@ -213,7 +215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     campaign_id=args.campaign_id,
                     provider=provider,
                     steps=args.steps,
-                    trusted_local_python=trusted_local_python,
+                    isolated_python=isolated_python,
                 )
             elif args.research_command == "status":
                 result = campaign_status(args.db, args.campaign_id)
@@ -238,7 +240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.data,
                     args.data_kind,
                     args.price_basis,
-                    trusted_local_python=trusted_local_python,
+                    isolated_python=isolated_python,
                 )
             elif args.research_command == "holdout":
                 result = run_holdout(
@@ -248,7 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.data_kind,
                     args.price_basis,
                     args.confirmation,
-                    trusted_local_python=trusted_local_python,
+                    isolated_python=isolated_python,
                 )
             else:
                 result = write_campaign_report(
