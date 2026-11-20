@@ -28,7 +28,7 @@ from prajnatrade.protected_eval import (
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
-from prajnatrade import dividend, snapshot
+from prajnatrade import dividend, release, snapshot
 from prajnatrade.snapshot_baseline import run_discovery_baseline
 from prajnatrade.store import SQLiteStore
 from prajnatrade.validation import freeze_candidate, run_holdout, validate_candidate
@@ -112,6 +112,47 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     evaluation_report.add_argument("--store", required=True, type=Path)
     evaluation_report.add_argument("--plan-id", required=True)
     evaluation_report.add_argument("--output", required=True, type=Path)
+
+    release_parser = commands.add_parser(
+        "release", help="approve frozen candidates and manage immutable release versions"
+    )
+    release_commands = release_parser.add_subparsers(
+        dest="release_command", required=True
+    )
+    release_approve = release_commands.add_parser(
+        "approve", help="record human approval and the unique immutable release artifact"
+    )
+    release_approve.add_argument("--store", required=True, type=Path)
+    release_approve.add_argument("--plan-id", required=True)
+    release_approve.add_argument("--reviewer", required=True)
+    release_approve.add_argument("--reason", required=True)
+
+    release_fetch = release_commands.add_parser(
+        "fetch", help="fetch one release artifact by exact ID and verify its content"
+    )
+    release_fetch.add_argument("--store", required=True, type=Path)
+    release_fetch.add_argument("--release-id", required=True)
+
+    release_status_parser = release_commands.add_parser(
+        "status", help="show the artifact fingerprints, admission and lifecycle timeline"
+    )
+    release_status_parser.add_argument("--store", required=True, type=Path)
+    release_status_parser.add_argument("--release-id", required=True)
+    release_status_parser.add_argument(
+        "--as-of", help="derive the tracked state at this after-close signal date"
+    )
+
+    for action, description in (
+        ("enable", "start tracking at a pre-registered after-close signal date"),
+        ("pause", "stop new signals at a pre-registered after-close signal date"),
+        ("resume", "resume the same ID while admission is still valid"),
+        ("retire", "terminally retire the version, keeping its history"),
+    ):
+        lifecycle = release_commands.add_parser(action, help=description)
+        lifecycle.add_argument("--store", required=True, type=Path)
+        lifecycle.add_argument("--release-id", required=True)
+        lifecycle.add_argument("--effective-signal-date", required=True)
+        lifecycle.add_argument("--reason", required=True)
 
     campaign = commands.add_parser("campaign", help="operator campaign setup")
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
@@ -311,6 +352,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
     args = parser.parse_args(argv)
     if args.command == "evaluation":
         return _evaluation_command(args, agent_only=agent_only)
+    if args.command == "release":
+        return _release_command(args)
     if args.command == "experiment":
         request = None
         try:
@@ -585,6 +628,39 @@ def _evaluation_command(args: argparse.Namespace, *, agent_only: bool) -> int:
                 args.plan_id, args.stage,
             )
     except EvaluationRejection as error:
+        result = {
+            "schema_version": 1,
+            "status": "rejected",
+            "error": error.details,
+            **error.context,
+        }
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 2
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 0
+
+
+def _release_command(args: argparse.Namespace) -> int:
+    try:
+        if args.release_command == "approve":
+            result = release.approve(
+                args.store, args.plan_id, args.reviewer, args.reason
+            )
+        elif args.release_command == "fetch":
+            result = release.fetch(args.store, args.release_id)
+        elif args.release_command == "status":
+            result = release.status(args.store, args.release_id, args.as_of)
+        else:
+            result = getattr(release, args.release_command)(
+                args.store,
+                args.release_id,
+                args.effective_signal_date,
+                args.reason,
+            )
+    except release.ReleaseRejection as error:
         result = {
             "schema_version": 1,
             "status": "rejected",
