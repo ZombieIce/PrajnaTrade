@@ -123,6 +123,60 @@ not consume this sealed snapshot interface and do not inherit its checks.
 Campaigns created before this change may have an incompatible fingerprint and
 must be recreated rather than resumed or validated.
 
+### Cash dividend correction successors (MVP-15)
+
+The trusted operator registers a supplier's changed **CNY per-unit cash
+dividend amount**, reviews exchange or fund-manager evidence, then seals a
+successor. This workflow inherits MVP-01's synthetic-only scope: the notices
+are explicitly synthetic and no actual ETF announcement is fetched or verified.
+The CLI validates the submitted evidence and records the operator's filing; it
+does not authenticate a publisher or inspect a supplier archive.
+
+```sh
+prajnatrade snapshot correction register --store /trusted/snapshots --input observation.json
+prajnatrade snapshot correction verify --store /trusted/snapshots --proposal-id <proposal-id> --input notice.json
+prajnatrade snapshot correction successor --store /trusted/snapshots --proposal-id <proposal-id> --revision-id <revision-id>
+prajnatrade snapshot read --store /trusted/snapshots --id <successor-id> --partition discovery --as-of 2024-01-04T15:00:00+08:00
+```
+
+An observation has `schema_version: 1`, `predecessor_id`, `symbol`, `ex_date`,
+`currency: "CNY"`, `old_amount`, `new_amount`, and `supplier` with `source`,
+`archive_reference`, and timezone-aware `observed_at`. Registration records
+`pending_verification` and changes no snapshot. For a Discovery date, the CLI
+checks the old amount against the unique cash dividend for that ETF and ex-date.
+For protected dates, the trusted operator must check the old value and event
+against an independently archived supplier record and provide its reference;
+the CLI deliberately does not compare it with a sealed payload.
+
+The notice has `kind: "synthetic"`, `authority` (`exchange` or `fund_manager`),
+`issuer`, `url` (HTTPS under `.invalid`), `reference`, matching `symbol`,
+`ex_date`, `currency` and `amount`, and timezone-aware `available_at` and
+`collected_at`. `available_at` is when the amount was originally public, not
+when a duplicate notice appeared or when the operator collected it. The CLI
+records actual `filed_at` in UTC. The same ETF, ex-date, currency, old/new
+amounts and original official availability instant identify one revision.
+Repeating a notice returns the original revision and filing time; additional
+reviewed sources are retained separately in the trusted journal.
+
+The successor manifest binds the predecessor ID and verified revision into a
+new content ID. It keeps original whole-snapshot hashes and gaps under
+`base_content_hashes` and `base_gaps`. Validation and Final Holdout retain
+their original descriptors and fingerprints; the correction workflow never
+opens or copies their payloads, grants evaluation access, or changes any
+query budget. A correction inside one of those ranges is recorded as lineage
+only, with no protected action data in the research receipt.
+
+For Discovery, `--as-of` uses official availability, not filing time: a
+synthetic 0.20 → 0.18 notice published after the ex-date leaves the original
+amount in an ex-date reconstruction; a notice already public at that time
+reconstructs 0.18 without claiming that the operator had filed or used it.
+Reads omit rows dated after the cutoff's China-market day or lacking evidence
+of availability by that instant. An amount correction does not make other
+terms (such as payment date) available early. Once a correction applies,
+the affected ETF's derived values are `null` rather than stale total-return
+inputs. `partition_content_hash` identifies the fixed Discovery descriptor;
+`content_hash` identifies only the requested historical projection.
+
 ## Research, validation, and reports
 
 ### External Discovery experiment protocol (synthetic only)

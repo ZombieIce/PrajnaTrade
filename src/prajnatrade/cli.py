@@ -21,7 +21,7 @@ from prajnatrade.experiment import (
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
-from prajnatrade import snapshot
+from prajnatrade import dividend, snapshot
 from prajnatrade.store import SQLiteStore
 from prajnatrade.validation import freeze_candidate, run_holdout, validate_candidate
 
@@ -76,6 +76,20 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("--store", required=True, type=Path)
     read.add_argument("--id", required=True)
     read.add_argument("--partition", required=True)
+    read.add_argument("--as-of", help="timezone-aware historical input cutoff (required for successors)")
+    correction = snapshot_commands.add_parser("correction", help="trusted cash dividend corrections")
+    correction_commands = correction.add_subparsers(dest="correction_command", required=True)
+    register = correction_commands.add_parser("register", help="file a pending supplier observation")
+    register.add_argument("--input", required=True, type=Path)
+    register.add_argument("--store", required=True, type=Path)
+    verify = correction_commands.add_parser("verify", help="file a reviewed dividend notice")
+    verify.add_argument("--input", required=True, type=Path)
+    verify.add_argument("--store", required=True, type=Path)
+    verify.add_argument("--proposal-id", required=True)
+    successor = correction_commands.add_parser("successor", help="seal a verified correction as a successor")
+    successor.add_argument("--store", required=True, type=Path)
+    successor.add_argument("--proposal-id", required=True)
+    successor.add_argument("--revision-id", required=True)
 
     baseline = commands.add_parser("baseline", help="run the equal-weight buy-and-hold benchmark")
     _add_data_arguments(baseline)
@@ -241,8 +255,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = snapshot.seal(args.input, args.store)
             elif args.snapshot_command == "manifest":
                 result = snapshot.manifest(args.store, args.id)
+            elif args.snapshot_command == "correction":
+                if args.correction_command == "register":
+                    result = dividend.register(args.input, args.store)
+                elif args.correction_command == "verify":
+                    result = dividend.verify(args.input, args.store, args.proposal_id)
+                else:
+                    result = dividend.successor(args.store, args.proposal_id, args.revision_id)
             else:
-                result = snapshot.read_discovery(args.store, args.id, args.partition)
+                result = snapshot.read_discovery(args.store, args.id, args.partition, args.as_of)
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 0
         if args.command == "project":
