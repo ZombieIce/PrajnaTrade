@@ -1,0 +1,17 @@
+---
+name: prajnatrade-research
+description: Run PrajnaTrade Discovery research, recover an experiment after a client handoff, or revise a hypothesis from a recorded result.
+---
+
+# PrajnaTrade Discovery research
+
+1. **Anchor the project.** Use the owner-provided project location and Campaign receipt with `prajnatrade-agent project status --project <project>`. Match `project_id` before proceeding. In the shared project workspace, record the Campaign ID, objective, measurable success criteria, and owner-approved constraints. If these are missing or conflict, ask the owner before spending an attempt.
+2. **Recover before proposing.** Read the saved request JSON files and query their submission keys with `prajnatrade-agent experiment status --project <project> --campaign-id <campaign-id> --submission-id <submission-id>`. Use the versioned receipts, not prior chat or the presence of a local output file, to establish what happened.
+   - `running`: poll status; the current execution owns the attempt.
+   - `error.code: EXECUTION_INTERRUPTED` with `error.next_action: resume`: call `experiment resume` with the same arguments. This runs the persisted request under the same experiment ID and consumes time, not another attempt. Zero attempts remaining does not prevent this recovery.
+   - `BUDGET_EXHAUSTED` or an interruption with `error.next_action: stop`: hand back control.
+   - `NOT_FOUND` for a saved request after verifying the project and Campaign: retry `experiment submit` with the original file and key if budget remains. A transport error alone does not establish that the submission was rejected.
+   - `succeeded` or terminal `failed`: retain the receipt and proceed to review. A failed receipt can come with a nonzero exit; read its JSON.
+3. **Review the facts.** Compare Discovery metrics and benchmark on the recorded fingerprints; inspect diagnostics or the failure code and phase. Record the observed result separately from your interpretation, and say whether the evidence met the prespecified criterion. Label synthetic data, scripted choices, and actual model decisions separately. A Discovery result is not independent validation.
+4. **Decide the next attempt.** If the objective is unmet and both budgets permit a new submission, select one falsifiable hypothesis: name the change, measurable predicted effect against a stated comparator, and observation that would reject it. Save the complete versioned request in the shared project before `experiment submit`; keep earlier requests. A revision uses `parent_experiment_id` from the same Campaign and a fresh `submission_id`. `next_action` describes protocol recovery, not a research recommendation.
+5. **Hand back control.** When time runs out, or attempts run out with no already-debited work left to recover, stop and give the owner the project/Campaign ID, relevant experiment IDs, remaining budget, and evidence. Only the owner can provision a Campaign; work within the existing allocation through the Agent command surface.

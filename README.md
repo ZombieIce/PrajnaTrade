@@ -138,8 +138,9 @@ identity; `--project` is just its location.
 prajnatrade project init --project ./strategy-A
 prajnatrade campaign create --project ./strategy-A --data discovery.csv \
   --data-kind synthetic --attempts 20 --max-seconds 3600
-prajnatrade experiment submit --project ./strategy-A --input first.json
-prajnatrade experiment status --project ./strategy-A \
+prajnatrade-agent project status --project ./strategy-A
+prajnatrade-agent experiment submit --project ./strategy-A --input first.json
+prajnatrade-agent experiment status --project ./strategy-A \
   --campaign-id <campaign-id> --submission-id first
 ```
 
@@ -160,25 +161,46 @@ Supported declarative families are `equal_weight`, `momentum`, `trend_filter`
 and `inverse_volatility`; parameters follow the existing research strategy
 definitions. A follow-up uses a fresh `submission_id` and may include a
 `parent_experiment_id` from the same Campaign. Submissions cannot override
-Campaign settings. Submit/status print versioned JSON on stdout; rejected and
+Campaign settings. Submit/status/resume print versioned JSON on stdout; rejected and
 failed requests return a nonzero exit code with a stable error and next action.
 Results include only Discovery metrics and an equal-weight benchmark using
 the same snapshot and evaluation settings.
 
 The same Campaign/submission ID and normalized content reuse one experiment;
 changed content conflicts, and invalid or conflicting requests do not consume
-an attempt. Accepted failures do consume one. Campaign execution is serialized
-and limited by the shared execution time budget. A process killed during
-execution is recorded as interrupted when next inspected or submitted; time
-through that inspection is conservatively charged. This ticket does not
-provide experiment resume. If runtime implementation or dependency fingerprints
-change, new execution fails rather than silently changing the Campaign.
+an attempt. Accepted failures do consume one. Only
+`EXECUTION_INTERRUPTED` can be resumed. A replacement client checks status
+with the same project, Campaign, and submission key. If the receipt has
+`error.next_action: resume`, it can run:
 
-This synthetic protocol is separate from the existing `research` registry and
-does not yet connect its experiments to `research freeze`. Project files and
-operator commands are not an OS-enforced authorization or isolation boundary;
-do not use this workflow for sealed data, untrusted Python, or real-data
-security claims.
+```sh
+prajnatrade-agent experiment resume --project ./strategy-A \
+  --campaign-id <campaign-id> --submission-id first
+```
+
+Resume restarts deterministic evaluation from the stored request under the
+same experiment ID, not from an in-memory checkpoint. It acquires the same
+Campaign lock as submit, does not debit another attempt, and accumulates
+execution time. After a hard kill, time until interruption detection is
+conservatively charged. Zero attempts remaining blocks new keys, not resumes;
+zero time remaining blocks all execution without discarding earlier receipts.
+Resume on a completed or terminally failed experiment returns its existing
+receipt. A runtime fingerprint change fails execution rather than changing the
+Campaign.
+
+Share [the `prajnatrade-research` Skill](.github/skills/prajnatrade-research/SKILL.md)
+with both clients (register that Skill directory in clients that do not
+discover `.github/skills`). Keep the objective, constraints, and saved request
+files with the handoff so the replacement client can query before deciding.
+The `prajnatrade-agent` entry point exposes only project status and experiment
+operations; use `prajnatrade` for operator setup. Expose only the Agent tool
+against the assigned project; the restricted entry point does not protect the
+ledger from a client with arbitrary shell or filesystem access under the
+operator's identity. OS-enforced isolation is tracked separately in
+[#18](https://github.com/ZombieIce/PrajnaTrade/issues/18).
+
+This synthetic protocol is separate from `research freeze`; the scripted
+handoff tests are not evidence of real Agent research or deployment isolation.
 
 Mock campaigns are deterministic orchestration checks, not AI research. They
 use recorded decisions to refine a retained or investigated direction or

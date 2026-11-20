@@ -13,7 +13,7 @@ import uuid
 from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, TypedDict
 
 from prajnatrade.backtest import equal_weight_buy_and_hold, run_backtest
 from prajnatrade.data import ValidatedData, load_bars
@@ -148,7 +148,12 @@ def _campaign(connection: sqlite3.Connection, campaign_id: str) -> sqlite3.Row:
     return row
 
 
-def _budget(connection: sqlite3.Connection, campaign: sqlite3.Row) -> dict[str, object]:
+class _Budget(TypedDict):
+    attempts_remaining: int
+    execution_seconds_remaining: float
+
+
+def _budget(connection: sqlite3.Connection, campaign: sqlite3.Row) -> _Budget:
     count = connection.execute(
         "SELECT count(*) FROM experiments WHERE campaign_id = ?", (campaign["campaign_id"],),
     ).fetchone()[0]
@@ -183,6 +188,10 @@ def _receipt(
         result.update(json.loads(experiment["result_json"]))
     if experiment["error_json"]:
         result["error"] = json.loads(experiment["error_json"])
+        if result["error"]["code"] == "EXECUTION_INTERRUPTED":
+            result["error"]["next_action"] = (
+                "resume" if result["budget"]["execution_seconds_remaining"] > 0 else "stop"
+            )
     return result
 
 
@@ -263,104 +272,159 @@ def experiment_submit(project: Path, raw: object) -> dict[str, Any]:
         request = _normalize_request(raw)
     except (ValueError, TypeError) as error:
         raise ProtocolError("INVALID_SUBMISSION", "admission", "correct", str(error)) from error
+    return _execute_request(project, request["campaign_id"], request["submission_id"], request)
+
+
+def experiment_resume(project: Path, campaign_id: str, submission_id: str) -> dict[str, Any]:
+    return _execute_request(project, campaign_id, submission_id, None)
+
+
+def _find_experiment(
+    connection: sqlite3.Connection, campaign_id: str, submission_id: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM experiments WHERE campaign_id = ? AND submission_id = ?",
+        (campaign_id, submission_id),
+    ).fetchone()
+
+
+def _execute_request(
+    project: Path, campaign_id: str, submission_id: str, request: dict[str, Any] | None,
+) -> dict[str, Any]:
     project_id = project_status(project)["project_id"]
-    campaign_id = request["campaign_id"]
     with _campaign_lock(project, campaign_id), _connection(project) as connection:
         campaign = _campaign(connection, campaign_id)
         _settle_interrupted(connection, campaign)
         campaign = _campaign(connection, campaign_id)
-        previous = connection.execute(
-            "SELECT * FROM experiments WHERE campaign_id = ? AND submission_id = ?",
-            (campaign_id, request["submission_id"]),
-        ).fetchone()
-        canonical = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        if previous:
-            if previous["request_json"] != canonical:
-                raise ProtocolError("SUBMISSION_CONFLICT", "admission", "use_new_submission_id", "Submission ID already has different content.")
-            return _receipt(project_id, connection, campaign, previous)
-        if request["parent_experiment_id"] is not None:
-            parent = connection.execute(
-                "SELECT 1 FROM experiments WHERE campaign_id = ? AND experiment_id = ?",
-                (campaign_id, request["parent_experiment_id"]),
-            ).fetchone()
-            if parent is None:
-                raise ProtocolError("INVALID_SUBMISSION", "admission", "correct", "Parent experiment is not in this campaign.")
-        budget = _budget(connection, campaign)
-        if budget["attempts_remaining"] <= 0 or budget["execution_seconds_remaining"] <= 0:
-            raise ProtocolError("BUDGET_EXHAUSTED", "admission", "stop", "Campaign budget exhausted.")
-        experiment_id = str(uuid.uuid4())
-        started = time.monotonic()
-        connection.execute(
-            """INSERT INTO experiments
-            (experiment_id, campaign_id, submission_id, request_json, status, started_at)
-            VALUES (?, ?, ?, ?, 'running', ?)""",
-            (experiment_id, campaign_id, request["submission_id"], canonical, time.time()),
-        )
-        connection.commit()
-        error_details = None
-        result = None
-        old_handler = signal.signal(signal.SIGALRM, _timeout)
-        try:
-            remaining = budget["execution_seconds_remaining"] - (time.monotonic() - started)
+        previous = _find_experiment(connection, campaign_id, submission_id)
+        if request is None:
+            if previous is None:
+                raise ProtocolError("NOT_FOUND", "resume", "check_id", "Unknown submission.")
+            receipt = _receipt(project_id, connection, campaign, previous)
+            if receipt.get("error", {}).get("code") != "EXECUTION_INTERRUPTED":
+                return receipt
+            remaining = _budget(connection, campaign)["execution_seconds_remaining"]
             if remaining <= 0:
-                raise _TimeExpired()
-            signal.setitimer(signal.ITIMER_REAL, remaining)
-            dataset = _load_snapshot(campaign["snapshot"], campaign["suffix"])
-            if dataset.data_hash != campaign["snapshot_hash"]:
-                raise ValueError("Snapshot fingerprint mismatch.")
-            config = json.loads(campaign["evaluation_json"])
-            if _fingerprint(config) != campaign["evaluation_hash"]:
-                raise ValueError("Evaluation fingerprint mismatch.")
-            if config["runtime"] != _runtime_identity():
-                raise ValueError("Campaign runtime fingerprint mismatch.")
-            spec = {"family": request["strategy"]["family"], "parameters": request["parameters"]}
-            backtest = run_backtest(
-                dataset, make_strategy(spec), initial_cash=config["initial_cash"],
-                transaction_cost_bps=config["transaction_cost_bps"], slippage_bps=config["slippage_bps"],
+                raise ProtocolError("BUDGET_EXHAUSTED", "resume", "stop", "Execution time exhausted.")
+            experiment_id = previous["experiment_id"]
+            request = json.loads(previous["request_json"])
+            started = time.monotonic()
+            connection.execute(
+                "UPDATE experiments SET status = 'running', started_at = ?, error_json = NULL "
+                "WHERE experiment_id = ?",
+                (time.time(), experiment_id),
             )
-            if time.monotonic() - started >= budget["execution_seconds_remaining"]:
-                raise _TimeExpired()
-            benchmark = json.loads(campaign["baseline_json"])
-            result = {
-                "fingerprints": {
-                    "strategy_and_parameters": _fingerprint({"strategy": spec, "runtime": config["runtime"]}),
-                    "snapshot": campaign["snapshot_hash"], "evaluation": campaign["evaluation_hash"],
-                },
-                "discovery": {
-                    "start_date": dataset.report["start_date"], "end_date": dataset.report["end_date"],
-                    "metrics": backtest.metrics, "benchmark": benchmark,
-                    "return_delta": backtest.metrics["total_return"] - benchmark["total_return"],
-                },
-                "diagnostics": [
-                    {"code": "WARMUP_REQUIRED", "required_sessions": request["parameters"]["lookback"]}
-                ] if "lookback" in request["parameters"] else [],
-            }
-        except _TimeExpired:
-            error_details = {"code": "BUDGET_EXHAUSTED", "phase": "discovery", "next_action": "stop", "message": "Execution time exhausted."}
-        except Exception as error:
-            error_details = {
-                "code": "EXECUTION_FAILED", "phase": "discovery", "next_action": "inspect",
-                "message": f"{type(error).__name__}: {error}",
-            }
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, old_handler)
-        elapsed = time.monotonic() - started
-        connection.execute(
-            "UPDATE campaigns SET elapsed_seconds = elapsed_seconds + ? WHERE campaign_id = ?",
-            (elapsed, campaign_id),
-        )
-        connection.execute(
-            "UPDATE experiments SET status = ?, result_json = ?, error_json = ? WHERE experiment_id = ?",
-            ("failed" if error_details else "succeeded", json.dumps(result) if result else None,
-             json.dumps(error_details) if error_details else None, experiment_id),
-        )
+        else:
+            canonical = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if previous is not None:
+                if previous["request_json"] != canonical:
+                    raise ProtocolError("SUBMISSION_CONFLICT", "admission", "use_new_submission_id", "Submission ID already has different content.")
+                return _receipt(project_id, connection, campaign, previous)
+            budget = _budget(connection, campaign)
+            remaining = budget["execution_seconds_remaining"]
+            experiment_id, started = _admit_attempt(
+                connection, campaign_id, submission_id, request, canonical, budget,
+            )
         connection.commit()
-        campaign = _campaign(connection, campaign_id)
-        experiment = connection.execute(
-            "SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,),
+        return _run_attempt(
+            connection, campaign, project_id, experiment_id, request, started, remaining,
+        )
+
+
+def _admit_attempt(
+    connection: sqlite3.Connection, campaign_id: str, submission_id: str,
+    request: dict[str, Any], canonical: str, budget: _Budget,
+) -> tuple[str, float]:
+    if request["parent_experiment_id"] is not None:
+        parent = connection.execute(
+            "SELECT 1 FROM experiments WHERE campaign_id = ? AND experiment_id = ?",
+            (campaign_id, request["parent_experiment_id"]),
         ).fetchone()
-        return _receipt(project_id, connection, campaign, experiment)
+        if parent is None:
+            raise ProtocolError("INVALID_SUBMISSION", "admission", "correct", "Parent experiment is not in this campaign.")
+    if budget["attempts_remaining"] <= 0 or budget["execution_seconds_remaining"] <= 0:
+        raise ProtocolError("BUDGET_EXHAUSTED", "admission", "stop", "Campaign budget exhausted.")
+    experiment_id = str(uuid.uuid4())
+    started = time.monotonic()
+    connection.execute(
+        """INSERT INTO experiments
+        (experiment_id, campaign_id, submission_id, request_json, status, started_at)
+        VALUES (?, ?, ?, ?, 'running', ?)""",
+        (experiment_id, campaign_id, submission_id, canonical, time.time()),
+    )
+    return experiment_id, started
+
+
+def _run_attempt(
+    connection: sqlite3.Connection, campaign: sqlite3.Row, project_id: object,
+    experiment_id: str, request: dict[str, Any], started: float, remaining: float,
+) -> dict[str, Any]:
+    campaign_id = campaign["campaign_id"]
+    error_details = None
+    result = None
+    old_handler = signal.signal(signal.SIGALRM, _timeout)
+    try:
+        slice_seconds = remaining - (time.monotonic() - started)
+        if slice_seconds <= 0:
+            raise _TimeExpired()
+        signal.setitimer(signal.ITIMER_REAL, slice_seconds)
+        dataset = _load_snapshot(campaign["snapshot"], campaign["suffix"])
+        if dataset.data_hash != campaign["snapshot_hash"]:
+            raise ValueError("Snapshot fingerprint mismatch.")
+        config = json.loads(campaign["evaluation_json"])
+        if _fingerprint(config) != campaign["evaluation_hash"]:
+            raise ValueError("Evaluation fingerprint mismatch.")
+        if config["runtime"] != _runtime_identity():
+            raise ValueError("Campaign runtime fingerprint mismatch.")
+        spec = {"family": request["strategy"]["family"], "parameters": request["parameters"]}
+        backtest = run_backtest(
+            dataset, make_strategy(spec), initial_cash=config["initial_cash"],
+            transaction_cost_bps=config["transaction_cost_bps"], slippage_bps=config["slippage_bps"],
+        )
+        benchmark = json.loads(campaign["baseline_json"])
+        result = {
+            "fingerprints": {
+                "strategy_and_parameters": _fingerprint({"strategy": spec, "runtime": config["runtime"]}),
+                "snapshot": campaign["snapshot_hash"], "evaluation": campaign["evaluation_hash"],
+            },
+            "discovery": {
+                "start_date": dataset.report["start_date"], "end_date": dataset.report["end_date"],
+                "metrics": backtest.metrics, "benchmark": benchmark,
+                "return_delta": backtest.metrics["total_return"] - benchmark["total_return"],
+            },
+            "diagnostics": [
+                {"code": "WARMUP_REQUIRED", "required_sessions": request["parameters"]["lookback"]}
+            ] if "lookback" in request["parameters"] else [],
+        }
+        if time.monotonic() - started >= remaining:
+            raise _TimeExpired()
+    except _TimeExpired:
+        error_details = {"code": "BUDGET_EXHAUSTED", "phase": "discovery", "next_action": "stop", "message": "Execution time exhausted."}
+    except Exception as error:
+        error_details = {
+            "code": "EXECUTION_FAILED", "phase": "discovery", "next_action": "inspect",
+            "message": f"{type(error).__name__}: {error}",
+        }
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+    elapsed = time.monotonic() - started
+    if error_details and error_details["code"] == "BUDGET_EXHAUSTED":
+        elapsed = max(elapsed, remaining)
+    connection.execute(
+        "UPDATE campaigns SET elapsed_seconds = elapsed_seconds + ? WHERE campaign_id = ?",
+        (elapsed, campaign_id),
+    )
+    connection.execute(
+        "UPDATE experiments SET status = ?, result_json = ?, error_json = ? WHERE experiment_id = ?",
+        ("failed" if error_details else "succeeded", json.dumps(result) if not error_details else None,
+         json.dumps(error_details) if error_details else None, experiment_id),
+    )
+    connection.commit()
+    campaign = _campaign(connection, campaign_id)
+    experiment = _find_experiment(connection, campaign_id, request["submission_id"])
+    assert experiment is not None
+    return _receipt(project_id, connection, campaign, experiment)
 
 
 def experiment_status(project: Path, campaign_id: str, submission_id: str) -> dict[str, Any]:
@@ -373,10 +437,7 @@ def experiment_status(project: Path, campaign_id: str, submission_id: str) -> di
     with _connection(project) as connection:
         connection.execute("BEGIN")
         campaign = _campaign(connection, campaign_id)
-        experiment = connection.execute(
-            "SELECT * FROM experiments WHERE campaign_id = ? AND submission_id = ?",
-            (campaign_id, submission_id),
-        ).fetchone()
+        experiment = _find_experiment(connection, campaign_id, submission_id)
         if experiment is None:
             raise ProtocolError("NOT_FOUND", "status", "check_id", "Unknown submission.")
         return _receipt(project_id, connection, campaign, experiment)
