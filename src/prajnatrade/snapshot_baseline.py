@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import pandas as pd
+
+from prajnatrade.backtest import (
+    Strategy,
+    _rebalance_at_open,
+    _validate_weights,
+    equal_weight_buy_and_hold,
+)
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot import read_discovery
 
@@ -12,6 +21,237 @@ from prajnatrade.snapshot import read_discovery
 _CN_TZ = timezone(timedelta(hours=8))
 _TARGET_WEIGHTS = {symbol: 1.0 / len(ETF_SYMBOLS) for symbol in ETF_SYMBOLS}
 _EPSILON = 1e-12
+
+
+def run_discovery_strategy(
+    data: dict[str, list[dict]],
+    snapshot_id: str,
+    partition_content_hash: str,
+    strategy: Strategy,
+    *,
+    signal_window_sessions: int,
+    initial_cash: float = 100_000.0,
+    transaction_cost_bps: float = 5.0,
+    slippage_bps: float = 0.0,
+) -> dict[str, Any]:
+    """Run a strategy with point-in-time signals and formal Discovery accounting."""
+    _validate_parameters(initial_cash, transaction_cost_bps, slippage_bps)
+    if signal_window_sessions <= 0:
+        raise ValueError("signal_window_sessions must be positive.")
+    sessions = sorted({row["date"] for row in data["calendar"]})
+    if not sessions:
+        raise ValueError("The Discovery partition has no trading sessions.")
+
+    raw_bars = _index_rows(data["raw_bars"], "raw_bars")
+    derived = _index_rows(data["derived"], "derived")
+    actions = _index_actions(data["corporate_actions"])
+    shares = {symbol: 0.0 for symbol in ETF_SYMBOLS}
+    cash = float(initial_cash)
+    receivables: list[dict[str, Any]] = []
+    unresolved_actions: dict[str, list[dict[str, str]]] = {
+        symbol: [] for symbol in ETF_SYMBOLS
+    }
+    signals: list[dict[str, Any]] = []
+    signal_gaps: list[dict[str, Any]] = []
+    fills: list[dict[str, Any]] = []
+    order_attempts: list[dict[str, Any]] = []
+    valuation_gaps: list[dict[str, str]] = []
+    equity_curve: list[dict[str, Any]] = []
+    fees_paid = slippage_paid = 0.0
+    fee_rate = transaction_cost_bps / 10_000.0
+    slippage_rate = slippage_bps / 10_000.0
+    pending: tuple[dict[str, Any], dict[str, float]] | None = None
+
+    for day_index, day in enumerate(sessions):
+        _apply_actions(
+            day, actions.get(day, []), shares, cash, receivables, unresolved_actions
+        )
+        for item in receivables[:]:
+            if item["pay_date"] <= day:
+                cash += item["amount"]
+                receivables.remove(item)
+
+        if pending is not None:
+            signal, weights = pending
+            open_cutoff = datetime.combine(
+                datetime.fromisoformat(day).date(), time(9, 30), tzinfo=_CN_TZ
+            )
+            open_prices = {
+                symbol: (
+                    float(row["open"])
+                    if _is_executable_open(row, open_cutoff)
+                    else None
+                )
+                for symbol in ETF_SYMBOLS
+                if (row := raw_bars.get((day, symbol))) is not None
+            }
+            missing_opens = sorted(
+                symbol
+                for symbol in ETF_SYMBOLS
+                if (
+                    weights.get(symbol, 0.0) > _EPSILON or shares[symbol] > _EPSILON
+                ) and open_prices.get(symbol) is None
+            )
+            attempt = {
+                "signal_date": signal["date"],
+                "date": day,
+                "attempts": 1,
+                "status": "not_filled" if missing_opens else "filled",
+            }
+            if missing_opens:
+                attempt["reason"] = "missing_or_unconfirmed_open"
+                attempt["missing_symbols"] = missing_opens
+            else:
+                open_equity = cash + math.fsum(
+                    shares[symbol] * float(open_prices.get(symbol) or 0.0)
+                    for symbol in ETF_SYMBOLS
+                )
+                target_shares = {
+                    symbol: (
+                        open_equity * weights.get(symbol, 0.0) / float(open_prices[symbol])
+                        if open_prices.get(symbol) is not None
+                        else 0.0
+                    )
+                    for symbol in ETF_SYMBOLS
+                }
+                day_fills, cash, shares, costs = _rebalance_at_open(
+                    pd.Timestamp(day),
+                    open_prices,
+                    target_shares,
+                    cash,
+                    shares,
+                    fee_rate,
+                    slippage_rate,
+                )
+                for fill in day_fills:
+                    fill["raw_open"] = open_prices[fill["symbol"]]
+                    fill["price_basis"] = "unadjusted_open"
+                fills.extend(day_fills)
+                fees_paid += costs["fees"]
+                slippage_paid += costs["slippage"]
+            order_attempts.append(attempt)
+            pending = None
+
+        nav_point, gaps = _valuation(
+            day, raw_bars, shares, cash, receivables, unresolved_actions
+        )
+        equity_curve.append(nav_point)
+        valuation_gaps.extend(gaps)
+
+        if day_index + 1 >= len(sessions):
+            continue
+        cutoff = datetime.combine(
+            datetime.fromisoformat(sessions[day_index + 1]).date(),
+            time(9, 30),
+            tzinfo=_CN_TZ,
+        )
+        window_start = day_index - signal_window_sessions + 1
+        if window_start < 0:
+            continue
+        window_days = sessions[window_start : day_index + 1]
+        missing: dict[str, set[str]] = {}
+        history_rows: list[dict[str, Any]] = []
+        latest_values: dict[str, float] = {}
+        for history_day in window_days:
+            day_values = {}
+            for symbol in ETF_SYMBOLS:
+                row = derived.get((history_day, symbol))
+                if row is None or row.get("value") is None or not _available_by(row, cutoff):
+                    missing.setdefault(history_day, set()).add(symbol)
+                else:
+                    day_values[symbol] = float(row["value"])
+            if len(day_values) == len(ETF_SYMBOLS):
+                history_rows.extend(
+                    {"date": history_day, "symbol": symbol, "close": value}
+                    for symbol, value in day_values.items()
+                )
+                latest_values = day_values
+        if missing:
+            signal_gaps.append({
+                "date": day,
+                "missing_sessions": [
+                    {"date": gap_day, "missing_symbols": sorted(symbols)}
+                    for gap_day, symbols in sorted(missing.items())
+                ],
+                "reason": "required_total_return_window_unavailable",
+            })
+            continue
+
+        state = {
+            "cash": cash,
+            "shares": dict(shares),
+            "equity": nav_point["nav"],
+        }
+        weights = strategy(pd.DataFrame(history_rows), state)
+        if weights is not None:
+            normalized = _validate_weights(weights)
+            signal = {
+                "date": day,
+                "execution_date": sessions[day_index + 1],
+                "target_weights": normalized,
+                "total_return_values": latest_values,
+                "window": list(window_days),
+            }
+            signals.append(signal)
+            pending = (signal, normalized)
+
+    final_nav = equity_curve[-1]["nav"]
+    total_return = final_nav / initial_cash - 1.0 if final_nav is not None else None
+    return {
+        "snapshot_id": snapshot_id,
+        "partition_content_hash": partition_content_hash,
+        "start_date": sessions[0],
+        "end_date": sessions[-1],
+        "initial_cash": initial_cash,
+        "ending_equity": final_nav,
+        "signals": signals,
+        "signal_gaps": signal_gaps,
+        "order_attempts": order_attempts,
+        "fills": fills,
+        "equity_curve": equity_curve,
+        "metrics": {
+            "total_return": total_return,
+            "fees_paid": fees_paid,
+            "slippage_paid": slippage_paid,
+        },
+        "gaps": {
+            "raw_bars": _data_gaps(sessions, raw_bars, "raw_bars"),
+            "derived": _data_gaps(sessions, derived, "derived"),
+            "valuation": valuation_gaps,
+        },
+    }
+
+
+def run_discovery_equal_weight(
+    data: dict[str, list[dict]],
+    snapshot_id: str,
+    partition_content_hash: str,
+    *,
+    initial_cash: float,
+    transaction_cost_bps: float,
+    slippage_bps: float,
+) -> dict[str, Any]:
+    """Run the fixed equal-weight buy-and-hold comparator."""
+    submitted = False
+
+    def buy_and_hold(history: pd.DataFrame, state: Mapping[str, Any]):
+        nonlocal submitted
+        if submitted:
+            return None
+        weights = equal_weight_buy_and_hold(history, state)
+        submitted = weights is not None
+        return weights
+
+    return run_discovery_strategy(
+        data,
+        snapshot_id,
+        partition_content_hash,
+        buy_and_hold,
+        signal_window_sessions=1,
+        initial_cash=initial_cash,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
+    )
 
 
 def run_discovery_baseline(
@@ -239,6 +479,7 @@ def _is_executable_open(row: dict | None, cutoff: datetime) -> bool:
         row is not None
         and row.get("trading_status") == "trading"
         and _valid_price(row.get("open"))
+        and _valid_price(row.get("volume"))
         and _available_by(row, cutoff)
     )
 

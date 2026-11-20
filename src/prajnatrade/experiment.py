@@ -7,17 +7,25 @@ import math
 import platform
 import signal
 import sqlite3
-import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Iterator, TypedDict
 
-from prajnatrade.backtest import equal_weight_buy_and_hold, run_backtest
-from prajnatrade.data import ValidatedData, load_bars
-from prajnatrade.strategies import STRATEGY_FAMILIES, make_strategy, normalize_strategy_spec
+from prajnatrade.snapshot import manifest as snapshot_manifest
+from prajnatrade.snapshot import read_discovery
+from prajnatrade.snapshot_baseline import (
+    run_discovery_equal_weight,
+    run_discovery_strategy,
+)
+from prajnatrade.strategies import (
+    STRATEGY_FAMILIES,
+    make_strategy,
+    normalize_strategy_spec,
+)
 
 
 def _fingerprint(value: object) -> str:
@@ -25,21 +33,75 @@ def _fingerprint(value: object) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def _load_snapshot(content: bytes, suffix: str) -> ValidatedData:
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / ("discovery" + suffix)
-        path.write_bytes(content)
-        return load_bars(path, "total_return")
+def _runtime_components() -> dict[str, str]:
+    directory = Path(__file__).parent
+    files = (
+        "strategies.py", "backtest.py", "data.py", "snapshot.py", "snapshot_baseline.py",
+    )
+    return {
+        **{
+            name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+            for name in files
+        },
+        "numpy": version("numpy"),
+        "pandas": version("pandas"),
+        "pyarrow": version("pyarrow"),
+        "python": platform.python_version(),
+    }
 
 
 def _runtime_identity() -> str:
-    directory = Path(__file__).parent
-    files = ("strategies.py", "backtest.py", "data.py")
-    return _fingerprint({
-        "files": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in files},
-        "numpy": version("numpy"), "pandas": version("pandas"),
-        "pyarrow": version("pyarrow"), "python": platform.python_version(),
-    })
+    return _fingerprint(_runtime_components())
+
+
+_EXECUTION_RULES = {
+    "signal": {
+        "source": "sealed_discovery.derived.value",
+        "basis": "total_return",
+        "availability": "evidence_required_before_next_open",
+    },
+    "execution": {
+        "source": "sealed_discovery.raw_bars.open",
+        "basis": "unadjusted",
+        "attempts": 1,
+        "missing_required_open": "whole_rebalance_not_filled",
+    },
+    "valuation": {
+        "source": "sealed_discovery.raw_bars.close",
+        "basis": "unadjusted",
+        "includes": ["cash", "dividend_receivables"],
+        "missing_required_close": "nav_unavailable",
+    },
+    "corporate_actions": {
+        "dividend": "ex_date_receivable_paid_on_pay_date",
+        "share_adjustment": "apply_before_open_execution",
+    },
+}
+
+
+def _campaign_evaluation(
+    *,
+    snapshot_id: str,
+    partition_content_hash: str,
+    as_of: str | None,
+    initial_cash: float,
+    transaction_cost_bps: float,
+    slippage_bps: float,
+) -> dict[str, Any]:
+    runtime_dependencies = _runtime_components()
+    return {
+        "engine": "sealed-discovery-v1",
+        "snapshot_id": snapshot_id,
+        "partition_content_hash": partition_content_hash,
+        "as_of": as_of,
+        "data_kind": "synthetic",
+        "initial_cash": initial_cash,
+        "transaction_cost_bps": transaction_cost_bps,
+        "slippage_bps": slippage_bps,
+        "execution_rules": _EXECUTION_RULES,
+        "runtime_dependencies": runtime_dependencies,
+        "runtime": _fingerprint(runtime_dependencies),
+    }
 
 
 def project_init(project: Path) -> dict[str, object]:
@@ -52,9 +114,10 @@ def project_init(project: Path) -> dict[str, object]:
             """CREATE TABLE campaigns (
                 campaign_id TEXT PRIMARY KEY, snapshot BLOB NOT NULL,
                 suffix TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
-                evaluation_json TEXT NOT NULL, evaluation_hash TEXT NOT NULL,
-                attempts INTEGER NOT NULL, max_seconds REAL NOT NULL,
-                elapsed_seconds REAL NOT NULL DEFAULT 0, baseline_json TEXT NOT NULL
+                snapshot_id TEXT, evaluation_json TEXT NOT NULL,
+                evaluation_hash TEXT NOT NULL, attempts INTEGER NOT NULL,
+                max_seconds REAL NOT NULL, elapsed_seconds REAL NOT NULL DEFAULT 0,
+                baseline_json TEXT NOT NULL
             )"""
         )
         connection.execute(
@@ -66,6 +129,25 @@ def project_init(project: Path) -> dict[str, object]:
                 UNIQUE(campaign_id, submission_id),
                 FOREIGN KEY(campaign_id) REFERENCES campaigns(campaign_id)
             )"""
+        )
+        connection.execute(
+            """CREATE TABLE frozen_candidates (
+                candidate_id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL,
+                experiment_id TEXT NOT NULL, candidate_hash TEXT NOT NULL,
+                candidate_json TEXT NOT NULL,
+                FOREIGN KEY(campaign_id) REFERENCES campaigns(campaign_id),
+                FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id)
+            )"""
+        )
+        connection.executescript(
+            """
+            CREATE TRIGGER frozen_candidates_no_update
+            BEFORE UPDATE ON frozen_candidates
+            BEGIN SELECT RAISE(ABORT, 'frozen candidates are immutable'); END;
+            CREATE TRIGGER frozen_candidates_no_delete
+            BEFORE DELETE ON frozen_candidates
+            BEGIN SELECT RAISE(ABORT, 'frozen candidates are immutable'); END;
+            """
         )
         project_id = str(uuid.uuid4())
         connection.execute("INSERT INTO project VALUES (?)", (project_id,))
@@ -84,43 +166,99 @@ def project_status(project: Path) -> dict[str, object]:
 
 
 def campaign_create(
-    project: Path, data: Path, attempts: int, max_seconds: float,
+    project: Path, store: Path, snapshot_id: str, attempts: int, max_seconds: float,
     initial_cash: float, transaction_cost_bps: float, slippage_bps: float,
+    as_of: str | None = None,
 ) -> dict[str, object]:
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("Attempts and execution seconds must be positive.")
-    content = data.read_bytes()
-    suffix = data.suffix.lower()
-    dataset = _load_snapshot(content, suffix)
-    evaluation = {
-        "price_basis": "total_return",
-        "data_kind": "synthetic",
-        "initial_cash": initial_cash,
-        "transaction_cost_bps": transaction_cost_bps,
-        "slippage_bps": slippage_bps,
-        "runtime": _runtime_identity(),
-    }
-    baseline = run_backtest(
-        dataset, equal_weight_buy_and_hold, initial_cash=initial_cash,
-        transaction_cost_bps=transaction_cost_bps, slippage_bps=slippage_bps,
+    metadata = snapshot_manifest(store, snapshot_id)
+    if metadata.get("data_kind") != "synthetic":
+        raise ValueError("External Discovery experiments currently require a synthetic sealed snapshot.")
+    receipt = read_discovery(store, snapshot_id, "discovery", as_of)
+    data = receipt["data"]
+    content = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    snapshot_hash = receipt["content_hash"]
+    partition_hash = receipt.get("partition_content_hash", snapshot_hash)
+    evaluation = _campaign_evaluation(
+        snapshot_id=snapshot_id,
+        partition_content_hash=partition_hash,
+        as_of=as_of,
+        initial_cash=initial_cash,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
+    )
+    baseline = run_discovery_equal_weight(
+        data,
+        snapshot_id,
+        partition_hash,
+        initial_cash=initial_cash,
+        transaction_cost_bps=transaction_cost_bps,
+        slippage_bps=slippage_bps,
     )
     campaign_id = str(uuid.uuid4())
     evaluation_hash = _fingerprint(evaluation)
     with sqlite3.connect(project / ".prajnatrade" / "project.sqlite") as connection:
+        _ensure_project_schema(connection)
         connection.execute(
             """INSERT INTO campaigns
-            (campaign_id, snapshot, suffix, snapshot_hash, evaluation_json,
+            (campaign_id, snapshot, suffix, snapshot_hash, snapshot_id, evaluation_json,
              evaluation_hash, attempts, max_seconds, baseline_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (campaign_id, content, suffix, dataset.data_hash, json.dumps(evaluation),
-             evaluation_hash, attempts, max_seconds, json.dumps(baseline.metrics)),
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                campaign_id,
+                content,
+                ".json",
+                snapshot_hash,
+                snapshot_id,
+                json.dumps(evaluation, sort_keys=True, separators=(",", ":")),
+                evaluation_hash,
+                attempts,
+                max_seconds,
+                json.dumps(baseline, sort_keys=True, separators=(",", ":"), allow_nan=False),
+            ),
         )
     return {
-        "schema_version": 1, "project_id": project_id, "campaign_id": campaign_id,
-        "fingerprints": {"snapshot": dataset.data_hash, "evaluation": evaluation_hash},
+        "schema_version": 1,
+        "project_id": project_id,
+        "campaign_id": campaign_id,
+        "snapshot_id": snapshot_id,
+        "data_kind": "synthetic",
+        "fingerprints": {
+            "snapshot": snapshot_hash,
+            "partition": partition_hash,
+            "evaluation": evaluation_hash,
+        },
         "budget": {"attempts_remaining": attempts, "execution_seconds_remaining": max_seconds},
     }
+
+
+def _ensure_project_schema(connection: sqlite3.Connection) -> None:
+    campaign_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(campaigns)").fetchall()
+    }
+    if "snapshot_id" not in campaign_columns:
+        connection.execute("ALTER TABLE campaigns ADD COLUMN snapshot_id TEXT")
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS frozen_candidates (
+            candidate_id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL,
+            experiment_id TEXT NOT NULL, candidate_hash TEXT NOT NULL,
+            candidate_json TEXT NOT NULL,
+            FOREIGN KEY(campaign_id) REFERENCES campaigns(campaign_id),
+            FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id)
+        )"""
+    )
+    connection.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS frozen_candidates_no_update
+        BEFORE UPDATE ON frozen_candidates
+        BEGIN SELECT RAISE(ABORT, 'frozen candidates are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS frozen_candidates_no_delete
+        BEFORE DELETE ON frozen_candidates
+        BEGIN SELECT RAISE(ABORT, 'frozen candidates are immutable'); END;
+        """
+    )
 
 
 class ProtocolError(Exception):
@@ -136,6 +274,7 @@ def _connection(project: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(project / ".prajnatrade" / "project.sqlite", timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    _ensure_project_schema(connection)
     return connection
 
 
@@ -368,8 +507,8 @@ def _run_attempt(
         if slice_seconds <= 0:
             raise _TimeExpired()
         signal.setitimer(signal.ITIMER_REAL, slice_seconds)
-        dataset = _load_snapshot(campaign["snapshot"], campaign["suffix"])
-        if dataset.data_hash != campaign["snapshot_hash"]:
+        data = json.loads(bytes(campaign["snapshot"]).decode("utf-8"))
+        if _fingerprint(data) != campaign["snapshot_hash"]:
             raise ValueError("Snapshot fingerprint mismatch.")
         config = json.loads(campaign["evaluation_json"])
         if _fingerprint(config) != campaign["evaluation_hash"]:
@@ -377,24 +516,57 @@ def _run_attempt(
         if config["runtime"] != _runtime_identity():
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec = {"family": request["strategy"]["family"], "parameters": request["parameters"]}
-        backtest = run_backtest(
-            dataset, make_strategy(spec), initial_cash=config["initial_cash"],
-            transaction_cost_bps=config["transaction_cost_bps"], slippage_bps=config["slippage_bps"],
+        window = _signal_window(spec)
+        discovery = run_discovery_strategy(
+            data,
+            config["snapshot_id"],
+            config["partition_content_hash"],
+            make_strategy(spec),
+            signal_window_sessions=window,
+            initial_cash=config["initial_cash"],
+            transaction_cost_bps=config["transaction_cost_bps"],
+            slippage_bps=config["slippage_bps"],
         )
         benchmark = json.loads(campaign["baseline_json"])
+        baseline_return = benchmark["metrics"]["total_return"]
+        result_return = discovery["metrics"]["total_return"]
+        comparison = {
+            "start_date": discovery["start_date"],
+            "end_date": discovery["end_date"],
+            "baseline": benchmark,
+            "return_delta": (
+                result_return - baseline_return
+                if result_return is not None and baseline_return is not None
+                else None
+            ),
+            "fees_paid_delta": (
+                discovery["metrics"]["fees_paid"] - benchmark["metrics"]["fees_paid"]
+            ),
+            "slippage_paid_delta": (
+                discovery["metrics"]["slippage_paid"] - benchmark["metrics"]["slippage_paid"]
+            ),
+        }
+        discovery.update({
+            "benchmark": benchmark["metrics"],
+            "return_delta": comparison["return_delta"],
+            "baseline_comparison": comparison,
+        })
         result = {
+            "data_kind": config["data_kind"],
             "fingerprints": {
-                "strategy_and_parameters": _fingerprint({"strategy": spec, "runtime": config["runtime"]}),
-                "snapshot": campaign["snapshot_hash"], "evaluation": campaign["evaluation_hash"],
+                "strategy_and_parameters": _fingerprint({
+                    "strategy": spec, "runtime": config["runtime"],
+                }),
+                "runtime_dependencies": config["runtime"],
+                "snapshot": campaign["snapshot_hash"],
+                "partition": config["partition_content_hash"],
+                "evaluation": campaign["evaluation_hash"],
             },
-            "discovery": {
-                "start_date": dataset.report["start_date"], "end_date": dataset.report["end_date"],
-                "metrics": backtest.metrics, "benchmark": benchmark,
-                "return_delta": backtest.metrics["total_return"] - benchmark["total_return"],
-            },
+            "runtime_dependencies": config["runtime_dependencies"],
+            "discovery": discovery,
             "diagnostics": [
-                {"code": "WARMUP_REQUIRED", "required_sessions": request["parameters"]["lookback"]}
-            ] if "lookback" in request["parameters"] else [],
+                {"code": "WARMUP_REQUIRED", "required_sessions": window}
+            ] if window > 1 else [],
         }
         if time.monotonic() - started >= remaining:
             raise _TimeExpired()
@@ -441,6 +613,87 @@ def experiment_status(project: Path, campaign_id: str, submission_id: str) -> di
         if experiment is None:
             raise ProtocolError("NOT_FOUND", "status", "check_id", "Unknown submission.")
         return _receipt(project_id, connection, campaign, experiment)
+
+
+def _signal_window(spec: dict[str, Any]) -> int:
+    family = spec["family"]
+    lookback = int(spec["parameters"].get("lookback", 1))
+    return lookback + 1 if family in {"momentum", "inverse_volatility"} else lookback
+
+
+def freeze_experiment_candidate(
+    project: Path,
+    campaign_id: str,
+    submission_id: str,
+    name: str,
+    conclusion: str,
+) -> dict[str, Any]:
+    if not name.strip() or not conclusion.strip():
+        raise ValueError("Candidate name and conclusion must not be empty.")
+    project_id = project_status(project)["project_id"]
+    with _connection(project) as connection:
+        campaign = _campaign(connection, campaign_id)
+        experiment = _find_experiment(connection, campaign_id, submission_id)
+        if experiment is None:
+            raise ValueError("Unknown experiment submission.")
+        if experiment["status"] != "succeeded" or not experiment["result_json"]:
+            raise ValueError("Only a successful experiment can be frozen as a candidate.")
+        request = json.loads(experiment["request_json"])
+        result = json.loads(experiment["result_json"])
+        config = json.loads(campaign["evaluation_json"])
+        candidate_id = str(uuid.uuid4())
+        frozen = {
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "project_id": project_id,
+            "campaign_id": campaign_id,
+            "experiment_id": experiment["experiment_id"],
+            "submission_id": submission_id,
+            "name": name.strip(),
+            "hypothesis": request["hypothesis"],
+            "conclusion": conclusion.strip(),
+            "strategy": request["strategy"],
+            "parameters": request["parameters"],
+            "fingerprints": result["fingerprints"],
+            "snapshot_id": config["snapshot_id"],
+            "evaluation": config,
+            "runtime_dependencies": result["runtime_dependencies"],
+            "execution_rules": config["execution_rules"],
+            "frozen_at": datetime.now(timezone.utc).isoformat(),
+        }
+        frozen["candidate_hash"] = _fingerprint(frozen)
+        canonical = json.dumps(frozen, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        connection.execute(
+            """INSERT INTO frozen_candidates
+            (candidate_id, campaign_id, experiment_id, candidate_hash, candidate_json)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                candidate_id,
+                campaign_id,
+                experiment["experiment_id"],
+                frozen["candidate_hash"],
+                canonical,
+            ),
+        )
+        return frozen
+
+
+def candidate_status(project: Path, candidate_id: str) -> dict[str, Any]:
+    project_status(project)
+    with _connection(project) as connection:
+        row = connection.execute(
+            "SELECT candidate_hash, candidate_json FROM frozen_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Unknown frozen candidate.")
+        candidate = json.loads(row["candidate_json"])
+        expected_hash = _fingerprint({
+            key: value for key, value in candidate.items() if key != "candidate_hash"
+        })
+        if expected_hash != candidate["candidate_hash"] or row["candidate_hash"] != expected_hash:
+            raise ValueError("Frozen candidate fingerprint mismatch.")
+        return candidate
 
 
 def error_context(project: Path, campaign_id: object, submission_id: object) -> dict[str, Any]:

@@ -16,8 +16,9 @@ from prajnatrade.backtest import (
 from prajnatrade.data import CASH, DataValidationError, load_bars, validate_calendar
 from prajnatrade.isolation import probe_isolation
 from prajnatrade.experiment import (
-    ProtocolError, campaign_create, error_context, experiment_resume, experiment_status,
-    experiment_submit, project_init, project_status,
+    ProtocolError, campaign_create, candidate_status, error_context,
+    experiment_resume, experiment_status, experiment_submit,
+    freeze_experiment_candidate, project_init, project_status,
 )
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
@@ -55,13 +56,26 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
     create = campaign_commands.add_parser("create")
     create.add_argument("--project", required=True, type=Path)
-    create.add_argument("--data", required=True, type=Path, help="synthetic Discovery bars")
-    create.add_argument("--data-kind", required=True, choices=["synthetic"])
+    create.add_argument("--store", required=True, type=Path, help="trusted sealed snapshot store")
+    create.add_argument("--snapshot-id", required=True, help="sealed snapshot with a Discovery partition")
+    create.add_argument("--as-of", help="historical cutoff for a successor snapshot")
     create.add_argument("--attempts", required=True, type=int)
     create.add_argument("--max-seconds", required=True, type=float)
     create.add_argument("--initial-cash", type=float, default=100_000.0)
     create.add_argument("--transaction-cost-bps", type=float, default=5.0)
     create.add_argument("--slippage-bps", type=float, default=0.0)
+
+    candidate = commands.add_parser("candidate", help="freeze and inspect successful Discovery candidates")
+    candidate_commands = candidate.add_subparsers(dest="candidate_command", required=True)
+    freeze = candidate_commands.add_parser("freeze")
+    freeze.add_argument("--project", required=True, type=Path)
+    freeze.add_argument("--campaign-id", required=True)
+    freeze.add_argument("--submission-id", required=True)
+    freeze.add_argument("--name", required=True)
+    freeze.add_argument("--conclusion", required=True)
+    candidate_lookup = candidate_commands.add_parser("status")
+    candidate_lookup.add_argument("--project", required=True, type=Path)
+    candidate_lookup.add_argument("--candidate-id", required=True)
 
     data = commands.add_parser("data", help="inspect and validate local datasets")
     data_commands = data.add_subparsers(dest="data_command", required=True)
@@ -294,8 +308,20 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
             return 0
         if args.command == "campaign":
             result = campaign_create(
-                args.project, args.data, args.attempts, args.max_seconds,
-                args.initial_cash, args.transaction_cost_bps, args.slippage_bps,
+                args.project, args.store, args.snapshot_id, args.attempts,
+                args.max_seconds, args.initial_cash, args.transaction_cost_bps,
+                args.slippage_bps, args.as_of,
+            )
+            print(json.dumps(result, sort_keys=True, allow_nan=False))
+            return 0
+        if args.command == "candidate":
+            result = (
+                freeze_experiment_candidate(
+                    args.project, args.campaign_id, args.submission_id,
+                    args.name, args.conclusion,
+                )
+                if args.candidate_command == "freeze"
+                else candidate_status(args.project, args.candidate_id)
             )
             print(json.dumps(result, sort_keys=True, allow_nan=False))
             return 0
