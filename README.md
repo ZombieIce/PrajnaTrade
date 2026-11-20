@@ -58,10 +58,127 @@ benchmark. The Python backtest interface provides
 and sessions.
 
 Dataset fingerprints preserve the full precision of floating-point values.
+
+### Synthetic shared snapshots (MVP-01)
+
+`snapshot seal` accepts **synthetic only** version-1 JSON and writes a shared,
+content-addressed snapshot outside any Git repository. This does not acquire or
+verify real market data. A trusted operator prepares the input and store:
+
+```sh
+prajnatrade snapshot seal --input synthetic.json --store /trusted/snapshots
+prajnatrade snapshot manifest --store /trusted/snapshots --id <snapshot-id>
+prajnatrade snapshot read --store /trusted/snapshots --id <snapshot-id> --partition discovery
+```
+
+Different project directories can refer to the same snapshot ID and read the
+same Discovery receipt. `read` rejects Validation and Final Holdout; their
+actual contents are already sealed and fingerprinted, not merely reserved
+dates. The CLI does not export sealed files or authorize protected evaluation.
+The store is read-only by file permissions and each read verifies the requested
+content's fingerprint. Those permissions and CLI checks are **not OS isolation**:
+any process with the trusted operator's filesystem permissions can bypass them.
+Protect the store with a separately enforced deployment boundary before using
+untrusted agents; this ticket does not verify that boundary.
+
+The input object has `schema_version: 1`, `data_kind: "synthetic"`,
+`derivation_rule_version`, `sources`, `symbol_coverage`, and arrays `calendar`,
+`raw_bars`, `corporate_actions`, and `derived`. `tests/test_snapshot_cli.py`
+contains a complete generated example. Each source in `sources` has `source`,
+`version`, `coverage_start`, `coverage_end`, `available_at`,
+`availability_evidence`, and `collected_at`. `symbol_coverage` maps each of
+`511260`, `518880`, `515080`, `513300`, and `159612` to an independently
+declared `{"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}` history; do not infer
+listing history from the first observed bar. The coverage declarations and
+calendar are synthetic fixtures, not proof of actual listings or exchange days.
+
+Every array entry includes `date`, timezone-aware ISO `available_at` and
+`collected_at`, and `availability_evidence`. Use explicit `null` for unknown
+availability or evidence; it is recorded as a gap, never replaced with the
+collection time. Non-calendar entries include `symbol`. Raw bars require
+`open`, `high`, `low`, `close`, `volume`, and `trading_status` (`trading`,
+`suspended`, or `unknown`); derived rows require `value`. Missing numeric
+values are explicit `null`, and unknown trading status is a gap. Corporate
+actions use `type: "cash_dividend"` with
+`cash_per_share`, `pay_date`, and `terms_evidence`, or
+`type: "share_adjustment"` with `ratio` and `terms_evidence`; unknown terms
+are explicit `null` and recorded as gaps. An empty actions array means the
+source's declared coverage asserts no actions. Source-level availability and
+collection evidence are required, not inferred.
+
+The common start is the latest declared symbol/source coverage start, aligned
+to the supplied calendar; the end is the last calendar session within all
+coverage with complete raw/derived values and availability evidence for all
+five ETFs and no incomplete action on that session. Intermediate gaps remain
+visible. At least five sessions are required. The first `floor(3N/5)` sessions
+are Discovery, the next `floor(N/5)` are Validation, and the rest are Final
+Holdout. The manifest includes source metadata, coverage, gaps, per-source and
+per-partition hashes, and the derivation version. The snapshot ID hashes the
+canonical manifest, including all three partition fingerprints, not paths.
+Changing fixed content produces a new ID; repeat sealing verifies existing
+content rather than overwriting it.
+
+The legacy `research`, `baseline`, and validation commands described below do
+not consume this sealed snapshot interface and do not inherit its checks.
 Campaigns created before this change may have an incompatible fingerprint and
 must be recreated rather than resumed or validated.
 
 ## Research, validation, and reports
+
+### External Discovery experiment protocol (synthetic only)
+
+The operator initializes a project and creates a Campaign. The input must be
+synthetic Discovery data only; `--data-kind synthetic` is an operator assertion,
+not proof of provenance. Each Campaign stores its own snapshot, evaluation
+configuration, runtime fingerprints and attempt/time budgets in the project's
+`.prajnatrade` directory. Move that directory with the project to preserve its
+identity; `--project` is just its location.
+
+```sh
+prajnatrade project init --project ./strategy-A
+prajnatrade campaign create --project ./strategy-A --data discovery.csv \
+  --data-kind synthetic --attempts 20 --max-seconds 3600
+prajnatrade experiment submit --project ./strategy-A --input first.json
+prajnatrade experiment status --project ./strategy-A \
+  --campaign-id <campaign-id> --submission-id first
+```
+
+`first.json` contains:
+
+```json
+{
+  "schema_version": 1,
+  "campaign_id": "<campaign-id>",
+  "submission_id": "first",
+  "hypothesis": "Equal weights match the Discovery benchmark.",
+  "strategy": {"family": "equal_weight"},
+  "parameters": {}
+}
+```
+
+Supported declarative families are `equal_weight`, `momentum`, `trend_filter`
+and `inverse_volatility`; parameters follow the existing research strategy
+definitions. A follow-up uses a fresh `submission_id` and may include a
+`parent_experiment_id` from the same Campaign. Submissions cannot override
+Campaign settings. Submit/status print versioned JSON on stdout; rejected and
+failed requests return a nonzero exit code with a stable error and next action.
+Results include only Discovery metrics and an equal-weight benchmark using
+the same snapshot and evaluation settings.
+
+The same Campaign/submission ID and normalized content reuse one experiment;
+changed content conflicts, and invalid or conflicting requests do not consume
+an attempt. Accepted failures do consume one. Campaign execution is serialized
+and limited by the shared execution time budget. A process killed during
+execution is recorded as interrupted when next inspected or submitted; time
+through that inspection is conservatively charged. This ticket does not
+provide experiment resume. If runtime implementation or dependency fingerprints
+change, new execution fails rather than silently changing the Campaign.
+
+This synthetic protocol is separate from the existing `research` registry and
+does not yet connect its experiments to `research freeze`. Project files and
+operator commands are not an OS-enforced authorization or isolation boundary;
+do not use this workflow for sealed data, untrusted Python, or real-data
+security claims.
 
 Mock campaigns are deterministic orchestration checks, not AI research. They
 use recorded decisions to refine a retained or investigated direction or
