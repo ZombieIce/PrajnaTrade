@@ -88,8 +88,8 @@ from prajnatrade import dividend, release, snapshot
 from prajnatrade.backtest import _validate_weights
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot_baseline import (
-    _CN_TZ,
-    _available_by,
+    CN_TZ,
+    available_by,
     _is_executable_open,
     _valid_price,
 )
@@ -186,13 +186,13 @@ def _failpoint(name: str) -> None:
 
 def _session_open(session: str) -> datetime:
     return datetime.combine(
-        datetime.fromisoformat(session).date(), _OPEN, tzinfo=_CN_TZ
+        datetime.fromisoformat(session).date(), _OPEN, tzinfo=CN_TZ
     )
 
 
 def _session_close(session: str) -> datetime:
     return datetime.combine(
-        datetime.fromisoformat(session).date(), _CLOSE, tzinfo=_CN_TZ
+        datetime.fromisoformat(session).date(), _CLOSE, tzinfo=CN_TZ
     )
 
 
@@ -423,12 +423,8 @@ def _valid_close(row: dict | None, cutoff: datetime) -> bool:
         row is not None
         and row.get("trading_status") == "trading"
         and _valid_price(row.get("close"))
-        and _available_by(row, cutoff)
+        and available_by(row, cutoff)
     )
-
-
-def _terms_available(action: dict, cutoff: datetime) -> bool:
-    return _available_by(action, cutoff)
 
 
 def _terms_valid(action: dict) -> bool:
@@ -641,6 +637,7 @@ class Ledger:
         expected_previous: str | None,
         start_date: str,
         state: str,
+        committed_at: str | None = None,
     ) -> None:
         """Commit one whole day and its progress atomically."""
         self._begin()
@@ -674,7 +671,7 @@ class Ledger:
                     session,
                     _canonical(result),
                     result_hash,
-                    _now(),
+                    committed_at if committed_at is not None else _now(),
                     result["status"],
                 ),
             )
@@ -823,8 +820,12 @@ def update(
     ``corrections_store`` is the trusted snapshot store that owns the verified
     dividend-correction journal.  Only ``.dividend-corrections/revision-*.json``
     entries are read, through :func:`prajnatrade.dividend.load_verified_revision`;
-    no sealed partition payload is opened and no query is debited.  Without it,
-    no correction is ever applied.
+    no sealed partition payload is opened and no query is debited.
+
+    The operator CLI requires ``--corrections-store`` so an eligible correction
+    cannot be silently skipped and pushed into a later session.  This Python
+    entry point keeps ``corrections_store=None`` for trusted callers that
+    deliberately run without the journal; such a run applies no correction.
     """
     feed = load_feed(data)
     try:
@@ -1733,6 +1734,7 @@ def _initial_prior(execution: dict[str, Any]) -> dict[str, Any]:
         "next_orders": [],
         "start_date": None,
         "last_committed_date": None,
+        "committed_at": None,
     }
 
 
@@ -1745,10 +1747,12 @@ def _prior_from_ledger(
             "PROGRESS_MISMATCH",
             f"The ledger progress points at {session} but no committed day is stored.",
         )
-    return _prior_from_result(day["result"])
+    return _prior_from_result(day["result"], committed_at=day["committed_at"])
 
 
-def _prior_from_result(result: dict[str, Any]) -> dict[str, Any]:
+def _prior_from_result(
+    result: dict[str, Any], *, committed_at: str | None = None
+) -> dict[str, Any]:
     return {
         "date": result["date"],
         "cash": float(result["cash"]),
@@ -1771,6 +1775,7 @@ def _prior_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "next_orders": [dict(order) for order in result["next_orders"]],
         "start_date": result["progress"]["start_date"],
         "last_committed_date": result["date"],
+        "committed_at": committed_at,
     }
 
 
@@ -1839,6 +1844,10 @@ def _process_session(
             # stuck on an incomplete frozen input.  A block is never a day row.
             database.delete_input(release_id, session)
         raise
+    # The order set becomes durable in the transaction below, so this is the
+    # persistence instant carried into the next session's frozen input.  It is
+    # captured after computation and immediately before the commit.
+    committed_at = _now()
     database.commit_day(
         version_id=release_id,
         release_id=release_id,
@@ -1848,10 +1857,11 @@ def _process_session(
         expected_previous=prior["last_committed_date"],
         start_date=result["progress"]["start_date"],
         state=state,
+        committed_at=committed_at,
     )
     if session == target:
         _failpoint("shadow_after_commit_before_report")
-    return _prior_from_result(result)
+    return _prior_from_result(result, committed_at=committed_at)
 
 
 def _build_input(
@@ -1916,7 +1926,7 @@ def _build_input(
             )
     for action in actions:
         symbol = action["symbol"]
-        available = _terms_available(action, open_cutoff)
+        available = available_by(action, open_cutoff)
         valid = _terms_valid(action)
         if held.get(symbol, 0.0) <= _EPSILON:
             if not available or not valid:
@@ -1964,7 +1974,7 @@ def _build_input(
                 if row is None or row.get("value") is None:
                     blockers.append(("missing_signal_input", f"{label} is missing."))
                     signal_gap = True
-                elif not _available_by(row, close_cutoff):
+                elif not available_by(row, close_cutoff):
                     blockers.append(
                         (
                             "missing_signal_input",
@@ -2296,7 +2306,7 @@ def _compute_day(
                 }
             )
             continue
-        if not _terms_available(action, open_cutoff) or not _terms_valid(action):
+        if not available_by(action, open_cutoff) or not _terms_valid(action):
             raise _Blocked(
                 "missing_action_terms",
                 f"{action['action_id']} has unresolved or unavailable terms.",
@@ -2330,7 +2340,7 @@ def _compute_day(
                 }
             )
             continue
-        if not _terms_available(action, open_cutoff) or not _terms_valid(action):
+        if not available_by(action, open_cutoff) or not _terms_valid(action):
             raise _Blocked(
                 "missing_action_terms",
                 f"{action['action_id']} has unresolved or unavailable terms.",
@@ -2437,6 +2447,20 @@ def _compute_day(
         symbol = order["symbol"]
         side = order["side"]
         quantity = float(order["quantity"])
+        committed_at = prior.get("committed_at")
+        try:
+            persisted = (
+                datetime.fromisoformat(committed_at)
+                if isinstance(committed_at, str) and committed_at
+                else None
+            )
+        except ValueError:
+            persisted = None
+        persisted_before_deadline = (
+            persisted is not None
+            and persisted.tzinfo is not None
+            and persisted < open_cutoff
+        )
         record = {
             "order_id": order["order_id"],
             "symbol": symbol,
@@ -2446,7 +2470,11 @@ def _compute_day(
             "execution_date": order.get("execution_date"),
             "submitted_at": order.get("submitted_at"),
             "deadline": order.get("deadline"),
-            "persisted_before_deadline": order.get("persisted_before_deadline"),
+            # The creation-time planning estimate is kept only until settlement;
+            # this field records the actual durable persistence time of the
+            # signal day that created the order.
+            "persisted_before_deadline": persisted_before_deadline,
+            "persisted_at": committed_at,
             "target_weight": order.get("target_weight"),
             "date": session,
             "status": None,
@@ -2462,7 +2490,7 @@ def _compute_day(
             submitted is None
             or submitted.tzinfo is None
             or submitted >= open_cutoff
-            or order.get("persisted_before_deadline") is not True
+            or not persisted_before_deadline
         ):
             record["status"] = "missed_deadline"
             record["reason"] = (
@@ -2649,7 +2677,7 @@ def _compute_day(
                         "missing_signal_input",
                         f"derived value for {entry['symbol']} on {entry['session']} is missing.",
                     )
-                if not _available_by(row, close_cutoff):
+                if not available_by(row, close_cutoff):
                     raise _Blocked(
                         "missing_signal_input",
                         f"derived value for {entry['symbol']} on {entry['session']} "

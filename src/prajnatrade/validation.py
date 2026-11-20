@@ -442,6 +442,13 @@ def _parameter_robustness(
     }
 
 
+def make_robustness_plan(
+    strategy: dict[str, Any], max_drawdown_limit: float | None,
+) -> dict[str, Any]:
+    """Public frozen parameter-neighbourhood planner (trusted seam, #28)."""
+    return _make_robustness_plan(strategy, max_drawdown_limit)
+
+
 def _make_robustness_plan(
     strategy: dict[str, Any], max_drawdown_limit: float | None,
 ) -> dict[str, Any]:

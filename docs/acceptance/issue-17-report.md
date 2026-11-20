@@ -4,18 +4,18 @@
 
 End-to-end MVP is NOT passed: the six-scenario rule was not met (1 of 6 required scenarios verified); 5 scenario(s) are blocked: real_snapshot_baseline, real_data_mock, controlled_real_llm, independent_validation_reports, immutable_release_forward.
 
-Manifest SHA-256: `7dec5953d62f3327b3fc8e0ca08c254cb356cc9f362908458529b44310c8806d`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
+Manifest SHA-256: `b20c6b56665d92eca6ff8c146e55324ecaf9d6887e799d761fe83ce8b686ef17`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
 
 ## Delivery
 
 | Field | Value |
 | --- | --- |
 | version | 0.1.0 (MVP-18 acceptance tooling) |
-| branch | ticket-35-acceptance |
-| tested_at | 2026-11-20T22:50:09+08:00 |
+| branch | zombieice-issue-17-implementation |
+| tested_at | 2026-11-21T00:00:33+08:00 |
 | environment | macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; offline; synthetic fixtures only. macOS sandbox-exec covers the synthetic isolation tests; no real deployment isolation is verified. |
-| test_command | PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /Users/yibinzhang/go/src/copilot-worktrees/PrajnaTrade/zombieice-fluffy-giggle/.venv/bin/python -m pytest -q -p no:cacheprovider tests/ |
-| test_result | 241 passed in 665.02s (0:11:05), exit 0 |
+| test_command | PYTHONPATH=src python -m pytest -q |
+| test_result | 249 passed in 688.71s (0:11:28), exit 0 |
 
 ## Scenario summary
 
@@ -38,7 +38,7 @@ Status counts: verified=1, blocked=5, failed=0, not_run=0.
 - **Expected**: The same delivery version runs the deterministic test suite and the public CLI workflows in a clean environment, with the operator/research split enforced and synthetic fixtures covering success, invalid input, replay, budget refusal, failure evidence and interrupted-resume paths.
 - **Observed**: The recorded full-suite command passes in this delivery. The operator-only acceptance report validates the strict manifest and renders deterministic Markdown/JSON; prajnatrade-agent rejects the acceptance command. Synthetic scope only: this proves the synthetic test/CLI path, not real market data, real model access, deployed OS isolation, protected real evaluations or real forward tracking.
 - **Evidence**:
-  - `test_suite` — `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /Users/yibinzhang/go/src/copilot-worktrees/PrajnaTrade/zombieice-fluffy-giggle/.venv/bin/python -m pytest -q -p no:cacheprovider tests/`: Full deterministic suite, exit 0; machine result is recorded in delivery.test_result. Synthetic fixtures only, no network and no broker.
+  - `test_suite` — `PYTHONPATH=src python -m pytest -q`: Full deterministic suite, exit 0; machine result is recorded in delivery.test_result. Synthetic fixtures only, no network and no broker.
   - `test_file` — `tests/test_acceptance_cli.py`: Public-CLI tests for strict manifest validation, stable rejection codes, verdict rules, deterministic rendering, no-store report generation and rejection of the operator command by prajnatrade-agent.
   - `test_file` — `tests/test_experiment_cli.py, tests/test_research_cli.py, tests/test_protected_eval_cli.py, tests/test_holdout_report_cli.py, tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py`: Public-CLI workflow tests for the experiment protocol, protected evaluation, release lifecycle, Shadow Live and comparison, all subprocess-based on synthetic fixtures.
 - **Blockers**: none
@@ -98,10 +98,10 @@ Status counts: verified=1, blocked=5, failed=0, not_run=0.
 ### 6. Immutable releases and multi-strategy Shadow Live (`immutable_release_forward`) — BLOCKED
 
 - **Scope**: data=synthetic, agent=mock, period=historical
-- **Expected**: At least two real-data independently validated, human-approved immutable release versions, explicitly enabled at pre-registered after-close signal points, tracking at least two consecutive, common, committed real forward trading days, with one after-close signal submitted pre-open and reconciled to the next session's terminal order state, plus controlled synthetic boundary coverage.
-- **Observed**: Release approval/fetch/lifecycle, Shadow Live atomic day commits, one-time dividend corrections and multi-version comparison pass on synthetic fixtures. There is no real approved release, no real forward ledger and no real multi-version tracking.
+- **Expected**: At least two real-data independently validated, human-approved immutable release versions, explicitly enabled at pre-registered after-close signal points, tracking at least two consecutive, common, committed real forward trading days, each recorded with its after-close signal_date, whether the resulting orders were persisted before the next session's open, the next_session where those orders reached a terminal state (filled/evidenced_not_filled), and the trusted ledger_day_id/result_hash, plus controlled synthetic boundary coverage.
+- **Observed**: Release approval/fetch/lifecycle, explicit immutable human rejection, Shadow Live atomic day commits, committed-time fill eligibility, one-time dividend corrections and multi-version comparison pass on synthetic fixtures. The strict acceptance schema now requires the forward-day signal/pre-open/next-session/terminal-state/ledger-hash reconciliation, but there is no real approved release, no real forward ledger and no real multi-version tracking.
 - **Evidence**:
-  - `synthetic_mechanism` — `tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py, tests/test_correction_delta_cli.py, tests/test_impact_cli.py`: Synthetic mechanism coverage only: immutable release identity, lifecycle, atomic Shadow Live days, reruns, missing-price and missed-deadline boundaries, corrections and common-interval comparison. Synthetic replay is not real forward evidence.
+  - `synthetic_mechanism` — `tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py, tests/test_correction_delta_cli.py, tests/test_impact_cli.py`: Synthetic mechanism coverage only: immutable release identity, explicit human rejection records, lifecycle, atomic Shadow Live days, reruns, missing-price and missed-deadline boundaries, committed-time fill eligibility, corrections and common-interval comparison. Synthetic replay is not real forward evidence.
 - **Blockers**:
   - Missing: At least two real candidates that independently passed real protected validation and received explicit human approval as immutable release versions; no real candidate has been approved.
     Unblock: After the real protected evaluation evidence exists, obtain explicit human approval for two distinct real candidates and register their unique immutable release IDs and pre-registered enable times (issue #14).
@@ -116,7 +116,7 @@ Status counts: verified=1, blocked=5, failed=0, not_run=0.
 | One real-Agent candidate is traceable from experiment → freeze → both protected stages → human approval → immutable release → real forward ledger (non-empty IDs). (`candidate_chain`) | NOT met | real_chain.agent_candidate is empty. |
 | The candidate's release is a real-data, human-approved immutable release bound to the same Validation and Final Holdout evidence. (`candidate_release`) | NOT met | No approved release entry matches the candidate release ID. |
 | At least two real, independently validated, human-approved immutable releases. (`two_real_approved_releases`) | NOT met | 0 real approved release(s); independent pair: none. |
-| At least two consecutive, common, committed real forward trading days. (`real_forward_days`) | NOT met | 0 forward day(s); consecutive real committed common window: none. |
+| At least two consecutive, common, committed real forward trading days, each with an after-close signal persisted pre-open and reconciled to the next session's order terminal state. (`real_forward_days`) | NOT met | 0 forward day(s); 0 reconciled (signal pre-open, terminal state recorded); consecutive real committed common window: none. |
 | The approved candidate has committed real forward ledger days. (`candidate_forward_ledger`) | NOT met | candidate forward days: none. |
 | The five real-required scenarios are verified with real-scope evidence (real data, controlled real Agent, real forward tracking). (`real_scope_evidence`) | NOT met | real_snapshot_baseline: status=blocked, data=synthetic (required real); real_data_mock: status=blocked, data=synthetic (required real); controlled_real_llm: status=blocked, agent=mock (required real), data=synthetic (required real); independent_validation_reports: status=blocked, data=synthetic (required real); immutable_release_forward: status=blocked, data=synthetic (required real), period=historical (required forward). |
 
@@ -142,10 +142,10 @@ Status counts: verified=1, blocked=5, failed=0, not_run=0.
 - Missing: At least two real, independently validated, human-approved immutable releases, each with its own Validation and Final Holdout evidence.
 - Unblock: Independently validate and approve two distinct real candidates; each must consume its own protected intervals and be registered as a unique immutable release.
 
-**`real_forward_days`** — At least two consecutive, common, committed real forward trading days.
+**`real_forward_days`** — At least two consecutive, common, committed real forward trading days, each with an after-close signal persisted pre-open and reconciled to the next session's order terminal state.
 
-- Missing: At least two consecutive, common, committed real forward trading days in the trusted Shadow Live ledger.
-- Unblock: Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable.
+- Missing: At least two consecutive, common, committed real forward trading days in the trusted Shadow Live ledger with pre-open persisted orders and a recorded next-session terminal order state.
+- Unblock: Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable, then record each day's after-close signal, pre-open persisted orders, next session, order terminal state and ledger day result hash in the acceptance manifest.
 
 **`candidate_forward_ledger`** — The approved candidate has committed real forward ledger days.
 
@@ -210,8 +210,8 @@ Status counts: verified=1, blocked=5, failed=0, not_run=0.
   - Missing: At least two real, independently validated, human-approved immutable releases, each with its own Validation and Final Holdout evidence.
   - Unblock: Independently validate and approve two distinct real candidates; each must consume its own protected intervals and be registered as a unique immutable release.
 - **`real_chain:real_forward_days`**
-  - Missing: At least two consecutive, common, committed real forward trading days in the trusted Shadow Live ledger.
-  - Unblock: Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable.
+  - Missing: At least two consecutive, common, committed real forward trading days in the trusted Shadow Live ledger with pre-open persisted orders and a recorded next-session terminal order state.
+  - Unblock: Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable, then record each day's after-close signal, pre-open persisted orders, next session, order terminal state and ledger day result hash in the acceptance manifest.
 - **`real_chain:candidate_forward_ledger`**
   - Missing: A non-empty real forward ledger for the approved candidate; every listed forward day must be a committed, common, real session.
   - Unblock: Record the candidate's release ID in the trusted forward ledger and commit its real forward days.
@@ -235,6 +235,6 @@ Status counts: verified=1, blocked=5, failed=0, not_run=0.
 12. Run one real-Agent campaign, freeze the candidate, pass both protected stages under separate human authorizations, approve the immutable release and commit its real forward ledger days.
 13. Obtain explicit human approval for the frozen candidate and register the unique immutable release ID bound to the same protected-stage evidence.
 14. Independently validate and approve two distinct real candidates; each must consume its own protected intervals and be registered as a unique immutable release.
-15. Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable.
+15. Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable, then record each day's after-close signal, pre-open persisted orders, next session, order terminal state and ledger day result hash in the acceptance manifest.
 16. Record the candidate's release ID in the trusted forward ledger and commit its real forward days.
 17. Complete scenarios 2–6 with real evidence; synthetic mechanism tests never satisfy the real-chain gate.

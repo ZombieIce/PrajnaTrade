@@ -6,9 +6,10 @@ immutable evaluation records; it never re-runs an evaluation, never opens a
 sealed snapshot partition and never debits a query.  The same report data is
 rendered to deterministic HTML (inline SVG curves) or JSON.
 
-Missing evidence is rendered as *incomplete / not approved*; a changed or
-missing record is an explicit error instead of a silent fallback.  The report
-never grants admission.
+Missing evidence is rendered as *evidence incomplete*; a changed or missing
+record is an explicit error instead of a silent fallback.  The verdict names
+``evidence_complete`` and ``all_stages_passed`` explicitly and never claims
+admission.
 """
 
 from __future__ import annotations
@@ -276,8 +277,16 @@ def _verdict(
         if query_receipts[stage].get("debited") is not True:
             incomplete.append(f"{label} query debit receipt is missing.")
     blockers = [*incomplete, *failed]
+    all_stages_passed = all(
+        stages[stage]["present"] is True
+        and stages[stage]["scoring"] is True
+        and stages[stage]["aborted"] is False
+        and stages[stage]["outcome"] == "passed"
+        for stage in STAGES
+    )
     return {
-        "approved": not blockers,
+        "evidence_complete": not blockers,
+        "all_stages_passed": all_stages_passed,
         "incomplete": bool(incomplete),
         "admission": False,
         "blockers": blockers,
@@ -288,7 +297,7 @@ def _verdict(
 def build_evaluation_report(store: str | Path, plan_id: str) -> dict[str, Any]:
     """Assemble the controlled report data from immutable stored evidence."""
     eval_store = protected_eval._store(store)
-    plan = protected_eval._load_plan(eval_store, plan_id)
+    plan = protected_eval.load_plan(eval_store, plan_id)
     ledger = _ledger_rows(eval_store)
     authorizations = _authorizations(eval_store, plan_id)
 
@@ -723,7 +732,7 @@ def _evidence_section(stage: str, section: dict[str, Any]) -> str:
     if not section.get("present"):
         return (
             heading
-            + '<p class="missing">Not approved / incomplete: '
+            + '<p class="missing">Evidence incomplete / not admitted: '
             + _esc(section.get("message") or "no evaluation record is stored.")
             + "</p>"
         )
@@ -828,8 +837,16 @@ def _style() -> str:
 
 def render_report_html(report: dict[str, Any]) -> str:
     verdict = report["verdict"]
-    state = "Approved" if verdict["approved"] else "Not approved"
-    completeness = "complete" if not verdict["incomplete"] else "incomplete"
+    state = (
+        "Evidence complete"
+        if verdict["evidence_complete"]
+        else "Evidence incomplete"
+    )
+    stages_state = (
+        "All stages passed"
+        if verdict["all_stages_passed"]
+        else "Not all stages passed"
+    )
     parts = [
         "<!doctype html>",
         '<html lang="en"><head><meta charset="utf-8">',
@@ -841,13 +858,14 @@ def render_report_html(report: dict[str, Any]) -> str:
         "<h1>PrajnaTrade controlled evaluation report</h1>",
         '<p class="badge">SYNTHETIC DATA — ENGINEERING EVIDENCE ONLY</p>',
         f'<p class="statement">{_esc(report["verdict"]["statement"])}</p>',
-        f'<p class="verdict">{state} · Evidence {completeness} · '
+        f'<p class="verdict">{state} · {stages_state} · '
         "Admission: not granted</p>",
         "</header>",
         "<section><h2>Verdict</h2>",
         _definition_list(
             [
-                ("Approved", verdict["approved"]),
+                ("Evidence complete", verdict["evidence_complete"]),
+                ("All stages passed", verdict["all_stages_passed"]),
                 ("Evidence incomplete", verdict["incomplete"]),
                 ("Admission", verdict["admission"]),
                 ("Report hash", report.get("report_hash")),
@@ -1005,7 +1023,8 @@ def write_evaluation_report(
         "output": str(output),
         "format": report_format,
         "report_hash": report["report_hash"],
-        "approved": report["verdict"]["approved"],
+        "evidence_complete": report["verdict"]["evidence_complete"],
+        "all_stages_passed": report["verdict"]["all_stages_passed"],
         "incomplete": report["verdict"]["incomplete"],
         "admission": False,
     }

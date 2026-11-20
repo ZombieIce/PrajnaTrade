@@ -62,12 +62,32 @@ def approve(
     )
 
 
+def reject(
+    store: Path,
+    plan_id: str,
+    *,
+    reviewer: str = "reviewer-reject",
+    reason: str = "Reviewed both passed stages and explicitly reject this candidate.",
+):
+    return cli(
+        "release", "reject",
+        "--store", str(store),
+        "--plan-id", plan_id,
+        "--reviewer", reviewer,
+        "--reason", reason,
+    )
+
+
 def fetch(store: Path, release_id: str):
     return cli(
         "release", "fetch",
         "--store", str(store),
         "--release-id", release_id,
     )
+
+
+def list_releases(store: Path):
+    return cli("release", "list", "--store", str(store))
 
 
 def lifecycle(
@@ -436,6 +456,135 @@ def test_approval_refuses_missing_or_failed_stage_evidence(evidence: dict) -> No
     assert no_override.returncode == 2
     assert "unrecognized arguments" in no_override.stderr
     assert not (entry["store"] / "releases").exists()
+
+
+# ---------------------------------------------------------------------------
+# 1b. An explicit human rejection is itself the recorded decision.
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_rejection_is_immutable_auditable_and_blocks_approval(
+    evidence: dict, tmp_path: Path
+) -> None:
+    store = clone_store(evidence["pristine"], tmp_path, "reject-store")
+    entry = evidence["main"]
+    plan = entry["plan"]
+    plan_id = plan["plan_id"]
+    release_id = canonical_hash(
+        {
+            "candidate_hash": plan["candidate_hash"],
+            "plan_hash": plan_id,
+            "release": "release-v1",
+        }
+    )
+
+    result = ok(
+        reject(
+            store,
+            plan_id,
+            reviewer="reviewer-reject",
+            reason="Reviewed both passed stages; reject for a reason outside the thresholds.",
+        )
+    )
+    assert result["status"] == "rejection_recorded"
+    assert result["decision"] == "rejected"
+    assert result["release_id"] == release_id
+    assert result["reused"] is False
+    assert result["artifact_created"] is False
+    assert result["events_created"] is False
+    rejection = result["rejection"]
+    assert rejection["schema_version"] == 1
+    assert rejection["kind"] == "immutable_release_rejection"
+    assert rejection["decision"] == "rejected"
+    assert rejection["reviewer"] == "reviewer-reject"
+    assert "outside the thresholds" in rejection["reason"]
+    assert rejection["recorded_at"]
+    assert rejection["release_id"] == release_id
+    assert rejection["candidate_id"] == plan["candidate_id"]
+    assert rejection["candidate_hash"] == plan["candidate_hash"]
+    assert rejection["plan_id"] == plan_id
+    assert rejection["plan_hash"] == plan_id
+    assert rejection["snapshot_id"] == plan["plan"]["snapshot_id"]
+    assert rejection["partition_fingerprints"] == {
+        "validation": plan["plan"]["partitions"]["validation"],
+        "final_holdout": plan["plan"]["partitions"]["final_holdout"],
+    }
+    runs = {"validation": entry["validation"], "final_holdout": entry["holdout"]}
+    for stage in ("validation", "final_holdout"):
+        reference = rejection["evaluations"][stage]
+        assert reference["evaluation_id"] == runs[stage]["evaluation_id"]
+        assert reference["record_hash"] == runs[stage]["record"]["record_hash"]
+        assert reference["outcome"] == "passed"
+    body = {key: value for key, value in rejection.items() if key != "rejection_id"}
+    assert rejection["rejection_id"] == canonical_hash(body)
+
+    # No release artifact, no lifecycle event and no tracking was created.
+    assert not (store / "releases" / release_id).exists()
+    assert not (store / "releases").exists()
+    rejection_path = store / "rejections" / f"{release_id}.json"
+    assert rejection_path.is_file()
+    assert rejection_path.stat().st_mode & 0o777 == 0o444
+    assert json.loads(rejection_path.read_text(encoding="utf-8")) == rejection
+
+    # The decision is visible through status and list_releases, even though no
+    # artifact exists.
+    current = ok(release_status(store, release_id))
+    assert current["state"] == "rejected"
+    assert current["decision"] == "rejected"
+    assert current["artifact_hash"] is None
+    assert current["timeline"] == []
+    assert current["rejection"] == rejection
+    assert current["admission"]["valid"] is False
+    listing = ok(list_releases(store))
+    entries = {entry["release_id"]: entry for entry in listing["releases"]}
+    assert set(entries) == {release_id}
+    assert entries[release_id]["state"] == "rejected"
+    assert entries[release_id]["decision"] == "rejected"
+    assert entries[release_id]["release_id"] == release_id
+
+    # A later approval for the same candidate+plan refuses explicitly. No
+    # artifact is created and the refusal is audited.
+    refused = rejected(approve(store, plan_id), "PRIOR_REJECTION")
+    assert refused["release_id"] == release_id
+    assert refused["release_created"] is False
+    assert refused["rejection_id"] == rejection["rejection_id"]
+    assert not (store / "releases" / release_id).exists()
+    audits = audit_records(store)
+    assert [audit["error"]["code"] for audit in audits] == ["PRIOR_REJECTION"]
+    assert audits[0]["command"] == "release approve"
+
+    # The decision is immutable: a second reject reuses the first record and
+    # never rewrites reviewer, reason or time.
+    again = ok(
+        reject(
+            store,
+            plan_id,
+            reviewer="reviewer-later",
+            reason="A later reviewer tries to replace the decision.",
+        )
+    )
+    assert again["reused"] is True
+    assert again["rejection"] == rejection
+    assert again["rejection_id"] == rejection["rejection_id"]
+    assert json.loads(rejection_path.read_text(encoding="utf-8")) == rejection
+
+    # A new frozen plan for the same candidate is a new decision path.
+    other = evidence["alt"]["plan"]
+    assert other["plan_id"] != plan_id
+    assert other["candidate_hash"] != plan["candidate_hash"]
+
+    # The agent surface cannot reject a candidate.
+    agent = cli(
+        "release", "reject",
+        "--store", str(store),
+        "--plan-id", plan_id,
+        "--reviewer", "agent",
+        "--reason", "agents cannot reject",
+        agent=True,
+    )
+    assert agent.returncode == 2
+    assert "invalid choice" in agent.stderr
+    assert agent.stdout == ""
 
 
 # ---------------------------------------------------------------------------

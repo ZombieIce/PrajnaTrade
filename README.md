@@ -1596,3 +1596,19 @@ empty, the six-scenario rule is not met and the overall verdict is `blocked` /
 not passed. The report lists the exact missing prerequisites and unblock
 conditions from #24/#26/#27 and this handoff. It is a checklist conclusion, not
 an investment, performance or real-execution claim.
+
+Each real forward day must also prove the after-close signal → next-open
+reconciliation: `signal_date`, `orders_persisted_before_open`, the next session,
+the order's terminal state (`filled` or `evidenced_not_filled`), and the trusted
+`ledger_day_id`/`result_hash`. A committed, common, real day without that
+reconciliation never satisfies the gate.
+
+## Deferred structural refactors
+
+The #17 work deliberately does not include two behaviour-preserving refactors:
+splitting the largest functions in `shadow.py`, `release.py` and
+`protected_eval.py`, and replacing the `cli.py` dispatch chain with a command
+registry. They need separate review; the public cross-module helper seams and
+the removed middlemen are recorded in
+[`docs/adr/0001-synthetic-only-protected-research.md`](docs/adr/0001-synthetic-only-protected-research.md).
+Domain terms live in [`GLOSSARY.md`](GLOSSARY.md).

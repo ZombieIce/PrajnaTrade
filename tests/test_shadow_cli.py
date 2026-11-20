@@ -232,6 +232,7 @@ def shadow_update(
     *,
     release_ids: tuple[str, ...] = (),
     env: dict[str, str] | None = None,
+    corrections_store: Path | None = None,
 ):
     arguments = [
         "shadow", "update",
@@ -239,6 +240,9 @@ def shadow_update(
         "--store", str(store),
         "--data", str(data),
         "--date", date,
+        # The operator CLI requires the trusted corrections store.  These tests
+        # do not exercise corrections, so an empty directory is sufficient.
+        "--corrections-store", str(corrections_store or ledger.parent),
     ]
     for release_id in release_ids:
         arguments += ["--release-id", release_id]
@@ -707,6 +711,69 @@ def test_historical_backfill_records_missed_deadline_and_creates_a_new_order(
 
     third = ok(shadow_update(ledger, store, feed, sessions[0]))  # no-op/earlier target
     assert third["versions"][0]["status"] == "already_committed"
+
+
+def test_fill_eligibility_uses_the_actual_committed_persistence_time(
+    releases: dict, tmp_path: Path
+) -> None:
+    entry = releases["equal_weight"]
+    release_id = entry["release_id"]
+    sessions = FUTURE[:3]
+
+    def run(name: str, committed_at: str) -> dict:
+        root = tmp_path / name
+        store = isolated_store(root, entry)
+        ledger = root / "ledger"
+        feed = write_feed(
+            root / "feed.json",
+            shadow_feed(
+                sessions,
+                closes={symbol: [10.0, 10.1, 10.2] for symbol in SYMBOLS},
+            ),
+        )
+        ok(lifecycle("enable", store, release_id, sessions[0]))
+        ok(shadow_update(ledger, store, feed, sessions[0]))
+
+        # Rewrite only the durable persistence instant of the signal day.  The
+        # committed day content and its result hash are untouched.
+        with sqlite3.connect(ledger / "shadow.sqlite") as connection:
+            connection.execute(
+                "UPDATE days SET committed_at = ? WHERE version_id = ? AND date = ?",
+                (committed_at, release_id, sessions[0]),
+            )
+
+        ok(shadow_update(ledger, store, feed, sessions[1]))
+        with sqlite3.connect(ledger / "shadow.sqlite") as connection:
+            row = connection.execute(
+                "SELECT input_json FROM input_snapshots "
+                "WHERE version_id = ? AND date = ?",
+                (release_id, sessions[1]),
+            ).fetchone()
+        # The prior day's persistence instant is carried into the next frozen
+        # input, so settlement does not have to trust the wall clock.
+        assert json.loads(row[0])["previous"]["committed_at"] == committed_at
+
+        result = day_record(
+            ledger, release_id, root / "report.json", sessions[1]
+        )["result"]
+        # A re-run returns the stored day without recomputing the fills.
+        again = ok(shadow_update(ledger, store, feed, sessions[1]))
+        assert again["versions"][0]["status"] == "already_committed"
+        return {"result": result, "ledger": ledger, "feed": feed, "store": store}
+
+    early = run("before-open", f"{sessions[1]}T01:00:00+00:00")  # 09:00 Shanghai
+    assert early["result"]["orders"]
+    assert all(order["status"] == "filled" for order in early["result"]["orders"])
+
+    late = run("after-open", f"{sessions[1]}T02:00:00+00:00")  # 10:00 Shanghai
+    assert late["result"]["orders"]
+    for order in late["result"]["orders"]:
+        assert order["status"] == "missed_deadline"
+        assert order["persisted_before_deadline"] is False
+        assert order["persisted_at"] == f"{sessions[1]}T02:00:00+00:00"
+        assert order["fill"] is None
+    assert late["result"]["fills"] == []
+    assert late["result"]["positions"][MOMENTUM_SYMBOL]["quantity"] == 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from prajnatrade import snapshot
+from prajnatrade import shadow, snapshot
 from test_protected_eval_cli import (
     SYMBOLS,
     cli,
@@ -280,9 +280,10 @@ def shadow_update_with_corrections(
         "--store", str(store),
         "--data", str(data),
         "--date", date,
+        # The operator CLI always requires the trusted corrections store; when a
+        # test does not file a journal, the empty release store is used.
+        "--corrections-store", str(corrections if corrections is not None else store),
     ]
-    if corrections is not None:
-        arguments += ["--corrections-store", str(corrections)]
     for release_id in release_ids:
         arguments += ["--release-id", release_id]
     return cli(*arguments, env=env)
@@ -1157,23 +1158,53 @@ def test_unavailable_corrections_store_is_rejected_before_any_day(
     assert ledger_rows(context["ledger"], "input_snapshots") == []
 
 
-def test_journal_without_the_corrections_flag_applies_nothing(
+def test_shadow_update_requires_the_corrections_store_flag(
     releases: dict, tmp_path: Path
 ) -> None:
+    entry = releases["equal_weight"]
+    context = scenario(entry, tmp_path / "flag-required", actions=[dividend_action()])
+    response = cli(
+        "shadow", "update",
+        "--ledger", str(context["ledger"]),
+        "--store", str(context["store"]),
+        "--data", str(context["feed"]),
+        "--date", EX_DATE,
+    )
+    assert response.returncode == 2
+    assert response.stdout == ""
+    assert "--corrections-store" in response.stderr
+    assert ledger_rows(context["ledger"], "days") == []
+    assert ledger_rows(context["ledger"], "input_snapshots") == []
+
+
+def test_direct_update_without_corrections_store_applies_nothing(
+    releases: dict, tmp_path: Path
+) -> None:
+    """The CLI requires the store, but the documented Python API keeps the opt-out.
+
+    A trusted caller may deliberately run without a corrections journal; such a
+    direct ``shadow.update(..., corrections_store=None)`` call must apply no
+    correction.  The operator path can never reach this state: the CLI requires
+    ``--corrections-store`` and is covered by the rejection test above.
+    """
     entry = releases["equal_weight"]
     release_id = entry["release_id"]
     context = scenario(entry, tmp_path / "no-flag", actions=[dividend_action()])
     journal = correction_journal(tmp_path / "journal")
-    ok(shadow_update_with_corrections(context["ledger"], context["store"],
-                                      context["feed"], EX_DATE))
-    # The journal exists and is verified, but the operator did not opt in.
-    ok(shadow_update_with_corrections(context["ledger"], context["store"],
-                                      context["feed"], CORRECTION_DAY))
+    report, blocked = shadow.update(
+        context["ledger"], context["store"], context["feed"], EX_DATE
+    )
+    assert blocked is False
+    assert "corrections" not in report
+    report, blocked = shadow.update(
+        context["ledger"], context["store"], context["feed"], CORRECTION_DAY
+    )
+    assert blocked is False
     day = day_record(
         context["ledger"], release_id, tmp_path / "report-no-flag.json", CORRECTION_DAY
     )["result"]
     assert day["corrections"] == []
-    # On the next uncommitted session the opted-in run applies it exactly once.
+    # On the next uncommitted session the CLI with the journal applies it once.
     later = ok(
         shadow_update_with_corrections(
             context["ledger"], context["store"], context["feed"], SESSIONS[4],

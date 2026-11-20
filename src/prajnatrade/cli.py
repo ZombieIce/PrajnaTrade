@@ -131,6 +131,20 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     release_approve.add_argument("--reviewer", required=True)
     release_approve.add_argument("--reason", required=True)
 
+    release_reject = release_commands.add_parser(
+        "reject",
+        help="record an immutable human rejection that blocks a later approval",
+    )
+    release_reject.add_argument("--store", required=True, type=Path)
+    release_reject.add_argument("--plan-id", required=True)
+    release_reject.add_argument("--reviewer", required=True)
+    release_reject.add_argument("--reason", required=True)
+
+    release_list = release_commands.add_parser(
+        "list", help="list every stored release and explicit rejection decision"
+    )
+    release_list.add_argument("--store", required=True, type=Path)
+
     release_fetch = release_commands.add_parser(
         "fetch", help="fetch one release artifact by exact ID and verify its content"
     )
@@ -158,6 +172,10 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     release_disposition.add_argument("--reason", required=True)
     release_disposition.add_argument(
         "--impact", choices=["sustained", "pending_review", "no_longer_supported"]
+    )
+    release_disposition.add_argument(
+        "--evidence",
+        help="required re-review evidence when --impact overrides the computed default",
     )
     release_disposition.add_argument(
         "--ledger", type=Path, help="Shadow Live ledger used to derive the pause point"
@@ -199,9 +217,10 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_update.add_argument("--date", required=True)
     shadow_update.add_argument(
         "--corrections-store",
+        required=True,
         type=Path,
-        help="trusted snapshot store whose verified dividend-correction journal is applied; "
-        "without it no correction is applied",
+        help="trusted snapshot store whose verified dividend-correction journal is "
+        "applied; required so an eligible correction can never be silently skipped",
     )
     shadow_update.add_argument(
         "--release-id",
@@ -745,6 +764,16 @@ def _release_command(args: argparse.Namespace) -> int:
             result = release.approve(
                 args.store, args.plan_id, args.reviewer, args.reason
             )
+        elif args.release_command == "reject":
+            result = release.reject(
+                args.store, args.plan_id, args.reviewer, args.reason
+            )
+        elif args.release_command == "list":
+            result = {
+                "schema_version": 1,
+                "status": "ok",
+                "releases": release.list_releases(args.store),
+            }
         elif args.release_command == "fetch":
             result = release.fetch(args.store, args.release_id)
         elif args.release_command == "status":
@@ -758,6 +787,7 @@ def _release_command(args: argparse.Namespace) -> int:
                 args.reviewer,
                 args.reason,
                 impact=args.impact,
+                evidence=args.evidence,
                 ledger=args.ledger,
                 data=args.data,
                 effective_signal_date=args.effective_signal_date,
