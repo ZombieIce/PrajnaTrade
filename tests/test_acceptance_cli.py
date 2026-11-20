@@ -125,7 +125,7 @@ def manifest() -> dict:
         "schema_version": 1,
         "delivery": {
             "version": "0.1.0",
-            "branch": "ticket-35-acceptance",
+            "branch": "fixture-branch",
             "tested_at": "2026-11-20T00:00:00+08:00",
             "environment": "synthetic fixture environment",
             "test_command": "python -m pytest -q tests/",
@@ -140,6 +140,14 @@ def manifest() -> dict:
     }
 
 
+def _write_manifest(tmp_path: Path, value: dict, *, name: str = "manifest.json") -> Path:
+    source = tmp_path / name
+    source.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return source
+
+
 def _run_report(
     tmp_path: Path,
     manifest_value: dict,
@@ -147,10 +155,7 @@ def _run_report(
     suffix: str = ".json",
     name: str = "manifest.json",
 ) -> tuple[dict, Path, Path]:
-    source = tmp_path / name
-    source.write_text(
-        json.dumps(manifest_value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    source = _write_manifest(tmp_path, manifest_value, name=name)
     output = tmp_path / f"report{suffix}"
     result = cli(
         "acceptance", "report", "--input", str(source), "--output", str(output)
@@ -204,6 +209,31 @@ def test_verified_scenario_without_evidence_is_rejected(tmp_path: Path) -> None:
     assert not (tmp_path / "report.json").exists()
 
 
+def _forward_day(
+    day: str,
+    *,
+    next_session: str,
+    terminal_state: str = "filled",
+    persisted_before_open: bool = True,
+    committed: bool = True,
+    common: bool = True,
+    real_data: bool = True,
+) -> dict:
+    """One reconciled real forward ledger day (after-close signal -> next open)."""
+    return {
+        "date": day,
+        "signal_date": day,
+        "orders_persisted_before_open": persisted_before_open,
+        "next_session": next_session,
+        "order_terminal_state": terminal_state,
+        "ledger_day_id": f"fixture-ledger-day-{day}",
+        "result_hash": "a" * 64,
+        "committed": committed,
+        "common": common,
+        "real_data": real_data,
+    }
+
+
 def _complete_real_chain_manifest() -> dict:
     """A structurally complete real chain in a clearly synthetic mechanism fixture.
 
@@ -248,8 +278,8 @@ def _complete_real_chain_manifest() -> dict:
             },
         ],
         "forward_days": [
-            {"date": "2030-01-02", "committed": True, "common": True, "real_data": True},
-            {"date": "2030-01-03", "committed": True, "common": True, "real_data": True},
+            _forward_day("2030-01-02", next_session="2030-01-03"),
+            _forward_day("2030-01-03", next_session="2030-01-04"),
         ],
     }
     return value
@@ -265,6 +295,12 @@ def test_complete_real_chain_fixture_is_end_to_end_passed(tmp_path: Path) -> Non
     assert report["verdict"]["overall_status"] == "passed"
     assert report["verdict"]["blockers"] == []
     assert all(item["satisfied"] for item in report["real_chain_checklist"])
+    # The forward-day reconciliation is explicit in the report, not inferred.
+    checklist = {item["id"]: item for item in report["real_chain_checklist"]}
+    assert "pre-open" in checklist["real_forward_days"]["label"]
+    assert "terminal" in checklist["real_forward_days"]["label"]
+    assert "2030-01-02" in checklist["real_forward_days"]["detail"]
+    assert "2030-01-03" in checklist["real_forward_days"]["detail"]
     # This is a mechanism fixture; the report still never claims real runs.
     assert "no trusted store is read" in report["notes"][0]
     assert all(
@@ -272,6 +308,71 @@ def test_complete_real_chain_fixture_is_end_to_end_passed(tmp_path: Path) -> Non
         for scenario in report["scenarios"]
         for entry in scenario["evidence"]
     )
+
+
+def test_forward_day_reconciliation_fields_are_required(tmp_path: Path) -> None:
+    for field in (
+        "signal_date",
+        "orders_persisted_before_open",
+        "next_session",
+        "order_terminal_state",
+        "ledger_day_id",
+        "result_hash",
+    ):
+        value = _complete_real_chain_manifest()
+        del value["real_chain"]["forward_days"][0][field]
+        result = cli(
+            "acceptance", "report",
+            "--input", str(_write_manifest(tmp_path, value)),
+            "--output", str(tmp_path / f"report-{field}.json"),
+        )
+        assert result.returncode == 2, (field, result.stdout)
+        payload = json.loads(result.stdout)
+        assert payload["status"] == "rejected", (field, payload)
+        assert payload["error"]["code"] in {
+            "FIELD_MISSING",
+            "REAL_CHAIN_INVALID",
+        }, (field, payload)
+        assert field in payload["error"]["message"], (field, payload)
+
+
+def test_unreconciled_forward_days_never_satisfy_the_real_chain(
+    tmp_path: Path,
+) -> None:
+    # An order that was not persisted before the next open cannot be counted as
+    # a reconciled real forward day, even when the day is committed and common.
+    value = _complete_real_chain_manifest()
+    value["real_chain"]["forward_days"][0]["orders_persisted_before_open"] = False
+    payload, _, output = _run_report(tmp_path, value)
+    assert payload["end_to_end_passed"] is False
+    report = json.loads(output.read_text(encoding="utf-8"))
+    checklist = {item["id"]: item for item in report["real_chain_checklist"]}
+    assert checklist["real_forward_days"]["satisfied"] is False
+    assert "pre-open" in checklist["real_forward_days"]["missing"]
+
+    # A terminal state that is not a documented evidenced state is rejected by
+    # the strict schema rather than being silently counted.
+    value = _complete_real_chain_manifest()
+    value["real_chain"]["forward_days"][1]["order_terminal_state"] = "unknown"
+    rejected(
+        cli(
+            "acceptance", "report",
+            "--input", str(_write_manifest(tmp_path, value)),
+            "--output", str(tmp_path / "report-terminal.json"),
+        ),
+        "REAL_CHAIN_INVALID",
+    )
+
+    # The next committed day must be the session in which the first day's
+    # pre-open order reached its terminal state.
+    value = _complete_real_chain_manifest()
+    value["real_chain"]["forward_days"][0]["next_session"] = "2030-01-07"
+    payload, _, output = _run_report(tmp_path, value)
+    assert payload["end_to_end_passed"] is False
+    report = json.loads(output.read_text(encoding="utf-8"))
+    checklist = {item["id"]: item for item in report["real_chain_checklist"]}
+    assert checklist["real_forward_days"]["satisfied"] is False
+
 
 
 def test_failed_scenario_makes_the_overall_verdict_failed(tmp_path: Path) -> None:
@@ -599,8 +700,14 @@ def test_empty_or_false_real_chain_ids_never_pass(tmp_path: Path) -> None:
             }
         ],
         "forward_days": [
-            {"date": "2030-01-02", "committed": False, "common": False, "real_data": False},
-            {"date": "2030-01-03", "committed": True, "common": True, "real_data": True},
+            _forward_day(
+                "2030-01-02",
+                next_session="2030-01-03",
+                committed=False,
+                common=False,
+                real_data=False,
+            ),
+            _forward_day("2030-01-03", next_session="2030-01-04"),
         ],
     }
     payload, _, output = _run_report(tmp_path, value)

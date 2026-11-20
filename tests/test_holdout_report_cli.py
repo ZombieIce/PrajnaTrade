@@ -4,8 +4,9 @@ Everything here is synthetic and exercises `prajnatrade evaluation ...`
 (operator) plus `prajnatrade-agent evaluation status ...` (research side).
 The sealed snapshot fixtures are shared with `test_protected_eval_cli`.
 
-This module is meant to be run as a whole: the receipt-constant test aggregates
-the research-side observations collected by the earlier tests.
+Each test owns its own trusted store and candidates.  The receipt-constant test
+builds every pending/unauthorized/completed/rejected/replayed state itself, so it
+also passes when selected alone with ``pytest -k``.
 """
 
 from __future__ import annotations
@@ -24,12 +25,14 @@ from test_protected_eval_cli import (
     create_plan,
     eval_store,
     evaluation_rows,
+    freeze_candidate,
     ok,
     plan_input,
     rejected,
     run_evaluation,
     submit_experiment,
     synthetic_snapshot,
+    write_json,
 )
 
 
@@ -434,7 +437,8 @@ def test_abort_after_the_holdout_read_keeps_the_debit_and_never_retries(
     assert holdout_entry["scoring"] is False
     assert holdout_entry["aborted"] is True
     assert data["query_receipts"]["final_holdout"]["status"] == "aborted"
-    assert data["verdict"]["approved"] is False
+    assert data["verdict"]["evidence_complete"] is False
+    assert data["verdict"]["all_stages_passed"] is False
     assert data["verdict"]["incomplete"] is True
     assert data["verdict"]["admission"] is False
     assert any("aborted" in blocker for blocker in data["verdict"]["blockers"])
@@ -530,7 +534,8 @@ def test_a_different_plan_cannot_reuse_the_consumed_holdout_range(
     # invented evaluation, and never claims admission.
     rejection_report = base["root"] / "holdout-consumed-report.json"
     generated = ok(report(store, second_plan["plan_id"], rejection_report))
-    assert generated["approved"] is False
+    assert generated["evidence_complete"] is False
+    assert generated["all_stages_passed"] is False
     data = json.loads(rejection_report.read_text(encoding="utf-8"))
     assert data["stages"]["final_holdout"]["present"] is False
     assert data["verdict"]["admission"] is False
@@ -558,7 +563,8 @@ def test_controlled_report_renders_every_section_from_records_only(
     generated = ok(report(store, plan["plan_id"], html_path))
     assert generated["status"] == "generated"
     assert generated["format"] == "html"
-    assert generated["approved"] is True
+    assert generated["evidence_complete"] is True
+    assert generated["all_stages_passed"] is True
     assert generated["admission"] is False
     assert html_path.is_file()
     # The report never re-runs an evaluation or debits a query.
@@ -650,7 +656,8 @@ def test_controlled_report_renders_every_section_from_records_only(
         assert entry["regimes"]["groups"]
         assert entry["curves"]["candidate"]["base"]
         assert entry["curves"]["baseline"]["stress"]
-    assert data["verdict"]["approved"] is True
+    assert data["verdict"]["evidence_complete"] is True
+    assert data["verdict"]["all_stages_passed"] is True
     assert data["verdict"]["incomplete"] is False
     assert data["verdict"]["admission"] is False
     assert data["verdict"]["blockers"] == []
@@ -675,10 +682,12 @@ def test_controlled_report_renders_every_section_from_records_only(
 
     incomplete_html = outputs / "incomplete.html"
     incomplete = ok(report(incomplete_store, incomplete_plan["plan_id"], incomplete_html))
-    assert incomplete["approved"] is False
+    assert incomplete["evidence_complete"] is False
+    assert incomplete["all_stages_passed"] is False
     assert incomplete["admission"] is False
     incomplete_text = incomplete_html.read_text(encoding="utf-8").lower()
-    assert "not approved" in incomplete_text
+    assert "evidence incomplete" in incomplete_text
+    assert "not all stages passed" in incomplete_text
     assert "incomplete" in incomplete_text
     assert "does not grant admission" in incomplete_text
 
@@ -688,7 +697,8 @@ def test_controlled_report_renders_every_section_from_records_only(
     assert incomplete_data["stages"]["validation"]["present"] is True
     assert incomplete_data["stages"]["final_holdout"]["present"] is False
     assert incomplete_data["authorizations"]["final_holdout"]["present"] is False
-    assert incomplete_data["verdict"]["approved"] is False
+    assert incomplete_data["verdict"]["evidence_complete"] is False
+    assert incomplete_data["verdict"]["all_stages_passed"] is False
     assert incomplete_data["verdict"]["incomplete"] is True
     assert incomplete_data["verdict"]["admission"] is False
     blockers = " ".join(incomplete_data["verdict"]["blockers"]).lower()
@@ -859,24 +869,136 @@ def test_agent_surface_cannot_authorize_run_or_report(
     assert not Path(output).exists()
 
 
-def test_holdout_receipt_is_byte_identical_across_every_state(observed: dict) -> None:
-    # completed, replayed, aborted, rejected (consumed range), unauthorized and
-    # still-pending Validation states were all observed by the tests above.
-    assert len(observed["payloads"]) >= 6
+def test_holdout_receipt_is_byte_identical_across_every_state(
+    base: dict, tmp_path: Path
+) -> None:
+    """The constant Holdout receipt is identical across every research state.
+
+    The test is self-contained: it builds a pending candidate, a rejected
+    Validation plan, a passed-but-not-yet-authorized state, the completed
+    Holdout state and a replay inside this test instead of relying on
+    observations accumulated by earlier tests.
+    """
+    observations: list[dict] = []
+    stdouts: list[str] = []
+
+    def observe(project: Path, candidate_id: str) -> dict:
+        result = cli(
+            "evaluation",
+            "status",
+            "--project",
+            str(project),
+            "--candidate-id",
+            candidate_id,
+            agent=True,
+        )
+        payload = ok(result)
+        observations.append(payload)
+        stdouts.append(result.stdout)
+        return payload
+
+    assert base["project"].is_dir()
+
+    # 1. Pending: a frozen candidate with no evaluation plan yet.
+    source = write_json(tmp_path / "submission-receipts.json", {})
+    submit_experiment(
+        base["project"],
+        base["campaign"]["campaign_id"],
+        source,
+        "receipt-pending",
+        "A candidate that has no protected evaluation plan yet.",
+        "equal_weight",
+        {},
+    )
+    pending_candidate = freeze_candidate(
+        base["project"],
+        base["campaign"]["campaign_id"],
+        "receipt-pending",
+        "candidate-receipt-pending",
+        "Pending state for the constant receipt test.",
+    )
+    pending = observe(base["project"], pending_candidate["candidate_id"])
+    assert pending["validation"] == {"status": "pending"}
+
+    # 2. Rejected Validation: a plan whose hard threshold fails.
+    rejected_store = eval_store(base, "receipt-rejected")
+    rejected_plan = create_plan(
+        base,
+        rejected_store,
+        pending_candidate,
+        plan_input(
+            thresholds=[
+                {"id": "relative", "metric": "return_delta", "op": ">=", "value": 0.5}
+            ]
+        ),
+        name="plan-receipt-rejected",
+    )
+    ok(authorize(rejected_store, rejected_plan["plan_id"]))
+    rejected_run = ok(run_evaluation(base, rejected_store, rejected_plan["plan_id"]))
+    assert rejected_run["outcome"] == "rejected"
+    rejected_payload = observe(base["project"], pending_candidate["candidate_id"])
+    assert rejected_payload["validation"]["status"] == "rejected"
+
+    # 3/4/5. Unauthorized, completed and replayed Holdout states.
+    submit_experiment(
+        base["project"],
+        base["campaign"]["campaign_id"],
+        source,
+        "receipt-complete",
+        "A candidate whose Validation passes before Holdout authorization.",
+        "momentum",
+        {"lookback": 2},
+    )
+    completed_candidate = freeze_candidate(
+        base["project"],
+        base["campaign"]["campaign_id"],
+        "receipt-complete",
+        "candidate-receipt-complete",
+        "Completed state for the constant receipt test.",
+    )
+    completed_store = eval_store(base, "receipt-completed")
+    completed_plan = create_plan(
+        base,
+        completed_store,
+        completed_candidate,
+        plan_input(),
+        name="plan-receipt-completed",
+    )
+    ok(authorize(completed_store, completed_plan["plan_id"]))
+    validation = ok(run_evaluation(base, completed_store, completed_plan["plan_id"]))
+    assert validation["outcome"] == "passed"
+
+    unauthorized = observe(base["project"], completed_candidate["candidate_id"])
+    assert unauthorized["validation"]["status"] == "passed"
+
+    ok(authorize_holdout(completed_store, completed_plan["plan_id"]))
+    holdout = ok(
+        run_evaluation(
+            base, completed_store, completed_plan["plan_id"], stage="final_holdout"
+        )
+    )
+    assert holdout["outcome"] == "passed"
+    completed = observe(base["project"], completed_candidate["candidate_id"])
+    assert completed["validation"]["status"] == "passed"
+    replayed = observe(base["project"], completed_candidate["candidate_id"])
+    assert replayed == completed
+
+    # The receipt bytes are constant across all five states.
+    assert len(observations) == 5
     serialized = {
         json.dumps(payload["final_holdout"], sort_keys=True, separators=(",", ":"))
-        for payload in observed["payloads"]
+        for payload in observations
     }
     assert serialized == {
         json.dumps(HOLDOUT_RECEIPT, sort_keys=True, separators=(",", ":"))
     }
-    statuses = {payload["validation"].get("status") for payload in observed["payloads"]}
-    assert {"pending", "rejected", "insufficient_evidence", "passed"} <= statuses
-    for payload in observed["payloads"]:
+    statuses = {payload["validation"].get("status") for payload in observations}
+    assert {"pending", "rejected", "passed"} <= statuses
+    for payload in observations:
         assert "validation" not in json.dumps(payload["final_holdout"])
         assert "holdout_outcome" not in payload
         assert "admission" not in payload
-    for stdout in observed["stdouts"]:
+    for stdout in stdouts:
         assert "2024-" not in stdout
         assert "evaluation_id" not in stdout
         assert "auth_id" not in stdout
@@ -884,7 +1006,6 @@ def test_holdout_receipt_is_byte_identical_across_every_state(observed: dict) ->
         assert "record_path" not in stdout
         assert "scoring" not in stdout
         assert "curves" not in stdout
-        # "thresholds" appears only in the fixed Validation coarse message.
         assert "skipped" not in stdout
         assert "outcome" not in stdout
         assert "aborted" not in stdout

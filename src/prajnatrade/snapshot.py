@@ -315,6 +315,34 @@ def manifest(store: Path, snapshot_id: str) -> dict:
     return {"snapshot_id": snapshot_id, **_manifest(_store_path(store), snapshot_id)}
 
 
+def lineage_ids(store: Path, snapshot_id: str) -> list[str]:
+    """Snapshot ID followed by its ``lineage.predecessor_id`` chain.
+
+    Metadata only: this reads each snapshot's immutable ``manifest.json`` and
+    never opens a partition payload.  A malformed or cyclic lineage raises
+    ``ValueError``; there is no fallback to another snapshot.
+    """
+    if not isinstance(snapshot_id, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
+        raise ValueError("Invalid snapshot ID.")
+    store = _store_path(Path(store))
+    ids: list[str] = []
+    current = snapshot_id
+    while True:
+        if current in ids:
+            raise ValueError("The snapshot lineage contains a cycle.")
+        ids.append(current)
+        metadata = _manifest(store, current)
+        if "lineage" not in metadata:
+            return ids
+        lineage = metadata["lineage"]
+        if not isinstance(lineage, dict):
+            raise ValueError("The snapshot lineage is not an object.")
+        predecessor = lineage.get("predecessor_id")
+        if not isinstance(predecessor, str) or not re.fullmatch(r"[0-9a-f]{64}", predecessor):
+            raise ValueError("The snapshot lineage has an invalid predecessor ID.")
+        current = predecessor
+
+
 def _discovery_descriptor(metadata: dict) -> dict:
     return next(p for p in metadata["partitions"] if p["name"] == "discovery")
 

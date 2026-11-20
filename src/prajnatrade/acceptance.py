@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -105,7 +106,25 @@ _RELEASE_KEYS = {
     "holdout_id",
     "approved",
 }
-_FORWARD_DAY_KEYS = {"date", "committed", "common", "real_data"}
+#: A forward day must record the reconciliation the real-chain rule requires:
+#: the after-close signal date, the next session whose open executes the signal,
+#: whether the resulting orders were durably persisted before that open, the
+#: terminal state those orders reached, and the trusted ledger day identity.
+_FORWARD_DAY_KEYS = {
+    "date",
+    "signal_date",
+    "orders_persisted_before_open",
+    "next_session",
+    "order_terminal_state",
+    "ledger_day_id",
+    "result_hash",
+    "committed",
+    "common",
+    "real_data",
+}
+#: The documented evidenced terminal outcomes for a persisted forward order.
+FORWARD_ORDER_TERMINAL_STATES = ("filled", "evidenced_not_filled")
+_RESULT_HASH = re.compile(r"[0-9a-f]{64}")
 
 NOT_A_REAL_CLAIM = (
     "This report is rendered only from the acceptance manifest. It does not "
@@ -437,10 +456,48 @@ def _validate_forward_days(value: object) -> list[dict[str, Any]]:
         day = _mapping(entry, label, allowed=_FORWARD_DAY_KEYS, required=_FORWARD_DAY_KEYS)
         result = {
             "date": _iso_date(day["date"], f"{label}.date"),
+            "signal_date": _iso_date(day["signal_date"], f"{label}.signal_date"),
+            "orders_persisted_before_open": _boolean(
+                day["orders_persisted_before_open"],
+                f"{label}.orders_persisted_before_open",
+            ),
+            "next_session": _iso_date(
+                day["next_session"], f"{label}.next_session"
+            ),
+            "order_terminal_state": _text(
+                day["order_terminal_state"], f"{label}.order_terminal_state"
+            ),
+            "ledger_day_id": _text(day["ledger_day_id"], f"{label}.ledger_day_id"),
+            "result_hash": _text(day["result_hash"], f"{label}.result_hash"),
             "committed": _boolean(day["committed"], f"{label}.committed"),
             "common": _boolean(day["common"], f"{label}.common"),
             "real_data": _boolean(day["real_data"], f"{label}.real_data"),
         }
+        if result["signal_date"] != result["date"]:
+            raise _reject(
+                "REAL_CHAIN_INVALID",
+                f"{label}.signal_date must equal the committed ledger day "
+                f"{result['date']!r}; the after-close signal is the day's own signal.",
+            )
+        if result["next_session"] <= result["date"]:
+            raise _reject(
+                "REAL_CHAIN_INVALID",
+                f"{label}.next_session must be a later trading session than the "
+                f"signal date {result['date']!r}.",
+            )
+        if result["order_terminal_state"] not in FORWARD_ORDER_TERMINAL_STATES:
+            raise _reject(
+                "REAL_CHAIN_INVALID",
+                f"{label}.order_terminal_state must be one of "
+                + ", ".join(FORWARD_ORDER_TERMINAL_STATES)
+                + ".",
+            )
+        if not _RESULT_HASH.fullmatch(result["result_hash"]):
+            raise _reject(
+                "REAL_CHAIN_INVALID",
+                f"{label}.result_hash must be a 64-character lowercase SHA-256 "
+                "content address of the committed ledger day.",
+            )
         if result["date"] in seen:
             raise _reject(
                 "REAL_CHAIN_INVALID",
@@ -566,20 +623,32 @@ def _real_release_pair(releases: list[dict[str, Any]]) -> tuple[dict[str, Any], 
     return None
 
 
+def _forward_day_reconciled(day: dict[str, Any]) -> bool:
+    """A committed real day whose after-close signal is reconciled to its order."""
+    return (
+        day["committed"] is True
+        and day["common"] is True
+        and day["real_data"] is True
+        and day["orders_persisted_before_open"] is True
+        and day["order_terminal_state"] in FORWARD_ORDER_TERMINAL_STATES
+    )
+
+
 def _consecutive_real_forward_days(
     days: list[dict[str, Any]],
 ) -> tuple[str, str] | None:
     # The manifest lists forward trading days; adjacency is the operator's
     # attested session order, so weekends and holidays are not calendar gaps.
+    # The pair is only reconciled when the first day's after-close signal was
+    # persisted before, and reached its terminal order state on, the second
+    # day's session (``next_session``).
     ordered = sorted(days, key=lambda day: day["date"])
     for first, second in zip(ordered, ordered[1:]):
-        qualifies = all(
-            day["committed"] is True
-            and day["common"] is True
-            and day["real_data"] is True
-            for day in (first, second)
-        )
-        if qualifies:
+        if (
+            _forward_day_reconciled(first)
+            and _forward_day_reconciled(second)
+            and first["next_session"] == second["date"]
+        ):
             return first["date"], second["date"]
     return None
 
@@ -696,27 +765,33 @@ def _real_chain_checklist(
     )
 
     window = _consecutive_real_forward_days(forward_days)
+    reconciled_days = [
+        day for day in forward_days if _forward_day_reconciled(day)
+    ]
     checklist.append(
         _checklist_item(
             "real_forward_days",
-            "At least two consecutive, common, committed real forward trading days.",
+            "At least two consecutive, common, committed real forward trading "
+            "days, each with an after-close signal persisted pre-open and "
+            "reconciled to the next session's order terminal state.",
             window is not None,
-            f"{len(forward_days)} forward day(s); consecutive real committed common "
+            f"{len(forward_days)} forward day(s); "
+            f"{len(reconciled_days)} reconciled (signal pre-open, terminal state "
+            "recorded); consecutive real committed common "
             + (f"window: {window[0]} → {window[1]}." if window else "window: none."),
             "At least two consecutive, common, committed real forward trading days "
-            "in the trusted Shadow Live ledger.",
+            "in the trusted Shadow Live ledger with pre-open persisted orders and "
+            "a recorded next-session terminal order state.",
             "Commit the same consecutive real forward sessions for the approved "
             "releases in the trusted Shadow Live ledger after a pre-registered "
-            "enable.",
+            "enable, then record each day's after-close signal, pre-open persisted "
+            "orders, next session, order terminal state and ledger day result hash "
+            "in the acceptance manifest.",
         )
     )
 
     qualifying_days = {
-        day["date"]
-        for day in forward_days
-        if day["committed"] is True
-        and day["common"] is True
-        and day["real_data"] is True
+        day["date"] for day in forward_days if _forward_day_reconciled(day)
     }
     candidate_days_satisfied = (
         bool(candidate_days) and all(day in qualifying_days for day in candidate_days)

@@ -19,7 +19,9 @@ from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot import read_discovery
 
 
-_CN_TZ = timezone(timedelta(hours=8))
+#: Asia/Shanghai is the trading-time anchor for both baselines and Shadow Live.
+CN_TZ = timezone(timedelta(hours=8))
+_CN_TZ = CN_TZ  # backward-compatible private alias
 _TARGET_WEIGHTS = {symbol: 1.0 / len(ETF_SYMBOLS) for symbol in ETF_SYMBOLS}
 _EPSILON = 1e-12
 
@@ -563,6 +565,11 @@ def _first_signal(
             "window": [day],
         }, gaps
     return None, gaps
+
+
+def available_by(row: dict, cutoff: datetime) -> bool:
+    """Public point-in-time availability check with evidence (trusted seam)."""
+    return _available_by(row, cutoff)
 
 
 def _available_by(row: dict, cutoff: datetime) -> bool:

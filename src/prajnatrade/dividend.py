@@ -222,6 +222,52 @@ def load_verified_revision(store: str | Path, revision_id: str) -> dict:
     return record
 
 
+def revision_predecessor(store: str | Path, revision_id: str) -> str | None:
+    """The snapshot ID that held the pre-correction amount for one revision.
+
+    This is a metadata-only lookup: it reads the write-once proposal and
+    verification-link journal entries (and their content addresses), never a
+    sealed partition payload and never a query ledger.  ``None`` means the
+    journal cannot bind the revision to a predecessor snapshot, so a release
+    cannot claim that lineage.
+    """
+    if not isinstance(revision_id, str) or not re.fullmatch(r"[0-9a-f]{64}", revision_id):
+        raise ValueError(
+            "Invalid revision ID; revision IDs are 64-character lowercase "
+            "hexadecimal content addresses."
+        )
+    store_path = snapshot._store_path(Path(store))
+    journal = store_path / ".dividend-corrections"
+    if not journal.is_dir():
+        return None
+    for path in sorted(journal.glob("proposal-*.json")):
+        proposal_id = path.stem[len("proposal-") :]
+        if not re.fullmatch(r"[0-9a-f]{64}", proposal_id):
+            continue
+        link_path = _journal(
+            store_path, "verification", _verification_key(proposal_id, revision_id)
+        )
+        if not link_path.is_file():
+            continue
+        try:
+            link = snapshot._read_json(link_path)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if not isinstance(link, dict) or (
+            link.get("proposal_id") != proposal_id
+            or link.get("revision_id") != revision_id
+        ):
+            continue
+        try:
+            pending = _pending(store_path, proposal_id)
+        except (OSError, UnicodeError, ValueError):
+            continue
+        predecessor = (pending.get("proposal") or {}).get("predecessor_id")
+        if isinstance(predecessor, str) and re.fullmatch(r"[0-9a-f]{64}", predecessor):
+            return predecessor
+    return None
+
+
 def successor(store: Path, proposal_id: str, revision_id: str) -> dict:
     store = snapshot._store_path(store)
     pending = _pending(store, proposal_id)

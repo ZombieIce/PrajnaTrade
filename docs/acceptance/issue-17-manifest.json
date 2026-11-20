@@ -2,11 +2,11 @@
   "schema_version": 1,
   "delivery": {
     "version": "0.1.0 (MVP-18 acceptance tooling)",
-    "branch": "ticket-35-acceptance",
-    "tested_at": "2026-11-20T22:50:09+08:00",
+    "branch": "zombieice-issue-17-implementation",
+    "tested_at": "2026-11-21T00:00:33+08:00",
     "environment": "macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; offline; synthetic fixtures only. macOS sandbox-exec covers the synthetic isolation tests; no real deployment isolation is verified.",
-    "test_command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /Users/yibinzhang/go/src/copilot-worktrees/PrajnaTrade/zombieice-fluffy-giggle/.venv/bin/python -m pytest -q -p no:cacheprovider tests/",
-    "test_result": "241 passed in 665.02s (0:11:05), exit 0"
+    "test_command": "PYTHONPATH=src python -m pytest -q",
+    "test_result": "249 passed in 688.71s (0:11:28), exit 0"
   },
   "scenarios": [
     {
@@ -23,7 +23,7 @@
       "evidence": [
         {
           "type": "test_suite",
-          "reference": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /Users/yibinzhang/go/src/copilot-worktrees/PrajnaTrade/zombieice-fluffy-giggle/.venv/bin/python -m pytest -q -p no:cacheprovider tests/",
+          "reference": "PYTHONPATH=src python -m pytest -q",
           "description": "Full deterministic suite, exit 0; machine result is recorded in delivery.test_result. Synthetic fixtures only, no network and no broker."
         },
         {
@@ -164,13 +164,13 @@
         "agent": "mock",
         "period": "historical"
       },
-      "expected": "At least two real-data independently validated, human-approved immutable release versions, explicitly enabled at pre-registered after-close signal points, tracking at least two consecutive, common, committed real forward trading days, with one after-close signal submitted pre-open and reconciled to the next session's terminal order state, plus controlled synthetic boundary coverage.",
-      "observed": "Release approval/fetch/lifecycle, Shadow Live atomic day commits, one-time dividend corrections and multi-version comparison pass on synthetic fixtures. There is no real approved release, no real forward ledger and no real multi-version tracking.",
+      "expected": "At least two real-data independently validated, human-approved immutable release versions, explicitly enabled at pre-registered after-close signal points, tracking at least two consecutive, common, committed real forward trading days, each recorded with its after-close signal_date, whether the resulting orders were persisted before the next session's open, the next_session where those orders reached a terminal state (filled/evidenced_not_filled), and the trusted ledger_day_id/result_hash, plus controlled synthetic boundary coverage.",
+      "observed": "Release approval/fetch/lifecycle, explicit immutable human rejection, Shadow Live atomic day commits, committed-time fill eligibility, one-time dividend corrections and multi-version comparison pass on synthetic fixtures. The strict acceptance schema now requires the forward-day signal/pre-open/next-session/terminal-state/ledger-hash reconciliation, but there is no real approved release, no real forward ledger and no real multi-version tracking.",
       "evidence": [
         {
           "type": "synthetic_mechanism",
           "reference": "tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py, tests/test_correction_delta_cli.py, tests/test_impact_cli.py",
-          "description": "Synthetic mechanism coverage only: immutable release identity, lifecycle, atomic Shadow Live days, reruns, missing-price and missed-deadline boundaries, corrections and common-interval comparison. Synthetic replay is not real forward evidence."
+          "description": "Synthetic mechanism coverage only: immutable release identity, explicit human rejection records, lifecycle, atomic Shadow Live days, reruns, missing-price and missed-deadline boundaries, committed-time fill eligibility, corrections and common-interval comparison. Synthetic replay is not real forward evidence."
         }
       ],
       "blockers": [

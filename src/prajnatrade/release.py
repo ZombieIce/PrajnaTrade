@@ -46,6 +46,15 @@ SCOPE = "synthetic"
 RELEASE_VERSION = "release-v1"
 ARTIFACT_KIND = "immutable_release_artifact"
 STATUS_KIND = "immutable_release_status"
+REJECTION_KIND = "immutable_release_rejection"
+REJECTION_STATUS_KIND = "immutable_release_rejection_status"
+REJECTION_STATEMENT = (
+    "This immutable record is the human admission decision for this frozen "
+    "candidate and release version: the reviewer explicitly rejected it. It "
+    "creates no release artifact, no lifecycle event and no tracking. A later "
+    "approval for the same candidate and plan is refused; only a new candidate "
+    "and a new frozen plan can be approved."
+)
 STAGES = protected_eval.STAGES
 ACTIONS = ("enable", "pause", "resume", "retire")
 STATE_FOR_ACTION = {
@@ -268,6 +277,265 @@ def _existing_artifact(store: Path, release_id: str) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# Explicit human rejection (#30)
+# ---------------------------------------------------------------------------
+
+
+def _rejection_location(store: Path, release_id: str) -> Path:
+    _check_release_id(release_id)
+    return store / "rejections" / f"{release_id}.json"
+
+
+def _load_rejection(store: Path, release_id: str) -> dict[str, Any] | None:
+    """Load and content-address-check one immutable rejection record."""
+    path = _rejection_location(store, release_id)
+    if not path.is_file():
+        return None
+    try:
+        record = snapshot._read_json(path)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "rejection",
+            "inspect",
+            f"The stored rejection record is unreadable: {error}",
+        ) from error
+    if not isinstance(record, dict):
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "rejection",
+            "inspect",
+            "The stored rejection record is not an object.",
+        )
+    body = {key: value for key, value in record.items() if key != "rejection_id"}
+    if record.get("rejection_id") != _hash(body):
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "rejection",
+            "inspect",
+            "The stored rejection record failed its content-address check.",
+        )
+    if record.get("decision") != "rejected" or record.get("release_id") != release_id:
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "rejection",
+            "inspect",
+            "The stored rejection record is not bound to this release ID.",
+        )
+    if (
+        _release_id(record.get("candidate_hash"), record.get("plan_id"))
+        != release_id
+    ):
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "rejection",
+            "inspect",
+            "The release ID is not the content address of the rejected "
+            "candidate and plan.",
+        )
+    return record
+
+
+def _rejection_ids(store: Path) -> list[str]:
+    directory = store / "rejections"
+    if not directory.is_dir():
+        return []
+    ids = []
+    for path in sorted(directory.iterdir()):
+        if path.is_file() and path.suffix == ".json" and _RELEASE_ID.fullmatch(path.stem):
+            ids.append(path.stem)
+    return ids
+
+
+def _review_references(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    """Bind the evidence that existed when the human decision was recorded.
+
+    This only reads the trusted plan, query ledger and immutable evaluation
+    records.  It opens no sealed partition, debits no query and never turns a
+    missing or mismatched record into evidence.
+    """
+    references: dict[str, Any] = {}
+    for stage in STAGES:
+        label = "Validation" if stage == protected_eval.VALIDATION_STAGE else "Final Holdout"
+        reference = None
+        content_hash = plan["partitions"][stage]["content_hash"]
+        try:
+            row = protected_eval._read_ledger_row(store, stage, content_hash)
+        except protected_eval.EvaluationRejection:
+            row = None
+        if (
+            isinstance(row, dict)
+            and isinstance(row.get("evaluation_id"), str)
+            and row["evaluation_id"]
+        ):
+            try:
+                record = _trusted_record(store, row["evaluation_id"], label)
+            except ReleaseRejection:
+                record = None
+            if isinstance(record, dict) and protected_eval._record_matches(
+                record, plan, stage
+            ):
+                reference = {
+                    "evaluation_id": record.get("evaluation_id"),
+                    "record_hash": record.get("record_hash"),
+                    "outcome": record.get("outcome"),
+                    "scoring": record.get("scoring"),
+                    "aborted": record.get("aborted"),
+                    "partition": stage,
+                    "partition_content_hash": content_hash,
+                    "authorization_id": (record.get("authorization") or {}).get(
+                        "auth_id"
+                    ),
+                }
+        references[stage] = reference
+    return references
+
+
+def _rejection_response(
+    record: dict[str, Any], path: Path, *, reused: bool
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "rejection_recorded",
+        "scope": SCOPE,
+        "release_id": record["release_id"],
+        "release_version": record["release_version"],
+        "candidate_id": record.get("candidate_id"),
+        "candidate_hash": record.get("candidate_hash"),
+        "plan_id": record.get("plan_id"),
+        "snapshot_id": record.get("snapshot_id"),
+        "decision": "rejected",
+        "reused": reused,
+        "rejection_id": record["rejection_id"],
+        "rejection": record,
+        "rejection_path": str(path),
+        "artifact_created": False,
+        "events_created": False,
+        "statement": REJECTION_STATEMENT,
+    }
+
+
+def reject(
+    store: str | Path,
+    plan_id: str,
+    reviewer: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record an immutable human rejection of one frozen candidate+plan (#30).
+
+    The decision is the reviewer's own; it is never inferred from a failed
+    threshold.  It binds the plan, candidate, snapshot, both protected
+    partition fingerprints and every evaluation record that was available at
+    decision time.  It creates no release artifact and no lifecycle event, and
+    a later ``approve`` for the same candidate+plan is refused with
+    ``PRIOR_REJECTION``.  The first decision is immutable: replaying ``reject``
+    returns it unchanged.
+    """
+    eval_store = _store(store)
+    reviewer = reviewer.strip() if isinstance(reviewer, str) else ""
+    reason = reason.strip() if isinstance(reason, str) else ""
+    context: dict[str, Any] = {"plan_id": plan_id}
+    if not reviewer or not reason:
+        raise _refusal(
+            eval_store,
+            context,
+            _reject(
+                "INVALID_REJECTION",
+                "rejection",
+                "correct",
+                "A rejection requires a non-empty reviewer and reason.",
+            ),
+            command="release reject",
+        )
+    try:
+        plan = protected_eval.load_plan(eval_store, plan_id)
+    except protected_eval.EvaluationRejection as error:
+        raise _refusal(
+            eval_store,
+            context,
+            _phase_rejection(error, "rejection"),
+            command="release reject",
+        ) from error
+    release_id = _release_id(plan["candidate_hash"], plan["plan_id"])
+    if not release_id:
+        raise _refusal(
+            eval_store,
+            context,
+            _reject(
+                "FINGERPRINT_MISMATCH",
+                "rejection",
+                "inspect",
+                "The frozen plan does not carry a usable candidate fingerprint.",
+            ),
+            command="release reject",
+        )
+    context = {
+        "plan_id": plan["plan_id"],
+        "release_id": release_id,
+        "candidate_id": plan.get("candidate_id"),
+        "candidate_hash": plan.get("candidate_hash"),
+        "snapshot_id": plan.get("snapshot_id"),
+    }
+    existing_artifact = _existing_artifact(eval_store, release_id)
+    if existing_artifact is not None:
+        raise _refusal(
+            eval_store,
+            context,
+            _reject(
+                "RELEASE_ALREADY_EXISTS",
+                "rejection",
+                "stop",
+                "An immutable release artifact already exists for this candidate "
+                "and plan; an approval cannot be replaced by a rejection. A new "
+                "candidate and frozen plan are the only path.",
+            ),
+            command="release reject",
+        )
+    existing = _load_rejection(eval_store, release_id)
+    if existing is not None:
+        # The first explicit decision is the decision; never rewrite it.
+        return _rejection_response(
+            existing, _rejection_location(eval_store, release_id), reused=True
+        )
+    references = _review_references(eval_store, plan)
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": REJECTION_KIND,
+        "scope": SCOPE,
+        "release_version": RELEASE_VERSION,
+        "release_id": release_id,
+        "decision": "rejected",
+        "candidate_id": plan.get("candidate_id"),
+        "candidate_hash": plan.get("candidate_hash"),
+        "project_id": plan.get("project_id"),
+        "plan_id": plan.get("plan_id"),
+        "plan_hash": plan.get("plan_id"),
+        "plan_frozen_at": plan.get("frozen_at"),
+        "snapshot_id": plan.get("snapshot_id"),
+        "partition_fingerprints": {
+            stage: plan["partitions"][stage] for stage in STAGES
+        },
+        "evaluations": references,
+        "reviewer": reviewer,
+        "reason": reason,
+        "recorded_at": _now(),
+        "statement": REJECTION_STATEMENT,
+        "artifact_created": False,
+        "events_created": False,
+    }
+    rejection_id = _hash(body)
+    record = {**body, "rejection_id": rejection_id}
+    path = _rejection_location(eval_store, release_id)
+    if not _write_immutable(path, record):
+        # A concurrent explicit rejection won the write-once race; the first
+        # decision is the decision.
+        stored = _load_rejection(eval_store, release_id)
+        assert stored is not None
+        return _rejection_response(stored, path, reused=True)
+    return _rejection_response(record, path, reused=False)
+
+
+# ---------------------------------------------------------------------------
 # Trusted evidence for an approval decision
 # ---------------------------------------------------------------------------
 
@@ -282,13 +550,6 @@ def _phase_rejection(
         error.details["message"],
         context=error.context,
     )
-
-
-def _load_plan(store: Path, plan_id: str) -> dict[str, Any]:
-    try:
-        return protected_eval._load_plan(store, plan_id)
-    except protected_eval.EvaluationRejection as error:
-        raise _phase_rejection(error, "approval") from error
 
 
 def _trusted_record(
@@ -907,9 +1168,13 @@ def approve(
             ),
         )
     try:
-        plan = _load_plan(eval_store, plan_id)
-    except ReleaseRejection as error:
-        raise _refusal(eval_store, {"plan_id": plan_id}, error) from error
+        plan = protected_eval.load_plan(eval_store, plan_id)
+    except protected_eval.EvaluationRejection as error:
+        raise _refusal(
+            eval_store,
+            {"plan_id": plan_id},
+            _phase_rejection(error, "approval"),
+        ) from error
     release_id = _release_id(plan["candidate_hash"], plan["plan_id"])
     if not release_id:
         raise _reject(
@@ -929,6 +1194,24 @@ def approve(
     if existing is not None:
         return _approval_response(
             _verified_artifact(existing, release_id), existing, reused=True
+        )
+    prior_rejection = _load_rejection(eval_store, release_id)
+    if prior_rejection is not None:
+        raise _refusal(
+            eval_store,
+            {
+                **context,
+                "rejection_id": prior_rejection["rejection_id"],
+                "rejection_path": str(_rejection_location(eval_store, release_id)),
+            },
+            _reject(
+                "PRIOR_REJECTION",
+                "approval",
+                "new-candidate",
+                "A prior immutable human rejection was recorded for this exact "
+                "candidate and frozen plan; a later approval is refused. Only a "
+                "new candidate and a new frozen plan can be approved.",
+            ),
         )
     try:
         evidence = _approval_evidence(eval_store, plan)
@@ -1353,7 +1636,7 @@ def admission_state(store: str | Path, release_id: str) -> dict[str, Any]:
 def _bound_plan(store: Path, artifact: dict[str, Any]) -> dict[str, Any]:
     """Re-verify that the artifact's frozen plan is the one that used the snapshot."""
     try:
-        plan = protected_eval._load_plan(store, artifact.get("plan_id"))
+        plan = protected_eval.load_plan(store, artifact.get("plan_id"))
     except protected_eval.EvaluationRejection as error:
         raise _phase_rejection(error, "disposition") from error
     if (
@@ -1441,8 +1724,21 @@ def _classification(
     frozen_at: str,
     exposed_stages: list[str],
     explicit_impact: str | None,
+    *,
+    evidence: str,
+    release_snapshot_id: str,
+    revision_predecessor_id: str | None,
+    release_lineage: list[str],
+    range_stages: list[str],
 ) -> dict[str, Any]:
-    """Record why (and on what basis) the impact value was chosen."""
+    """Record why (and on what basis) the impact value was chosen.
+
+    Exposure requires **both** that the release's snapshot is in the revision's
+    predecessor lineage and that the ex-date falls inside an evaluated partition
+    range.  An explicit impact that overrides the computed default must carry a
+    non-empty evidence statement; a bare override never silently erases the
+    classification.
+    """
     try:
         official = snapshot._instant(
             revision.get("official_available_at"), "official_available_at"
@@ -1453,24 +1749,54 @@ def _classification(
         ) from error
     frozen = snapshot._instant(frozen_at, "plan frozen_at")
     timing_impact = "pending_review" if official <= frozen else "sustained"
+    in_lineage = (
+        revision_predecessor_id is not None
+        and revision_predecessor_id in release_lineage
+    )
+    computed = timing_impact if exposed_stages else NOT_APPLICABLE_IMPACT
+    if not exposed_stages and explicit_impact in INVALIDATING_IMPACTS:
+        raise _reject(
+            "IMPACT_NOT_APPLICABLE",
+            "disposition",
+            "correct",
+            "The revision is not exposed by this release (its snapshot is not in "
+            "the revision's lineage, or the ex-date is outside both evaluated "
+            "protected ranges), so this release cannot have used that input; an "
+            "unaffected release is never paused or invalidated.",
+        )
+    if explicit_impact is not None and explicit_impact != computed and not evidence:
+        raise _reject(
+            "IMPACT_EVIDENCE_REQUIRED",
+            "disposition",
+            "correct",
+            "An explicit --impact that overrides the computed default "
+            f"({computed}) must carry a non-empty --evidence statement explaining "
+            "the re-review; a bare override never erases the recorded evidence.",
+        )
     if not exposed_stages:
-        if explicit_impact in INVALIDATING_IMPACTS:
-            raise _reject(
-                "IMPACT_NOT_APPLICABLE",
-                "disposition",
-                "correct",
-                "The revision's ex-date is outside both evaluated protected ranges, "
-                "so this release cannot have used that input; an unaffected release "
-                "is never paused or invalidated.",
-            )
         recorded = "sustained" if explicit_impact == "sustained" else NOT_APPLICABLE_IMPACT
         method = (
-            "operator_override" if explicit_impact else "excluded_from_evaluated_ranges"
+            "operator_override"
+            if explicit_impact
+            else (
+                "outside_revision_lineage"
+                if range_stages
+                else "excluded_from_evaluated_ranges"
+            )
         )
-        basis = (
-            "The revision's ex-date is outside both evaluated protected ranges, so "
-            "this release's evidence could not include that corporate action."
-        )
+        if range_stages:
+            basis = (
+                "The revision's ex-date is inside an evaluated protected range, but "
+                f"the release snapshot {release_snapshot_id} is not in the "
+                f"revision's predecessor lineage "
+                f"({revision_predecessor_id or 'unbound'}); this release's evidence "
+                "could not include that corporate action."
+            )
+        else:
+            basis = (
+                "The revision's ex-date is outside both evaluated protected ranges, "
+                "so this release's evidence could not include that corporate action."
+            )
         if explicit_impact == "sustained":
             basis += " The operator recorded that the original evidence still holds."
     else:
@@ -1498,17 +1824,26 @@ def _classification(
             )
         if explicit_impact and explicit_impact != timing_impact:
             basis += f" The operator recorded {explicit_impact} explicitly."
-    return {
+    result = {
         "method": method,
         "exposure": "evaluated" if exposed_stages else "not_applicable",
         "exposed_stages": exposed_stages,
+        "evaluated_range_stages": range_stages,
+        "release_snapshot_id": release_snapshot_id,
+        "revision_predecessor_id": revision_predecessor_id,
+        "release_snapshot_in_lineage": in_lineage,
+        "release_lineage": release_lineage,
         "official_available_at": revision.get("official_available_at"),
         "plan_frozen_at": frozen_at,
         "timing_impact": timing_impact,
+        "computed_impact": computed,
         "recorded_impact": recorded,
         "official_available_before_or_at_freeze": official <= frozen,
         "basis": basis,
     }
+    if evidence:
+        result["evidence"] = evidence
+    return result
 
 
 def _next_disposition_sequence(store: Path, release_id: str) -> int:
@@ -1536,6 +1871,7 @@ def disposition(
     reason: str,
     *,
     impact: str | None = None,
+    evidence: str | None = None,
     ledger: str | Path | None = None,
     data: str | Path | None = None,
     effective_signal_date: str | None = None,
@@ -1561,6 +1897,7 @@ def disposition(
         raise ValueError(
             "--impact must be one of " + ", ".join(DISPOSITION_CHOICES) + "."
         )
+    evidence = evidence.strip() if isinstance(evidence, str) else ""
     if (ledger is None) != (data is None):
         raise ValueError(
             "--ledger and --data must be supplied together to derive the first "
@@ -1615,12 +1952,55 @@ def disposition(
         raise _refusal(
             eval_store, context, error, command="release disposition"
         ) from error
+    release_snapshot_id = artifact.get("snapshot_id")
     try:
-        exposed_stages = _exposed_stages(
+        release_lineage = snapshot.lineage_ids(snapshot_store, release_snapshot_id)
+    except (OSError, ValueError) as error:
+        raise _refusal(
+            eval_store,
+            context,
+            _reject(
+                "SNAPSHOT_LINEAGE_UNAVAILABLE",
+                "disposition",
+                "inspect",
+                f"The release snapshot lineage cannot be established without "
+                f"opening a sealed payload: {error}",
+            ),
+            command="release disposition",
+        ) from error
+    try:
+        revision_predecessor_id = dividend.revision_predecessor(
+            snapshot_store, revision_id
+        )
+    except ValueError as error:
+        raise _refusal(
+            eval_store,
+            context,
+            _reject(
+                "REVISION_INVALID", "disposition", "inspect", str(error)
+            ),
+            command="release disposition",
+        ) from error
+    try:
+        range_stages = _exposed_stages(
             artifact.get("partition_fingerprints"), revision["ex_date"]
         )
+        exposed_stages = (
+            range_stages
+            if revision_predecessor_id is not None
+            and revision_predecessor_id in release_lineage
+            else []
+        )
         classification = _classification(
-            revision, frozen_at, exposed_stages, impact
+            revision,
+            frozen_at,
+            exposed_stages,
+            impact,
+            evidence=evidence,
+            release_snapshot_id=release_snapshot_id,
+            revision_predecessor_id=revision_predecessor_id,
+            release_lineage=release_lineage,
+            range_stages=range_stages,
         )
     except ReleaseRejection as error:
         raise _refusal(
@@ -1634,13 +2014,12 @@ def disposition(
     pause_date: str | None = None
     if invalidating and state == "enabled":
         last_signal_date = events[-1]["effective_signal_date"]
-        if explicit_date is not None:
-            pause_date = explicit_date
-        elif ledger is not None and data is not None:
+        derived_date: str | None = None
+        if ledger is not None and data is not None:
             from prajnatrade import shadow  # deferred: shadow imports this module
 
             try:
-                pause_date = shadow.first_uncommitted_signal_date(
+                derived_date = shadow.first_uncommitted_signal_date(
                     ledger,
                     data,
                     release_id,
@@ -1659,7 +2038,7 @@ def disposition(
                     ),
                     command="release disposition",
                 ) from error
-            if pause_date is None:
+            if derived_date is None:
                 raise _refusal(
                     eval_store,
                     context,
@@ -1672,6 +2051,29 @@ def disposition(
                     ),
                     command="release disposition",
                 )
+        if explicit_date is not None:
+            if derived_date is not None and explicit_date != derived_date:
+                raise _refusal(
+                    eval_store,
+                    {
+                        **context,
+                        "derived_signal_date": derived_date,
+                        "effective_signal_date": explicit_date,
+                    },
+                    _reject(
+                        "EFFECTIVE_SIGNAL_DATE_MISMATCH",
+                        "disposition",
+                        "correct",
+                        "The exposed correction must pause at the first "
+                        f"not-yet-committed after-close signal point {derived_date}; "
+                        f"the explicit date {explicit_date} would leave new signals "
+                        "running and is refused.",
+                    ),
+                    command="release disposition",
+                )
+            pause_date = explicit_date
+        elif derived_date is not None:
+            pause_date = derived_date
         else:
             raise _refusal(
                 eval_store,
@@ -1731,6 +2133,7 @@ def disposition(
         "impact": recorded_impact,
         "implication": IMPLICATION_FOR_IMPACT[recorded_impact],
         "classification": classification,
+        "evidence": evidence,
         "reviewer": reviewer,
         "reason": reason,
         "recorded_at": recorded_at,
@@ -1820,7 +2223,7 @@ def _verify_bindings(store: Path, artifact: dict[str, Any]) -> None:
     """Re-verify the artifact's plan and both bound records (immutability check)."""
     plan_id = artifact.get("plan_id")
     try:
-        plan = protected_eval._load_plan(store, plan_id)
+        plan = protected_eval.load_plan(store, plan_id)
     except protected_eval.EvaluationRejection as error:
         raise _reject(
             "RELEASE_INTEGRITY_FAILED",
@@ -2086,12 +2489,63 @@ def _release_ids(store: Path) -> list[str]:
     return ids
 
 
+def _rejection_status(
+    store: Path, release_id: str, as_of: str | None = None
+) -> dict[str, Any]:
+    """Operator view of an explicit rejection decision (no artifact exists)."""
+    rejection = _load_rejection(store, release_id)
+    assert rejection is not None
+    as_of_date = _as_of_date(as_of) if as_of is not None else None
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "kind": REJECTION_STATUS_KIND,
+        "scope": SCOPE,
+        "release_id": rejection["release_id"],
+        "release_version": rejection.get("release_version"),
+        "artifact_hash": None,
+        "release_path": None,
+        "candidate_id": rejection.get("candidate_id"),
+        "candidate_hash": rejection.get("candidate_hash"),
+        "plan_id": rejection.get("plan_id"),
+        "plan_hash": rejection.get("plan_hash"),
+        "project_id": rejection.get("project_id"),
+        "snapshot_id": rejection.get("snapshot_id"),
+        "partition_fingerprints": rejection.get("partition_fingerprints"),
+        "approval": {
+            "reviewer": None,
+            "decision": None,
+            "reason": None,
+            "approved_at": None,
+        },
+        "evaluations": rejection.get("evaluations"),
+        "decision": "rejected",
+        "rejection": rejection,
+        "rejection_id": rejection["rejection_id"],
+        "rejection_path": str(_rejection_location(store, release_id)),
+        "admission": {
+            "valid": False,
+            "reason": "prior_rejection",
+            "retired": False,
+            "dispositions": [],
+            "invalidating_dispositions": [],
+        },
+        "state": "rejected",
+        "current_state": "rejected",
+        "active": False,
+        "as_of": as_of_date,
+        "timeline": [],
+    }
+
+
 def status(
     store: str | Path, release_id: str, as_of: str | None = None
 ) -> dict[str, Any]:
     """Operator view: artifact fingerprints, approval, admission and timeline."""
     eval_store = _store(store)
     path = _artifact_location(eval_store, release_id)
+    if not path.is_file() and _load_rejection(eval_store, release_id) is not None:
+        return _rejection_status(eval_store, release_id, as_of)
     artifact = _verified_artifact(path, release_id)
     events = _timeline(eval_store, release_id)
     current = _current_state(events)
@@ -2171,7 +2625,7 @@ def releases_active_at(store: str | Path, signal_date: str) -> list[dict[str, An
 
 
 def list_releases(store: str | Path) -> list[dict[str, Any]]:
-    """Every stored release with its current state and admission (operator/#32)."""
+    """Every stored release or explicit rejection with its current state."""
     eval_store = _store(store)
     summaries = []
     for release_id in _release_ids(eval_store):
@@ -2199,4 +2653,35 @@ def list_releases(store: str | Path) -> list[dict[str, Any]]:
                 "timeline_length": len(events),
             }
         )
-    return summaries
+    for release_id in _rejection_ids(eval_store):
+        rejection = _load_rejection(eval_store, release_id)
+        assert rejection is not None
+        summaries.append(
+            {
+                "release_id": release_id,
+                "release_version": rejection.get("release_version"),
+                "artifact_hash": None,
+                "candidate_id": rejection.get("candidate_id"),
+                "candidate_hash": rejection.get("candidate_hash"),
+                "plan_id": rejection.get("plan_id"),
+                "snapshot_id": rejection.get("snapshot_id"),
+                "approval": {
+                    "reviewer": rejection.get("reviewer"),
+                    "decision": "rejected",
+                    "reason": rejection.get("reason"),
+                    "approved_at": None,
+                },
+                "decision": "rejected",
+                "rejection_id": rejection["rejection_id"],
+                "state": "rejected",
+                "admission": {
+                    "valid": False,
+                    "reason": "prior_rejection",
+                    "retired": False,
+                    "dispositions": [],
+                    "invalidating_dispositions": [],
+                },
+                "timeline_length": 0,
+            }
+        )
+    return sorted(summaries, key=lambda entry: entry["release_id"])

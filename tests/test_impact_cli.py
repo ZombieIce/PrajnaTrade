@@ -47,6 +47,10 @@ DISCOVERY_EX_DATE = "2024-01-04"  # inside Discovery (2024-01-01..12)
 
 REVIEWER = "reviewer-impact"
 REASON = "Verified official revision reviewed against the frozen evidence."
+REVIEW_EVIDENCE = (
+    "Re-review evidence: the frozen judgement was compared with the verified "
+    "revision and the stored protected record."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +379,7 @@ def disposition(
     revision_id: str,
     *,
     impact: str | None = None,
+    evidence: str | None = None,
     ledger: Path | None = None,
     data: Path | None = None,
     date: str | None = None,
@@ -392,6 +397,8 @@ def disposition(
     ]
     if impact is not None:
         arguments += ["--impact", impact]
+    if evidence is not None:
+        arguments += ["--evidence", evidence]
     if ledger is not None:
         arguments += ["--ledger", str(ledger)]
     if data is not None:
@@ -415,6 +422,8 @@ def shadow_update(ledger: Path, store: Path, data: Path, date: str):
         "--store", str(store),
         "--data", str(data),
         "--date", date,
+        # These tests exercise #31 pause points, not #33 correction deltas.
+        "--corrections-store", str(ledger.parent),
     )
 
 
@@ -609,6 +618,127 @@ def test_out_of_range_revision_is_not_applicable_and_other_versions_run(
 
 
 # ---------------------------------------------------------------------------
+# 2b. Exposure requires the release snapshot to share the revision's lineage.
+# ---------------------------------------------------------------------------
+
+
+def test_revision_from_another_snapshot_lineage_is_not_applicable(
+    world: dict, tmp_path: Path
+) -> None:
+    entry = world["exposed"]
+    release_id = entry["release_id"]
+    store = clone_store(world, tmp_path)
+    snapshot_store = clone_snapshot_store(world, tmp_path, entry)
+
+    # Seal an unrelated snapshot that carries the same dividend action, then
+    # file the verified revision against that other lineage.
+    payload = synthetic_snapshot(discovery_marker="2024-01-04")
+    payload["corporate_actions"] = [
+        {
+            "date": EXPOSED_EX_DATE,
+            "symbol": SYMBOLS[0],
+            "type": "cash_dividend",
+            "cash_per_share": 0.20,
+            "pay_date": "2024-01-17",
+            "terms_evidence": "synthetic dividend terms",
+            **EVIDENCE,
+        }
+    ]
+    other = seal_snapshot(tmp_path / "other", payload, "snapshots")
+    shutil.copytree(
+        other["store"] / other["snapshot_id"],
+        snapshot_store / other["snapshot_id"],
+    )
+    revision = _revision(
+        tmp_path / "revisions",
+        snapshot_store,
+        other["snapshot_id"],
+        ex_date=EXPOSED_EX_DATE,
+        old_amount=0.20,
+        new_amount=0.17,
+        official_available_at="2024-01-04T09:00:00+08:00",
+        tag="other-lineage",
+    )
+    assert revision["revision_id"] != world["pending_revision"]["revision_id"]
+
+    result = ok(
+        disposition(
+            store,
+            snapshot_store,
+            release_id,
+            revision["revision_id"],
+            reason="The ex-date is inside the range but the snapshot lineage differs.",
+        )
+    )
+    assert result["impact"] == "not_applicable"
+    assert result["paused_event"] is None
+    assert result["admission"]["valid"] is True
+    classification = result["classification"]
+    assert classification["exposure"] == "not_applicable"
+    assert classification["method"] == "outside_revision_lineage"
+    assert classification["evaluated_range_stages"] == ["validation"]
+    assert classification["exposed_stages"] == []
+    assert classification["revision_predecessor_id"] == other["snapshot_id"]
+    assert classification["release_snapshot_in_lineage"] is False
+    assert entry["base"]["snapshot_id"] in classification["release_lineage"]
+    assert other["snapshot_id"] not in classification["release_lineage"]
+    # The mismatch is recorded, not silently dropped.
+    assert "not in the revision's predecessor lineage" in classification["basis"]
+
+
+# ---------------------------------------------------------------------------
+# 2c. An explicit impact override needs recorded re-review evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_impact_override_without_evidence_is_refused(
+    world: dict, tmp_path: Path
+) -> None:
+    entry = world["exposed"]
+    release_id = entry["release_id"]
+    revision_id = world["pending_revision"]["revision_id"]
+    store = clone_store(world, tmp_path)
+    ok(lifecycle("enable", store, release_id, "2030-09-01"))
+
+    refused = rejected(
+        disposition(
+            store,
+            entry["base"]["snapshot_store"],
+            release_id,
+            revision_id,
+            impact="sustained",
+            reason="A bare sustained override must not erase the classification.",
+        ),
+        "IMPACT_EVIDENCE_REQUIRED",
+    )
+    assert "evidence" in refused["error"]["message"].lower()
+    assert not (store / "releases" / release_id / "dispositions").exists()
+    assert ok(status(store, release_id))["timeline"][-1]["action"] == "enable"
+
+    recorded = ok(
+        disposition(
+            store,
+            entry["base"]["snapshot_store"],
+            release_id,
+            revision_id,
+            impact="sustained",
+            evidence="The re-review compared the verified revision with the frozen record.",
+            reason="The operator records a sustained override with its evidence.",
+        )
+    )
+    assert recorded["impact"] == "sustained"
+    assert recorded["classification"]["method"] == "operator_override"
+    assert recorded["classification"]["computed_impact"] == "pending_review"
+    assert recorded["classification"]["evidence"] == (
+        "The re-review compared the verified revision with the frozen record."
+    )
+    assert recorded["disposition"]["evidence"] == (
+        "The re-review compared the verified revision with the frozen record."
+    )
+    assert recorded["paused_event"] is None
+
+
+# ---------------------------------------------------------------------------
 # 3. A supplier error already present at freeze time is pending review: pause.
 # ---------------------------------------------------------------------------
 
@@ -698,6 +828,7 @@ def test_supplier_error_at_freeze_pauses_at_first_uncommitted_signal_point(
             release_id,
             revision_id,
             impact="sustained",
+            evidence=REVIEW_EVIDENCE,
             reason="Re-review proved the frozen judgement does not depend on the amount.",
         )
     )
@@ -727,6 +858,88 @@ def test_supplier_error_at_freeze_pauses_at_first_uncommitted_signal_point(
 
 
 # ---------------------------------------------------------------------------
+# 3b. The pause point is the first uncommitted signal point, never a later day.
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_derived_pause_point_rejects_a_later_explicit_date(
+    world: dict, tmp_path: Path
+) -> None:
+    entry = world["exposed"]
+    release_id = entry["release_id"]
+    revision_id = world["pending_revision"]["revision_id"]
+    store = clone_store(world, tmp_path)
+    sessions = FUTURE[:6]
+    feed = write_json(
+        tmp_path / "feed.json",
+        shadow_feed(
+            sessions,
+            closes={MOMENTUM_SYMBOL: [10.0, 10.1, 10.2, 10.3, 10.4, 10.5]},
+        ),
+    )
+    ledger = tmp_path / "ledger"
+    ok(lifecycle("enable", store, release_id, sessions[0]))
+    ok(shadow_update(ledger, store, feed, sessions[2]))
+    assert ok(status(store, release_id))["timeline"][-1]["effective_signal_date"] == (
+        sessions[0]
+    )
+
+    # The first not-yet-committed after-close signal point is sessions[3]; a
+    # later explicit date (or any other date) must not silently pass.
+    for later in (sessions[4], sessions[5]):
+        refused = rejected(
+            disposition(
+                store,
+                entry["base"]["snapshot_store"],
+                release_id,
+                revision_id,
+                ledger=ledger,
+                data=feed,
+                date=later,
+            ),
+            "EFFECTIVE_SIGNAL_DATE_MISMATCH",
+        )
+        assert refused["derived_signal_date"] == sessions[3]
+        assert refused["effective_signal_date"] == later
+        assert ok(status(store, release_id))["timeline"] == [
+            event
+            for event in ok(status(store, release_id))["timeline"]
+        ]
+        assert not (store / "releases" / release_id / "dispositions").exists()
+
+    # Supplying the derived point explicitly is accepted and pauses there.
+    result = ok(
+        disposition(
+            store,
+            entry["base"]["snapshot_store"],
+            release_id,
+            revision_id,
+            ledger=ledger,
+            data=feed,
+            date=sessions[3],
+        )
+    )
+    assert result["impact"] == "pending_review"
+    assert result["paused_event"]["effective_signal_date"] == sessions[3]
+    assert result["disposition"]["pause_effective_signal_date"] == sessions[3]
+
+    # Without --ledger/--data an explicit date is still required.
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    other = clone_store(world, other_root)
+    ok(lifecycle("enable", other, release_id, sessions[0]))
+    rejected(
+        disposition(
+            other,
+            entry["base"]["snapshot_store"],
+            release_id,
+            revision_id,
+        ),
+        "EFFECTIVE_SIGNAL_DATE_REQUIRED",
+    )
+
+
+# ---------------------------------------------------------------------------
 # 4. ``no_longer_supported`` is final: no resume, no enable, no reused range.
 # ---------------------------------------------------------------------------
 
@@ -748,6 +961,7 @@ def test_no_longer_supported_is_final_and_requires_a_new_release(
             release_id,
             revision_id,
             impact="no_longer_supported",
+            evidence=REVIEW_EVIDENCE,
             date="2030-05-05",
             reason="The frozen judgement depended on an amount that cannot stand.",
         )
@@ -769,6 +983,7 @@ def test_no_longer_supported_is_final_and_requires_a_new_release(
             release_id,
             revision_id,
             impact="sustained",
+            evidence=REVIEW_EVIDENCE,
             reason="A late re-review claim that must not resurrect a final refusal.",
         )
     )
@@ -822,6 +1037,7 @@ def test_published_release_with_invalid_admission_cannot_be_enabled(
             release_id,
             world["pending_revision"]["revision_id"],
             impact="pending_review",
+            evidence=REVIEW_EVIDENCE,
             reason="Recorded before the release was ever enabled.",
         )
     )
@@ -929,6 +1145,7 @@ def test_paused_version_settles_but_never_backfills_a_resumed_signal(
             release_id,
             revision_id,
             impact="sustained",
+            evidence=REVIEW_EVIDENCE,
             reason="Re-review confirmed the frozen judgement is unaffected.",
         )
     )
@@ -986,6 +1203,7 @@ def test_disposition_reads_no_sealed_payload_and_debits_no_query(
             release_id,
             world["pending_revision"]["revision_id"],
             impact="pending_review",
+            evidence=REVIEW_EVIDENCE,
             date="2030-06-05",
             reason="Reviewed from the journal only; the sealed payloads stay closed.",
         )
@@ -1091,6 +1309,7 @@ def test_disposition_records_are_immutable_and_resolved_latest_wins(
             release_id,
             revision_id,
             impact="pending_review",
+            evidence=REVIEW_EVIDENCE,
             date="2030-04-05",
         )
     )
@@ -1108,6 +1327,7 @@ def test_disposition_records_are_immutable_and_resolved_latest_wins(
             release_id,
             revision_id,
             impact="sustained",
+            evidence=REVIEW_EVIDENCE,
             reason="A later re-review clears the pending state.",
         )
     )
@@ -1137,6 +1357,7 @@ def test_disposition_records_are_immutable_and_resolved_latest_wins(
             release_id,
             revision_id,
             impact="no_longer_supported",
+            evidence=REVIEW_EVIDENCE,
             reason="The frozen judgement cannot be supported after all.",
         )
     )
@@ -1152,6 +1373,7 @@ def test_disposition_records_are_immutable_and_resolved_latest_wins(
             release_id,
             revision_id,
             impact="sustained",
+            evidence=REVIEW_EVIDENCE,
             reason="A late sustained claim must not clear a final refusal.",
         )
     )
@@ -1187,6 +1409,7 @@ def test_illegal_disposition_inputs_are_rejected_without_partial_mutation(
             release_id,
             "f" * 64,
             impact="pending_review",
+            evidence=REVIEW_EVIDENCE,
             date="2030-08-15",
         ),
         "REVISION_NOT_FOUND",
@@ -1210,6 +1433,7 @@ def test_illegal_disposition_inputs_are_rejected_without_partial_mutation(
             release_id,
             world["pending_revision"]["revision_id"],
             impact="pending_review",
+            evidence=REVIEW_EVIDENCE,
             date="2030-08-01",
         ),
         "ILLEGAL_PAUSE",
@@ -1223,6 +1447,7 @@ def test_illegal_disposition_inputs_are_rejected_without_partial_mutation(
             unaffected["release_id"],
             world["outside_revision"]["revision_id"],
             impact="no_longer_supported",
+            evidence=REVIEW_EVIDENCE,
         ),
         "IMPACT_NOT_APPLICABLE",
     )

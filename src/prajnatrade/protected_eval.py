@@ -35,9 +35,13 @@ from prajnatrade.backtest import equal_weight_buy_and_hold
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.experiment import _runtime_identity, candidate_status, project_status
 from prajnatrade.isolation import probe_isolation_evidence
-from prajnatrade.snapshot_baseline import _CN_TZ, _available_by, run_partition_strategy
+from prajnatrade.snapshot_baseline import (
+    CN_TZ,
+    available_by,
+    run_partition_strategy,
+)
 from prajnatrade.strategies import make_strategy
-from prajnatrade.validation import _make_robustness_plan
+from prajnatrade.validation import make_robustness_plan
 
 
 SCHEMA_VERSION = 1
@@ -581,7 +585,7 @@ def _signal_window(candidate: dict[str, Any]) -> int:
 
 
 def _neighbourhood(candidate: dict[str, Any]) -> dict[str, Any]:
-    plan = _make_robustness_plan(
+    plan = make_robustness_plan(
         {
             "family": candidate["strategy"]["family"],
             "parameters": candidate["parameters"],
@@ -780,6 +784,11 @@ def _load_plan(store: Path, plan_id: str) -> dict[str, Any]:
             "The frozen plan does not match its content address.",
         )
     return plan
+
+
+def load_plan(store: Path, plan_id: str) -> dict[str, Any]:
+    """Public trusted loader for one frozen plan (no sealed read, no debit)."""
+    return _load_plan(store, plan_id)
 
 
 def _authorization_files(directory: Path, stage: str) -> list[Path]:
@@ -1426,6 +1435,19 @@ def _audit(
     return audit_id
 
 
+def audit(
+    store: Path,
+    context: dict[str, Any],
+    code: str,
+    message: str,
+    *,
+    command: str = "evaluation run",
+    phase: str = "run",
+) -> str | None:
+    """Public trusted-side refusal audit writer (no sealed read, no debit)."""
+    return _audit(store, context, code, message, command=command, phase=phase)
+
+
 def _failpoint(name: str) -> None:
     if os.environ.get("PRAJNATRADE_TEST_FAILPOINT") == name:
         raise RuntimeError(f"synthetic test failpoint {name!r} reached")
@@ -1861,7 +1883,7 @@ def _day_available(
 ) -> bool:
     for symbol in ETF_SYMBOLS:
         row = derived.get((day, symbol))
-        if row is None or row.get("value") is None or not _available_by(row, cutoff):
+        if row is None or row.get("value") is None or not available_by(row, cutoff):
             return False
     return True
 
@@ -1884,7 +1906,7 @@ def _regime_labels(
     labels: dict[str, str | None] = {}
     for day in sessions:
         cutoff = datetime.combine(
-            date.fromisoformat(day), clock_time(9, 30), tzinfo=_CN_TZ
+            date.fromisoformat(day), clock_time(9, 30), tzinfo=CN_TZ
         )
         prior_days = [candidate for candidate in ordered if candidate < day]
         if len(prior_days) < definition["lookback"] + 1:
