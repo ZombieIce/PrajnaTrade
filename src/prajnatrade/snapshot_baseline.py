@@ -4,7 +4,7 @@ import math
 from collections.abc import Mapping
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -17,7 +17,6 @@ from prajnatrade.backtest import (
 )
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot import read_discovery
-
 
 #: Asia/Shanghai is the trading-time anchor for both baselines and Shadow Live.
 CN_TZ = timezone(timedelta(hours=8))
@@ -297,7 +296,7 @@ def _metrics(
     sharpe = None
     if len(valued) >= 2:
         returns = np.asarray(
-            [right / left - 1.0 for left, right in zip(valued, valued[1:])],
+            [right / left - 1.0 for left, right in zip(valued, valued[1:], strict=False)],
             dtype=float,
         )
         std = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
@@ -397,7 +396,7 @@ def run_discovery_baseline(
     fee_rate = transaction_cost_bps / 10_000.0
     slippage_rate = slippage_bps / 10_000.0
 
-    for day_index, day in enumerate(sessions):
+    for day in sessions:
         day_actions = actions.get(day, [])
         _apply_actions(
             day, day_actions, shares, cash, receivables, unresolved_actions

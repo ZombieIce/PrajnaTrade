@@ -280,9 +280,6 @@ def _rebalance_at_open(
 ) -> tuple[list[dict[str, Any]], float, dict[str, float], dict[str, float]]:
     fills: list[dict[str, Any]] = []
     costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
-    open_equity = cash + sum(
-        shares[symbol] * float(open_prices[symbol] or 0.0) for symbol in ETF_SYMBOLS
-    )
 
     for symbol in ETF_SYMBOLS:
         quantity = max(0.0, shares[symbol] - target_shares[symbol])

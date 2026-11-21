@@ -321,7 +321,7 @@ def _equity_and_drawdown(curve: list[dict[str, Any]], title: str) -> str:
     for equity in equities:
         peak = max(peak, equity)
         peaks.append(peak)
-    drawdowns = [equity / peak - 1.0 for equity, peak in zip(equities, peaks)]
+    drawdowns = [equity / peak - 1.0 for equity, peak in zip(equities, peaks, strict=True)]
     return (
         f"<h5>{html.escape(title)} equity</h5>{_svg_plot(equities, "#2665a8", "Equity")}"
         f"<h5>{html.escape(title)} drawdown</h5>{_svg_plot(drawdowns, "#c14444", "Drawdown")}"
