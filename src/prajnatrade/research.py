@@ -5,7 +5,7 @@ import json
 import math
 import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +15,9 @@ from prajnatrade.isolation import IsolationError
 from prajnatrade.providers import (
     MockProvider,
     OpenAICompatibleProvider,
+    Proposal,
     ProviderBudgetExceeded,
     ProviderError,
-    Proposal,
     ResearchProvider,
     combine_usage,
     recent_experiment_context,
@@ -26,7 +26,6 @@ from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import (
     make_strategy,
     normalize_strategy_spec,
-    strategy_fingerprint,
 )
 
 RESEARCH_OBJECTIVE = (
@@ -184,7 +183,7 @@ def advance_campaign(
             checkpoint = campaign["updated_at"]
         try:
             checkpoint_time = datetime.fromisoformat(checkpoint)
-            recovery_seconds = (datetime.now(timezone.utc) - checkpoint_time).total_seconds()
+            recovery_seconds = (datetime.now(UTC) - checkpoint_time).total_seconds()
         except (TypeError, ValueError) as error:
             raise ValueError("Invalid interrupted campaign time checkpoint.") from error
         if recovery_seconds < 0:
@@ -791,4 +790,4 @@ def _save_progress(
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

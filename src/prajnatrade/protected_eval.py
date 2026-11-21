@@ -23,10 +23,11 @@ from __future__ import annotations
 import json
 import math
 import os
-import statistics
 import sqlite3
+import statistics
 import uuid
-from datetime import date, datetime, time as clock_time, timezone
+from datetime import UTC, date, datetime
+from datetime import time as clock_time
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +43,6 @@ from prajnatrade.snapshot_baseline import (
 )
 from prajnatrade.strategies import make_strategy
 from prajnatrade.validation import make_robustness_plan
-
 
 SCHEMA_VERSION = 1
 SCOPE = "synthetic"
@@ -166,7 +166,7 @@ class EvaluationRejection(Exception):
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _hash(value: object) -> str:
@@ -1918,7 +1918,7 @@ def _regime_labels(
             continue
         returns = [
             index[right] / index[left] - 1.0
-            for left, right in zip(window, window[1:])
+            for left, right in zip(window, window[1:], strict=False)
         ]
         volatility = statistics.stdev(returns)
         labels[day] = volatile if volatility >= definition["volatility_threshold"] else calm

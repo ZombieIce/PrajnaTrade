@@ -24,7 +24,6 @@ from typing import Any
 
 from prajnatrade import protected_eval, snapshot
 
-
 REPORT_SCHEMA_VERSION = 1
 REPORT_KIND = "controlled_evaluation_report"
 STAGES = protected_eval.STAGES
@@ -469,7 +468,7 @@ def _svg_plot(points: list[tuple[str, float]], color: str, label: str) -> str:
     low, high = min(numbers), max(numbers)
     spread = high - low or 1.0
     plotted = []
-    for index, (date, value) in enumerate(values):
+    for index, (_date, value) in enumerate(values):
         x = margin + (width - 2 * margin) * index / max(1, len(values) - 1)
         y = height - margin - (height - 2 * margin) * (value - low) / spread
         plotted.append(f"{x:.1f},{y:.1f}")

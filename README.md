@@ -3,6 +3,15 @@
 PrajnaTrade is a local-first research CLI for a fixed portfolio universe:
 ETFs `511260`, `518880`, `515080`, `513300`, `159612`, plus cash.
 
+## Development
+
+Start with the map before changing the code:
+
+- **Tests:** [`docs/agents/testing.md`](docs/agents/testing.md) — how the suite is organized and run.
+- **Architecture:** [`docs/agents/architecture.md`](docs/agents/architecture.md) — modules, trusted stores, CLI flows and the test map.
+- **Standards:** [`CODING_STANDARDS.md`](CODING_STANDARDS.md) — review judgement calls; mechanical rules live in ruff/CI.
+- **Worktrees:** [`docs/agents/worktrees.md`](docs/agents/worktrees.md) — parallel worktree workflow.
+
 ## Data format
 
 CSV and Parquet inputs use one row per symbol and date with these columns:

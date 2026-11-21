@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import fcntl
+import hashlib
 import json
 import math
 import platform
@@ -9,11 +9,12 @@ import signal
 import sqlite3
 import time
 import uuid
+from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Iterator, TypedDict
+from typing import Any, TypedDict
 
 from prajnatrade.snapshot import manifest as snapshot_manifest
 from prajnatrade.snapshot import read_discovery
@@ -363,7 +364,9 @@ def _normalize_request(raw: object) -> dict[str, Any]:
 
 
 @contextmanager
-def _campaign_lock(project: Path, campaign_id: str, *, blocking: bool = True) -> Iterator[None]:
+def _campaign_lock(
+    project: Path, campaign_id: str, *, blocking: bool = True
+) -> Generator[None, None, None]:
     filename = hashlib.sha256(campaign_id.encode()).hexdigest() + ".lock"
     with (project / ".prajnatrade" / filename).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
@@ -659,7 +662,7 @@ def freeze_experiment_candidate(
             "evaluation": config,
             "runtime_dependencies": result["runtime_dependencies"],
             "execution_rules": config["execution_rules"],
-            "frozen_at": datetime.now(timezone.utc).isoformat(),
+            "frozen_at": datetime.now(UTC).isoformat(),
         }
         frozen["candidate_hash"] = _fingerprint(frozen)
         canonical = json.dumps(frozen, sort_keys=True, separators=(",", ":"), allow_nan=False)

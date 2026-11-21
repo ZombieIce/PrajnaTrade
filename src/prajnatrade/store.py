@@ -5,7 +5,7 @@ import math
 import sqlite3
 import uuid
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -265,7 +265,7 @@ class SQLiteStore:
                 """,
                 (
                     request_id, campaign_id, stage, ordinal, _json_dump(usage),
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(UTC).isoformat(),
                 ),
             )
             connection.commit()
@@ -319,7 +319,7 @@ class SQLiteStore:
                 "requests": 1,
                 "usage_estimated": False,
                 "reconciliation_evidence": evidence.strip(),
-                "reconciled_at": datetime.now(timezone.utc).isoformat(),
+                "reconciled_at": datetime.now(UTC).isoformat(),
                 "previous_usage": previous,
             }
             connection.execute(
