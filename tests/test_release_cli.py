@@ -19,26 +19,22 @@ from pathlib import Path
 
 import pytest
 
+from cli_helpers import cli, cli_env, ok, rejected, write_json
 from prajnatrade import release
-
 from test_protected_eval_cli import (
     SYMBOLS,
     authorize,
     build_scenario,
-    cli,
-    cli_env,
     create_plan,
     eval_store,
     freeze_candidate,
-    ok,
     plan_input,
-    rejected,
     run_evaluation,
     submit_experiment,
     synthetic_snapshot,
-    write_json,
 )
 
+pytestmark = pytest.mark.isolation
 
 APPROVAL_REASON = "Both protected stages passed; approve the frozen candidate."
 APPROVED_AT_FROM = "reviewer-alpha"

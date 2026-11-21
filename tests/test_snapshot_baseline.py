@@ -1,15 +1,13 @@
 import json
-import os
 import subprocess
-import sys
 from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
+from cli_helpers import cli
 from prajnatrade.data import ETF_SYMBOLS
-
 
 SYMBOLS = ETF_SYMBOLS
 
@@ -68,15 +66,7 @@ def _snapshot_input() -> dict:
 
 
 def _cli(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-    return subprocess.run(
-        [sys.executable, "-m", "prajnatrade", *args],
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    return cli(*args, cwd=cwd)
 
 
 def _run_baseline(tmp_path: Path, payload: dict, name: str) -> dict:

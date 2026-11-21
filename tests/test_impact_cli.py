@@ -23,23 +23,21 @@ from pathlib import Path
 
 import pytest
 
+from cli_helpers import cli, ok, rejected, write_json
 from test_protected_eval_cli import (
     EVIDENCE,
     SYMBOLS,
     authorize,
-    cli,
     create_plan,
     freeze_candidate,
-    ok,
     plan_input,
-    rejected,
     seal_snapshot,
     submit_experiment,
     synthetic_snapshot,
-    write_json,
 )
 from test_shadow_cli import FUTURE, MOMENTUM_SYMBOL, shadow_feed
 
+pytestmark = pytest.mark.isolation
 
 PLAN_FROZEN_AT = "2024-01-10T00:00:00+00:00"
 EXPOSED_EX_DATE = "2024-01-15"  # inside the Validation partition (2024-01-13..16)

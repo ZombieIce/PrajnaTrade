@@ -29,15 +29,11 @@ from pathlib import Path
 
 import pytest
 
-from prajnatrade import shadow, snapshot
+from cli_helpers import cli, cli_env, ok, write_json
 from test_protected_eval_cli import (
     SYMBOLS,
-    cli,
-    cli_env,
-    ok,
     seal_snapshot,
     synthetic_snapshot,
-    write_json,
 )
 from test_shadow_cli import (
     DIVIDEND_SYMBOL,
@@ -53,6 +49,9 @@ from test_shadow_cli import (
     write_feed,
 )
 
+from prajnatrade import shadow, snapshot
+
+pytestmark = pytest.mark.isolation
 
 SESSIONS = ["2030-01-02", "2030-01-03", "2030-01-04", "2030-01-07",
             "2030-01-08", "2030-01-09", "2030-01-10", "2030-01-11"]

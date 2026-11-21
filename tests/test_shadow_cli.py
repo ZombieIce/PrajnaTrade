@@ -21,22 +21,19 @@ from pathlib import Path
 
 import pytest
 
+from cli_helpers import cli, cli_env, ok, write_json
 from test_protected_eval_cli import (
     SYMBOLS,
     authorize,
-    cli,
-    cli_env,
     create_plan,
     freeze_candidate,
-    ok,
     plan_input,
-    rejected,
     seal_snapshot,
     submit_experiment,
     synthetic_snapshot,
-    write_json,
 )
 
+pytestmark = pytest.mark.isolation
 
 FUTURE = ["2030-01-02", "2030-01-03", "2030-01-04", "2030-01-07", "2030-01-08", "2030-01-09"]
 PAST = ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05", "2024-01-08"]

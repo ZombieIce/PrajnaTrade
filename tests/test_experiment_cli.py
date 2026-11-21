@@ -1,32 +1,12 @@
 import json
-import os
 import signal
 import subprocess
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 
-
-def cli_env() -> dict[str, str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        (str(Path(__file__).parents[1] / "src"), env.get("PYTHONPATH", ""))
-    )
-    return env
-
-
-AGENT_CLI = (
-    sys.executable, "-c", "from prajnatrade.cli import agent_main; raise SystemExit(agent_main())",
-)
-
-
-def cli(*args: str, agent: bool = False) -> subprocess.CompletedProcess[str]:
-    command = AGENT_CLI if agent else (sys.executable, "-m", "prajnatrade")
-    return subprocess.run(
-        [*command, *args], capture_output=True, text=True, env=cli_env(), timeout=45,
-    )
+from cli_helpers import AGENT_COMMAND, cli, cli_env
 
 
 def sealed_snapshot_input(day_count: int = 15) -> dict:
@@ -437,7 +417,7 @@ def test_execution_timeout_is_charged_and_blocks_new_attempts(tmp_path: Path) ->
 
 def kill_after_admission(submit_args: tuple[str, ...], status_args: tuple[str, ...]) -> dict:
     with subprocess.Popen(
-        [*AGENT_CLI, *submit_args], stdout=subprocess.PIPE,
+        [*AGENT_COMMAND, *submit_args], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, env=cli_env(),
     ) as process:
         try:

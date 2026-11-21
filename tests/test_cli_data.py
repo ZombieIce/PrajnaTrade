@@ -1,12 +1,10 @@
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from cli_helpers import cli as _run_cli
 from prajnatrade.data import load_bars
 
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
@@ -38,19 +36,6 @@ def _write_bars(
                 row += f",{basis}"
             lines.append(row)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        (str(Path(__file__).parents[1] / "src"), env.get("PYTHONPATH", ""))
-    )
-    return subprocess.run(
-        [sys.executable, "-m", "prajnatrade", *args],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
 
 
 def test_data_validate_reports_missing_bars_and_unavailable_opens(

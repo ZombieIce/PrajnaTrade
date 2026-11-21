@@ -16,25 +16,22 @@ from pathlib import Path
 
 import pytest
 
+from cli_helpers import cli, cli_env, ok, rejected, write_json
 from test_protected_eval_cli import (
     authorize,
     build_scenario,
-    cli,
-    cli_env,
     consumed_rows,
     create_plan,
     eval_store,
     evaluation_rows,
     freeze_candidate,
-    ok,
     plan_input,
-    rejected,
     run_evaluation,
     submit_experiment,
     synthetic_snapshot,
-    write_json,
 )
 
+pytestmark = pytest.mark.isolation
 
 HOLDOUT_RECEIPT = {
     "schema_version": 1,
@@ -50,7 +47,6 @@ def base(tmp_path_factory: pytest.TempPathFactory) -> dict:
         create_campaign,
         freeze_candidate,
         seal_snapshot,
-        write_json,
     )
 
     root = tmp_path_factory.mktemp("holdout-evaluation")

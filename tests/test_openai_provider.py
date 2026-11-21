@@ -1,16 +1,24 @@
+"""OpenAI-compatible provider tests (fake local HTTP server, synthetic data).
+
+The generated-Python variant of
+``test_campaign_records_provider_usage_without_persisting_api_credentials`` is
+marked ``isolation`` because it executes the generated strategy through the
+real macOS sandbox; the equal-weight variant stays in the fast suite.
+"""
+
 from __future__ import annotations
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import date, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
 import prajnatrade.isolation as isolation
-from prajnatrade.data import ETF_SYMBOLS, load_bars
 from prajnatrade.cli import main
+from prajnatrade.data import ETF_SYMBOLS, load_bars
 from prajnatrade.providers import (
     OpenAICompatibleProvider,
     ProviderBudgetExceeded,
@@ -660,7 +668,10 @@ def test_openai_provider_bounds_http_timeout_by_remaining_campaign_time(
     assert timeouts == [0.25]
 
 
-@pytest.mark.parametrize("generated_python", [False, True])
+@pytest.mark.parametrize(
+    "generated_python",
+    [False, pytest.param(True, marks=pytest.mark.isolation)],
+)
 def test_campaign_records_provider_usage_without_persisting_api_credentials(
     tmp_path: Path, generated_python: bool,
 ) -> None:
