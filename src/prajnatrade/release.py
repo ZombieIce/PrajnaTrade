@@ -34,12 +34,11 @@ from __future__ import annotations
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from prajnatrade import dividend, protected_eval, snapshot
-
 
 SCHEMA_VERSION = 1
 SCOPE = "synthetic"
@@ -130,7 +129,7 @@ def _reject(
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _hash(value: object) -> str:
@@ -1424,7 +1423,7 @@ def _disposition_order(entry: dict[str, Any]) -> tuple[Any, int, str]:
     except ValueError:
         instant = None
     if instant is None:
-        instant = datetime.min.replace(tzinfo=timezone.utc)
+        instant = datetime.min.replace(tzinfo=UTC)
     sequence = entry.get("sequence")
     if isinstance(sequence, bool) or not isinstance(sequence, int):
         sequence = 0

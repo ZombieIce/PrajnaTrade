@@ -1,0 +1,14 @@
+# Pre-commit hooks for PrajnaTrade.
+#
+# Ruff only (no ruff-format): the codebase is not formatter-clean yet and a
+# 18k-line reformat is out of scope. The hook auto-fixes safe findings and
+# fails on the rest; configuration lives in .ruff.toml.
+#
+# Install with `pre-commit install`; run manually with `pre-commit run --all-files`.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.6
+    hooks:
+      - id: ruff
+        name: ruff (lint, auto-fix safe)
+        args: [--fix]

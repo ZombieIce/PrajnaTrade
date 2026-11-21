@@ -78,9 +78,10 @@ import math
 import os
 import re
 import sqlite3
-from datetime import date, datetime, time, timezone
+from collections.abc import Iterator
+from datetime import UTC, datetime, time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pandas as pd
 
@@ -89,16 +90,15 @@ from prajnatrade.backtest import _validate_weights
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot_baseline import (
     CN_TZ,
-    available_by,
     _is_executable_open,
     _valid_price,
+    available_by,
 )
 from prajnatrade.strategies import (
     STRATEGY_FAMILIES,
     make_strategy,
     normalize_strategy_spec,
 )
-
 
 SCHEMA_VERSION = 1
 SCOPE = "synthetic"
@@ -167,7 +167,7 @@ def _reject(code: str, phase: str, next_action: str, message: str) -> ShadowReje
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _hash(value: object) -> str:
@@ -777,7 +777,7 @@ def first_uncommitted_signal_date(
             )
         start = feed.index[last] + 1
     else:
-        reference = datetime.now(timezone.utc)
+        reference = datetime.now(UTC)
         if after is not None:
             try:
                 filed = snapshot._instant(after, "filed_at")
@@ -1565,7 +1565,7 @@ def _run_version(
     try:
         fetched = release.fetch(store, release_id)
     except release.ReleaseRejection as error:
-        raise _Blocked(error.details["code"], error.details["message"])
+        raise _Blocked(error.details["code"], error.details["message"]) from error
     artifact = fetched["artifact"]
     execution = _execution_settings(artifact)
     try:
@@ -1574,7 +1574,7 @@ def _run_version(
             for session in feed.sessions
         }
     except release.ReleaseRejection as error:
-        raise _Blocked(error.details["code"], error.details["message"])
+        raise _Blocked(error.details["code"], error.details["message"]) from error
     target_index = feed.index[target]
     target_state = states[target]
     progress = database.get_progress(release_id)
@@ -1834,7 +1834,7 @@ def _process_session(
         body = built
         frozen_now = database.freeze_input(release_id, session, body, input_hash)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     try:
         result = _compute_day(body, execution, now)
     except _Blocked:

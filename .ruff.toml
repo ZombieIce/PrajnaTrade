@@ -1,0 +1,30 @@
+# Standalone Ruff configuration for PrajnaTrade.
+#
+# Kept out of pyproject.toml on purpose: the build metadata is owned by the
+# guardrails branch, and lint settings should be reviewable on their own.
+#
+# Scope is deliberately conservative: correctness-oriented rules only. There is
+# no formatter config yet; reformatting the codebase is a separate change.
+
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+# `tests/` and sibling git worktrees (`.worktrees/`) are out of scope for now.
+# `extend-exclude` is additive to Ruff's built-in excludes (`.git`, `.venv`, ...).
+extend-exclude = ["tests", ".worktrees"]
+
+[lint]
+select = [
+    "E4",      # import formatting
+    "E7",      # statement-level errors
+    "E9",      # runtime errors (syntax, IO)
+    "F",       # pyflakes: undefined names, unused imports/variables
+    "I",       # import sorting
+    "B",       # bugbear: likely bugs
+    "UP",      # pyupgrade: modern Python 3.12 syntax
+    "PLC2701", # private names imported from another module
+]
+
+# PLC2701 is a preview rule in Ruff, so it only runs with preview enabled.
+preview = true

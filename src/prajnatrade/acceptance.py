@@ -38,7 +38,6 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-
 SCHEMA_VERSION = 1
 REPORT_KIND = "issue_17_acceptance_report"
 REPORT_SCHEMA_VERSION = 1
@@ -643,7 +642,7 @@ def _consecutive_real_forward_days(
     # persisted before, and reached its terminal order state on, the second
     # day's session (``next_session``).
     ordered = sorted(days, key=lambda day: day["date"])
-    for first, second in zip(ordered, ordered[1:]):
+    for first, second in zip(ordered, ordered[1:], strict=False):
         if (
             _forward_day_reconciled(first)
             and _forward_day_reconciled(second)

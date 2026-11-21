@@ -6,8 +6,8 @@ import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
-from urllib.parse import parse_qsl, urlparse, urlunparse
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from prajnatrade.store import SQLiteStore

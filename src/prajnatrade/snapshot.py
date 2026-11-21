@@ -13,7 +13,6 @@ from pathlib import Path
 
 from prajnatrade.data import ETF_SYMBOLS
 
-
 KINDS = ("calendar", "raw_bars", "corporate_actions", "derived")
 RAW_FIELDS = ("open", "high", "low", "close", "volume")
 
@@ -236,7 +235,7 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
     groups = (sessions[:discovery_end], sessions[discovery_end:validation_end], sessions[validation_end:])
     partitions = {}
     descriptions = []
-    for name, days in zip(("discovery", "validation", "final_holdout"), groups):
+    for name, days in zip(("discovery", "validation", "final_holdout"), groups, strict=True):
         day_set = set(days)
         content = {kind: [row for row in records[kind] if row["date"] in day_set] for kind in KINDS}
         partitions[name] = content
@@ -302,7 +301,9 @@ def _publish(store: Path, manifest: dict, partitions: dict) -> dict:
             try:
                 os.rename(staging, target)
             except FileExistsError:
-                raise ValueError("Snapshot was concurrently created; retry to verify it.")
+                raise ValueError(
+                    "Snapshot was concurrently created; retry to verify it."
+                ) from None
             target.chmod(0o555)
         finally:
             if staging.exists():
