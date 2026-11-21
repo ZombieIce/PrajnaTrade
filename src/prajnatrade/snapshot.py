@@ -15,6 +15,11 @@ from prajnatrade.data import ETF_SYMBOLS
 
 KINDS = ("calendar", "raw_bars", "corporate_actions", "derived")
 RAW_FIELDS = ("open", "high", "low", "close", "volume")
+SCHEMA_VERSION = {1: "synthetic", 2: "real"}
+SYNTHETIC_STATUSES = ("trading", "suspended", "unknown")
+REAL_STATUSES = ("trading", "partial_halt", "suspended", "unknown")
+DERIVATION_METHOD = "cash_dividend_reinvested_at_ex_date_close"
+HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _bytes(value: object) -> bytes:
@@ -72,6 +77,183 @@ def _evidence(record: object, *, allow_unknown: bool = False) -> None:
         raise ValueError("Missing availability_evidence.")
 
 
+def _input_kind(data: object) -> tuple[int, str]:
+    """Return the declared schema version and data kind; never infer one."""
+    if not isinstance(data, dict):
+        raise ValueError("Snapshot input must be an object.")
+    schema_version = data.get("schema_version")
+    data_kind = data.get("data_kind")
+    if type(schema_version) is int and SCHEMA_VERSION.get(schema_version) == data_kind:
+        return schema_version, data_kind
+    raise ValueError(
+        "Snapshot input must be schema version 1 synthetic data or "
+        "schema version 2 real data."
+    )
+
+
+def _evidence_bundle(data: dict) -> dict:
+    evidence = data.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != {"items"}:
+        raise ValueError("Real snapshot input requires an evidence block with only items.")
+    items = evidence["items"]
+    if not isinstance(items, list) or not items:
+        raise ValueError("The evidence block requires at least one item.")
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {
+            "id", "kind", "reference", "sha256", "available_at",
+        }:
+            raise ValueError(
+                "Each evidence item needs id, kind, reference, sha256 and available_at."
+            )
+        for key in ("id", "kind", "reference"):
+            if not isinstance(item[key], str) or not item[key].strip():
+                raise ValueError(f"Invalid evidence {key}.")
+        if item["id"] in seen:
+            raise ValueError("Evidence item ids must be unique.")
+        seen.add(item["id"])
+        if not isinstance(item["sha256"], str) or not HEX_SHA256.fullmatch(item["sha256"]):
+            raise ValueError("Evidence sha256 must be 64 lowercase hex characters.")
+        _instant(item["available_at"], "available_at")
+    return evidence
+
+
+def _derivation(data: dict, rule: str) -> dict:
+    derivation = data.get("derivation")
+    if not isinstance(derivation, dict) or set(derivation) != {
+        "rule_version", "method", "evidence",
+    }:
+        raise ValueError(
+            "Real snapshot input requires a derivation block with rule_version, "
+            "method and evidence."
+        )
+    if not isinstance(derivation["rule_version"], str) or not derivation["rule_version"].strip():
+        raise ValueError("Invalid derivation rule_version.")
+    if derivation["rule_version"] != rule:
+        raise ValueError("The derivation rule_version must match derivation_rule_version.")
+    if derivation["method"] != DERIVATION_METHOD:
+        raise ValueError(
+            f"Unsupported derivation method; expected {DERIVATION_METHOD!r}."
+        )
+    evidence = derivation["evidence"]
+    if isinstance(evidence, str):
+        nonempty = bool(evidence.strip())
+    elif isinstance(evidence, list):
+        nonempty = bool(evidence) and all(
+            isinstance(item, str) and item.strip() for item in evidence
+        )
+    else:
+        nonempty = False
+    if not nonempty:
+        raise ValueError("The derivation block requires non-empty evidence.")
+    return derivation
+
+
+def _halt(value: object, *, required: bool) -> dict | None:
+    if value is None:
+        if required:
+            raise ValueError("A partial_halt raw bar requires a halt window.")
+        return None
+    if not isinstance(value, dict) or set(value) != {"start", "end"}:
+        raise ValueError("Halt must be an object with start and end timestamps.")
+    start = _instant(value["start"], "halt.start")
+    end = _instant(value["end"], "halt.end")
+    if end <= start:
+        raise ValueError("The halt window must end after it starts.")
+    return value
+
+
+def _per_field_instant(row: dict, key: str, *, required: bool) -> None:
+    if key not in row:
+        raise ValueError(f"Missing {key} in raw_bars; per-field availability is required.")
+    value = row[key]
+    if value is None:
+        if required:
+            raise ValueError(f"Missing {key}; this trading status needs that timestamp.")
+    else:
+        _instant(value, key)
+
+
+def _real_raw_bar(row: dict) -> None:
+    status = row.get("trading_status")
+    if status not in REAL_STATUSES:
+        raise ValueError("Invalid or missing trading_status in raw_bars.")
+    if status == "trading":
+        if any(row.get(field) is None for field in RAW_FIELDS):
+            raise ValueError(
+                "A trading raw bar requires open, high, low, close and volume."
+            )
+        if row.get("halt") is not None:
+            raise ValueError("A trading raw bar cannot declare a halt window.")
+    elif status == "partial_halt":
+        if row.get("open") is not None:
+            raise ValueError(
+                "A partial_halt raw bar must not store an executable open price."
+            )
+        _halt(row.get("halt"), required=True)
+    elif status == "suspended":
+        if any(row.get(field) is not None for field in RAW_FIELDS):
+            raise ValueError(
+                "A suspended raw bar requires null open, high, low, close and volume."
+            )
+        _halt(row.get("halt"), required=False)
+    elif row.get("halt") is not None:
+        raise ValueError("An unknown raw bar cannot declare a halt window.")
+    _per_field_instant(
+        row, "open_available_at",
+        required=status in ("trading", "partial_halt") or row.get("open") is not None,
+    )
+    _per_field_instant(
+        row, "close_available_at", required=row.get("close") is not None
+    )
+
+
+def _real_corporate_action(row: dict) -> None:
+    if "record_date" in row and row["record_date"] is not None:
+        _date(row["record_date"])
+    action_type = row["type"]
+    required = (
+        ("cash_per_share", "pay_date", "terms_evidence")
+        if action_type == "cash_dividend"
+        else ("ratio", "terms_evidence")
+    )
+    if any(row.get(key) is None for key in required):
+        raise ValueError(
+            "Real corporate action terms must be present; use a verified value, "
+            "not null."
+        )
+
+
+def _real_derived(rows: list[dict], raw_bars: dict[tuple[str, str], dict]) -> None:
+    for row in rows:
+        raw = raw_bars.get((row["date"], row["symbol"]))
+        if raw is None:
+            continue
+        status = raw["trading_status"]
+        if status == "trading" and row.get("value") is None:
+            raise ValueError(
+                "A real derived value must be present on a trading session."
+            )
+        if status == "suspended" and row.get("value") is not None:
+            raise ValueError(
+                "A real derived value must be null on a suspended session."
+            )
+
+
+def _complete_row(row: dict, kind: str, *, is_real: bool) -> bool:
+    """Whether one row confirms its value; a real partial halt still has a close."""
+    if kind == "derived":
+        return row.get("value") is not None
+    if not is_real:
+        return all(row.get(field) is not None for field in RAW_FIELDS)
+    status = row.get("trading_status")
+    if status == "trading":
+        return all(row.get(field) is not None for field in RAW_FIELDS)
+    if status == "partial_halt":
+        return row.get("close") is not None
+    return False
+
+
 def _store_path(path: Path) -> Path:
     path = path.resolve()
     existing = path
@@ -94,8 +276,8 @@ def _read_json(path: Path) -> object:
 
 
 def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
-    if not isinstance(data, dict) or data.get("schema_version") != 1 or data.get("data_kind") != "synthetic":
-        raise ValueError("Snapshot input must be schema version 1 synthetic data.")
+    schema_version, data_kind = _input_kind(data)
+    is_real = data_kind == "real"
     sources = data.get("sources")
     if not isinstance(sources, dict) or set(sources) != set(KINDS):
         raise ValueError("Sources must describe calendar, raw_bars, corporate_actions and derived.")
@@ -108,8 +290,16 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
     rule = data.get("derivation_rule_version")
     if not isinstance(rule, str) or not rule.strip():
         raise ValueError("Missing derivation_rule_version.")
+    evidence = derivation = None
+    if is_real:
+        evidence = _evidence_bundle(data)
+        derivation = _derivation(data, rule)
+        declared_basis = data.get("raw_price_basis", "unadjusted")
+        if declared_basis != "unadjusted":
+            raise ValueError("Real snapshots require unadjusted raw prices.")
 
     records: dict[str, list[dict]] = {}
+    real_raw_bars: dict[tuple[str, str], dict] = {}
     for kind in KINDS:
         rows = data.get(kind)
         if not isinstance(rows, list) or (kind != "corporate_actions" and not rows):
@@ -139,6 +329,8 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
                     raise ValueError("Invalid corporate action terms evidence.")
                 if action_type == "cash_dividend" and row["pay_date"] is not None:
                     _date(row["pay_date"])
+                if is_real:
+                    _real_corporate_action(row)
             if kind in ("raw_bars", "derived"):
                 for field in (RAW_FIELDS if kind == "raw_bars" else ("value",)):
                     value = row.get(field)
@@ -151,7 +343,9 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
                     if field not in row:
                         raise ValueError(f"Missing {field} in {kind}; use null for a gap.")
             if kind == "raw_bars":
-                if row.get("trading_status") not in ("trading", "suspended", "unknown"):
+                if row.get("trading_status") not in (
+                    REAL_STATUSES if is_real else SYNTHETIC_STATUSES
+                ):
                     raise ValueError("Invalid or missing trading_status in raw_bars.")
                 high, low = row["high"], row["low"]
                 prices = [v for v in (row["open"], row["close"]) if v is not None]
@@ -159,7 +353,12 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
                     or (low is not None and any(low > price for price in prices))
                     or (high is not None and low is not None and high < low)):
                     raise ValueError("Invalid raw_bars OHLC values.")
+                if is_real:
+                    _real_raw_bar(row)
+                    real_raw_bars[(row["date"], row["symbol"])] = row
         records[kind] = sorted(rows, key=lambda row: (row["date"], row.get("symbol", ""), _bytes(row)))
+    if is_real:
+        _real_derived(records["derived"], real_raw_bars)
 
     dates = [row["date"] for row in records["calendar"]]
     date_set = set(dates)
@@ -206,8 +405,8 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
     complete = [
         day for day in dates if start <= day <= source_end and all(
             (day, symbol) in indexed[kind]
-            and all(indexed[kind][day, symbol][field] is not None for field in fields)
-            for kind, fields in (("raw_bars", RAW_FIELDS), ("derived", ("value",)))
+            and _complete_row(indexed[kind][day, symbol], kind, is_real=is_real)
+            for kind in ("raw_bars", "derived")
             for symbol in ETF_SYMBOLS
         ) and day not in incomplete_days
     ]
@@ -244,7 +443,8 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
             "content_hash": _hash(content),
         })
     manifest = {
-        "schema_version": 1, "data_kind": "synthetic", "symbols": sorted(ETF_SYMBOLS),
+        "schema_version": schema_version, "data_kind": data_kind,
+        "symbols": sorted(ETF_SYMBOLS),
         "sources": sources, "derivation_rule_version": rule,
         "symbol_coverage": coverage,
         "common_range": {"start": start, "end": end}, "gaps": gaps,
@@ -263,6 +463,10 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
             } for symbol in sorted(ETF_SYMBOLS)
         },
     }
+    if is_real:
+        manifest["raw_price_basis"] = "unadjusted"
+        manifest["evidence"] = evidence
+        manifest["derivation"] = derivation
     return manifest, partitions
 
 
@@ -309,7 +513,11 @@ def _publish(store: Path, manifest: dict, partitions: dict) -> dict:
             if staging.exists():
                 staging.chmod(0o755)
                 shutil.rmtree(staging)
-    return {"schema_version": 1, "snapshot_id": snapshot_id, "data_kind": "synthetic"}
+    return {
+        "schema_version": manifest["schema_version"],
+        "snapshot_id": snapshot_id,
+        "data_kind": manifest["data_kind"],
+    }
 
 
 def manifest(store: Path, snapshot_id: str) -> dict:
@@ -512,7 +720,9 @@ def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | N
         raise ValueError("Discovery partition integrity check failed.")
     content = latest if cutoff is None else _discovery_view(base, revisions, cutoff)
     return {
-        "schema_version": 1, "snapshot_id": snapshot_id, "partition": partition,
+        "schema_version": metadata["schema_version"],
+        "data_kind": metadata["data_kind"],
+        "snapshot_id": snapshot_id, "partition": partition,
         "content_hash": _hash(content), "data": content,
         **({"as_of": cutoff.isoformat(), "partition_content_hash": fingerprint}
            if cutoff is not None else {}),

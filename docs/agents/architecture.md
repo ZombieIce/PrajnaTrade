@@ -78,13 +78,19 @@ state and controlled-report internals never move to the agent CLI.
 
 ## Synthetic-only boundary and blocked real evidence
 
-Every artifact in this build is synthetic: outputs carry
-`scope`/`data_kind: "synthetic"`, and the acceptance gate requires real scope
-**and** a complete real chain, so synthetic coverage can never pass it.
+Every research, evaluation, release and acceptance artifact in this build is
+synthetic: those outputs carry `scope`/`data_kind: "synthetic"`, and the
+acceptance gate requires real scope **and** a complete real chain, so synthetic
+coverage can never pass it. `snapshot seal` and `baseline` additionally accept
+schema-version-2 real Discovery inputs as #24 mechanism support; campaigns,
+protected evaluation, release and Shadow Live still reject real snapshots and no
+real snapshot has been sealed or reconciled.
 
 - **#24 — real five-ETF snapshot/baseline:** a real sealed snapshot with an
   official exchange calendar, verified corporate actions and point-in-time
   availability evidence, plus an independently reproduced Discovery baseline.
+  The sealer and baseline mechanism for schema v2 exists; the real inputs,
+  seal and reconciliation are still missing.
 - **#26 — real-data Mock campaign:** a bounded Mock campaign with fixed
   configuration and seed on that real Discovery partition, including
   parent/child and interrupted-then-resumed evidence.
@@ -109,7 +115,7 @@ across files, never mutable state.
 | Flow | Test file | Covers |
 | --- | --- | --- |
 | Experiment | [`test_experiment_cli.py`](../../tests/test_experiment_cli.py) | Campaign lock, submit/status, idempotent replay, resume, budget/timeout, candidate freeze, agent surface |
-| Snapshot | [`test_snapshot_cli.py`](../../tests/test_snapshot_cli.py), [`test_snapshot_baseline.py`](../../tests/test_snapshot_baseline.py), [`test_cli_baseline.py`](../../tests/test_cli_baseline.py), [`test_cli_data.py`](../../tests/test_cli_data.py) | Seal/manifest/integrity, partition split, Discovery-only reads, corrections/successors, point-in-time accounting, legacy baseline, bar validation |
+| Snapshot | [`test_snapshot_cli.py`](../../tests/test_snapshot_cli.py), [`test_snapshot_baseline.py`](../../tests/test_snapshot_baseline.py), [`test_real_snapshot.py`](../../tests/test_real_snapshot.py), [`test_cli_baseline.py`](../../tests/test_cli_baseline.py), [`test_cli_data.py`](../../tests/test_cli_data.py) | Seal/manifest/integrity, partition split, Discovery-only reads, corrections/successors, point-in-time accounting, schema-v2 real validation and per-field availability/halts, real Discovery baseline, legacy baseline, bar validation |
 | Protected evaluation | [`test_protected_eval_cli.py`](../../tests/test_protected_eval_cli.py) | Plan frozen before read, authorization, isolation probe, debit-before-read, single-use ledger, rejection without debit, agent receipt |
 | Holdout/report | [`test_holdout_report_cli.py`](../../tests/test_holdout_report_cli.py) | Separate Holdout authorization, no re-read of Validation, controlled-report sections, constant Holdout receipt |
 | Release | [`test_release_cli.py`](../../tests/test_release_cli.py) | Approval over passed records, immutable artifact/fetch, explicit rejection, lifecycle timeline |

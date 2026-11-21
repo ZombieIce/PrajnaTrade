@@ -370,6 +370,7 @@ def run_discovery_baseline(
     _validate_parameters(initial_cash, transaction_cost_bps, slippage_bps)
     receipt = read_discovery(store, snapshot_id, "discovery")
     data = receipt["data"]
+    data_kind = receipt["data_kind"]
     sessions = sorted({row["date"] for row in data["calendar"]})
     if not sessions:
         raise ValueError("The Discovery partition has no trading sessions.")
@@ -413,7 +414,9 @@ def run_discovery_baseline(
             )
             missing_opens = [
                 symbol for symbol in ETF_SYMBOLS
-                if not _is_executable_open(raw_bars.get((day, symbol)), open_cutoff)
+                if not _is_executable_open(
+                    raw_bars.get((day, symbol)), open_cutoff, data_kind=data_kind
+                )
             ]
             attempt = {
                 "signal_date": signal["date"],
@@ -434,7 +437,8 @@ def run_discovery_baseline(
             order_attempts.append(attempt)
 
         nav_point, gaps = _valuation(
-            day, raw_bars, shares, cash, receivables, unresolved_actions
+            day, raw_bars, shares, cash, receivables, unresolved_actions,
+            data_kind=data_kind,
         )
         equity_curve.append(nav_point)
         valuation_gaps.extend(gaps)
@@ -449,7 +453,7 @@ def run_discovery_baseline(
     }
     return {
         "schema_version": 1,
-        "data_kind": "synthetic",
+        "data_kind": data_kind,
         "snapshot_id": receipt["snapshot_id"],
         "partition": "discovery",
         "partition_content_hash": receipt["content_hash"],
@@ -482,8 +486,13 @@ def run_discovery_baseline(
         "ending_equity": final_nav,
         "metrics": metrics,
         "gaps": {
-            "raw_bars": _data_gaps(sessions, raw_bars, "raw_bars"),
-            "derived": _data_gaps(sessions, derived, "derived"),
+            "raw_bars": _data_gaps(
+                sessions, raw_bars, "raw_bars", data_kind=data_kind
+            ),
+            "derived": _data_gaps(
+                sessions, derived, "derived",
+                raw_bars=raw_bars, data_kind=data_kind,
+            ),
             "valuation": valuation_gaps,
         },
     }
@@ -583,14 +592,35 @@ def _available_by(row: dict, cutoff: datetime) -> bool:
     return available_at.tzinfo is not None and available_at <= cutoff
 
 
-def _is_executable_open(row: dict | None, cutoff: datetime) -> bool:
-    return (
-        row is not None
-        and row.get("trading_status") == "trading"
-        and _valid_price(row.get("open"))
-        and _valid_price(row.get("volume"))
-        and _available_by(row, cutoff)
-    )
+def _instant_by(value: object, cutoff: datetime) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        available_at = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return available_at.tzinfo is not None and available_at <= cutoff
+
+
+def _is_executable_open(
+    row: dict | None, cutoff: datetime, *, data_kind: str = "synthetic"
+) -> bool:
+    if (
+        row is None
+        or row.get("trading_status") != "trading"
+        or not _valid_price(row.get("open"))
+        or not _valid_price(row.get("volume"))
+    ):
+        return False
+    if data_kind == "real":
+        return _instant_by(row.get("open_available_at"), cutoff)
+    return _available_by(row, cutoff)
+
+
+def _close_available(row: dict, cutoff: datetime, data_kind: str) -> bool:
+    if data_kind == "real":
+        return _instant_by(row.get("close_available_at"), cutoff)
+    return _available_by(row, cutoff)
 
 
 def _valid_price(value: object) -> bool:
@@ -719,6 +749,8 @@ def _valuation(
     cash: float,
     receivables: list[dict[str, Any]],
     unresolved: dict[str, list[dict[str, str]]],
+    *,
+    data_kind: str = "synthetic",
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     holdings = {}
     gaps = []
@@ -730,19 +762,33 @@ def _valuation(
     for symbol in ETF_SYMBOLS:
         quantity = shares[symbol]
         row = raw_bars.get((day, symbol))
-        close = row.get("close") if row else None
+        status = row.get("trading_status") if row is not None else None
+        markable = status == "trading" or (
+            data_kind == "real" and status == "partial_halt"
+        )
+        close = row.get("close") if row is not None else None
         if quantity > _EPSILON and (
             row is None
-            or row.get("trading_status") != "trading"
+            or not markable
             or not _valid_price(close)
-            or not _available_by(row, close_cutoff)
+            or not _close_available(row, close_cutoff, data_kind)
         ):
             valid = False
-            gaps.append({
+            gap = {
                 "date": day,
                 "symbol": symbol,
                 "reason": "missing_or_unconfirmed_unadjusted_close",
-            })
+            }
+            if data_kind == "real" and status in ("partial_halt", "suspended", "unknown"):
+                gap["trading_status"] = status
+                gap["status_reason"] = {
+                    "partial_halt": "partial_halt_no_confirmed_close",
+                    "suspended": "suspended_no_confirmed_close",
+                    "unknown": "unknown_trading_status",
+                }[status]
+                if row is not None and isinstance(row.get("halt"), dict):
+                    gap["halt"] = row["halt"]
+            gaps.append(gap)
             close = None
         if unresolved[symbol]:
             valid = False
@@ -773,6 +819,9 @@ def _data_gaps(
     sessions: list[str],
     rows: dict[tuple[str, str], dict],
     kind: str,
+    *,
+    raw_bars: dict[tuple[str, str], dict] | None = None,
+    data_kind: str = "synthetic",
 ) -> list[dict[str, Any]]:
     required = ("open", "close") if kind == "raw_bars" else ("value",)
     gaps = []
@@ -785,6 +834,42 @@ def _data_gaps(
             ]
             if kind == "raw_bars" and row is not None and row.get("trading_status") == "unknown":
                 missing.append("trading_status")
-            if missing:
-                gaps.append({"date": day, "symbol": symbol, "missing_fields": missing})
+            if not missing:
+                continue
+            gap = {"date": day, "symbol": symbol, "missing_fields": missing}
+            if data_kind == "real":
+                _describe_real_gap(gap, row, kind, raw_bars)
+            gaps.append(gap)
     return gaps
+
+
+def _describe_real_gap(
+    gap: dict[str, Any],
+    row: dict | None,
+    kind: str,
+    raw_bars: dict[tuple[str, str], dict] | None,
+) -> None:
+    status_row = row if kind == "raw_bars" else (raw_bars or {}).get(
+        (gap["date"], gap["symbol"])
+    )
+    if status_row is None:
+        return
+    status = status_row.get("trading_status")
+    if status not in ("partial_halt", "suspended", "unknown"):
+        return
+    gap["trading_status"] = status
+    gap["reason"] = (
+        {
+            "partial_halt": "partial_halt_no_executable_open",
+            "suspended": "suspended_session",
+            "unknown": "unknown_trading_status",
+        }[status]
+        if kind == "raw_bars"
+        else {
+            "partial_halt": "partial_halt_no_confirmed_close",
+            "suspended": "suspended_no_confirmed_close",
+            "unknown": "unknown_trading_status",
+        }[status]
+    )
+    if isinstance(status_row.get("halt"), dict):
+        gap["halt"] = status_row["halt"]
