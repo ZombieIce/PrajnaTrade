@@ -1,0 +1,175 @@
+{
+  "common_range": {
+    "end": "2026-11-20",
+    "start": "2022-05-20"
+  },
+  "cost_scenarios": [
+    {
+      "baseline": {
+        "dividend_cash": 2803.6472647266837,
+        "ending_equity": 155603.34717297764,
+        "fees_paid": 49.97501249375313,
+        "fill_date": "2022-05-23",
+        "fills": 5,
+        "nav_gaps": [
+          "2025-01-10",
+          "2025-01-24"
+        ],
+        "slippage_paid": 0.0,
+        "valued_sessions": 654
+      },
+      "checks": {
+        "dividend_cash": true,
+        "ending_nav": true,
+        "fill_date": true,
+        "fill_fees": true,
+        "fill_slippage": true,
+        "fill_values": true,
+        "nav_gap_sets": true,
+        "nav_path": true,
+        "trade_count_and_keys": true
+      },
+      "deltas": {
+        "dividend_cash_absolute_cny": 0.0,
+        "end_nav_absolute_cny": 0.0,
+        "fees_absolute_cny": 0.0,
+        "max_fill_fee_absolute_cny": 0.0,
+        "max_fill_relative": 0.0,
+        "max_nav_absolute_cny": 0.0,
+        "max_nav_relative": 0.0
+      },
+      "label": "discovery-5bps-0bps-slippage",
+      "passed": true,
+      "recomputed": {
+        "dividend_cash": 2803.6472647266837,
+        "ending_equity": 155603.34717297764,
+        "fees_paid": 49.97501249375313,
+        "fill_date": "2022-05-23",
+        "fills": 5,
+        "nav_gaps": [
+          "2025-01-10",
+          "2025-01-24"
+        ],
+        "slippage_paid": 0.0,
+        "valued_sessions": 654
+      },
+      "sessions": 656
+    },
+    {
+      "baseline": {
+        "dividend_cash": 2796.6535344486324,
+        "ending_equity": 155215.19283766544,
+        "fees_paid": 199.60079840319364,
+        "fill_date": "2022-05-23",
+        "fills": 5,
+        "nav_gaps": [
+          "2025-01-10",
+          "2025-01-24"
+        ],
+        "slippage_paid": 99.70069850308315,
+        "valued_sessions": 654
+      },
+      "checks": {
+        "dividend_cash": true,
+        "ending_nav": true,
+        "fill_date": true,
+        "fill_fees": true,
+        "fill_slippage": true,
+        "fill_values": true,
+        "nav_gap_sets": true,
+        "nav_path": true,
+        "trade_count_and_keys": true
+      },
+      "deltas": {
+        "dividend_cash_absolute_cny": 4.547473508864641e-13,
+        "end_nav_absolute_cny": 0.0,
+        "fees_absolute_cny": 0.0,
+        "max_fill_fee_absolute_cny": 0.0,
+        "max_fill_relative": 1.3008328569412693e-16,
+        "max_nav_absolute_cny": 5.820766091346741e-11,
+        "max_nav_relative": 4.2475522912541604e-16
+      },
+      "label": "discovery-20bps-10bps-slippage",
+      "passed": true,
+      "recomputed": {
+        "dividend_cash": 2796.653534448632,
+        "ending_equity": 155215.19283766544,
+        "fees_paid": 199.60079840319364,
+        "fill_date": "2022-05-23",
+        "fills": 5,
+        "nav_gaps": [
+          "2025-01-10",
+          "2025-01-24"
+        ],
+        "slippage_paid": 99.70069850308313,
+        "valued_sessions": 654
+      },
+      "sessions": 656
+    }
+  ],
+  "data_kind": "real",
+  "derived_check": {
+    "max_relative_delta": 0.0,
+    "mismatches": 0,
+    "passed": true,
+    "rows": 3280,
+    "tolerance": 1e-06
+  },
+  "full_window": {
+    "derived_check": {
+      "max_relative_delta": 0.0,
+      "mismatches": 0,
+      "passed": true,
+      "rows": 5470,
+      "tolerance": 1e-06
+    },
+    "engine_minus_probe_cny": -49.97501249372726,
+    "engine_model": {
+      "ending_equity": 176691.81681066097,
+      "fees_paid": 49.97501249375313,
+      "nav_gaps": [
+        "2025-01-10",
+        "2025-01-24"
+      ]
+    },
+    "fee_accounting_explains_difference": true,
+    "input": "real.json",
+    "passed": true,
+    "range": [
+      "2022-05-20",
+      "2026-11-20"
+    ],
+    "research_probe_model": {
+      "ending_equity": 176741.7918231547,
+      "fees_paid": 49.97501249375313,
+      "nav_gaps": [
+        "2025-01-10",
+        "2025-01-24"
+      ]
+    },
+    "research_reference_check": true,
+    "research_reference_delta_cny": 0.0018231546855531633,
+    "research_reference_nav": 176741.79,
+    "sessions": 1094
+  },
+  "integrity": {
+    "discovery_partition": true,
+    "manifest": true
+  },
+  "partition": "discovery",
+  "partition_content_hash": "1fb6d1db77c25c35ded5ea5e82655b81e3581878ee3d74526bdc57d324e75f54",
+  "passed": true,
+  "schema_version": 1,
+  "snapshot_id": "b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d",
+  "tolerances": {
+    "derived_relative": 1e-06,
+    "dividend_cash_absolute_cny": 1e-06,
+    "fill_fee_absolute_cny": 1e-06,
+    "fill_quantity_price_notional_relative": 1e-09,
+    "nav_absolute_cny": 0.0001,
+    "nav_gap_sets": "exact",
+    "nav_relative": 0.0001,
+    "research_sanity_absolute_cny": 0.01,
+    "trade_count_and_keys": "exact"
+  }
+}
