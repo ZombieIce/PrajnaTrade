@@ -73,9 +73,11 @@ Dataset fingerprints preserve the full precision of floating-point values.
 
 ### Synthetic shared snapshots (MVP-01)
 
-`snapshot seal` accepts **synthetic only** version-1 JSON and writes a shared,
-content-addressed snapshot outside any Git repository. This does not acquire or
-verify real market data. A trusted operator prepares the input and store:
+`snapshot seal` accepts version-1 **synthetic** JSON by default, plus the
+version-2 **real** input described in the next subsection for the MVP-06
+mechanism. It writes a shared, content-addressed snapshot outside any Git
+repository. The synthetic path does not acquire or verify real market data. A
+trusted operator prepares the input and store:
 
 ```sh
 prajnatrade snapshot seal --input synthetic.json --store /trusted/snapshots
@@ -130,6 +132,70 @@ canonical manifest, including all three partition fingerprints, not paths.
 Changing fixed content produces a new ID; repeat sealing verifies existing
 content rather than overwriting it.
 
+### Real schema-version-2 snapshots (MVP-06, mechanism only)
+
+`snapshot seal` also accepts `{"schema_version": 2, "data_kind": "real"}` input.
+This is mechanism support for the [#24](https://github.com/ZombieIce/PrajnaTrade/issues/24)
+acquisition script, not evidence about real data: the tests use synthetic JSON
+labelled real, and no real snapshot has been sealed or reconciled here. Real and
+synthetic never fall back to each other; a mismatched schema version/data kind
+pair is rejected.
+
+Real input adds a top-level `evidence` block and a `derivation` block:
+
+- `evidence` has exactly the key `items`; each item has exactly `id`, `kind`,
+  `reference`, `sha256` (64 lowercase hex characters), and timezone-aware
+  `available_at`. The sealer validates structure only and never opens the
+  referenced files; the manifest records the block.
+- `derivation` has exactly `rule_version`, `method`, and `evidence`.
+  `rule_version` must equal the top-level `derivation_rule_version`, `method`
+  must be `cash_dividend_reinvested_at_ex_date_close`, and `evidence` is a
+  non-empty string or a non-empty list of strings. The sealer does not
+  recompute the total-return series; it records the declared rule and evidence.
+- If `raw_price_basis` is present it must be `unadjusted`; the real manifest
+  records `raw_price_basis: "unadjusted"`.
+
+Real `raw_bars` rows keep the v1 fields and add timezone-aware
+`open_available_at` and `close_available_at`. A `null` per-field timestamp is
+allowed only where the corresponding price is absent (`partial_halt`'s
+`open_available_at` still records the resume availability). `trading_status`
+extends to `trading`, `partial_halt`, `suspended`, and `unknown`:
+
+- `trading`: non-null open/high/low/close/volume, positive OHLC, non-negative
+  volume, and both per-field timestamps present. The 09:30 open and the close
+  are treated as available at those declared timestamps by market rule.
+- `partial_halt`: there is no executable 09:30 open, so `open` must be `null`
+  and a `halt: {"start": ..., "end": ...}` window is required. `high`, `low`,
+  `close`, and `volume` may describe the resumed session; `open_available_at`
+  is the resume availability, and a present close needs `close_available_at`.
+  The vendor's post-resume first trade must not be stored in `open`.
+- `suspended`: open/high/low/close/volume are all `null`; `halt` is optional.
+  This represents full-day halts such as `159612` on 2025-01-10 and 2025-01-24.
+- `unknown`: nulls are allowed and the row is treated as a gap.
+
+For any real row, `available_at` still needs the documented evidence, but it is
+not the open or close availability; the per-field timestamps are authoritative.
+That keeps a close-publication timestamp from gating a 09:30 fill, and keeps a
+later close from being backdated.
+
+Real `corporate_actions` rows keep the v1 fields, may add `record_date`, and
+require non-null `cash_per_share` (cash dividend) or `ratio` (share
+adjustment), `pay_date` for cash dividends, and non-empty `terms_evidence`.
+Real `derived` rows must carry a non-null value on `trading` sessions and `null`
+on `suspended` sessions. The real manifest adds `schema_version: 2`,
+`data_kind: "real"`, `raw_price_basis`, `evidence`, and `derivation`; the
+synthetic manifest is unchanged.
+
+The 09:30 open is a market-rule assertion, not an archived quote: exchange rules
+say continuous trading starts at 09:30, while the archived bar only proves the
+day's OHLC after the close. A real snapshot must therefore report coverage and
+gaps, and a real label is not proof of point-in-time availability. A real
+`partial_halt` session with a confirmed close still counts toward the common
+range (for example a window ending on 2026-11-20), while its missing open and
+any suspended session remain listed gaps. Both `seal` and `snapshot read`
+receipts report `schema_version` and `data_kind`, so the baseline takes the kind
+from the sealed receipt instead of assuming synthetic.
+
 ### Discovery snapshot equal-weight baseline (MVP-04)
 
 The snapshot baseline reads only the sealed Discovery partition. It treats
@@ -158,8 +224,24 @@ of-day, or non-trading close for a held ETF, or unresolved held corporate
 action terms, makes that day's NAV unknown and is listed as a gap rather than
 filled from a stale price or guessed terms. The output records the snapshot
 and Discovery content hashes, price roles, signal/fill details, costs, and
-gaps for reproducibility. This interface currently accepts synthetic sealed
-snapshots only; it is not evidence of real-data correctness or OS isolation.
+gaps for reproducibility. This interface accepts both synthetic and real sealed
+snapshots; neither path is evidence of real-data correctness or OS isolation.
+The real path is mechanism support until a real snapshot is sealed and
+reconciled.
+
+For a schema-v2 real snapshot the output carries `data_kind: "real"` from the
+sealed receipt. Execution compares `raw_bars.open_available_at` with the 09:30
+cutoff and does not use `available_at`; a `trading` row needs a valid open and
+volume, and `partial_halt`/`suspended` rows are never executable. If any
+required open is missing or unconfirmed, the single attempt is recorded as
+`not_filled` and is never deferred. Valuation compares `close_available_at`
+with the end-of-day cutoff (`available_at` is the fallback only for v1 synthetic
+rows). A held ETF that is `partial_halt` with a confirmed close is marked at
+that close; a held `partial_halt` or `suspended` row with no confirmed close
+makes that NAV `null`, with a `missing_or_unconfirmed_unadjusted_close` gap
+that also records the trading status and halt window. A stale close is never
+carried. Full-day halts therefore produce unknown-NAV days, partial halts
+produce no executable 09:30 open, and the one-time buy rule still applies.
 
 The legacy `research` and validation commands do not consume sealed snapshots
 or inherit their checks. Campaigns created before this change may have an
