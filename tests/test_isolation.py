@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import socket
-import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -9,6 +8,8 @@ import pytest
 
 from prajnatrade.isolation import IsolationError, IsolationLimits
 from prajnatrade.strategies import make_strategy
+
+pytestmark = pytest.mark.isolation
 
 
 def _strategy(source: str) -> dict[str, object]:

@@ -1,10 +1,9 @@
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
+
+from cli_helpers import cli
 
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
 
@@ -31,37 +30,25 @@ def test_baseline_cli_buys_at_the_next_open_and_reports_reproducible_value(
     bars = tmp_path / "bars.csv"
     output = tmp_path / "baseline.json"
     _write_bars(bars)
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        (str(Path(__file__).parents[1] / "src"), env.get("PYTHONPATH", ""))
+    arguments = (
+        "baseline",
+        "--data",
+        str(bars),
+        "--output",
+        str(output),
+        "--initial-cash",
+        "10000",
+        "--price-basis",
+        "total_return",
+        "--data-kind",
+        "synthetic",
+        "--transaction-cost-bps",
+        "0",
+        "--slippage-bps",
+        "0",
     )
 
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "prajnatrade",
-            "baseline",
-            "--data",
-            str(bars),
-            "--output",
-            str(output),
-            "--initial-cash",
-            "10000",
-            "--price-basis",
-            "total_return",
-            "--data-kind",
-            "synthetic",
-            "--transaction-cost-bps",
-            "0",
-            "--slippage-bps",
-            "0",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    completed = cli(*arguments)
     assert completed.returncode == 0, completed.stderr
 
     result = json.loads(output.read_text(encoding="utf-8"))
@@ -76,8 +63,6 @@ def test_baseline_cli_buys_at_the_next_open_and_reports_reproducible_value(
     assert result["relative_returns"]["yearly_returns"] == {
         "2024": pytest.approx(0.21)
     }
-    repeat = subprocess.run(
-        completed.args, check=False, capture_output=True, text=True, env=env
-    )
+    repeat = cli(*arguments)
     assert repeat.returncode == 0, repeat.stderr
     assert json.loads(output.read_text(encoding="utf-8")) == result

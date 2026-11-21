@@ -19,16 +19,15 @@ from pathlib import Path
 
 import pytest
 
-from test_protected_eval_cli import (
-    SYMBOLS,
-    cli,
-    ok,
-    synthetic_snapshot,
-)
+from cli_helpers import cli, ok
 from test_correction_delta_cli import (
     SESSIONS as CORRECTION_SESSIONS,
     correction_journal,
     shadow_update_with_corrections,
+)
+from test_protected_eval_cli import (
+    SYMBOLS,
+    synthetic_snapshot,
 )
 from test_shadow_cli import (
     DIVIDEND_SYMBOL,
@@ -45,6 +44,8 @@ from test_shadow_cli import (
     shadow_update,
     write_feed,
 )
+
+pytestmark = pytest.mark.isolation
 
 
 # ---------------------------------------------------------------------------

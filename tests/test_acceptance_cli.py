@@ -12,13 +12,10 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import subprocess
-import sys
 from pathlib import Path
 
-import pytest
-
+from cli_helpers import cli, ok as generated, rejected as _rejected
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIO_IDS = (
@@ -31,52 +28,9 @@ SCENARIO_IDS = (
 )
 
 
-def cli_env(**extra: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        (str(ROOT / "src"), env.get("PYTHONPATH", ""))
-    )
-    env.update(extra)
-    return env
-
-
-def cli(
-    *args: str,
-    agent: bool = False,
-    env: dict[str, str] | None = None,
-    cwd: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
-    command = (
-        (
-            sys.executable,
-            "-c",
-            "from prajnatrade.cli import agent_main; raise SystemExit(agent_main())",
-        )
-        if agent
-        else (sys.executable, "-m", "prajnatrade")
-    )
-    return subprocess.run(
-        [*command, *args],
-        capture_output=True,
-        text=True,
-        env=env or cli_env(),
-        cwd=cwd,
-        timeout=120,
-    )
-
-
-def generated(result: subprocess.CompletedProcess[str]) -> dict:
-    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
-    return json.loads(result.stdout)
-
-
 def rejected(result: subprocess.CompletedProcess[str], code: str) -> dict:
-    assert result.returncode == 2, (result.returncode, result.stdout, result.stderr)
-    payload = json.loads(result.stdout)
-    assert payload["status"] == "rejected", payload
-    assert payload["error"]["code"] == code, payload
-    assert payload["error"]["phase"] == "acceptance", payload
-    return payload
+    """Acceptance reports always reject in the ``acceptance`` phase."""
+    return _rejected(result, code, phase="acceptance")
 
 
 def _scenario(

@@ -3,16 +3,18 @@
 These tests exercise `prajnatrade evaluation ...` (operator) and
 `prajnatrade-agent evaluation status ...` (research side).  The sealed snapshot
 fixtures are synthetic; no real market data is used.
+
+The whole module is marked ``isolation`` because the protected-evaluation flow
+probes the real macOS sandbox (``sandbox_init``) before it opens a sealed
+partition.  Run the fast suite with ``-m "not isolation"`` to deselect it.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, timedelta
@@ -20,57 +22,16 @@ from pathlib import Path
 
 import pytest
 
+from cli_helpers import cli, cli_env, ok, rejected, write_json
 
-ROOT = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.isolation
+
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
 EVIDENCE = {
     "available_at": "2023-12-31T00:00:00+08:00",
     "availability_evidence": "synthetic release schedule",
     "collected_at": "2024-02-01T00:00:00+08:00",
 }
-
-
-def cli_env(**extra: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        (str(ROOT / "src"), env.get("PYTHONPATH", ""))
-    )
-    env.update(extra)
-    return env
-
-
-def cli(
-    *args: str, agent: bool = False, env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
-    command = (
-        (
-            sys.executable,
-            "-c",
-            "from prajnatrade.cli import agent_main; raise SystemExit(agent_main())",
-        )
-        if agent
-        else (sys.executable, "-m", "prajnatrade")
-    )
-    return subprocess.run(
-        [*command, *args],
-        capture_output=True,
-        text=True,
-        env=env or cli_env(),
-        timeout=120,
-    )
-
-
-def ok(result: subprocess.CompletedProcess[str]) -> dict:
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    return json.loads(result.stdout)
-
-
-def rejected(result: subprocess.CompletedProcess[str], code: str) -> dict:
-    assert result.returncode == 2, (result.returncode, result.stdout, result.stderr)
-    payload = json.loads(result.stdout)
-    assert payload["status"] == "rejected", payload
-    assert payload["error"]["code"] == code, payload
-    return payload
 
 
 def synthetic_snapshot(
@@ -187,12 +148,6 @@ def plan_input(**overrides: object) -> dict:
     payload = deepcopy(DEFAULT_PLAN_INPUT)
     payload.update(overrides)
     return payload
-
-
-def write_json(path: Path, payload: object) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return path
 
 
 def seal_snapshot(root: Path, payload: dict, name: str = "snapshots") -> dict:

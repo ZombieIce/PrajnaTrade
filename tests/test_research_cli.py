@@ -1,6 +1,13 @@
-import json
+"""Research CLI and campaign-loop tests (synthetic only).
+
+Most tests here exercise pure bookkeeping and are safe in the fast suite.  The
+tests that actually execute generated Python through the real macOS sandbox are
+marked ``isolation`` individually so ``-m "not isolation"`` still covers the
+rest of the campaign loop.
+"""
+
 import html
-import os
+import json
 import subprocess
 import sys
 import time
@@ -9,12 +16,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
-import prajnatrade.research as research
-import prajnatrade.isolation as isolation
-import prajnatrade.strategies as strategies
 import pytest
+
+from cli_helpers import cli as _run_cli
+import prajnatrade.isolation as isolation
+import prajnatrade.research as research
+import prajnatrade.strategies as strategies
 from prajnatrade.data import load_bars
-from prajnatrade.providers import MockProvider, Proposal, ProviderBudgetExceeded, ProviderError, Reflection
+from prajnatrade.providers import (
+    MockProvider,
+    Proposal,
+    ProviderBudgetExceeded,
+    ProviderError,
+    Reflection,
+)
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
 from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import make_strategy
@@ -44,19 +59,6 @@ def _write_bars(path: Path, day_count: int = 12, start_day: int = 0) -> None:
                 "1000,total_return"
             )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        (str(Path(__file__).parents[1] / "src"), env.get("PYTHONPATH", ""))
-    )
-    return subprocess.run(
-        [sys.executable, "-m", "prajnatrade", *args],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
 
 
 def test_holdout_is_imported_only_after_confirmation(tmp_path: Path) -> None:
@@ -618,6 +620,7 @@ def test_time_budget_is_checked_before_backtest(tmp_path: Path) -> None:
     assert experiment["error"] == "Backtest not completed: time_budget."
 
 
+@pytest.mark.isolation
 def test_generated_python_requires_explicit_isolation_before_execution(tmp_path: Path) -> None:
     marker = tmp_path / "executed"
     spec = {
@@ -728,6 +731,7 @@ def test_exhausted_reflection_budget_retains_newly_completed_backtest(tmp_path: 
     freeze_candidate(database, started["campaign_id"], experiment["experiment_id"], "candidate", "Frozen")
 
 
+@pytest.mark.isolation
 @pytest.mark.parametrize("budget_kind", ["token_budget", "cost_budget"])
 def test_exhausted_proposal_budget_resumes_backtest_without_another_request(
     tmp_path: Path, budget_kind: str, monkeypatch: pytest.MonkeyPatch,
@@ -803,6 +807,7 @@ def test_exhausted_proposal_budget_resumes_backtest_without_another_request(
     assert provider.reflections == 0
 
 
+@pytest.mark.isolation
 def test_time_budget_exhaustion_finalizes_unfinished_backtest(tmp_path: Path) -> None:
     bars = tmp_path / "bars.csv"
     database = tmp_path / "research.sqlite"
@@ -860,6 +865,7 @@ def test_generated_strategy_cannot_declare_non_numeric_parameters_absent() -> No
         }, isolated_python=True)
 
 
+@pytest.mark.isolation
 @pytest.mark.parametrize("fail_variant,minimum", [(False, 2), (True, 2), (False, 10)])
 def test_generated_strategy_freezes_and_evaluates_declared_parameter_plan(
     tmp_path: Path, fail_variant: bool, minimum: int,
@@ -937,6 +943,7 @@ def test_generated_strategy_freezes_and_evaluates_declared_parameter_plan(
         assert all(item["risk_limit_breach"] for item in result["variants"])
 
 
+@pytest.mark.isolation
 @pytest.mark.parametrize("operator", ["<=", "=="])
 def test_joint_parameter_perturbation_is_frozen_before_validation(
     tmp_path: Path, operator: str,
@@ -994,6 +1001,7 @@ def test_joint_parameter_perturbation_is_frozen_before_validation(
     assert len(result["variants"]) == (3 if operator == "<=" else 1)
 
 
+@pytest.mark.isolation
 def test_frozen_plan_covers_all_six_parameters_before_second_perturbations(tmp_path: Path) -> None:
     class SixParameterProvider(MockProvider):
         def propose(self, iteration, context):
@@ -1085,6 +1093,7 @@ def test_mock_generated_revision_uses_recorded_feedback() -> None:
     assert stopped.decision == "stop"
 
 
+@pytest.mark.isolation
 def test_cli_refuses_generated_python_when_memory_limit_is_unavailable(
     tmp_path: Path,
 ) -> None:

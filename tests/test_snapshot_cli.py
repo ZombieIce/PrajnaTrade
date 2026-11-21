@@ -1,13 +1,12 @@
 import json
-import os
 import stat
 import subprocess
-import sys
 from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
+from cli_helpers import cli
 
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
 
@@ -58,15 +57,7 @@ def _fixture() -> dict:
 
 
 def _cli(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-    return subprocess.run(
-        [sys.executable, "-m", "prajnatrade", *args],
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    return cli(*args, cwd=cwd)
 
 
 def test_snapshot_manifest_fixes_common_range_and_partition_contents(tmp_path: Path) -> None:
