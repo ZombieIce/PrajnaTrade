@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "delivery": {
-    "version": "0.1.0 (MVP-18 acceptance tooling)",
+    "version": "0.1.0 (issue #17 synthetic workflow + #24 real snapshot/baseline)",
     "branch": "zombieice-issue-17-implementation",
-    "tested_at": "2026-11-21T00:00:33+08:00",
-    "environment": "macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; offline; synthetic fixtures only. macOS sandbox-exec covers the synthetic isolation tests; no real deployment isolation is verified.",
+    "tested_at": "2026-11-22T00:45:26+08:00",
+    "environment": "macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. No real deployment isolation is verified.",
     "test_command": "PYTHONPATH=src python -m pytest -q",
-    "test_result": "249 passed in 688.71s (0:11:28), exit 0"
+    "test_result": "281 passed in 657.54s (0:10:57), exit 0"
   },
   "scenarios": [
     {
@@ -44,27 +44,50 @@
       "title": "Real five-ETF snapshot and equal-weight baseline",
       "status": "blocked",
       "scope": {
-        "data": "synthetic",
+        "data": "real",
         "agent": "mock",
         "period": "historical"
       },
       "expected": "A shared real snapshot for 511260, 518880, 515080, 513300 and 159612 with official exchange calendar, verified corporate actions and price basis, point-in-time availability evidence, frozen 60/20/20 partitions and a Discovery equal-weight baseline that a second researcher can reproduce from the same approved inputs.",
-      "observed": "Only the synthetic snapshot-sealing, partition and equal-weight baseline mechanisms have been exercised. No real five-ETF snapshot has been acquired, sealed, partitioned or independently recomputed in this delivery.",
+      "observed": "A real snapshot was sealed and baselined outside Git: snapshot ID b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d, schema 2, data_kind real, 1,094 sessions 2022-05-20..2026-11-20, partitions 656 Discovery / 218 Validation / 220 Final Holdout, 5,470 raw bars, 5,470 derived values, 20 official cash dividends and 211 hashed evidence items (official calendars, listings, dividends, halts, price archive samples). The Discovery equal-weight baseline (5 bps / 0 slippage, then 20 bps / 10 bps) filled all five ETFs on 2022-05-23 and ended at 155,603.3472 / 155,215.1928 with two declared unknown-NAV days (159612 full halts on 2025-01-10 and 2025-01-24); a second independent machine implementation recomputed the derived series, fills, fees, dividend cash, NAV path and gaps exactly. Still missing: an independent human researcher's reconciliation on the same snapshot ID, OS-level Discovery-only enforcement, archived point-in-time 09:30/15:00 availability (currently a market-rule assertion), and exhaustive dated price-archive coverage (7 of 1,094 sessions sampled).",
       "evidence": [
         {
-          "type": "synthetic_mechanism",
-          "reference": "tests/test_snapshot_cli.py, tests/test_snapshot_baseline.py, tests/test_cli_baseline.py",
-          "description": "Synthetic mechanism coverage only: sealing, content fingerprints, Discovery-only reads, partition freezing and baseline reproduction on synthetic fixtures. This is not real market evidence."
+          "type": "real_snapshot",
+          "reference": "docs/research/real-snapshot-result.md (snapshot b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d)",
+          "description": "Sealed schema-2 real snapshot outside Git: 1,094 sessions, 656/218/220 partitions, 5,470 raw bars, 5,470 derived values, 20 official dividends, 211 SHA-256-verified evidence items. Official listing/calendar/dividend/halt sources; prices are a current vendor reconstruction."
+        },
+        {
+          "type": "real_baseline",
+          "reference": "docs/research/real-discovery-baseline.json; docs/research/real-discovery-baseline-high-cost.json",
+          "description": "Discovery-only equal-weight baseline at 5 bps / 0 and 20 bps / 10 bps: five fills on 2022-05-23, ending NAV 155,603.3472 / 155,215.1928, two declared unknown-NAV days from 159612 full halts, no deferred fills and no stale marks."
+        },
+        {
+          "type": "machine_cross_check",
+          "reference": "docs/research/real-snapshot-reconciliation.md; docs/research/real-snapshot-reconciliation.json",
+          "description": "Independent standard-library recomputation from the sealed snapshot: derived values, fills, fees, dividend cash, every NAV point and the gap sets match exactly within pre-registered tolerances. This is a machine cross-check, not the independent human researcher #24 requires."
+        },
+        {
+          "type": "official_source_evidence",
+          "reference": "docs/research/real-etf-data-sources.md; docs/research/real-snapshot-result.md",
+          "description": "Official five listing announcements, five SSE annual notices plus 59 SZSE month calendar responses, 20 dividend PDFs, 118+2 159612 and 43 513300 halt notices, and seven sampled TDX dated packages; all hashed in the snapshot evidence block. Vendor qfq/hfq was not used as the total-return series."
         }
       ],
       "blockers": [
         {
-          "missing": "A real five-ETF snapshot (511260, 518880, 515080, 513300, 159612) with official exchange calendar, verified corporate actions/price basis and point-in-time availability evidence; no real data has been acquired or sealed.",
-          "unblock": "Acquire and seal the real shared snapshot with official calendars, corporate actions and point-in-time availability evidence, freeze the 60/20/20 partition fingerprints, and keep the sealed partitions outside the research project (issue #24)."
+          "missing": "An independent human researcher has not recomputed the Discovery baseline from the same sealed snapshot ID and approved inputs within the pre-registered tolerances.",
+          "unblock": "Hand the snapshot ID b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d, the evidence store and the baseline configurations to a named second researcher; have them recompute trades, fees, dividends, NAV path and gaps within the documented tolerances and record the comparison receipt."
         },
         {
-          "missing": "A frozen Discovery content fingerprint and a second researcher's independent re-computation of the equal-weight baseline trades, fees and NAV on the same approved inputs.",
-          "unblock": "Publish the Discovery snapshot manifest and baseline configuration, then have an independent reviewer reproduce the Discovery equal-weight baseline from the same sealed inputs within the predeclared tolerance (issue #24)."
+          "missing": "No OS-level enforcement that the research side can read only Discovery; the CLI and file permissions are process-level checks, not a verified deployment boundary (#12).",
+          "unblock": "Provide the #12 deployment boundary (separate OS identity/container) and verify allowed Discovery reads plus refused Validation/Final Holdout and trusted-store reads, with trusted-side receipts."
+        },
+        {
+          "missing": "The 09:30 open and 15:00 close availability are exchange-market-rule assertions, not archived point-in-time quotes; only seven sampled TDX dated packages carry vendor timestamps and the vendor price history is a current reconstruction.",
+          "unblock": "Either obtain a dated intraday/opening-auction archive covering the evaluated sessions, or record an explicit human decision accepting the market-rule availability assertion; otherwise split fills that require a proven 09:30 open remain blocked."
+        },
+        {
+          "missing": "The Discovery baseline has two declared unknown-NAV days (159612 full halts 2025-01-10 and 2025-01-24) and therefore cannot claim complete coverage or admission-grade evidence.",
+          "unblock": "Accept the two declared gaps as genuine halt sessions for the research baseline, or document why they make the Discovery range inadmissible; do not impute a stale close or a synthetic mark."
         }
       ]
     },
@@ -78,7 +101,7 @@
         "period": "historical"
       },
       "expected": "A bounded fixed-Mock, fixed-config and fixed-seed campaign on the real Discovery partition with hypotheses, parent/child experiment IDs, receipt-driven iterations, deterministic diagnostics, failure and budget records, and an interrupted-then-resumed run that matches the uninterrupted run without duplicate attempts or lost records.",
-      "observed": "The experiment protocol, idempotent replay/resume and budget accounting are exercised only on synthetic fixtures. No bounded Mock campaign has run on a real Discovery partition, so real-data flow evidence is missing.",
+      "observed": "The real Discovery snapshot from #24 exists (snapshot b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d), but the experiment/campaign protocol still rejects non-synthetic sealed snapshots and the bounded fixed-Mock campaign has only run on synthetic fixtures. No real-data parent/child trace, interruption/resume comparison or real budget reconciliation exists.",
       "evidence": [
         {
           "type": "synthetic_mechanism",
@@ -88,12 +111,12 @@
       ],
       "blockers": [
         {
-          "missing": "The real Discovery partition from issue #24; no approved real snapshot exists for a bounded Mock campaign.",
-          "unblock": "After the real Discovery snapshot is sealed and partitioned, run the bounded fixed-Mock, fixed-config and fixed-seed campaign on it and reconcile attempts, budget, diagnostics and receipts (issue #26)."
+          "missing": "Experiment/campaign support for the real sealed Discovery snapshot (`campaign create` currently requires a synthetic snapshot), and a bounded fixed-Mock/fixed-seed campaign on that real Discovery partition.",
+          "unblock": "Extend the campaign/evaluation path to accept real sealed snapshots without weakening the sealed/Discovery-only rules, then run the bounded fixed-Mock campaign on the #24 snapshot."
         },
         {
-          "missing": "A real parent/child experiment trace and an interrupted-then-resumed comparison on real Discovery, including failure records and budget debit/refund accounting.",
-          "unblock": "Retain the real campaign's structured hypotheses, submissions, parent/child experiment IDs, deterministic diagnostics, failures and budget reconciliation, including the interrupted-run resume, for independent review (issue #26)."
+          "missing": "A real parent/child experiment trace and an interrupted-then-resumed comparison on real Discovery, including failure and budget records.",
+          "unblock": "Execute the bounded Mock campaign, interrupt and resume one experiment, and record the deterministic diagnostics, IDs, budget ledger and parent/child links."
         }
       ]
     },
@@ -107,7 +130,7 @@
         "period": "historical"
       },
       "expected": "One complete autonomous iteration by an authorized real external LLM on the real Discovery campaign under verified deployment isolation: a falsifiable first hypothesis and strategy, a real receipt read, a self-justified successor experiment, at least one executed model-generated or model-modified Python strategy, and attributable model request/session and usage references.",
-      "observed": "Only mock/stub providers, synthetic isolation probes and the disabled trusted-local path exist. No authorized real model access, real Discovery campaign or verified deployed OS isolation has been exercised, and no model-generated Python strategy has run.",
+      "observed": "Only mock/stub providers, synthetic isolation probes and the disabled trusted-local path exist. The #24 real Discovery snapshot is available, but no authorized real model access, real Discovery campaign or verified deployed OS isolation has been exercised, and no model-generated Python strategy has run.",
       "evidence": [
         {
           "type": "synthetic_mechanism",
@@ -136,7 +159,7 @@
         "period": "historical"
       },
       "expected": "Immutable frozen plan and candidate fingerprints, single human authorizations, debit-before-read, one quota per sealed partition, Validation and separately authorized Final Holdout passes for a real-Agent candidate on real data, and a controlled report whose allowed and rejected paths are independently reviewable.",
-      "observed": "Protected evaluation, authorization, debit, rejection and controlled-report mechanics pass only on synthetic snapshots. No real-Agent candidate has been validated on real data, no sealed real partition has been opened and no real restricted report exists.",
+      "observed": "Protected evaluation, authorization, debit, rejection and controlled-report mechanics pass only on synthetic snapshots. The #24 real Discovery snapshot exists, but no real-Agent candidate has been validated on real data, no sealed real protected partition has been opened and no real restricted report exists.",
       "evidence": [
         {
           "type": "synthetic_mechanism",
@@ -165,7 +188,7 @@
         "period": "historical"
       },
       "expected": "At least two real-data independently validated, human-approved immutable release versions, explicitly enabled at pre-registered after-close signal points, tracking at least two consecutive, common, committed real forward trading days, each recorded with its after-close signal_date, whether the resulting orders were persisted before the next session's open, the next_session where those orders reached a terminal state (filled/evidenced_not_filled), and the trusted ledger_day_id/result_hash, plus controlled synthetic boundary coverage.",
-      "observed": "Release approval/fetch/lifecycle, explicit immutable human rejection, Shadow Live atomic day commits, committed-time fill eligibility, one-time dividend corrections and multi-version comparison pass on synthetic fixtures. The strict acceptance schema now requires the forward-day signal/pre-open/next-session/terminal-state/ledger-hash reconciliation, but there is no real approved release, no real forward ledger and no real multi-version tracking.",
+      "observed": "Release approval/fetch/lifecycle, explicit immutable human rejection, Shadow Live atomic day commits, committed-time fill eligibility, one-time dividend corrections and multi-version comparison pass on synthetic fixtures. The #24 real snapshot exists, but there is no real approved release, no real forward Shadow Live ledger and no real forward day reconciliation.",
       "evidence": [
         {
           "type": "synthetic_mechanism",

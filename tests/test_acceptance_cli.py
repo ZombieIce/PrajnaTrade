@@ -570,9 +570,37 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
         for scenario_id in SCENARIO_IDS[1:]
     )
 
-    # The checked-in manifest may cite synthetic mechanism tests, but it must
-    # not claim real data, a real Agent, a forward period or a real chain.
+    # Scenario 2 now carries real snapshot/baseline evidence but stays blocked:
+    # the independent human reconciliation, OS-level Discovery-only enforcement
+    # and archived point-in-time availability are still missing. Everything else
+    # is synthetic mechanism evidence only, and the real chain is empty.
+    real_snapshot = scenarios["real_snapshot_baseline"]
+    assert real_snapshot["scope"] == {
+        "data": "real",
+        "agent": "mock",
+        "period": "historical",
+    }
+    assert real_snapshot["status"] == "blocked"
+    assert any(
+        entry["type"] == "real_snapshot" for entry in real_snapshot["evidence"]
+    )
+    assert any(
+        entry["type"] == "real_baseline" for entry in real_snapshot["evidence"]
+    )
+    assert any(
+        entry["type"] == "machine_cross_check" for entry in real_snapshot["evidence"]
+    )
+    assert any(
+        "independent human researcher" in blocker["missing"].lower()
+        for blocker in real_snapshot["blockers"]
+    )
+    assert any(
+        "os-level enforcement" in blocker["missing"].lower()
+        for blocker in real_snapshot["blockers"]
+    )
     for scenario in scenarios.values():
+        if scenario["id"] == "real_snapshot_baseline":
+            continue
         assert scenario["scope"] == {
             "data": "synthetic",
             "agent": "mock",
@@ -580,6 +608,7 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
         }
         for entry in scenario["evidence"]:
             assert entry["type"] in {"test_suite", "test_file", "synthetic_mechanism"}
+    for scenario in scenarios.values():
         for blocker in scenario["blockers"]:
             assert blocker["missing"].strip()
             assert blocker["unblock"].strip()
