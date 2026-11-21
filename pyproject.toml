@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+test = ["pytest>=8.0", "ruff>=0.9"]
 
 [project.scripts]
 prajnatrade = "prajnatrade.cli:main"
@@ -26,3 +26,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "isolation: requires the real macOS sandbox_init boundary; excluded in nested/sandboxed sessions",
+]
