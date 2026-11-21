@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 *.sqlite*
 *.db
+.DS_Store
+.worktrees/
+*.egg-info/
+.prajnatrade/
