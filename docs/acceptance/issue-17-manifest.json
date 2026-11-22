@@ -3,10 +3,10 @@
   "delivery": {
     "version": "0.1.0 (issue #17 synthetic workflow + #24 real snapshot/baseline)",
     "branch": "zombieice-issue-17-implementation",
-    "tested_at": "2026-11-22T00:45:26+08:00",
+    "tested_at": "2026-11-22T12:50:14+08:00",
     "environment": "macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. The later #24 reconciliation used a verified Discovery-only Colima container.",
     "test_command": "PYTHONPATH=src python -m pytest -q",
-    "test_result": "281 passed in 657.54s (0:10:57), exit 0"
+    "test_result": "282 passed in 756.81s (0:12:36), exit 0"
   },
   "scenarios": [
     {

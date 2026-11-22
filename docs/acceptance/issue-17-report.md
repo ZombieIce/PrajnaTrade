@@ -4,7 +4,7 @@
 
 End-to-end MVP is NOT passed: the six-scenario rule was not met (3 of 6 required scenarios verified); 3 scenario(s) are blocked: controlled_real_llm, independent_validation_reports, immutable_release_forward.
 
-Manifest SHA-256: `68603697972c2cbf346b3b3d59e5fe0db6a813f0cba198a1c24c5e4d4f5072da`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
+Manifest SHA-256: `a7250cc789a7e975016aac0f3448d1d3a669fa3d82ffd05ffbadd667025246f1`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
 
 ## Delivery
 
@@ -12,10 +12,10 @@ Manifest SHA-256: `68603697972c2cbf346b3b3d59e5fe0db6a813f0cba198a1c24c5e4d4f507
 | --- | --- |
 | version | 0.1.0 (issue #17 synthetic workflow + #24 real snapshot/baseline) |
 | branch | zombieice-issue-17-implementation |
-| tested_at | 2026-11-22T00:45:26+08:00 |
+| tested_at | 2026-11-22T12:50:14+08:00 |
 | environment | macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. The later #24 reconciliation used a verified Discovery-only Colima container. |
 | test_command | PYTHONPATH=src python -m pytest -q |
-| test_result | 281 passed in 657.54s (0:10:57), exit 0 |
+| test_result | 282 passed in 756.81s (0:12:36), exit 0 |
 
 ## Scenario summary
 
