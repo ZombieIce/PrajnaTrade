@@ -368,6 +368,103 @@ def _log(message: str) -> None:
     print(f"relay: {message}", file=sys.stderr)
 
 
+def _summary_for_receipt(
+    receipt: bytes,
+    *,
+    submission_id: str,
+    campaign_id: str | None,
+    receipt_name: str,
+    receipt_sha256: str,
+    kind: str,
+) -> dict[str, Any]:
+    """Build a small, model-readable summary of a trusted receipt.
+
+    The full receipt stays in ``<stem>.receipt.json``; this summary carries only
+    the decision-relevant fields (status, budget, metrics, fills, errors and the
+    container-isolation evidence).  It never adds information that is not in the
+    receipt, and it carries the receipt SHA-256 so a note can cite the source.
+    """
+    try:
+        value = json.loads(receipt)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    discovery = value.get("discovery")
+    discovery = discovery if isinstance(discovery, dict) else {}
+    metrics = discovery.get("metrics")
+    benchmark = discovery.get("benchmark")
+    gaps = discovery.get("gaps")
+    gaps = gaps if isinstance(gaps, dict) else {}
+    fills = discovery.get("fills")
+    fills = fills if isinstance(fills, list) else []
+    signals = discovery.get("signals")
+    signals = signals if isinstance(signals, list) else []
+    executor = value.get("executor")
+    executor = executor if isinstance(executor, dict) else {}
+    invocations = executor.get("invocations")
+    invocations = invocations if isinstance(invocations, list) else []
+    isolation = [
+        inv.get("isolation_checks")
+        for inv in invocations
+        if isinstance(inv, dict) and isinstance(inv.get("isolation_checks"), dict)
+    ]
+    strategy = value.get("strategy")
+    strategy = strategy if isinstance(strategy, dict) else {}
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "receipt_summary",
+        "submission_id": submission_id,
+        "campaign_id": campaign_id,
+        "receipt_file": receipt_name,
+        "receipt_sha256": receipt_sha256,
+        "receipt_kind": kind,
+        "status": value.get("status"),
+        "experiment_id": value.get("experiment_id"),
+        "parent_experiment_id": value.get("parent_experiment_id"),
+        "data_kind": value.get("data_kind"),
+        "budget": value.get("budget"),
+        "hypothesis": value.get("hypothesis"),
+        "strategy": {
+            "family": strategy.get("family"),
+            "source_sha256": strategy.get("source_sha256"),
+        },
+        "discovery": {
+            "start_date": discovery.get("start_date"),
+            "end_date": discovery.get("end_date"),
+            "metrics": metrics,
+            "benchmark": benchmark,
+            "return_delta": discovery.get("return_delta"),
+            "signal_count": len(signals),
+            "fills_count": len(fills),
+            "fills": fills[:20],
+            "gaps_counts": {
+                key: len(item) if isinstance(item, list) else item
+                for key, item in gaps.items()
+            },
+            "equity_curve_points": len(discovery.get("equity_curve") or []),
+        },
+        "diagnostics": value.get("diagnostics"),
+        "error": value.get("error"),
+        "executor": {
+            "kind": executor.get("kind"),
+            "image": executor.get("image"),
+            "invocation_count": executor.get("invocation_count"),
+            "evidence_sha256": executor.get("evidence_sha256"),
+            "isolation_checks_all": (
+                all(check is True for item in isolation for check in item.values())
+                if isolation
+                else None
+            ),
+        },
+        "note": (
+            "Derived from the trusted receipt for the research model. Cite "
+            "receipt_sha256; the full record is receipt_file."
+        ),
+    }
+    return summary
+
+
 def _emit(
     context: Context,
     *,
@@ -399,6 +496,24 @@ def _emit(
     }
     sidecar = meta_name if meta_name is not None else f"{stem}.meta.json"
     _write_atomic(context.outbox / sidecar, _json_bytes(meta))
+    summary_name = (
+        f"{stem}.status.summary.json"
+        if meta_name is not None and ".status." in meta_name
+        else f"{stem}.summary.json"
+    )
+    _write_atomic(
+        context.outbox / summary_name,
+        _json_bytes(
+            _summary_for_receipt(
+                receipt,
+                submission_id=submission_id,
+                campaign_id=campaign_id,
+                receipt_name=receipt_name,
+                receipt_sha256=meta["receipt_sha256"],
+                kind=kind,
+            )
+        ),
+    )
     _log(f"{kind} {submission_id}: returncode={returncode} receipt={receipt_name}")
     return context.outbox / receipt_name
 

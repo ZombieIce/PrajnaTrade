@@ -57,6 +57,27 @@ def test_relay_once_writes_receipt_sidecar_and_processed(tmp_path: Path) -> None
     assert "<trusted>" in json.dumps(meta["command"])
 
 
+def test_relay_writes_a_compact_summary_derived_from_the_receipt(tmp_path: Path) -> None:
+    project, research, campaign = workspace_and_project(tmp_path)
+    fake = fake_agent(tmp_path)
+    submission(research, campaign["campaign_id"], "exp-001")
+
+    result = relay(project, research, fake, "--once", env=cli_env())
+
+    assert result.returncode == 0, result.stderr
+    summary_path = research / "outbox" / "exp-001.summary.json"
+    assert summary_path.is_file()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    meta = json.loads((research / "outbox" / "exp-001.meta.json").read_text(encoding="utf-8"))
+    assert summary["kind"] == "receipt_summary"
+    assert summary["status"] == "succeeded"
+    assert summary["receipt_sha256"] == meta["receipt_sha256"]
+    assert summary["discovery"]["metrics"] == {"total_return": 0.01}
+    assert summary["discovery"]["equity_curve_points"] == 0
+    assert "\"equity_curve\":" not in json.dumps(summary)
+    assert str(project) not in summary_path.read_text(encoding="utf-8")
+
+
 def test_relay_redacts_trusted_paths_from_receipts(tmp_path: Path) -> None:
     project, research, campaign = workspace_and_project(tmp_path)
     fake = fake_agent(tmp_path)

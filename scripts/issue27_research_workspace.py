@@ -394,10 +394,12 @@ installed the campaign yet. Stop and write a note saying so.
    `notes/<NNN>-plan.md` before submitting.
 3. Write one submission to `inbox/<submission-id>.json` (use an ID such as
    `exp-001`; letters, digits, `.`, `_` and `-` only).
-4. Wait for `outbox/<submission-id>.receipt.json`. Poll at a modest interval
+4. Wait for `outbox/<submission-id>.receipt.json` (and its compact
+   `outbox/<submission-id>.summary.json`). Poll at a modest interval
    (for example every five seconds) and do not rewrite the inbox file while it
    is being processed. The trusted side moves the request to `processed/`.
-5. Read the receipt and `outbox/<submission-id>.meta.json`. The meta file's
+5. Read the compact `outbox/<submission-id>.summary.json` first, then the full
+   receipt and `outbox/<submission-id>.meta.json` if needed. The meta file's
    `receipt_sha256` is the exact digest of the receipt. A missing receipt
    means the trusted operator has not processed the request yet: use a
    `status-<submission-id>.json` request (see below) rather than resubmitting.
@@ -441,9 +443,11 @@ installed the campaign yet. Stop and write a note saying so.
 | --- | --- | --- |
 | `inbox/<submission-id>.json` | you | one experiment submission |
 | `inbox/status-<submission-id>.json` | you | query an existing submission without spending an attempt |
-| `outbox/<submission-id>.receipt.json` | relay | the trusted CLI receipt (JSON) |
+| `outbox/<submission-id>.receipt.json` | relay | the trusted CLI receipt (JSON, full record) |
+| `outbox/<submission-id>.summary.json` | relay | compact derived summary: status, budget, `discovery.metrics`, baseline, fills (first 20), gaps counts, diagnostics, error and executor/isolation summary. Cite its `receipt_sha256`. |
 | `outbox/<submission-id>.meta.json` | relay | submission sidecar: `processed_at`, `command` (logical argv with trusted paths redacted), `returncode`, `input_sha256`, `receipt_sha256`, `redacted` |
 | `outbox/<submission-id>.status.meta.json` | relay | sidecar for a status query |
+| `outbox/<submission-id>.status.summary.json` | relay | compact summary for a status query |
 | `processed/<original name>` | relay | archived request |
 | `notes/*.md` | you | the reasoning transcript |
 | `receipts/*.json` | you | optional archived copies of receipts you cite; the relay never reads this directory |
