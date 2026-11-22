@@ -768,17 +768,27 @@ def experiment_status(project: Path, campaign_id: str, submission_id: str) -> di
         return _receipt(project_id, connection, campaign, experiment)
 
 
+PYTHON_SIGNAL_WINDOW_SESSIONS = 60
+MAX_SIGNAL_WINDOW_SESSIONS = 252
+
+
 def _signal_window(spec: dict[str, Any]) -> int:
     family = spec["family"]
     raw_lookback = spec["parameters"].get("lookback", 1)
     if family == "python":
-        lookback = (
-            raw_lookback
-            if isinstance(raw_lookback, int)
-            and not isinstance(raw_lookback, bool)
-            and raw_lookback >= 1
-            else 1
-        )
+        # Generated Python needs a real history panel, not the one-session
+        # cross-section a lookback-less declarative strategy sees.  A strategy
+        # may request a smaller window via ``parameters.lookback``; the window
+        # is always point-in-time and capped to one trading year.
+        requested_lookback = spec["parameters"].get("lookback")
+        if (
+            isinstance(requested_lookback, int)
+            and not isinstance(requested_lookback, bool)
+            and 1 <= requested_lookback <= MAX_SIGNAL_WINDOW_SESSIONS
+        ):
+            lookback = requested_lookback
+        else:
+            lookback = PYTHON_SIGNAL_WINDOW_SESSIONS
     else:
         lookback = int(raw_lookback)
     return lookback + 1 if family in {"momentum", "inverse_volatility"} else lookback

@@ -100,7 +100,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, executor: FakeExecutor) -> None:
 def _sealed_project(tmp_path: Path) -> tuple[Path, Path, str]:
     project = tmp_path / "project"
     source = tmp_path / "snapshot.json"
-    source.write_text(json.dumps(sealed_snapshot_input()), encoding="utf-8")
+    source.write_text(json.dumps(sealed_snapshot_input(110)), encoding="utf-8")
     store = tmp_path / "store"
     snapshot = seal(source, store)
     project_init(project)
@@ -423,7 +423,7 @@ def test_cli_requires_strategy_image_and_rejects_python_without_container(
 ) -> None:
     project = tmp_path / "strategy-a"
     source = tmp_path / "discovery.json"
-    source.write_text(json.dumps(sealed_snapshot_input()), encoding="utf-8")
+    source.write_text(json.dumps(sealed_snapshot_input(110)), encoding="utf-8")
     assert cli("project", "init", "--project", str(project)).returncode == 0
     options = campaign_options(project, source)
 
@@ -452,3 +452,13 @@ def test_cli_requires_strategy_image_and_rejects_python_without_container(
     assert payload["status"] == "rejected"
     assert payload["error"]["code"] == "INVALID_SUBMISSION"
     assert payload["budget"]["attempts_remaining"] == 2
+
+
+def test_python_signal_window_is_a_point_in_time_panel() -> None:
+    default = {"family": "python", "parameters": {}}
+    assert experiment._signal_window(default) == experiment.PYTHON_SIGNAL_WINDOW_SESSIONS
+    assert experiment._signal_window(default) >= 20
+    requested = {"family": "python", "parameters": {"lookback": 20}}
+    assert experiment._signal_window(requested) == 20
+    too_large = {"family": "python", "parameters": {"lookback": 10_000}}
+    assert experiment._signal_window(too_large) == experiment.PYTHON_SIGNAL_WINDOW_SESSIONS
