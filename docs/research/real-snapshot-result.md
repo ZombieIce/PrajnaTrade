@@ -1,9 +1,10 @@
 # Real five-ETF snapshot: acquisition, seal and Discovery baseline result (MVP-06 / #24)
 
 Status: **sealed, baselined and machine-cross-checked; #24 is not yet
-accepted.** The independent human reconciliation, OS-level Discovery-only
-enforcement and (if required) archived intraday open availability are still
-outstanding. See [Remaining #24 blockers](#remaining-24-blockers).
+accepted.** The owner confirmed the default session times for Discovery on
+2026-11-22. A Colima container enforced Discovery-only input during the #24
+reconciliation. The project owner will review the independent Agent's
+calculation. See the [review worksheet](issue-24-researcher-handoff.md).
 
 This note records what was built from the researched probe artifacts, what is
 official evidence, what is a market-rule assertion, and what is still missing.
@@ -112,6 +113,12 @@ and re-sealing returns the same snapshot ID.
 
 **Asserted (not archived point-in-time evidence):**
 
+For #24 Discovery the owner accepts 09:30 and 15:00 Asia/Shanghai as the
+normal session's open and close. The trading calendar, instrument halts and
+confirmed prices govern exceptions. A delayed first print cannot fill the
+09:30 attempt. A full suspension yields no fill and missing held closes
+remain unknown for valuation.
+
 - `open_available_at = 09:30 +08:00`: exchange trading rules say continuous
   trading starts at 09:30; no archived 09:30 quote exists. This is a
   **market-rule assertion**, recorded per row and in `availability_evidence`.
@@ -136,8 +143,8 @@ and re-sealing returns the same snapshot ID.
 
 - No independent human researcher has recomputed the baseline from the same
   snapshot ID (see the machine cross-check below, which is not a substitute).
-- No OS-level enforcement that research code can read only Discovery; the CLI
-  refuses protected reads, but that is process-level, not a sandbox boundary.
+- The Colima access receipt covers the #24 Discovery calculation. Deployment
+  evidence for the external model and protected evaluation belongs to later stages.
 - No archived 09:30 opening quote or notarised intraday archive was found.
 - TDX archive coverage is a 7-session sample, not the full 1,094 sessions.
 - The SZSE calendar evidence is the probe's machine transcription
@@ -359,21 +366,17 @@ publications.
 
 ## Remaining #24 blockers
 
+The [second researcher's worksheet](issue-24-researcher-handoff.md) pins the
+Discovery inputs, both comparison files and the fields for recording the
+researcher's results and the operator's decisions.
+
 1. **Independent human reconciliation.** A named second researcher must
    recompute the same Discovery inputs from snapshot ID
    `b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d` and
    compare trades, fees, dividends, NAV path, the two gaps and the end NAV.
    This note's cross-check is a machine check by the same author and does not
    satisfy that requirement.
-2. **OS-level Discovery-only enforcement.** Research access is enforced by the
-   CLI (protected partitions are refused), not by the operating system. Issue
-   #12/#17 must close the deployment boundary before #24 can claim isolation.
-3. **Archived intraday open availability (if required).** The 09:30 open is a
-   market-rule assertion; no public archived 09:30 quote or notarised intraday
-   archive was found. If the owner requires archived proof, the fill rule must
-   change (or the ticket remains blocked) — this is a human policy decision,
-   not a data-fetch bug.
-4. **Point-in-time price provenance.** The prices are the vendors' current
+2. **Point-in-time price provenance.** The prices are the vendors' current
    reconstruction; the dated TDX packages are samples (7 sessions). Nobody has
    proven that the values were visible on each session date.
 
