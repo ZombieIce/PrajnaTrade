@@ -76,24 +76,15 @@ release, shadow and acceptance are operator-only. New research surfaces require
 an explicit grant in the spec; sealed partitions, Holdout diagnostics, admission
 state and controlled-report internals never move to the agent CLI.
 
-## Synthetic-only boundary and blocked real evidence
+## Real Discovery and the protected research boundary
 
-Every research, evaluation, release and acceptance artifact in this build is
-synthetic: those outputs carry `scope`/`data_kind: "synthetic"`, and the
-acceptance gate requires real scope **and** a complete real chain, so synthetic
-coverage can never pass it. `snapshot seal` and `baseline` additionally accept
-schema-version-2 real Discovery inputs as #24 mechanism support; campaigns,
-protected evaluation, release and Shadow Live still reject real snapshots and no
-real snapshot has been sealed or reconciled.
+Schema-version-2 historical Discovery is supported by snapshot sealing,
+baselines and declarative campaigns. Issue #24 verified the real five-ETF
+baseline. Issue #26 verified the bounded Mock campaign, including OS isolation
+for the actual research run and a reconciled interruption and resume.
+Protected evaluation, release and Shadow Live remain synthetic or replay.
+The overall gate requires real evidence and the complete real chain.
 
-- **#24 — real five-ETF snapshot/baseline:** a real sealed snapshot with an
-  official exchange calendar, verified corporate actions and point-in-time
-  availability evidence, plus an independently reproduced Discovery baseline.
-  The sealer and baseline mechanism for schema v2 exists; the real inputs,
-  seal and reconciliation are still missing.
-- **#26 — real-data Mock campaign:** a bounded Mock campaign with fixed
-  configuration and seed on that real Discovery partition, including
-  parent/child and interrupted-then-resumed evidence.
 - **#27 — real model and deployment isolation:** authorized real LLM access and
   verified OS deployment isolation with allowed, rejection and resource-abort
   evidence; synthetic probes and trusted-local execution do not count.

@@ -568,7 +568,7 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert all(
         scenarios[scenario_id]["status"] == "blocked"
         for scenario_id in SCENARIO_IDS
-        if scenario_id not in {"tests_and_cli", "real_snapshot_baseline"}
+        if scenario_id not in {"tests_and_cli", "real_snapshot_baseline", "real_data_mock"}
     )
 
     real_snapshot = scenarios["real_snapshot_baseline"]
@@ -584,8 +584,15 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert evidence["human_reconciliation"]["reference"].startswith(
         "https://github.com/ZombieIce/PrajnaTrade/issues/24#issuecomment-"
     )
+    real_mock = scenarios["real_data_mock"]
+    assert real_mock["status"] == "verified"
+    assert real_mock["scope"] == {"data": "real", "agent": "mock", "period": "historical"}
+    assert real_mock["blockers"] == []
+    assert any(
+        entry["type"] == "real_discovery_mock" for entry in real_mock["evidence"]
+    )
     for scenario in scenarios.values():
-        if scenario["id"] == "real_snapshot_baseline":
+        if scenario["id"] in {"real_snapshot_baseline", "real_data_mock"}:
             continue
         assert scenario["scope"] == {
             "data": "synthetic",
@@ -644,7 +651,7 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert "NOT passed" in report["verdict"]["statement"]
     assert "six-scenario rule was not met" in report["verdict"]["statement"]
     assert report["scenario_status_counts"] == {
-        "verified": 2, "blocked": 4, "failed": 0, "not_run": 0
+        "verified": 3, "blocked": 3, "failed": 0, "not_run": 0
     }
 
 

@@ -31,6 +31,7 @@ def run_discovery_strategy(
     partition_content_hash: str,
     strategy: Strategy,
     *,
+    data_kind: str = "synthetic",
     signal_window_sessions: int,
     initial_cash: float = 100_000.0,
     transaction_cost_bps: float = 5.0,
@@ -43,6 +44,7 @@ def run_discovery_strategy(
         partition_content_hash,
         strategy,
         partition_name="discovery",
+        data_kind=data_kind,
         signal_window_sessions=signal_window_sessions,
         prior_history=None,
         initial_cash=initial_cash,
@@ -58,6 +60,7 @@ def run_partition_strategy(
     strategy: Strategy,
     *,
     partition_name: str,
+    data_kind: str = "synthetic",
     signal_window_sessions: int,
     prior_history: tuple[list[str], list[dict]] | None = None,
     initial_cash: float = 100_000.0,
@@ -127,7 +130,7 @@ def run_partition_strategy(
             open_prices = {
                 symbol: (
                     float(row["open"])
-                    if _is_executable_open(row, open_cutoff)
+                    if _is_executable_open(row, open_cutoff, data_kind=data_kind)
                     else None
                 )
                 for symbol in ETF_SYMBOLS
@@ -181,7 +184,7 @@ def run_partition_strategy(
             pending = None
 
         nav_point, gaps = _valuation(
-            day, raw_bars, shares, cash, receivables, unresolved_actions
+            day, raw_bars, shares, cash, receivables, unresolved_actions, data_kind=data_kind,
         )
         equity_curve.append(nav_point)
         valuation_gaps.extend(gaps)
@@ -269,8 +272,10 @@ def run_partition_strategy(
         "equity_curve": equity_curve,
         "metrics": metrics,
         "gaps": {
-            "raw_bars": _data_gaps(sessions, raw_bars, "raw_bars"),
-            "derived": _data_gaps(sessions, derived, "derived"),
+            "raw_bars": _data_gaps(sessions, raw_bars, "raw_bars", data_kind=data_kind),
+            "derived": _data_gaps(
+                sessions, derived, "derived", raw_bars=raw_bars, data_kind=data_kind,
+            ),
             "valuation": valuation_gaps,
         },
     }
@@ -331,6 +336,7 @@ def run_discovery_equal_weight(
     snapshot_id: str,
     partition_content_hash: str,
     *,
+    data_kind: str = "synthetic",
     initial_cash: float,
     transaction_cost_bps: float,
     slippage_bps: float,
@@ -351,6 +357,7 @@ def run_discovery_equal_weight(
         snapshot_id,
         partition_content_hash,
         buy_and_hold,
+        data_kind=data_kind,
         signal_window_sessions=1,
         initial_cash=initial_cash,
         transaction_cost_bps=transaction_cost_bps,

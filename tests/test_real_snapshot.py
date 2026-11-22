@@ -373,6 +373,50 @@ def test_real_baseline_marks_partial_halt_held_day_at_its_confirmed_close(
     }
 
 
+def test_real_campaign_copies_only_discovery_and_uses_field_availability(tmp_path: Path) -> None:
+    payload = _real_input()
+    payload["raw_bars"][0]["availability_evidence"] = "fixture:收盘行情"
+    sealed = _snapshot_command(tmp_path, "seal", payload=payload)
+    snapshot_id = sealed["snapshot_id"]
+    store = tmp_path / "store"
+    snapshot = store / snapshot_id
+    snapshot.chmod(0o755)
+    for partition in ("validation", "final_holdout"):
+        (snapshot / f"{partition}.json").unlink()
+    project = tmp_path / "strategy"
+    assert _cli(tmp_path, "project", "init", "--project", str(project)).returncode == 0
+    created = _cli(
+        tmp_path, "campaign", "create", "--project", str(project), "--store", str(store),
+        "--snapshot-id", snapshot_id, "--attempts", "1", "--max-seconds", "30",
+    )
+    assert created.returncode == 0, created.stderr
+    campaign = json.loads(created.stdout)
+    assert campaign["data_kind"] == "real"
+    store.rename(tmp_path / "detached")
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({
+        "schema_version": 1, "campaign_id": campaign["campaign_id"], "submission_id": "first",
+        "hypothesis": "Equal weights match the comparator.",
+        "strategy": {"family": "equal_weight"}, "parameters": {},
+    }), encoding="utf-8")
+    submitted = cli(
+        "experiment", "submit", "--project", str(project), "--input", str(request),
+        cwd=tmp_path, agent=True,
+    )
+    assert submitted.returncode == 0, submitted.stderr
+    receipt = json.loads(submitted.stdout)
+    assert receipt["data_kind"] == "real"
+    assert receipt["fingerprints"]["snapshot"] == campaign["fingerprints"]["snapshot"]
+    discovery = receipt["discovery"]
+    benchmark = discovery["baseline_comparison"]["baseline"]
+    for result in (discovery, benchmark):
+        assert len(result["fills"]) == len(SYMBOLS)
+        assert all(fill["date"] == _day(1) for fill in result["fills"])
+        nav = {point["date"]: point["nav"] for point in result["equity_curve"]}
+        assert nav[_day(HALT_INDEX)] is not None
+        assert nav[_day(SUSPENDED_INDEX)] is None
+
+
 def test_real_baseline_suspended_held_day_is_an_unknown_nav_gap(
     tmp_path: Path,
 ) -> None:

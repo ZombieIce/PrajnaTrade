@@ -16,7 +16,6 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any, TypedDict
 
-from prajnatrade.snapshot import manifest as snapshot_manifest
 from prajnatrade.snapshot import read_discovery
 from prajnatrade.snapshot_baseline import (
     run_discovery_equal_weight,
@@ -82,6 +81,7 @@ _EXECUTION_RULES = {
 
 def _campaign_evaluation(
     *,
+    data_kind: str,
     snapshot_id: str,
     partition_content_hash: str,
     as_of: str | None,
@@ -95,7 +95,7 @@ def _campaign_evaluation(
         "snapshot_id": snapshot_id,
         "partition_content_hash": partition_content_hash,
         "as_of": as_of,
-        "data_kind": "synthetic",
+        "data_kind": data_kind,
         "initial_cash": initial_cash,
         "transaction_cost_bps": transaction_cost_bps,
         "slippage_bps": slippage_bps,
@@ -174,15 +174,16 @@ def campaign_create(
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("Attempts and execution seconds must be positive.")
-    metadata = snapshot_manifest(store, snapshot_id)
-    if metadata.get("data_kind") != "synthetic":
-        raise ValueError("External Discovery experiments currently require a synthetic sealed snapshot.")
     receipt = read_discovery(store, snapshot_id, "discovery", as_of)
     data = receipt["data"]
-    content = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    data_kind = receipt["data_kind"]
+    content = json.dumps(
+        data, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
     snapshot_hash = receipt["content_hash"]
     partition_hash = receipt.get("partition_content_hash", snapshot_hash)
     evaluation = _campaign_evaluation(
+        data_kind=data_kind,
         snapshot_id=snapshot_id,
         partition_content_hash=partition_hash,
         as_of=as_of,
@@ -194,6 +195,7 @@ def campaign_create(
         data,
         snapshot_id,
         partition_hash,
+        data_kind=data_kind,
         initial_cash=initial_cash,
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
@@ -225,7 +227,7 @@ def campaign_create(
         "project_id": project_id,
         "campaign_id": campaign_id,
         "snapshot_id": snapshot_id,
-        "data_kind": "synthetic",
+        "data_kind": data_kind,
         "fingerprints": {
             "snapshot": snapshot_hash,
             "partition": partition_hash,
@@ -510,9 +512,10 @@ def _run_attempt(
         if slice_seconds <= 0:
             raise _TimeExpired()
         signal.setitimer(signal.ITIMER_REAL, slice_seconds)
-        data = json.loads(bytes(campaign["snapshot"]).decode("utf-8"))
-        if _fingerprint(data) != campaign["snapshot_hash"]:
+        content = bytes(campaign["snapshot"])
+        if hashlib.sha256(content).hexdigest() != campaign["snapshot_hash"]:
             raise ValueError("Snapshot fingerprint mismatch.")
+        data = json.loads(content)
         config = json.loads(campaign["evaluation_json"])
         if _fingerprint(config) != campaign["evaluation_hash"]:
             raise ValueError("Evaluation fingerprint mismatch.")
@@ -525,6 +528,7 @@ def _run_attempt(
             config["snapshot_id"],
             config["partition_content_hash"],
             make_strategy(spec),
+            data_kind=config["data_kind"],
             signal_window_sessions=window,
             initial_cash=config["initial_cash"],
             transaction_cost_bps=config["transaction_cost_bps"],

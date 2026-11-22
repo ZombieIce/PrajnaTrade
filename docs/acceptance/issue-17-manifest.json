@@ -87,31 +87,27 @@
     {
       "id": "real_data_mock",
       "title": "Real-data bounded Mock campaign",
-      "status": "blocked",
+      "status": "verified",
       "scope": {
-        "data": "synthetic",
+        "data": "real",
         "agent": "mock",
         "period": "historical"
       },
       "expected": "A bounded fixed-Mock, fixed-config and fixed-seed campaign on the real Discovery partition with hypotheses, parent/child experiment IDs, receipt-driven iterations, deterministic diagnostics, failure and budget records, and an interrupted-then-resumed run that matches the uninterrupted run without duplicate attempts or lost records.",
-      "observed": "The real Discovery snapshot from #24 exists (snapshot b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d), but the experiment/campaign protocol still rejects non-synthetic sealed snapshots and the bounded fixed-Mock campaign has only run on synthetic fixtures. No real-data parent/child trace, interruption/resume comparison or real budget reconciliation exists.",
+      "observed": "The fixed deterministic Mock (seed 1) ran on all 656 approved Discovery sessions in two isolated campaigns. Both recorded three linked submissions with identical decisions, Discovery results and diagnostics. The interrupted second experiment reported EXECUTION_INTERRUPTED and resumed under its original ID. Both budgets reconciled to three attempts with replay idempotency and fourth-attempt refusal. The research container had only the Discovery project copy and could not open the protected paths. The evidence is limited to historical real data and a fixed Mock.",
       "evidence": [
         {
           "type": "synthetic_mechanism",
           "reference": "tests/test_experiment_cli.py, tests/test_research_cli.py",
           "description": "Synthetic mechanism coverage only: Mock iterations, idempotent submission, resume, failure evidence and budget accounting. This proves the protocol, not real Discovery execution."
-        }
-      ],
-      "blockers": [
-        {
-          "missing": "Experiment/campaign support for the real sealed Discovery snapshot (`campaign create` currently requires a synthetic snapshot), and a bounded fixed-Mock/fixed-seed campaign on that real Discovery partition.",
-          "unblock": "Extend the campaign/evaluation path to accept real sealed snapshots without weakening the sealed/Discovery-only rules, then run the bounded fixed-Mock campaign on the #24 snapshot."
         },
         {
-          "missing": "A real parent/child experiment trace and an interrupted-then-resumed comparison on real Discovery, including failure and budget records.",
-          "unblock": "Execute the bounded Mock campaign, interrupt and resume one experiment, and record the deterministic diagnostics, IDs, budget ledger and parent/child links."
+          "type": "real_discovery_mock",
+          "reference": "docs/acceptance/issue-26-real-discovery-mock.md",
+          "description": "Full result comparison SHA-256 74fca7201a6c3f52b7cc5c1d175a4d0f3dee925392144024595094d3cce8d6e9. Separate control and resumed projects record the hypotheses, parent links, interruption, stable experiment ID, diagnostics, attempt and execution-time budgets, and OS-level access probes."
         }
-      ]
+      ],
+      "blockers": []
     },
     {
       "id": "controlled_real_llm",
@@ -123,7 +119,7 @@
         "period": "historical"
       },
       "expected": "One complete autonomous iteration by an authorized real external LLM on the real Discovery campaign under verified deployment isolation: a falsifiable first hypothesis and strategy, a real receipt read, a self-justified successor experiment, at least one executed model-generated or model-modified Python strategy, and attributable model request/session and usage references.",
-      "observed": "Only mock/stub providers, synthetic isolation probes and the disabled trusted-local path exist. The #24 real Discovery snapshot is available, but no authorized real model access, real Discovery campaign or verified deployed OS isolation has been exercised, and no model-generated Python strategy has run.",
+      "observed": "A fixed Mock campaign ran on real Discovery in #26. This scenario still needs authorized real model access, attributable model requests, and verified isolation of model-generated Python in the deployment.",
       "evidence": [
         {
           "type": "synthetic_mechanism",

@@ -132,14 +132,13 @@ canonical manifest, including all three partition fingerprints, not paths.
 Changing fixed content produces a new ID; repeat sealing verifies existing
 content rather than overwriting it.
 
-### Real schema-version-2 snapshots (MVP-06, mechanism only)
+### Real schema-version-2 snapshots (MVP-06)
 
 `snapshot seal` also accepts `{"schema_version": 2, "data_kind": "real"}` input.
-This is mechanism support for the [#24](https://github.com/ZombieIce/PrajnaTrade/issues/24)
-acquisition script, not evidence about real data: the tests use synthetic JSON
-labelled real, and no real snapshot has been sealed or reconciled here. Real and
-synthetic never fall back to each other; a mismatched schema version/data kind
-pair is rejected.
+The [#24 result note](docs/research/real-snapshot-result.md) records the sealed
+real snapshot, independent reconciliation and human acceptance. The test suite
+uses synthetic fixtures. The sealer rejects a mismatched schema version and
+data kind.
 
 Real input adds a top-level `evidence` block and a `derivation` block:
 
@@ -225,9 +224,8 @@ action terms, makes that day's NAV unknown and is listed as a gap rather than
 filled from a stale price or guessed terms. The output records the snapshot
 and Discovery content hashes, price roles, signal/fill details, costs, and
 gaps for reproducibility. This interface accepts both synthetic and real sealed
-snapshots; neither path is evidence of real-data correctness or OS isolation.
-The real path is mechanism support until a real snapshot is sealed and
-reconciled.
+snapshots. The #24 result note and its signed review document the real baseline
+and the isolation evidence for the reconciliation.
 
 For a schema-v2 real snapshot the output carries `data_kind: "real"` from the
 sealed receipt. Execution compares `raw_bars.open_available_at` with the 09:30
@@ -304,14 +302,19 @@ inputs. `partition_content_hash` identifies the fixed Discovery descriptor;
 
 ## Research, validation, and reports
 
-### External Discovery experiment protocol (synthetic only)
+### External Discovery experiment protocol
 
-The operator seals a synthetic snapshot, initializes a project, and creates a
-Campaign against its Discovery partition. Campaign creation reads Discovery
+The operator seals a snapshot, initializes a project, and creates a Campaign
+against its Discovery partition. The protocol accepts synthetic and real
+snapshots. Campaign creation reads Discovery
 only, copies that partition into the project, and locks its snapshot ID,
 evaluation rules, runtime fingerprints, and attempt/time budgets in the
 project's `.prajnatrade` directory. Move that directory with the project to
 preserve its identity; `--project` is just its location.
+
+The [#26 acceptance record](docs/acceptance/issue-26-real-discovery-mock.md)
+documents the real-data Mock run, budget reconciliation and interrupted
+experiment recovery.
 
 ```sh
 prajnatrade snapshot seal --input synthetic-snapshot.json --store ./sealed-data
@@ -1678,9 +1681,10 @@ that the six-scenario rule was not met. The command is operator-only:
 `prajnatrade-agent` has no `acceptance` command.
 
 **The overall #17 verdict remains blocked.** The tests and CLI scenario and
-the real five-ETF historical Discovery baseline are verified (2 of 6).
+the real five-ETF historical Discovery baseline and bounded Mock campaign are
+verified (3 of 6).
 @ZombieIce accepted the two cost scenarios and both halt-related NAV gaps.
-Scenarios 3–6 remain blocked and the real candidate-to-release chain is empty.
+Scenarios 4–6 remain blocked and the real candidate-to-release chain is empty.
 See the [acceptance report](docs/acceptance/issue-17-report.md) and the
 [signed Discovery review](docs/research/issue-24-researcher-handoff.md).
 
