@@ -9,13 +9,17 @@ import signal
 import sqlite3
 import time
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, TypedDict
 
+from prajnatrade.container_executor import (
+    ContainerStrategyExecutor,
+    executor_from_config,
+)
 from prajnatrade.snapshot import read_discovery
 from prajnatrade.snapshot_baseline import (
     run_discovery_equal_weight,
@@ -33,16 +37,21 @@ def _fingerprint(value: object) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def _runtime_components() -> dict[str, str]:
+def _runtime_components(
+    strategy_executor: dict[str, Any] | None = None,
+) -> dict[str, str]:
     directory = Path(__file__).parent
     files = (
         "strategies.py", "backtest.py", "data.py", "snapshot.py", "snapshot_baseline.py",
+        "container_executor.py",
     )
+    executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}
     return {
         **{
             name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
             for name in files
         },
+        "strategy_executor": _fingerprint(executor),
         "numpy": version("numpy"),
         "pandas": version("pandas"),
         "pyarrow": version("pyarrow"),
@@ -50,8 +59,13 @@ def _runtime_components() -> dict[str, str]:
     }
 
 
-def _runtime_identity() -> str:
-    return _fingerprint(_runtime_components())
+def _runtime_identity(strategy_executor: dict[str, Any] | None = None) -> str:
+    return _fingerprint(_runtime_components(strategy_executor))
+
+
+def _executor_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    candidate = config.get("strategy_executor")
+    return dict(candidate) if isinstance(candidate, Mapping) else {"kind": "none"}
 
 
 _EXECUTION_RULES = {
@@ -88,8 +102,9 @@ def _campaign_evaluation(
     initial_cash: float,
     transaction_cost_bps: float,
     slippage_bps: float,
+    strategy_executor: dict[str, Any],
 ) -> dict[str, Any]:
-    runtime_dependencies = _runtime_components()
+    runtime_dependencies = _runtime_components(strategy_executor)
     return {
         "engine": "sealed-discovery-v1",
         "snapshot_id": snapshot_id,
@@ -100,6 +115,7 @@ def _campaign_evaluation(
         "transaction_cost_bps": transaction_cost_bps,
         "slippage_bps": slippage_bps,
         "execution_rules": _EXECUTION_RULES,
+        "strategy_executor": strategy_executor,
         "runtime_dependencies": runtime_dependencies,
         "runtime": _fingerprint(runtime_dependencies),
     }
@@ -169,11 +185,17 @@ def project_status(project: Path) -> dict[str, object]:
 def campaign_create(
     project: Path, store: Path, snapshot_id: str, attempts: int, max_seconds: float,
     initial_cash: float, transaction_cost_bps: float, slippage_bps: float,
-    as_of: str | None = None,
+    as_of: str | None = None, *,
+    strategy_executor: str = "none",
+    strategy_image: str | None = None,
+    executor: ContainerStrategyExecutor | None = None,
 ) -> dict[str, object]:
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("Attempts and execution seconds must be positive.")
+    executor_config = _resolve_executor_config(
+        strategy_executor, strategy_image, executor,
+    )
     receipt = read_discovery(store, snapshot_id, "discovery", as_of)
     data = receipt["data"]
     data_kind = receipt["data_kind"]
@@ -190,6 +212,7 @@ def campaign_create(
         initial_cash=initial_cash,
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
+        strategy_executor=executor_config,
     )
     baseline = run_discovery_equal_weight(
         data,
@@ -234,7 +257,30 @@ def campaign_create(
             "evaluation": evaluation_hash,
         },
         "budget": {"attempts_remaining": attempts, "execution_seconds_remaining": max_seconds},
+        "strategy_executor": executor_config,
     }
+
+
+def _resolve_executor_config(
+    strategy_executor: str,
+    strategy_image: str | None,
+    executor: ContainerStrategyExecutor | None,
+) -> dict[str, Any]:
+    if strategy_executor not in {"none", "container"}:
+        raise ValueError("Strategy executor must be none or container.")
+    if strategy_executor == "none":
+        if strategy_image is not None:
+            raise ValueError("--strategy-image requires --strategy-executor container.")
+        if executor is not None:
+            raise ValueError("A container executor was supplied without the container kind.")
+        return {"kind": "none"}
+    if not isinstance(strategy_image, str) or not strategy_image.strip():
+        raise ValueError("--strategy-image is required when --strategy-executor is container.")
+    configured = executor or ContainerStrategyExecutor(strategy_image)
+    configuration = configured.resolve_configuration()
+    if configuration.get("kind") != "container":
+        raise ValueError("The supplied container executor did not resolve a container config.")
+    return configuration
 
 
 def _ensure_project_schema(connection: sqlite3.Connection) -> None:
@@ -352,15 +398,43 @@ def _normalize_request(raw: object) -> dict[str, Any]:
     if parent is not None and (not isinstance(parent, str) or not parent.strip()):
         raise ValueError("parent_experiment_id must be a non-empty string.")
     strategy = raw["strategy"]
-    if not isinstance(strategy, dict) or set(strategy) != {"family"}:
-        raise ValueError("Strategy must identify a declarative family.")
-    if strategy["family"] not in STRATEGY_FAMILIES:
-        raise ValueError("Unsupported declarative strategy family.")
-    spec = normalize_strategy_spec({"family": strategy["family"], "parameters": raw["parameters"]})
+    if not isinstance(strategy, dict):
+        raise ValueError("Strategy must be a JSON object.")
+    family = strategy.get("family")
+    if family in STRATEGY_FAMILIES:
+        if set(strategy) != {"family"}:
+            raise ValueError("Declarative strategies accept only the family field.")
+        spec = normalize_strategy_spec(
+            {"family": family, "parameters": raw["parameters"]}
+        )
+        canonical_strategy: dict[str, Any] = {"family": spec["family"]}
+    elif family == "python":
+        if "source" not in strategy or set(strategy) - {"family", "source", "parameter_schema"}:
+            raise ValueError(
+                "Python strategies require family and source and accept only parameter_schema."
+            )
+        candidate: dict[str, Any] = {
+            "family": "python",
+            "source": strategy["source"],
+            "parameters": raw["parameters"],
+        }
+        if "parameter_schema" in strategy:
+            candidate["parameter_schema"] = strategy["parameter_schema"]
+        spec = normalize_strategy_spec(candidate)
+        canonical_source = str(spec["source"])
+        canonical_strategy = {
+            "family": "python",
+            "source": canonical_source,
+            "source_sha256": hashlib.sha256(canonical_source.encode("utf-8")).hexdigest(),
+        }
+        if "parameter_schema" in spec:
+            canonical_strategy["parameter_schema"] = spec["parameter_schema"]
+    else:
+        raise ValueError("Unsupported strategy family.")
     return {
         "schema_version": 1, "campaign_id": raw["campaign_id"],
         "submission_id": raw["submission_id"], "hypothesis": raw["hypothesis"],
-        "strategy": {"family": spec["family"]}, "parameters": spec["parameters"],
+        "strategy": canonical_strategy, "parameters": spec["parameters"],
         "parent_experiment_id": parent,
     }
 
@@ -464,6 +538,7 @@ def _execute_request(
                 if previous["request_json"] != canonical:
                     raise ProtocolError("SUBMISSION_CONFLICT", "admission", "use_new_submission_id", "Submission ID already has different content.")
                 return _receipt(project_id, connection, campaign, previous)
+            _require_container_executor(campaign, request)
             budget = _budget(connection, campaign)
             remaining = budget["execution_seconds_remaining"]
             experiment_id, started = _admit_attempt(
@@ -472,6 +547,20 @@ def _execute_request(
         connection.commit()
         return _run_attempt(
             connection, campaign, project_id, experiment_id, request, started, remaining,
+        )
+
+
+def _require_container_executor(
+    campaign: sqlite3.Row, request: Mapping[str, Any],
+) -> None:
+    if request["strategy"]["family"] != "python":
+        return
+    executor = _executor_config(json.loads(campaign["evaluation_json"]))
+    if executor.get("kind") != "container":
+        raise ProtocolError(
+            "INVALID_SUBMISSION", "admission", "correct",
+            "Generated Python requires a campaign created with "
+            "--strategy-executor container.",
         )
 
 
@@ -499,11 +588,40 @@ def _admit_attempt(
     return experiment_id, started
 
 
+def _strategy_identity(request: Mapping[str, Any]) -> dict[str, Any]:
+    strategy = request["strategy"]
+    identity: dict[str, Any] = {
+        "family": strategy["family"], "parameters": request["parameters"],
+    }
+    if strategy["family"] == "python":
+        identity["source_sha256"] = strategy["source_sha256"]
+        if "parameter_schema" in strategy:
+            identity["parameter_schema"] = strategy["parameter_schema"]
+    return identity
+
+
+def _executor_evidence(
+    config: Mapping[str, Any], invocations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    limits = config.get("limits")
+    return {
+        "kind": "container",
+        "image": {"reference": config.get("image"), "digest": config.get("digest")},
+        "limits": dict(limits) if isinstance(limits, Mapping) else {},
+        "invocation_count": len(invocations),
+        "invocations": list(invocations),
+        "evidence_sha256": _fingerprint(list(invocations)),
+    }
+
+
 def _run_attempt(
     connection: sqlite3.Connection, campaign: sqlite3.Row, project_id: object,
     experiment_id: str, request: dict[str, Any], started: float, remaining: float,
 ) -> dict[str, Any]:
     campaign_id = campaign["campaign_id"]
+    family = request["strategy"]["family"]
+    executor_config: dict[str, Any] = {"kind": "none"}
+    executor_evidence: list[dict[str, Any]] = []
     error_details = None
     result = None
     old_handler = signal.signal(signal.SIGALRM, _timeout)
@@ -519,15 +637,35 @@ def _run_attempt(
         config = json.loads(campaign["evaluation_json"])
         if _fingerprint(config) != campaign["evaluation_hash"]:
             raise ValueError("Evaluation fingerprint mismatch.")
-        if config["runtime"] != _runtime_identity():
+        executor_config = _executor_config(config)
+        if config["runtime"] != _runtime_identity(executor_config):
             raise ValueError("Campaign runtime fingerprint mismatch.")
-        spec = {"family": request["strategy"]["family"], "parameters": request["parameters"]}
+        spec: dict[str, Any] = {
+            "family": family, "parameters": request["parameters"],
+        }
+        strategy = None
+        if family == "python":
+            if executor_config.get("kind") != "container":
+                raise ValueError(
+                    "Generated Python requires a campaign created with "
+                    "--strategy-executor container."
+                )
+            spec["source"] = str(request["strategy"]["source"])
+            if "parameter_schema" in request["strategy"]:
+                spec["parameter_schema"] = request["strategy"]["parameter_schema"]
+            strategy = make_strategy(
+                spec,
+                container_executor=executor_from_config(executor_config),
+                evidence_callback=executor_evidence.append,
+            )
+        else:
+            strategy = make_strategy(spec)
         window = _signal_window(spec)
         discovery = run_discovery_strategy(
             data,
             config["snapshot_id"],
             config["partition_content_hash"],
-            make_strategy(spec),
+            strategy,
             data_kind=config["data_kind"],
             signal_window_sessions=window,
             initial_cash=config["initial_cash"],
@@ -562,7 +700,7 @@ def _run_attempt(
             "data_kind": config["data_kind"],
             "fingerprints": {
                 "strategy_and_parameters": _fingerprint({
-                    "strategy": spec, "runtime": config["runtime"],
+                    "strategy": _strategy_identity(request), "runtime": config["runtime"],
                 }),
                 "runtime_dependencies": config["runtime"],
                 "snapshot": campaign["snapshot_hash"],
@@ -575,6 +713,9 @@ def _run_attempt(
                 {"code": "WARMUP_REQUIRED", "required_sessions": window}
             ] if window > 1 else [],
         }
+        if family == "python":
+            result["strategy"] = dict(request["strategy"])
+            result["executor"] = _executor_evidence(executor_config, executor_evidence)
         if time.monotonic() - started >= remaining:
             raise _TimeExpired()
     except _TimeExpired:
@@ -587,6 +728,11 @@ def _run_attempt(
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old_handler)
+    if error_details is not None and family == "python":
+        if executor_config.get("kind") == "container":
+            error_details["executor"] = _executor_evidence(
+                executor_config, executor_evidence,
+            )
     elapsed = time.monotonic() - started
     if error_details and error_details["code"] == "BUDGET_EXHAUSTED":
         elapsed = max(elapsed, remaining)
@@ -624,7 +770,17 @@ def experiment_status(project: Path, campaign_id: str, submission_id: str) -> di
 
 def _signal_window(spec: dict[str, Any]) -> int:
     family = spec["family"]
-    lookback = int(spec["parameters"].get("lookback", 1))
+    raw_lookback = spec["parameters"].get("lookback", 1)
+    if family == "python":
+        lookback = (
+            raw_lookback
+            if isinstance(raw_lookback, int)
+            and not isinstance(raw_lookback, bool)
+            and raw_lookback >= 1
+            else 1
+        )
+    else:
+        lookback = int(raw_lookback)
     return lookback + 1 if family in {"momentum", "inverse_volatility"} else lookback
 
 

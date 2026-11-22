@@ -48,6 +48,26 @@ let CI do it. A failure that names `sandbox_init`, `sandbox_install_failed`, or
 an unavailable sandbox runtime is usually this boundary, not a product bug —
 confirm on the host before changing code.
 
+## Docker tests
+
+`tests/test_container_executor.py` exercises the real Docker/Colima boundary for
+generated Python and is marked `docker`. It skips cleanly when the Docker CLI,
+the daemon or the runner image is unavailable, so the default suite does not
+require Docker. To run it, first build the runner image and point Docker at
+Colima:
+
+```bash
+DOCKER_HOST=unix://$HOME/.colima/default/docker.sock \
+  scripts/issue27-runner/build.sh
+DOCKER_HOST=unix://$HOME/.colima/default/docker.sock \
+  PYTHONPATH=src python -m pytest -q -m docker tests/test_container_executor.py
+```
+
+`PRAJNA_ISSUE27_IMAGE` overrides the image tag (default
+`prajnatrade-issue27-runner:local`); `PRAJNA_DOCKER_HOST` overrides
+`DOCKER_HOST`. The image build needs network for the pinned wheels; the tests
+run it with `--network none`.
+
 ## venv and pip inside the sandbox
 
 Inside the DSH sandbox, `python -m venv` and `pip install` can fail because

@@ -25,8 +25,9 @@ private reuse (`snapshot._read_json` and friends) is legacy, not precedent.
 | --- | --- | --- |
 | [`snapshot.py`](../../src/prajnatrade/snapshot.py) | Sealed snapshot codec: canonical JSON hashing, seal/verify, frozen partition descriptors, Discovery-only reads, successor lineage. | `seal`, `manifest`, `partition_descriptor`, `read_discovery`, `read_protected`, `lineage_ids` |
 | [`snapshot_baseline.py`](../../src/prajnatrade/snapshot_baseline.py) | Point-in-time Discovery accounting: availability by next open, equal-weight comparator, costs, dividends, per-partition strategy runs. | `run_discovery_baseline`, `run_discovery_equal_weight`, `run_discovery_strategy`, `run_partition_strategy`, `available_by`, `CN_TZ` |
-| [`experiment.py`](../../src/prajnatrade/experiment.py) | Research project and bounded Campaign protocol: locked config, attempts, receipts, idempotent replay/resume, candidate freeze. | `project_init`, `project_status`, `campaign_create`, `experiment_submit`, `experiment_resume`, `experiment_status`, `freeze_experiment_candidate`, `candidate_status` |
+| [`experiment.py`](../../src/prajnatrade/experiment.py) | Research project and bounded Campaign protocol: locked config (including the optional container executor and its image digest), attempts, receipts, idempotent replay/resume, candidate freeze. | `project_init`, `project_status`, `campaign_create`, `experiment_submit`, `experiment_resume`, `experiment_status`, `freeze_experiment_candidate`, `candidate_status` |
 | [`isolation.py`](../../src/prajnatrade/isolation.py) | OS worker boundary for generated Python: CPU/memory/wall/output limits and filesystem/network/process probes. | `run_isolated_strategy`, `probe_isolation_evidence`, `probe_isolation`, `IsolationLimits`, `IsolationError` |
+| [`container_executor.py`](../../src/prajnatrade/container_executor.py) | Docker/Colima boundary for generated Python: image-digest resolution, one fresh container per strategy call, actual-inspect verification, bounded JSON protocol, trusted weight validation and per-invocation evidence. | `ContainerStrategyExecutor`, `ContainerLimits`, `ExecutionResult`, `ImageIdentity`, `executor_from_config` |
 | [`dividend.py`](../../src/prajnatrade/dividend.py) | Trusted cash-dividend correction journal; builds verified successor snapshots without rewriting the predecessor. | `register`, `verify`, `load_verified_revision`, `revision_predecessor`, `successor` |
 | [`protected_eval.py`](../../src/prajnatrade/protected_eval.py) | Frozen plan, single human authorization, isolation probe, debit-before-read and immutable record for Validation/Final Holdout; publishes the coarse research receipt. | `create_plan`, `load_plan`, `authorize`, `run_evaluation`, `evaluation_status`, `agent_evaluation_status`, `audit` |
 | [`evaluation_report.py`](../../src/prajnatrade/evaluation_report.py) | Operator-only controlled report rendered from stored records; deterministic JSON/HTML; never re-runs, never opens sealed data. | `build_evaluation_report`, `render_report_html`, `write_evaluation_report` |
@@ -87,7 +88,10 @@ The overall gate requires real evidence and the complete real chain.
 
 - **#27 — real model and deployment isolation:** authorized real LLM access and
   verified OS deployment isolation with allowed, rejection and resource-abort
-  evidence; synthetic probes and trusted-local execution do not count.
+  evidence; synthetic probes and trusted-local execution do not count. The
+  trusted container boundary and generated-Python submission protocol now
+  exist, but the external model session, project-only relay and real-Discovery
+  iteration remain outstanding, so the scenario stays blocked.
 - **Also blocked:** real protected evaluation (#12/#13/#14) and real approved
   releases with reconciled forward days (#9/#14).
 
@@ -106,6 +110,7 @@ across files, never mutable state.
 | Flow | Test file | Covers |
 | --- | --- | --- |
 | Experiment | [`test_experiment_cli.py`](../../tests/test_experiment_cli.py) | Campaign lock, submit/status, idempotent replay, resume, budget/timeout, candidate freeze, agent surface |
+| Generated Python | [`test_experiment_python.py`](../../tests/test_experiment_python.py), [`test_container_executor.py`](../../tests/test_container_executor.py) | Python submission normalization, source hash/fingerprint, executor requirement, replay/conflict/parent/budget/resume with a fake executor, persisted evidence; real Docker/Colima boundary, host/network denial, invalid-weight rejection (Docker-gated) |
 | Snapshot | [`test_snapshot_cli.py`](../../tests/test_snapshot_cli.py), [`test_snapshot_baseline.py`](../../tests/test_snapshot_baseline.py), [`test_real_snapshot.py`](../../tests/test_real_snapshot.py), [`test_cli_baseline.py`](../../tests/test_cli_baseline.py), [`test_cli_data.py`](../../tests/test_cli_data.py) | Seal/manifest/integrity, partition split, Discovery-only reads, corrections/successors, point-in-time accounting, schema-v2 real validation and per-field availability/halts, real Discovery baseline, legacy baseline, bar validation |
 | Protected evaluation | [`test_protected_eval_cli.py`](../../tests/test_protected_eval_cli.py) | Plan frozen before read, authorization, isolation probe, debit-before-read, single-use ledger, rejection without debit, agent receipt |
 | Holdout/report | [`test_holdout_report_cli.py`](../../tests/test_holdout_report_cli.py) | Separate Holdout authorization, no re-read of Validation, controlled-report sections, constant Holdout receipt |

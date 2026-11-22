@@ -288,6 +288,14 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     create.add_argument("--initial-cash", type=float, default=100_000.0)
     create.add_argument("--transaction-cost-bps", type=float, default=5.0)
     create.add_argument("--slippage-bps", type=float, default=0.0)
+    create.add_argument(
+        "--strategy-executor", choices=["none", "container"], default="none",
+        help="verify generated Python in a Docker container (default: none)",
+    )
+    create.add_argument(
+        "--strategy-image",
+        help="container image for generated Python (required with --strategy-executor container)",
+    )
 
     candidate = commands.add_parser("candidate", help="freeze and inspect successful Discovery candidates")
     candidate_commands = candidate.add_subparsers(dest="candidate_command", required=True)
@@ -545,6 +553,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 args.project, args.store, args.snapshot_id, args.attempts,
                 args.max_seconds, args.initial_cash, args.transaction_cost_bps,
                 args.slippage_bps, args.as_of,
+                strategy_executor=args.strategy_executor,
+                strategy_image=args.strategy_image,
             )
             print(json.dumps(result, sort_keys=True, allow_nan=False))
             return 0

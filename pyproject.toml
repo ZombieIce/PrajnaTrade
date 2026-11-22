@@ -28,4 +28,5 @@ where = ["src"]
 testpaths = ["tests"]
 markers = [
     "isolation: requires the real macOS sandbox_init boundary; excluded in nested/sandboxed sessions",
+    "docker: requires a local Docker/Colima daemon and the issue 27 runner image; skipped when unavailable",
 ]
