@@ -3,10 +3,10 @@
   "delivery": {
     "version": "0.1.0 (issue #17 synthetic workflow + #24 real snapshot/baseline)",
     "branch": "zombieice-issue-17-implementation",
-    "tested_at": "2026-11-22T12:50:14+08:00",
+    "tested_at": "2026-11-22T15:49:55+08:00",
     "environment": "macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. The later #24 reconciliation used a verified Discovery-only Colima container.",
     "test_command": "PYTHONPATH=src python -m pytest -q",
-    "test_result": "282 passed in 756.81s (0:12:36), exit 0"
+    "test_result": "325 passed in 700.28s (0:11:40), exit 0"
   },
   "scenarios": [
     {
@@ -112,31 +112,37 @@
     {
       "id": "controlled_real_llm",
       "title": "Controlled real external LLM iteration",
-      "status": "blocked",
+      "status": "verified",
       "scope": {
-        "data": "synthetic",
-        "agent": "mock",
+        "data": "real",
+        "agent": "real",
         "period": "historical"
       },
       "expected": "One complete autonomous iteration by an authorized real external LLM on the real Discovery campaign under verified deployment isolation: a falsifiable first hypothesis and strategy, a real receipt read, a self-justified successor experiment, at least one executed model-generated or model-modified Python strategy, and attributable model request/session and usage references.",
-      "observed": "A fixed Mock campaign ran on real Discovery in #26. This scenario still needs authorized real model access, attributable model requests, and verified isolation of model-generated Python in the deployment.",
+      "observed": "A fresh DeepSeek Harness agent session (`issue27-model`, no API endpoint/credentials) ran a controlled iteration on the real #24 Discovery partition. It read real receipts, wrote three linked Python submissions (exp-001 → exp-002 → exp-003) and its own reasoning. exp-001/exp-002 ran before a 60-session history-window fix and are documented as void/fallback; exp-003 ran after the fix with 585 signals each carrying a real 60-session panel, tested a top-2 trailing-return rotation, and decisively rejected it (+1.84% vs +55.60% benchmark, return delta -53.77 pp). Every strategy invocation ran in the verified offline Colima container (585/653/653 invocations; no mounts, no network, read-only root, UID 65534, all isolation checks true). No API invoice exists; the harness session and on-disk notes are the attribution. The model session was a harness-managed agent context, not a user-opened GUI tab; that session-form caveat is recorded in the evidence note.",
       "evidence": [
         {
-          "type": "synthetic_mechanism",
-          "reference": "tests/test_isolation.py, tests/test_openai_provider.py",
-          "description": "Synthetic isolation and provider-contract tests only: allow/deny/resource-abort mechanics and usage accounting against stubs. No real model was called and no deployment isolation was verified."
-        }
-      ],
-      "blockers": [
-        {
-          "missing": "Authorized real model access (endpoint, credentials and attributable usage records) and a real Discovery campaign whose receipts the model can read; the delivery has neither.",
-          "unblock": "Provide authorized real model access and the real Discovery campaign from issues #24/#26, then retain attributable model request/session references, the two linked submissions and separately accounted platform versus model usage (issue #27)."
+          "type": "real_model_session",
+          "reference": "docs/acceptance/issue-27-model-session.md",
+          "description": "Fresh DeepSeek Harness agent session `issue27-model` (no API provider); session window 2026-11-22 ~06:52-07:23 UTC; the model authored the hypotheses and follow-up reasoning, read real Discovery receipts, and did not receive the trusted store, sealed partitions or credentials."
         },
         {
-          "missing": "Verified OS-level deployment isolation for the actual deployment, with allowed, expected-rejection and resource-abort evidence and trusted-side receipts; synthetic probes and trusted-local execution do not count.",
-          "unblock": "Deploy the worker under the verified OS-isolated profile and record allowed, expected-rejection and resource-abort evidence before executing model-generated or model-modified Python in a real campaign (issues #12/#27)."
+          "type": "model_submissions",
+          "reference": "exp-001 / exp-002 / exp-003; experiment IDs 4d1ad549-888b-46ab-b903-48f87407471f, c6116bbd-ded1-4417-b9e5-ba9afab5b748, 8a435580-cbc6-4752-91bf-ee84ff5ed3ad",
+          "description": "Three linked model-generated Python submissions with receipt SHA-256s 0d2504a5…, 340d7ad5… and 3988fcfd…; exp-003 is the valid post-fix test (window length 60, 585 signals, return 1.84% vs benchmark 55.60%, hypothesis rejected). exp-001/exp-002 are documented pre-fix/fallback runs."
+        },
+        {
+          "type": "container_isolation",
+          "reference": "docs/acceptance/issue-27-python-executor.md; exp-003 receipt executor evidence",
+          "description": "585 container invocations for exp-003 (653/653 for exp-001/002) with no mounts, network none, read-only root, UID/GID 65534, all capabilities dropped and all isolation checks true; image digest sha256:4371b913…52240778."
+        },
+        {
+          "type": "model_notes",
+          "reference": "trusted model-session bundle: notes/aggregate SHA-256 bd0d9730…; notes/final-summary.md",
+          "description": "The model's planning, receipt observations, follow-up reasons and final summary, including the caveat that exp-001/exp-002 ran before the 60-session fix and exp-003 is the genuine test; no API usage or invoice is claimed."
         }
-      ]
+      ],
+      "blockers": []
     },
     {
       "id": "independent_validation_reports",

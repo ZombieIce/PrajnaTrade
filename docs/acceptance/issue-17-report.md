@@ -2,9 +2,9 @@
 
 **Verdict: NOT PASSED — blocked**
 
-End-to-end MVP is NOT passed: the six-scenario rule was not met (3 of 6 required scenarios verified); 3 scenario(s) are blocked: controlled_real_llm, independent_validation_reports, immutable_release_forward.
+End-to-end MVP is NOT passed: the six-scenario rule was not met (4 of 6 required scenarios verified); 2 scenario(s) are blocked: independent_validation_reports, immutable_release_forward.
 
-Manifest SHA-256: `a7250cc789a7e975016aac0f3448d1d3a669fa3d82ffd05ffbadd667025246f1`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
+Manifest SHA-256: `980103de72f6272add7fc039570a32fb8c0a69bf26a8abaac86b44dea78d0168`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
 
 ## Delivery
 
@@ -12,10 +12,10 @@ Manifest SHA-256: `a7250cc789a7e975016aac0f3448d1d3a669fa3d82ffd05ffbadd66702524
 | --- | --- |
 | version | 0.1.0 (issue #17 synthetic workflow + #24 real snapshot/baseline) |
 | branch | zombieice-issue-17-implementation |
-| tested_at | 2026-11-22T12:50:14+08:00 |
+| tested_at | 2026-11-22T15:49:55+08:00 |
 | environment | macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. The later #24 reconciliation used a verified Discovery-only Colima container. |
 | test_command | PYTHONPATH=src python -m pytest -q |
-| test_result | 282 passed in 756.81s (0:12:36), exit 0 |
+| test_result | 325 passed in 700.28s (0:11:40), exit 0 |
 
 ## Scenario summary
 
@@ -24,11 +24,11 @@ Manifest SHA-256: `a7250cc789a7e975016aac0f3448d1d3a669fa3d82ffd05ffbadd66702524
 | 1 | `tests_and_cli` — Deterministic tests and public CLI | verified | synthetic | mock | historical |
 | 2 | `real_snapshot_baseline` — Real five-ETF snapshot and equal-weight baseline | verified | real | mock | historical |
 | 3 | `real_data_mock` — Real-data bounded Mock campaign | verified | real | mock | historical |
-| 4 | `controlled_real_llm` — Controlled real external LLM iteration | blocked | synthetic | mock | historical |
+| 4 | `controlled_real_llm` — Controlled real external LLM iteration | verified | real | real | historical |
 | 5 | `independent_validation_reports` — Independent protected validation and controlled reports | blocked | synthetic | mock | historical |
 | 6 | `immutable_release_forward` — Immutable releases and multi-strategy Shadow Live | blocked | synthetic | mock | historical |
 
-Status counts: verified=3, blocked=3, failed=0, not_run=0.
+Status counts: verified=4, blocked=2, failed=0, not_run=0.
 
 ## Scenario details
 
@@ -67,18 +67,17 @@ Status counts: verified=3, blocked=3, failed=0, not_run=0.
   - `real_discovery_mock` — `docs/acceptance/issue-26-real-discovery-mock.md`: Full result comparison SHA-256 74fca7201a6c3f52b7cc5c1d175a4d0f3dee925392144024595094d3cce8d6e9. Separate control and resumed projects record the hypotheses, parent links, interruption, stable experiment ID, diagnostics, attempt and execution-time budgets, and OS-level access probes.
 - **Blockers**: none
 
-### 4. Controlled real external LLM iteration (`controlled_real_llm`) — BLOCKED
+### 4. Controlled real external LLM iteration (`controlled_real_llm`) — VERIFIED
 
-- **Scope**: data=synthetic, agent=mock, period=historical
+- **Scope**: data=real, agent=real, period=historical
 - **Expected**: One complete autonomous iteration by an authorized real external LLM on the real Discovery campaign under verified deployment isolation: a falsifiable first hypothesis and strategy, a real receipt read, a self-justified successor experiment, at least one executed model-generated or model-modified Python strategy, and attributable model request/session and usage references.
-- **Observed**: A fixed Mock campaign ran on real Discovery in #26. This scenario still needs authorized real model access, attributable model requests, and verified isolation of model-generated Python in the deployment.
+- **Observed**: A fresh DeepSeek Harness agent session (`issue27-model`, no API endpoint/credentials) ran a controlled iteration on the real #24 Discovery partition. It read real receipts, wrote three linked Python submissions (exp-001 → exp-002 → exp-003) and its own reasoning. exp-001/exp-002 ran before a 60-session history-window fix and are documented as void/fallback; exp-003 ran after the fix with 585 signals each carrying a real 60-session panel, tested a top-2 trailing-return rotation, and decisively rejected it (+1.84% vs +55.60% benchmark, return delta -53.77 pp). Every strategy invocation ran in the verified offline Colima container (585/653/653 invocations; no mounts, no network, read-only root, UID 65534, all isolation checks true). No API invoice exists; the harness session and on-disk notes are the attribution. The model session was a harness-managed agent context, not a user-opened GUI tab; that session-form caveat is recorded in the evidence note.
 - **Evidence**:
-  - `synthetic_mechanism` — `tests/test_isolation.py, tests/test_openai_provider.py`: Synthetic isolation and provider-contract tests only: allow/deny/resource-abort mechanics and usage accounting against stubs. No real model was called and no deployment isolation was verified.
-- **Blockers**:
-  - Missing: Authorized real model access (endpoint, credentials and attributable usage records) and a real Discovery campaign whose receipts the model can read; the delivery has neither.
-    Unblock: Provide authorized real model access and the real Discovery campaign from issues #24/#26, then retain attributable model request/session references, the two linked submissions and separately accounted platform versus model usage (issue #27).
-  - Missing: Verified OS-level deployment isolation for the actual deployment, with allowed, expected-rejection and resource-abort evidence and trusted-side receipts; synthetic probes and trusted-local execution do not count.
-    Unblock: Deploy the worker under the verified OS-isolated profile and record allowed, expected-rejection and resource-abort evidence before executing model-generated or model-modified Python in a real campaign (issues #12/#27).
+  - `real_model_session` — `docs/acceptance/issue-27-model-session.md`: Fresh DeepSeek Harness agent session `issue27-model` (no API provider); session window 2026-11-22 ~06:52-07:23 UTC; the model authored the hypotheses and follow-up reasoning, read real Discovery receipts, and did not receive the trusted store, sealed partitions or credentials.
+  - `model_submissions` — `exp-001 / exp-002 / exp-003; experiment IDs 4d1ad549-888b-46ab-b903-48f87407471f, c6116bbd-ded1-4417-b9e5-ba9afab5b748, 8a435580-cbc6-4752-91bf-ee84ff5ed3ad`: Three linked model-generated Python submissions with receipt SHA-256s 0d2504a5…, 340d7ad5… and 3988fcfd…; exp-003 is the valid post-fix test (window length 60, 585 signals, return 1.84% vs benchmark 55.60%, hypothesis rejected). exp-001/exp-002 are documented pre-fix/fallback runs.
+  - `container_isolation` — `docs/acceptance/issue-27-python-executor.md; exp-003 receipt executor evidence`: 585 container invocations for exp-003 (653/653 for exp-001/002) with no mounts, network none, read-only root, UID/GID 65534, all capabilities dropped and all isolation checks true; image digest sha256:4371b913…52240778.
+  - `model_notes` — `trusted model-session bundle: notes/aggregate SHA-256 bd0d9730…; notes/final-summary.md`: The model's planning, receipt observations, follow-up reasons and final summary, including the caveat that exp-001/exp-002 ran before the 60-session fix and exp-003 is the genuine test; no API usage or invoice is claimed.
+- **Blockers**: none
 
 ### 5. Independent protected validation and controlled reports (`independent_validation_reports`) — BLOCKED
 
@@ -110,19 +109,19 @@ Status counts: verified=3, blocked=3, failed=0, not_run=0.
 
 | Check | Result | Detail |
 | --- | --- | --- |
-| All six required scenarios are present and verified. (`six_scenarios_verified`) | NOT met | 3/6 verified (verified=3, blocked=3, failed=0, not_run=0). |
+| All six required scenarios are present and verified. (`six_scenarios_verified`) | NOT met | 4/6 verified (verified=4, blocked=2, failed=0, not_run=0). |
 | One real-Agent candidate is traceable from experiment → freeze → both protected stages → human approval → immutable release → real forward ledger (non-empty IDs). (`candidate_chain`) | NOT met | real_chain.agent_candidate is empty. |
 | The candidate's release is a real-data, human-approved immutable release bound to the same Validation and Final Holdout evidence. (`candidate_release`) | NOT met | No approved release entry matches the candidate release ID. |
 | At least two real, independently validated, human-approved immutable releases. (`two_real_approved_releases`) | NOT met | 0 real approved release(s); independent pair: none. |
 | At least two consecutive, common, committed real forward trading days, each with an after-close signal persisted pre-open and reconciled to the next session's order terminal state. (`real_forward_days`) | NOT met | 0 forward day(s); 0 reconciled (signal pre-open, terminal state recorded); consecutive real committed common window: none. |
 | The approved candidate has committed real forward ledger days. (`candidate_forward_ledger`) | NOT met | candidate forward days: none. |
-| The five real-required scenarios are verified with real-scope evidence (real data, controlled real Agent, real forward tracking). (`real_scope_evidence`) | NOT met | real_snapshot_baseline: real-scope verified; real_data_mock: real-scope verified; controlled_real_llm: status=blocked, agent=mock (required real), data=synthetic (required real); independent_validation_reports: status=blocked, data=synthetic (required real); immutable_release_forward: status=blocked, data=synthetic (required real), period=historical (required forward). |
+| The five real-required scenarios are verified with real-scope evidence (real data, controlled real Agent, real forward tracking). (`real_scope_evidence`) | NOT met | real_snapshot_baseline: real-scope verified; real_data_mock: real-scope verified; controlled_real_llm: real-scope verified; independent_validation_reports: status=blocked, data=synthetic (required real); immutable_release_forward: status=blocked, data=synthetic (required real), period=historical (required forward). |
 
 ### Unmet real-chain conditions
 
 **`six_scenarios_verified`** — All six required scenarios are present and verified.
 
-- Missing: The six-scenario rule is not met: not verified for controlled_real_llm, independent_validation_reports, immutable_release_forward.
+- Missing: The six-scenario rule is not met: not verified for independent_validation_reports, immutable_release_forward.
 - Unblock: Provide verifiable evidence for every required scenario; a synthetic-only result marks at most its synthetic scope and never satisfies the real criterion.
 
 **`candidate_chain`** — One real-Agent candidate is traceable from experiment → freeze → both protected stages → human approval → immutable release → real forward ledger (non-empty IDs).
@@ -152,7 +151,7 @@ Status counts: verified=3, blocked=3, failed=0, not_run=0.
 
 **`real_scope_evidence`** — The five real-required scenarios are verified with real-scope evidence (real data, controlled real Agent, real forward tracking).
 
-- Missing: Real-scope verification evidence for: controlled_real_llm, independent_validation_reports, immutable_release_forward.
+- Missing: Real-scope verification evidence for: independent_validation_reports, immutable_release_forward.
 - Unblock: Complete scenarios 2–6 with real evidence; synthetic mechanism tests never satisfy the real-chain gate.
 
 ## Verdict
@@ -165,12 +164,6 @@ Status counts: verified=3, blocked=3, failed=0, not_run=0.
 
 ### Blockers
 
-- **`scenario:controlled_real_llm`**
-  - Missing: Authorized real model access (endpoint, credentials and attributable usage records) and a real Discovery campaign whose receipts the model can read; the delivery has neither.
-  - Unblock: Provide authorized real model access and the real Discovery campaign from issues #24/#26, then retain attributable model request/session references, the two linked submissions and separately accounted platform versus model usage (issue #27).
-- **`scenario:controlled_real_llm`**
-  - Missing: Verified OS-level deployment isolation for the actual deployment, with allowed, expected-rejection and resource-abort evidence and trusted-side receipts; synthetic probes and trusted-local execution do not count.
-  - Unblock: Deploy the worker under the verified OS-isolated profile and record allowed, expected-rejection and resource-abort evidence before executing model-generated or model-modified Python in a real campaign (issues #12/#27).
 - **`scenario:independent_validation_reports`**
   - Missing: A real protected Evaluation (Validation, then separately authorized Final Holdout) for a frozen real-Agent candidate on the real snapshot, with immutable plans, authorizations, query ledger and controlled report.
   - Unblock: Freeze the candidate and evaluation plan on the real snapshot, authorize and run Validation, obtain separate Final Holdout authorization and retain the immutable trusted records and controlled reports (issues #12/#13/#14).
@@ -184,7 +177,7 @@ Status counts: verified=3, blocked=3, failed=0, not_run=0.
   - Missing: At least two consecutive, common, committed real forward trading days in a Shadow Live ledger, including one after-close signal submitted pre-open and reconciled to the next session's terminal order state.
   - Unblock: Enable the approved releases after the pre-registered signal point, run trusted manual Shadow Live updates on at least two consecutive real sessions and reconcile the forward ledger without reusing synthetic or backtest data (issues #9/#14).
 - **`real_chain:six_scenarios_verified`**
-  - Missing: The six-scenario rule is not met: not verified for controlled_real_llm, independent_validation_reports, immutable_release_forward.
+  - Missing: The six-scenario rule is not met: not verified for independent_validation_reports, immutable_release_forward.
   - Unblock: Provide verifiable evidence for every required scenario; a synthetic-only result marks at most its synthetic scope and never satisfies the real criterion.
 - **`real_chain:candidate_chain`**
   - Missing: An end-to-end real-Agent candidate trace with non-empty experiment, candidate, Validation, Final Holdout, release and forward-ledger IDs.
@@ -202,21 +195,19 @@ Status counts: verified=3, blocked=3, failed=0, not_run=0.
   - Missing: A non-empty real forward ledger for the approved candidate; every listed forward day must be a committed, common, real session.
   - Unblock: Record the candidate's release ID in the trusted forward ledger and commit its real forward days.
 - **`real_chain:real_scope_evidence`**
-  - Missing: Real-scope verification evidence for: controlled_real_llm, independent_validation_reports, immutable_release_forward.
+  - Missing: Real-scope verification evidence for: independent_validation_reports, immutable_release_forward.
   - Unblock: Complete scenarios 2–6 with real evidence; synthetic mechanism tests never satisfy the real-chain gate.
 
 ### Unblock conditions
 
-1. Provide authorized real model access and the real Discovery campaign from issues #24/#26, then retain attributable model request/session references, the two linked submissions and separately accounted platform versus model usage (issue #27).
-2. Deploy the worker under the verified OS-isolated profile and record allowed, expected-rejection and resource-abort evidence before executing model-generated or model-modified Python in a real campaign (issues #12/#27).
-3. Freeze the candidate and evaluation plan on the real snapshot, authorize and run Validation, obtain separate Final Holdout authorization and retain the immutable trusted records and controlled reports (issues #12/#13/#14).
-4. Run the real protected evaluation successfully and have an independent reviewer verify frozen inputs, authorization, debit-before-read, coverage gaps, baseline, cost stress, parameter neighbourhood, thresholds and the allowed/rejected paths in the controlled report (issue #13).
-5. After the real protected evaluation evidence exists, obtain explicit human approval for two distinct real candidates and register their unique immutable release IDs and pre-registered enable times (issue #14).
-6. Enable the approved releases after the pre-registered signal point, run trusted manual Shadow Live updates on at least two consecutive real sessions and reconcile the forward ledger without reusing synthetic or backtest data (issues #9/#14).
-7. Provide verifiable evidence for every required scenario; a synthetic-only result marks at most its synthetic scope and never satisfies the real criterion.
-8. Run one real-Agent campaign, freeze the candidate, pass both protected stages under separate human authorizations, approve the immutable release and commit its real forward ledger days.
-9. Obtain explicit human approval for the frozen candidate and register the unique immutable release ID bound to the same protected-stage evidence.
-10. Independently validate and approve two distinct real candidates; each must consume its own protected intervals and be registered as a unique immutable release.
-11. Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable, then record each day's after-close signal, pre-open persisted orders, next session, order terminal state and ledger day result hash in the acceptance manifest.
-12. Record the candidate's release ID in the trusted forward ledger and commit its real forward days.
-13. Complete scenarios 2–6 with real evidence; synthetic mechanism tests never satisfy the real-chain gate.
+1. Freeze the candidate and evaluation plan on the real snapshot, authorize and run Validation, obtain separate Final Holdout authorization and retain the immutable trusted records and controlled reports (issues #12/#13/#14).
+2. Run the real protected evaluation successfully and have an independent reviewer verify frozen inputs, authorization, debit-before-read, coverage gaps, baseline, cost stress, parameter neighbourhood, thresholds and the allowed/rejected paths in the controlled report (issue #13).
+3. After the real protected evaluation evidence exists, obtain explicit human approval for two distinct real candidates and register their unique immutable release IDs and pre-registered enable times (issue #14).
+4. Enable the approved releases after the pre-registered signal point, run trusted manual Shadow Live updates on at least two consecutive real sessions and reconcile the forward ledger without reusing synthetic or backtest data (issues #9/#14).
+5. Provide verifiable evidence for every required scenario; a synthetic-only result marks at most its synthetic scope and never satisfies the real criterion.
+6. Run one real-Agent campaign, freeze the candidate, pass both protected stages under separate human authorizations, approve the immutable release and commit its real forward ledger days.
+7. Obtain explicit human approval for the frozen candidate and register the unique immutable release ID bound to the same protected-stage evidence.
+8. Independently validate and approve two distinct real candidates; each must consume its own protected intervals and be registered as a unique immutable release.
+9. Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable, then record each day's after-close signal, pre-open persisted orders, next session, order terminal state and ledger day result hash in the acceptance manifest.
+10. Record the candidate's release ID in the trusted forward ledger and commit its real forward days.
+11. Complete scenarios 2–6 with real evidence; synthetic mechanism tests never satisfy the real-chain gate.

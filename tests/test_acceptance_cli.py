@@ -568,7 +568,10 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert all(
         scenarios[scenario_id]["status"] == "blocked"
         for scenario_id in SCENARIO_IDS
-        if scenario_id not in {"tests_and_cli", "real_snapshot_baseline", "real_data_mock"}
+        if scenario_id not in {
+            "tests_and_cli", "real_snapshot_baseline", "real_data_mock",
+            "controlled_real_llm",
+        }
     )
 
     real_snapshot = scenarios["real_snapshot_baseline"]
@@ -591,8 +594,20 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert any(
         entry["type"] == "real_discovery_mock" for entry in real_mock["evidence"]
     )
+    real_llm = scenarios["controlled_real_llm"]
+    assert real_llm["status"] == "verified"
+    assert real_llm["scope"] == {
+        "data": "real",
+        "agent": "real",
+        "period": "historical",
+    }
+    assert real_llm["blockers"] == []
+    llm_evidence = {entry["type"] for entry in real_llm["evidence"]}
+    assert {"real_model_session", "model_submissions", "container_isolation", "model_notes"} <= llm_evidence
     for scenario in scenarios.values():
-        if scenario["id"] in {"real_snapshot_baseline", "real_data_mock"}:
+        if scenario["id"] in {
+            "real_snapshot_baseline", "real_data_mock", "controlled_real_llm",
+        }:
             continue
         assert scenario["scope"] == {
             "data": "synthetic",
@@ -619,8 +634,6 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     for phrase in (
         "official exchange calendar",
         "point-in-time availability",
-        "os-level deployment isolation",
-        "authorized real model access",
         "real protected evaluation",
         "at least two real candidates",
         "at least two consecutive, common, committed real forward trading days",
@@ -651,7 +664,7 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert "NOT passed" in report["verdict"]["statement"]
     assert "six-scenario rule was not met" in report["verdict"]["statement"]
     assert report["scenario_status_counts"] == {
-        "verified": 3, "blocked": 3, "failed": 0, "not_run": 0
+        "verified": 4, "blocked": 2, "failed": 0, "not_run": 0
     }
 
 

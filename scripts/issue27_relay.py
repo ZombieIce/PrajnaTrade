@@ -368,6 +368,27 @@ def _log(message: str) -> None:
     print(f"relay: {message}", file=sys.stderr)
 
 
+def _redact_command(command: list[str], replacements: dict[str, str]) -> list[str]:
+    """Redact trusted and operator absolute paths from the logged command.
+
+    The research model can read the sidecar, so only the logical command shape
+    is retained: project paths become ``<trusted>``, research paths
+    ``<research>``, and any other absolute operator path (for example the
+    interpreter or a repository path) becomes ``<operator>``.
+    """
+    redacted = redact_value(command, replacements)
+    if not isinstance(redacted, list):
+        return []
+    result = []
+    for item in redacted:
+        text = item if isinstance(item, str) else str(item)
+        if text.startswith("/") and "<research>" not in text and "<trusted>" not in text:
+            result.append("<operator>")
+        else:
+            result.append(text)
+    return result
+
+
 def _summary_for_receipt(
     receipt: bytes,
     *,
@@ -487,7 +508,7 @@ def _emit(
         "submission_id": submission_id,
         "campaign_id": campaign_id,
         "processed_at": _utc_now(),
-        "command": redact_value(command, context.replacements),
+        "command": _redact_command(command, context.replacements),
         "returncode": returncode,
         "input_sha256": input_sha256,
         "receipt_sha256": _sha256(receipt),

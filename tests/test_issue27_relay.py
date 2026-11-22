@@ -55,6 +55,8 @@ def test_relay_once_writes_receipt_sidecar_and_processed(tmp_path: Path) -> None
     assert str(research) not in text
     assert "do-not-leak" not in text
     assert "<trusted>" in json.dumps(meta["command"])
+    assert all(not item.startswith("/") for item in meta["command"])
+    assert meta["command"][0] == "<operator>"
 
 
 def test_relay_writes_a_compact_summary_derived_from_the_receipt(tmp_path: Path) -> None:

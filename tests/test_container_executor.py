@@ -100,7 +100,7 @@ def _submit(
         "submission_id": submission_id,
         "hypothesis": "Container-isolated generated Python can trade Discovery.",
         "strategy": {"family": "python", "source": source},
-        "parameters": {},
+        "parameters": {"lookback": 1},
     }
     path = project.parent / f"{submission_id}.json"
     path.write_text(json.dumps(request), encoding="utf-8")
