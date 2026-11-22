@@ -392,6 +392,111 @@ strategy, parameters, hypothesis, conclusion, snapshot/evaluation
 fingerprints, runtime dependencies, and execution rules. It is immutable;
 freezing is not validation, approval, or a release.
 
+#### Container-isolated generated Python (#18/#27)
+
+Generated Python is accepted only by a Campaign created with a container
+executor. Build the runner image once, then create the Campaign:
+
+```sh
+DOCKER_HOST=unix://$HOME/.colima/default/docker.sock scripts/issue27-runner/build.sh
+# prints the local image digest, e.g. sha256:<image-id>
+
+prajnatrade campaign create --project ./strategy-A --store ./sealed-data \
+  --snapshot-id <snapshot-id> --attempts 20 --max-seconds 3600 \
+  --strategy-executor container --strategy-image prajnatrade-issue27-runner:local
+```
+
+`--strategy-executor` defaults to `none`, so existing declarative Campaigns are
+unchanged. `--strategy-image` is required for `container`; the image digest is
+resolved with `docker image inspect` at creation and frozen into the Campaign
+evaluation config and runtime fingerprint. `DOCKER_HOST` (or
+`PRAJNA_DOCKER_HOST`, which takes precedence) selects the daemon and
+`PRAJNA_DOCKER_BIN` the Docker CLI binary. If Docker/Colima is unavailable, the
+image cannot be resolved, or its digest later changes, execution fails; there
+is no trusted-local fallback.
+
+A Python submission uses the same envelope with `source` inside `strategy` and
+the top-level `parameters`:
+
+```json
+{
+  "schema_version": 1,
+  "campaign_id": "<campaign-id>",
+  "submission_id": "generated-1",
+  "hypothesis": "A generated momentum variant can beat equal weight.",
+  "strategy": {
+    "family": "python",
+    "source": "def strategy(history, state):\n    return {CASH: 1.0}\n",
+    "parameter_schema": {
+      "parameters": {
+        "lookback": {"type": "integer", "default": 3, "min": 2, "max": 252, "step": 1}
+      },
+      "constraints": []
+    }
+  },
+  "parameters": {"lookback": 3},
+  "parent_experiment_id": "<optional parent experiment id>"
+}
+```
+
+`parameter_schema` is optional. The trusted side compiles and normalizes the
+source (1-20,000 characters), validates the schema and parameters, stores the
+canonical source with `strategy.source_sha256`, and includes that hash in the
+`strategy_and_parameters` fingerprint. A Python submission to a Campaign
+without the container executor is rejected at admission without consuming an
+attempt or execution time. Declarative families keep their existing schema,
+replay/conflict, parent/child, budget, interruption and resume semantics; a
+Python attempt consumes an attempt and elapsed time exactly like a declarative
+one.
+
+Each strategy call starts one fresh container with the verified boundary:
+
+```
+docker run --rm -i --network none --read-only --user 65534:65534 \
+  --cap-drop ALL --security-opt no-new-privileges --pids-limit 64 \
+  --memory 512m --cpus 1 --tmpfs /tmp:rw,size=16m \
+  -e PYTHONDONTWRITEBYTECODE=1 <image> python -I -c <worker>
+```
+
+There are no host mounts, no container environment secrets and no network. The
+worker builds the pandas history frame, exposes `ETF_SYMBOLS`, `CASH` and
+`parameters`, executes the source, and calls `strategy(history, state)`; its
+stdout is bounded. Before the strategy is allowed to start, the trusted
+controller inspects the running container and fails the attempt unless the
+actual mounts, network mode, read-only root, UID/GID, dropped capabilities,
+`no-new-privileges`, memory, PID and CPU limits match. Returned weights are
+validated again in the trusted process (finite, non-negative, allowed assets,
+sum 1). A strategy that reads a host path or opens a socket cannot return a
+usable result; container failures, timeouts, output overruns and invalid
+weights fail the attempt with no trusted-local retry, while the attempt and
+elapsed time remain charged.
+
+Each experiment receipt includes `strategy.source_sha256` and an `executor`
+object with:
+
+- `kind`, `image.reference`, `image.digest` and the frozen `limits`;
+- `invocation_count`, `invocations` and `evidence_sha256`;
+- per invocation: `run_id`, `image_reference`, `image_digest`, `container_id`,
+  the actual `inspect` summary (`mounts`, `network_mode`, `read_only`, `user`,
+  `cap_drop`, `security_opt`, memory/PIDs/CPU/tmpfs), `input_sha256` and
+  `input_bytes`, `output_sha256` and `output_bytes`, `wall_seconds`,
+  `exit_code`, `source_started`, `strategy_started`, `result` and
+  `weights_valid`.
+
+No secrets are recorded (no environment values, credential paths or host mount
+sources). Failed attempts persist the same evidence under `error.executor`.
+
+The runner image is built from `scripts/issue27-runner/Dockerfile`:
+`python:3.12-bookworm` pinned by digest, with `numpy==2.2.6` and
+`pandas==2.2.3` (the #26 versions) and nothing else. The build needs network
+for those wheels; execution is offline. The observed digest and Docker-gated
+test commands are recorded in
+[docs/acceptance/issue-27-python-executor.md](docs/acceptance/issue-27-python-executor.md).
+The external model session, project-only relay and generated model strategy are
+the remaining #27 integration; this change provides only the trusted execution
+boundary and submission protocol and does not run a model. Frozen Python
+candidates are not yet executed by protected evaluation.
+
 Share [the `prajnatrade-research` Skill](.github/skills/prajnatrade-research/SKILL.md)
 with both clients (register that Skill directory in clients that do not
 discover `.github/skills`). Keep the objective, constraints, and saved request

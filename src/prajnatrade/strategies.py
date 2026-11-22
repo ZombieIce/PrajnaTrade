@@ -11,8 +11,13 @@ import numpy as np
 import pandas as pd
 
 from prajnatrade.backtest import Strategy, equal_weight_buy_and_hold
+from prajnatrade.container_executor import ContainerStrategyExecutor
 from prajnatrade.data import CASH, ETF_SYMBOLS
-from prajnatrade.isolation import IsolationLimits, run_isolated_strategy
+from prajnatrade.isolation import (
+    IsolationError,
+    IsolationLimits,
+    run_isolated_strategy,
+)
 
 STRATEGY_FAMILIES = (
     "equal_weight",
@@ -209,11 +214,19 @@ def make_strategy(
     isolated_python: bool = False,
     isolation_limits: IsolationLimits | None = None,
     evidence_callback: Callable[[dict[str, Any]], None] | None = None,
+    container_executor: ContainerStrategyExecutor | None = None,
 ) -> Strategy:
     normalized = normalize_strategy_spec(spec)
     family = normalized["family"]
     params = normalized["parameters"]
     if family == "python":
+        if container_executor is not None:
+            return _container_python_strategy(
+                str(normalized["source"]),
+                dict(params),
+                container_executor,
+                evidence_callback,
+            )
         require_execution_permission(normalized, isolated_python=isolated_python)
 
         def strategy(history: pd.DataFrame, state: Mapping[str, object]):
@@ -241,6 +254,28 @@ def make_strategy(
     if family == "inverse_volatility":
         return _inverse_volatility_strategy(int(params["lookback"]))
     raise ValueError(f"Unsupported strategy family: {family!r}.")
+
+
+def _container_python_strategy(
+    source: str,
+    parameters: dict[str, Any],
+    executor: ContainerStrategyExecutor,
+    evidence_callback: Callable[[dict[str, Any]], None] | None,
+) -> Strategy:
+    """Run the generated strategy in the verified container boundary."""
+
+    def strategy(history: pd.DataFrame, state: Mapping[str, object]):
+        try:
+            result = executor.run(source, parameters, history, dict(state))
+        except IsolationError as error:
+            if evidence_callback is not None and error.evidence is not None:
+                evidence_callback(dict(error.evidence))
+            raise
+        if evidence_callback is not None:
+            evidence_callback(dict(result.evidence))
+        return result.weights
+
+    return strategy
 
 
 def _integer_parameter(
