@@ -567,36 +567,22 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert scenarios["tests_and_cli"]["status"] == "verified"
     assert all(
         scenarios[scenario_id]["status"] == "blocked"
-        for scenario_id in SCENARIO_IDS[1:]
+        for scenario_id in SCENARIO_IDS
+        if scenario_id not in {"tests_and_cli", "real_snapshot_baseline"}
     )
 
-    # Scenario 2 now carries real snapshot/baseline evidence but stays blocked:
-    # the independent human reconciliation, OS-level Discovery-only enforcement
-    # and archived point-in-time availability are still missing. Everything else
-    # is synthetic mechanism evidence only, and the real chain is empty.
     real_snapshot = scenarios["real_snapshot_baseline"]
     assert real_snapshot["scope"] == {
         "data": "real",
         "agent": "mock",
         "period": "historical",
     }
-    assert real_snapshot["status"] == "blocked"
-    assert any(
-        entry["type"] == "real_snapshot" for entry in real_snapshot["evidence"]
-    )
-    assert any(
-        entry["type"] == "real_baseline" for entry in real_snapshot["evidence"]
-    )
-    assert any(
-        entry["type"] == "machine_cross_check" for entry in real_snapshot["evidence"]
-    )
-    assert any(
-        "independent human researcher" in blocker["missing"].lower()
-        for blocker in real_snapshot["blockers"]
-    )
-    assert any(
-        "os-level enforcement" in blocker["missing"].lower()
-        for blocker in real_snapshot["blockers"]
+    assert real_snapshot["status"] == "verified"
+    assert real_snapshot["blockers"] == []
+    evidence = {entry["type"]: entry for entry in real_snapshot["evidence"]}
+    assert {"real_snapshot", "real_baseline", "machine_cross_check", "discovery_isolation"} <= evidence.keys()
+    assert evidence["human_reconciliation"]["reference"].startswith(
+        "https://github.com/ZombieIce/PrajnaTrade/issues/24#issuecomment-"
     )
     for scenario in scenarios.values():
         if scenario["id"] == "real_snapshot_baseline":
@@ -658,7 +644,7 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert "NOT passed" in report["verdict"]["statement"]
     assert "six-scenario rule was not met" in report["verdict"]["statement"]
     assert report["scenario_status_counts"] == {
-        "verified": 1, "blocked": 5, "failed": 0, "not_run": 0
+        "verified": 2, "blocked": 4, "failed": 0, "not_run": 0
     }
 
 

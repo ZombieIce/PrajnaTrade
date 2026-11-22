@@ -4,7 +4,7 @@
     "version": "0.1.0 (issue #17 synthetic workflow + #24 real snapshot/baseline)",
     "branch": "zombieice-issue-17-implementation",
     "tested_at": "2026-11-22T00:45:26+08:00",
-    "environment": "macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. No real deployment isolation is verified.",
+    "environment": "macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. The later #24 reconciliation used a verified Discovery-only Colima container.",
     "test_command": "PYTHONPATH=src python -m pytest -q",
     "test_result": "281 passed in 657.54s (0:10:57), exit 0"
   },
@@ -42,14 +42,14 @@
     {
       "id": "real_snapshot_baseline",
       "title": "Real five-ETF snapshot and equal-weight baseline",
-      "status": "blocked",
+      "status": "verified",
       "scope": {
         "data": "real",
         "agent": "mock",
         "period": "historical"
       },
       "expected": "A shared real snapshot for 511260, 518880, 515080, 513300 and 159612 with official exchange calendar, verified corporate actions and price basis, point-in-time availability evidence, frozen 60/20/20 partitions and a Discovery equal-weight baseline that a second researcher can reproduce from the same approved inputs.",
-      "observed": "A real snapshot was sealed and baselined outside Git: snapshot ID b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d, schema 2, data_kind real, 1,094 sessions 2022-05-20..2026-11-20, partitions 656 Discovery / 218 Validation / 220 Final Holdout, 5,470 raw bars, 5,470 derived values, 20 official cash dividends and 211 hashed evidence items (official calendars, listings, dividends, halts, price archive samples). The Discovery equal-weight baseline (5 bps / 0 slippage, then 20 bps / 10 bps) filled all five ETFs on 2022-05-23 and ended at 155,603.3472 / 155,215.1928 with two declared unknown-NAV days (159612 full halts on 2025-01-10 and 2025-01-24); a second independent machine implementation recomputed the derived series, fills, fees, dividend cash, NAV path and gaps exactly. Still missing: an independent human researcher's reconciliation on the same snapshot ID, OS-level Discovery-only enforcement, archived point-in-time 09:30/15:00 availability (currently a market-rule assertion), and exhaustive dated price-archive coverage (7 of 1,094 sessions sampled).",
+      "observed": "A real snapshot was sealed and baselined outside Git: snapshot ID b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d, schema 2, data_kind real, 1,094 sessions 2022-05-20..2026-11-20, partitions 656 Discovery / 218 Validation / 220 Final Holdout, 5,470 raw bars, 5,470 derived values, 20 official cash dividends and 211 hashed evidence items (official calendars, listings, dividends, halts, price archive samples). The Discovery equal-weight baseline (5 bps / 0 slippage, then 20 bps / 10 bps) filled all five ETFs on 2022-05-23 and ended at 155,603.3472 / 155,215.1928 with two declared unknown-NAV days (159612 full halts on 2025-01-10 and 2025-01-24). An independent Agent recomputed all 656 Discovery sessions in a read-only Colima container. @ZombieIce accepted both cost configurations within tolerance and both unknown NAV dates on 2026-11-22. Regular session times follow the agreed 09:30/15:00 assumption subject to actual halts. The daily prices are a vendor reconstruction with seven dated archive samples.",
       "evidence": [
         {
           "type": "real_snapshot",
@@ -70,26 +70,19 @@
           "type": "official_source_evidence",
           "reference": "docs/research/real-etf-data-sources.md; docs/research/real-snapshot-result.md",
           "description": "Official five listing announcements, five SSE annual notices plus 59 SZSE month calendar responses, 20 dividend PDFs, 118+2 159612 and 43 513300 halt notices, and seven sampled TDX dated packages; all hashed in the snapshot evidence block. Vendor qfq/hfq was not used as the total-return series."
+        },
+        {
+          "type": "discovery_isolation",
+          "reference": "docs/research/issue-24-researcher-handoff.md",
+          "description": "Trusted operator verified the single read-only Discovery mount and seven inaccessible source or protected paths in the isolated calculation."
+        },
+        {
+          "type": "human_reconciliation",
+          "reference": "https://github.com/ZombieIce/PrajnaTrade/issues/24#issuecomment-7074089930",
+          "description": "Independent Agent computed the baseline using the approved Discovery input. @ZombieIce accepted the two cost scenarios and the 2025-01-10 and 2025-01-24 halt gaps. Comparison receipt SHA-256 4cde8098f699c0665e6fb17ac9dddaa82c987f28813cdd57784de5059acc574e."
         }
       ],
-      "blockers": [
-        {
-          "missing": "An independent human researcher has not recomputed the Discovery baseline from the same sealed snapshot ID and approved inputs within the pre-registered tolerances.",
-          "unblock": "Hand the snapshot ID b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d, the evidence store and the baseline configurations to a named second researcher; have them recompute trades, fees, dividends, NAV path and gaps within the documented tolerances and record the comparison receipt."
-        },
-        {
-          "missing": "No OS-level enforcement that the research side can read only Discovery; the CLI and file permissions are process-level checks, not a verified deployment boundary (#12).",
-          "unblock": "Provide the #12 deployment boundary (separate OS identity/container) and verify allowed Discovery reads plus refused Validation/Final Holdout and trusted-store reads, with trusted-side receipts."
-        },
-        {
-          "missing": "The 09:30 open and 15:00 close availability are exchange-market-rule assertions, not archived point-in-time quotes; only seven sampled TDX dated packages carry vendor timestamps and the vendor price history is a current reconstruction.",
-          "unblock": "Either obtain a dated intraday/opening-auction archive covering the evaluated sessions, or record an explicit human decision accepting the market-rule availability assertion; otherwise split fills that require a proven 09:30 open remain blocked."
-        },
-        {
-          "missing": "The Discovery baseline has two declared unknown-NAV days (159612 full halts 2025-01-10 and 2025-01-24) and therefore cannot claim complete coverage or admission-grade evidence.",
-          "unblock": "Accept the two declared gaps as genuine halt sessions for the research baseline, or document why they make the Discovery range inadmissible; do not impute a stale close or a synthetic mark."
-        }
-      ]
+      "blockers": []
     },
     {
       "id": "real_data_mock",

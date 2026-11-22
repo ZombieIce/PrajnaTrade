@@ -119,7 +119,7 @@ lower than the full-window figure because (a) the Discovery baseline stops at
 
 - Same author, same host, same language and the same data files: an independent
   implementation, **not** an independent researcher or an independent data
-  capture. #24's human reconciliation is still outstanding.
+  capture. The subsequent independent Agent calculation and @ZombieIce's decision are recorded in the [review worksheet](issue-24-researcher-handoff.md).
 - The check verifies the sealed numbers against the same raw closes and action
   rows; it does not re-download the evidence PDFs or re-derive the dividend
   terms from them. Evidence integrity is recorded as SHA-256 in the manifest.

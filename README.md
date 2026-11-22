@@ -1677,16 +1677,12 @@ carry real-scope evidence. Anything short of the full gate is reported as
 that the six-scenario rule was not met. The command is operator-only:
 `prajnatrade-agent` has no `acceptance` command.
 
-**Checked-in state: end-to-end MVP is NOT accepted.** The checked-in manifest and
-its CLI-generated report (`docs/acceptance/issue-17-manifest.json`,
-`docs/acceptance/issue-17-report.md`) mark scenario 1 (tests and CLI) `verified`
-in synthetic scope and scenarios 2–6 `blocked`. No real five-ETF snapshot, real
-model access, verified deployment isolation, real protected pass, real approved
-release or real forward trading day exists in this delivery; `real_chain` is
-empty, the six-scenario rule is not met and the overall verdict is `blocked` /
-not passed. The report lists the exact missing prerequisites and unblock
-conditions from #24/#26/#27 and this handoff. It is a checklist conclusion, not
-an investment, performance or real-execution claim.
+**The overall #17 verdict remains blocked.** The tests and CLI scenario and
+the real five-ETF historical Discovery baseline are verified (2 of 6).
+@ZombieIce accepted the two cost scenarios and both halt-related NAV gaps.
+Scenarios 3–6 remain blocked and the real candidate-to-release chain is empty.
+See the [acceptance report](docs/acceptance/issue-17-report.md) and the
+[signed Discovery review](docs/research/issue-24-researcher-handoff.md).
 
 Each real forward day must also prove the after-close signal → next-open
 reconciliation: `signal_date`, `orders_persisted_before_open`, the next session,

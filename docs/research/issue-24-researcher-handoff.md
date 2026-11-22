@@ -1,7 +1,7 @@
 # Issue #24 independent Discovery reconciliation
 
 The project owner designated an independent Agent to perform the calculation
-and retained the human review. The technical results below are ready for that review.
+and accepted the results for historical Discovery on 2026-11-22.
 
 ## Inputs for the researcher
 
@@ -61,8 +61,7 @@ The trusted-side comparison checked seven inaccessible paths, the single
 read-only Discovery mount, exit code zero, UID 65534, both reference
 fingerprints and the pre-registered tolerances.
 
-**Human review:** the project owner requested this independent calculation
-and will review the results. The human conclusion and attribution are pending.
+**Human acceptance, 2026-11-22.** @ZombieIce accepted both cost scenarios within the pre-registered tolerances and the two unknown portfolio NAVs caused by the full-day suspensions of 159612 on 2025-01-10 and 2025-01-24. Both values remain null. [Signed issue decision](https://github.com/ZombieIce/PrajnaTrade/issues/24#issuecomment-7074089930)
 
 ## Operator and owner decisions
 

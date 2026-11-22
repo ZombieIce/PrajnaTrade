@@ -1,10 +1,9 @@
 # Real five-ETF snapshot: acquisition, seal and Discovery baseline result (MVP-06 / #24)
 
-Status: **sealed, baselined and machine-cross-checked; #24 is not yet
-accepted.** The owner confirmed the default session times for Discovery on
-2026-11-22. A Colima container enforced Discovery-only input during the #24
-reconciliation. The project owner will review the independent Agent's
-calculation. See the [review worksheet](issue-24-researcher-handoff.md).
+**Accepted for #24 historical Discovery on 2026-11-22.** An independent
+Agent performed the calculation in a Discovery-only Colima container.
+@ZombieIce accepted both cost scenarios and the two full-halt valuation
+gaps. [Review record](issue-24-researcher-handoff.md)
 
 This note records what was built from the researched probe artifacts, what is
 official evidence, what is a market-rule assertion, and what is still missing.
@@ -141,8 +140,6 @@ remain unknown for valuation.
 
 **Missing / not established:**
 
-- No independent human researcher has recomputed the baseline from the same
-  snapshot ID (see the machine cross-check below, which is not a substitute).
 - The Colima access receipt covers the #24 Discovery calculation. Deployment
   evidence for the external model and protected evaluation belongs to later stages.
 - No archived 09:30 opening quote or notarised intraday archive was found.
@@ -364,21 +361,12 @@ publications.
   5,470 bars, 5,470 derived rows and 211 evidence items (with `collected_at`
   values from the refetch time, so it was not sealed).
 
-## Remaining #24 blockers
+## Acceptance scope
 
-The [second researcher's worksheet](issue-24-researcher-handoff.md) pins the
-Discovery inputs, both comparison files and the fields for recording the
-researcher's results and the operator's decisions.
-
-1. **Independent human reconciliation.** A named second researcher must
-   recompute the same Discovery inputs from snapshot ID
-   `b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d` and
-   compare trades, fees, dividends, NAV path, the two gaps and the end NAV.
-   This note's cross-check is a machine check by the same author and does not
-   satisfy that requirement.
-2. **Point-in-time price provenance.** The prices are the vendors' current
-   reconstruction; the dated TDX packages are samples (7 sessions). Nobody has
-   proven that the values were visible on each session date.
+The signed review covers the 656 Discovery sessions. The two missing NAVs
+remain null. The normal 09:30/15:00 availability times are exchange-rule
+assumptions subject to documented halts. The vendor reconstructed the daily
+history, and dated price packages cover seven sessions.
 
 ## What is committed and what is not
 
