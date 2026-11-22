@@ -13,14 +13,24 @@ Example (the command the lead runs)::
         --snapshot-id <approved-24-snapshot-id> \
         --trusted-project <trusted-project-outside-research> \
         --research-dir ~/PrajnaTrade-research/issue27 \
-        --strategy-image python:issue27-runner \
-        --attempts 3 --max-seconds 90
+        --strategy-image prajnatrade-issue27-runner:local \
+        --attempts 3 --max-seconds 3600
 
 ``--strategy-executor container`` (the default) requires the
 ``--strategy-executor`` / ``--strategy-image`` flags from the Python-executor
 branch; without them the script fails before touching anything and says so.
+The image is resolved by ``campaign create`` (``docker image inspect``) and its
+``sha256:`` local image ID is frozen into the campaign and the public metadata.
+Build the runner with ``scripts/issue27-runner/build.sh`` first.
+
 Explicit attempt/time budgets are recorded in the public metadata; the
-campaign itself still owns the authoritative counters.
+campaign itself still owns the authoritative counters.  The container executor
+starts one fresh container per rebalance (about 0.68 s per invocation in the
+accepted runner evidence).  A full 656-session Discovery run is roughly 650
+invocations, so the execution budget must be minutes, not the #26 Mock's 90 s;
+the default 3600 s covers two full Python attempts with headroom.  An attempt
+is charged exactly once per submission even though it may spawn many
+containers.
 
 Safety rules:
 
@@ -44,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -53,6 +64,8 @@ from pathlib import Path
 from typing import Any
 
 from issue27_research_workspace import WorkspaceError, write_public_campaign
+
+SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 class SetupError(Exception):
@@ -179,6 +192,7 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         "strategy_executor": {
             "kind": args.strategy_executor,
             "image": args.strategy_image if args.strategy_executor == "container" else None,
+            "digest": args.image_digest if args.strategy_executor == "container" else None,
         },
     }
 
@@ -201,8 +215,11 @@ def _differences(row: dict[str, Any], requested: dict[str, Any], *, check_execut
     wanted = requested["strategy_executor"]
     if stored["kind"] != wanted["kind"]:
         differences.append("strategy_executor")
-    elif wanted["kind"] == "container" and stored["image"] != wanted["image"]:
-        differences.append("strategy_image")
+    elif wanted["kind"] == "container":
+        if stored["image"] != wanted["image"]:
+            differences.append("strategy_image")
+        if wanted["digest"] is not None and stored["digest"] != wanted["digest"]:
+            differences.append("strategy_image_digest")
     return differences
 
 
@@ -296,8 +313,13 @@ def _executor_from_receipt(
         )
     digest = executor.get("digest")
     image = executor.get("image")
-    if not isinstance(image, str) or not image.strip() or not isinstance(digest, str) or not digest:
-        raise SetupError("campaign create did not return the container image and digest.")
+    if (
+        not isinstance(image, str)
+        or not image.strip()
+        or not isinstance(digest, str)
+        or SHA256_DIGEST.fullmatch(digest) is None
+    ):
+        raise SetupError("campaign create did not return the container image and sha256 digest.")
     if args.image_digest is not None and args.image_digest != digest:
         raise SetupError("--image-digest does not match the digest campaign create recorded.")
     return {
@@ -378,7 +400,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--strategy-image",
-        help="container image for generated Python (required for --strategy-executor container)",
+        help=(
+            "container image for generated Python (required for --strategy-executor container; "
+            "build it with scripts/issue27-runner/build.sh)"
+        ),
     )
     parser.add_argument(
         "--image-digest",
@@ -386,7 +411,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--attempts", type=int, default=3, help="attempt budget (default: 3)")
     parser.add_argument(
-        "--max-seconds", type=float, default=90.0, help="execution budget in seconds (default: 90)"
+        "--max-seconds",
+        type=float,
+        default=3600.0,
+        help=(
+            "execution budget in seconds (default: 3600). A full 656-session Python "
+            "Discovery run is ~650 container invocations (~0.68 s each), so allow minutes."
+        ),
     )
     parser.add_argument("--initial-cash", type=float, default=100_000.0)
     parser.add_argument("--transaction-cost-bps", type=float, default=5.0)
@@ -429,6 +460,8 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         raise SetupError("--strategy-image requires --strategy-executor container.")
     if args.strategy_executor == "none" and args.image_digest:
         raise SetupError("--image-digest requires --strategy-executor container.")
+    if args.image_digest is not None and SHA256_DIGEST.fullmatch(args.image_digest) is None:
+        raise SetupError("--image-digest must look like sha256:<64 lowercase hex characters>.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -493,6 +526,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.strategy_executor == "container":
                 if executor["kind"] != "container":
                     raise SetupError("The existing campaign has no container executor.")
+                if not isinstance(executor["digest"], str) or SHA256_DIGEST.fullmatch(
+                    executor["digest"]
+                ) is None:
+                    raise SetupError("The existing campaign records no valid sha256 image digest.")
                 if args.image_digest is not None and args.image_digest != executor["digest"]:
                     raise SetupError("--image-digest does not match the existing campaign.")
                 executor = _stored_executor(existing)

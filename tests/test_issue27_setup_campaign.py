@@ -56,6 +56,7 @@ def test_dry_run_prints_the_plan_and_writes_nothing(tmp_path: Path) -> None:
     assert plan["campaign_config"]["strategy_executor"] == {
         "kind": "container",
         "image": "python:issue27-runner",
+        "digest": None,
     }
     assert not project.exists()
     assert (research / "campaign.json").read_bytes() == before
@@ -206,3 +207,42 @@ def test_setup_rejects_a_research_dir_inside_the_project(tmp_path: Path) -> None
     assert result.returncode == 2
     assert "separate from the trusted project" in result.stderr
     assert not (unsafe / "campaign.json").exists()
+
+
+def test_dry_run_accepts_the_installed_container_flags(tmp_path: Path) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    project = tmp_path / "trusted" / "project"
+    research = build_workspace(tmp_path)
+
+    result = setup_campaign(
+        store, SNAPSHOT_ID, project, research,
+        "--strategy-image", "prajnatrade-issue27-runner:local",
+        "--dry-run",
+    )
+
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(result.stdout)
+    assert plan["campaign_config"]["strategy_executor"] == {
+        "kind": "container",
+        "image": "prajnatrade-issue27-runner:local",
+        "digest": None,
+    }
+    assert plan["campaign_config"]["max_seconds"] == 3600.0
+    assert plan["would_create"] is True
+    assert not project.exists()
+
+
+def test_setup_rejects_a_malformed_image_digest(tmp_path: Path) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    research = build_workspace(tmp_path)
+
+    result = setup_campaign(
+        store, SNAPSHOT_ID, tmp_path / "trusted" / "project", research,
+        "--strategy-image", "prajnatrade-issue27-runner:local",
+        "--image-digest", "sha256:not-a-digest",
+    )
+
+    assert result.returncode == 2
+    assert "--image-digest must look like" in result.stderr

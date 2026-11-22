@@ -48,6 +48,14 @@ workspace; the workspace has no trusted path.
 | Executor image / immutable digest | `<pending>` |
 | Research workspace location (outside Git) | `<pending>` |
 | Workspace commit / template hash | `<pending>` |
+| Executor implementation record | [issue-27-python-executor.md](issue-27-python-executor.md) |
+
+Budget sizing note: the accepted container executor starts one fresh
+container per rebalance (about 0.68 s per invocation on the reference machine).
+A full 656-session Discovery run is roughly 650 invocations, i.e. several
+minutes of wall time, so the campaign must be sized for minutes rather than
+the #26 Mock's 90 seconds; 3600 execution seconds covers two full Python
+attempts with headroom. One Python submission is still one attempt.
 
 ## The two submissions
 
@@ -161,9 +169,9 @@ evidence. It verifies the relay/workspace mechanism only.
 
 | Check | Command | Result |
 | --- | --- | --- |
-| Relay and workspace tests | `PYTHONPATH=src python -m pytest -q tests/test_issue27_relay.py tests/test_issue27_workspace.py tests/test_issue27_setup_campaign.py` | `26 passed` |
+| Relay and workspace tests | `PYTHONPATH=src python -m pytest -q tests/test_issue27_relay.py tests/test_issue27_workspace.py tests/test_issue27_setup_campaign.py` | `29 passed` |
 | Lint | `ruff check .` | `All checks passed.` |
-| Existing suite unaffected | `scripts/test.sh fast` | `190 passed, 118 deselected` (164 pre-existing fast tests plus 26 new; the 118 isolation-marked tests are unchanged) |
+| Existing suite unaffected | `scripts/test.sh fast` | `202 passed, 3 skipped, 118 deselected` on the integrated branch (164 pre-existing fast tests + 29 relay/workspace/setup + 9 fake-executor tests; the 3 skips are Docker-gated and the 118 isolation-marked tests are unchanged) |
 
 The deployment-isolation evidence required by #12/#27 must come from the real
 run; synthetic probes and trusted-local execution do not count.
@@ -174,11 +182,11 @@ run; synthetic probes and trusted-local execution do not count.
 
 - [ ] No authorized external-model session has run; the DSH session reference
       and redacted transcript are pending.
-- [ ] The container-executor submission path must be merged and advertised by
+- [x] The container-executor submission path is integrated and advertised by
       `campaign create --help` (`--strategy-executor container`,
-      `--strategy-image IMAGE`). The relay/setup scripts were written against
-      that stated interface; the integration branch at the time of this
-      template did not yet contain it.
+      `--strategy-image IMAGE`); the trusted-side boundary evidence is in
+      [issue-27-python-executor.md](issue-27-python-executor.md). It still
+      awaits a real campaign and real model session.
 - [ ] No real Discovery campaign has been created for this session; the
       campaign ID, snapshot, budgets and executor digest are pending.
 - [ ] The two linked submissions, the model-read first receipt and the
@@ -213,8 +221,8 @@ python scripts/issue27_setup_campaign.py \
   --snapshot-id <approved-snapshot-id> \
   --trusted-project <trusted-project-outside-research> \
   --research-dir ~/PrajnaTrade-research/issue27 \
-  --strategy-image <immutable-executor-image> \
-  --attempts <attempts> --max-seconds <seconds>
+  --strategy-image prajnatrade-issue27-runner:local \
+  --attempts <attempts> --max-seconds 3600
 
 # 3. Start the new DSH session in the research workspace with AGENT_PROMPT.md,
 #    then relay its requests (run one mode at a time):

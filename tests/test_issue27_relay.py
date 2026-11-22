@@ -298,3 +298,35 @@ def test_relay_serve_processes_until_the_limit_then_stops(tmp_path: Path) -> Non
     assert (research / "outbox" / "a-first.receipt.json").is_file()
     assert not (research / "outbox" / "b-second.receipt.json").exists()
     assert (research / "inbox" / "b-second.json").is_file()
+
+
+def test_relay_forwards_a_python_rejection_on_a_declarative_campaign(
+    tmp_path: Path,
+) -> None:
+    project, research, campaign = workspace_and_project(tmp_path)
+    payload = {
+        "schema_version": 1,
+        "campaign_id": campaign["campaign_id"],
+        "submission_id": "exp-python",
+        "hypothesis": "A generated strategy should be rejected without Docker.",
+        "strategy": {
+            "family": "python",
+            "source": "def strategy(history, state):\n    return {CASH: 1.0}\n",
+        },
+        "parameters": {},
+    }
+    (research / "inbox" / "exp-python.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_script(
+        RELAY,
+        "--project", str(project),
+        "--research-dir", str(research),
+        "--once",
+    )
+
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads((research / "outbox" / "exp-python.receipt.json").read_text())
+    assert receipt["status"] == "rejected"
+    assert receipt["error"]["code"] == "INVALID_SUBMISSION"
+    assert "container" in receipt["error"]["message"]
+    assert receipt["budget"]["attempts_remaining"] == 3

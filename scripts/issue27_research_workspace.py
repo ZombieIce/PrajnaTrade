@@ -419,12 +419,17 @@ installed the campaign yet. Stop and write a note saying so.
   Discovery partition. `discovery.metrics`, `discovery.fills`,
   `discovery.nav` and `discovery.benchmark` are the observations. There are
   no real forward trades and no protected Validation or Final Holdout
-  results.
+  results. A Python receipt also contains `strategy.source_sha256` and an
+  `executor` block with the per-invocation container evidence; read them,
+  never invent them.
 - `status: "rejected"` or `"failed"` contains an `error` object with `code`,
   `phase`, `next_action` and `message`. Follow `next_action`: correct the
   request, resume with a `status-*.json` request, or stop.
 - `budget.attempts_remaining` and `budget.execution_seconds_remaining` are the
-  remaining campaign budget. Do not exceed it.
+  remaining campaign budget. Do not exceed it. One submission consumes one
+  attempt and its elapsed wall time, even though a Python submission starts a
+  fresh container for every rebalance; a full Discovery run can therefore take
+  minutes, so check the budget before planning a large change.
 - A code starting with `RELAY_` came from the relay, not from the experiment
   protocol. Correct the request or ask the operator.
 - A missing `outbox/<id>.receipt.json` is normal while the relay has not
@@ -547,13 +552,16 @@ submission to a declarative campaign is rejected at admission. Put the source
 }
 ```
 
-The source must define `strategy(history, state)` and return a
-`{symbol: weight}` mapping, or `None` for no change. `history` is a
-point-in-time pandas DataFrame of the approved ETF bars; `state` is the
+The source (1 to 20,000 characters) must define `strategy(history, state)`
+and return a `{symbol: weight}` mapping, or `None` for no change. `history` is
+a point-in-time pandas DataFrame of the approved ETF bars; `state` is the
 engine state. `ETF_SYMBOLS`, `CASH` and `parameters` are available globals.
 Do not import network, process or filesystem modules; the trusted side runs
 the source in the isolated executor. Do not send `source_sha256`; the trusted
-side computes and records it.
+side computes and records it. A successful Python receipt includes
+`strategy.source_sha256` and an `executor` block (image reference/digest,
+per-invocation container inspection, hashes, exit code and wall time); a
+failed attempt may report the same evidence under `error.executor`.
 
 `strategy.parameter_schema` is optional; if you send it, it is validated like
 a declarative parameter schema. Unknown strategy keys are rejected.
