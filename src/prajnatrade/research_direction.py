@@ -16,6 +16,7 @@ from typing import Any
 from prajnatrade.experiment import (
     ProtocolError,
     campaign_discovery,
+    campaign_execution_lock,
     campaign_experiment_history,
     evaluation_subject,
     freeze_research_candidate,
@@ -202,7 +203,7 @@ def kickoff(project: Path, store: Path, prepared: dict[str, Any]) -> dict[str, A
         raise ValueError("Trusted evaluation store must be outside the research project.")
     trusted = evaluation_store(store)
     target = _kickoff_path(trusted, round_id)
-    with _project(project) as connection:
+    with campaign_execution_lock(project, prepared["campaign_id"]), _project(project) as connection:
         connection.execute("BEGIN IMMEDIATE")
         previous = connection.execute(
             "SELECT kickoff_json FROM research_rounds WHERE campaign_id = ?",
@@ -332,8 +333,11 @@ def proposal_submit(
             "SELECT 1 FROM research_validation_proposals WHERE proposal_id = ?", (proposal_id,),
         ).fetchone()
         if exists is None:
-            _require_open(project, connection, round_id)
-            _require_selection_impact(connection, proposal, "proposal")
+            evaluations = _evaluations(connection, round_id)
+            fingerprint = subject["fingerprints"]["strategy_and_parameters"]
+            if fingerprint not in _version_fingerprints(project, campaign_id, evaluations):
+                _require_open(project, connection, round_id)
+                require_selection_impact(proposal, "proposal", passed=_has_passed(evaluations))
             connection.execute(
                 "INSERT INTO research_validation_proposals VALUES (?, ?, ?)",
                 (proposal_id, round_id, _json(receipt)),
@@ -381,6 +385,16 @@ def _has_passed(evaluations: list[dict[str, Any]]) -> bool:
     return any(_passed(evaluation) for evaluation in evaluations)
 
 
+def _version_fingerprints(
+    project: Path, campaign_id: str, evaluations: list[dict[str, Any]],
+) -> set[str]:
+    return {
+        evaluation_subject(project, campaign_id, evaluation["submission_id"])
+        ["fingerprints"]["strategy_and_parameters"]
+        for evaluation in evaluations
+    }
+
+
 def _finished_retrospective(connection: sqlite3.Connection, round_id: str) -> dict[str, Any] | None:
     row = connection.execute(
         "SELECT receipt_json FROM research_retrospectives WHERE round_id = ?", (round_id,),
@@ -393,10 +407,34 @@ def _require_open(project: Path, connection: sqlite3.Connection, round_id: str) 
         raise ProtocolError("RESEARCH_ROUND_CLOSED", "round", "review", "The research round has ended.")
 
 
-def _require_selection_impact(
-    connection: sqlite3.Connection, proposal: dict[str, Any], phase: str,
+def require_discovery_work(
+    project: Path, connection: sqlite3.Connection, campaign_id: str,
 ) -> None:
-    if not proposal["selection_impact"] and _has_passed(_evaluations(connection, proposal["round_id"])):
+    """Allow computation on unmanaged Campaigns or rounds with room for new versions."""
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'research_rounds'",
+    ).fetchone() is None:
+        return
+    managed = connection.execute(
+        "SELECT round_id FROM research_rounds WHERE campaign_id = ?", (campaign_id,),
+    ).fetchone()
+    if managed is None:
+        return
+    round_id = managed["round_id"]
+    approved = _project_kickoff(connection, round_id)
+    _require_open(project, connection, round_id)
+    if len(_evaluations(connection, round_id)) >= approved["validation_budget"]:
+        raise ProtocolError(
+            "VALIDATION_BUDGET_EXHAUSTED", "discovery", "review",
+            "The round has no Validation allowance left for a new Discovery version.",
+        )
+
+
+def require_selection_impact(
+    proposal: dict[str, Any], phase: str, *, passed: bool,
+) -> None:
+    """Require a comparison question for a new version after a Validation pass."""
+    if passed and not proposal["selection_impact"]:
         raise ProtocolError(
             "VALIDATION_SELECTION_QUESTION_REQUIRED", phase, "preregister",
             "A passed version exists. Explain how the question could change selection.",
@@ -411,14 +449,13 @@ def validation_submission(
     with _round_lock(project, round_id):
         with _project(project) as connection:
             proposal = _proposal(connection, round_id, proposal_id)
-            linked = connection.execute(
-                "SELECT 1 FROM research_validation_proposal_results WHERE proposal_id = ?",
-                (proposal_id,),
-            ).fetchone()
-            if linked is None:
-                _require_open(project, connection, round_id)
-                _require_selection_impact(connection, proposal, "run")
         yield proposal
+
+
+def require_open_round(project: Path, round_id: str) -> None:
+    """Check the round before the evaluator admits a new Validation version."""
+    with _project(project) as connection:
+        _require_open(project, connection, round_id)
 
 
 _RECEIPT_FIELDS = (
@@ -541,29 +578,46 @@ def validation_details(
         return _detail_receipt(_details_row(connection, round_id, access_id), include_details=True)
 
 
-def publish_validation_details(
-    project: Path, round_id: str, detail_access_id: str, rows: dict[str, Any] | None,
+def validation_detail_receipt(
+    request: dict[str, Any], authorization_id: str, partition_hash: str,
+    details: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Fulfill the recorded question with a trusted, single-date projection."""
+    """Bind a recorded Validation question to the verified record and its projection."""
+    access_id = request["detail_access_id"]
+    request_body = {key: value for key, value in request.items() if key != "detail_access_id"}
+    if _hash(request_body) != access_id:
+        raise ValueError("Validation detail request fingerprint mismatch.")
+    provenance = {
+        "authorization_id": authorization_id,
+        "validation_record_hash": request["record_hash"],
+        "partition_content_hash": partition_hash,
+        "projection_hash": _hash(details),
+    }
+    receipt = {
+        "schema_version": 1, "request": request, "provenance": provenance,
+        "status": "completed" if details is not None else "unavailable",
+        "opened_protected_source": False, "query_debited": False,
+    }
+    return {**receipt, "provenance": {**provenance, "receipt_id": _hash(receipt)}}
+
+
+def publish_validation_details(
+    project: Path, round_id: str, detail_access_id: str, receipt: dict[str, Any],
+    details: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Publish a single-date projection only after the trusted receipt is recorded."""
     with _project(project) as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = _details_row(connection, round_id, detail_access_id)
         request = json.loads(row["request_json"])
-        if rows is None:
-            resolution: dict[str, Any] = {"status": "unavailable"}
-        else:
-            if (
-                rows.get("date") != request["date"]
-                or not isinstance(rows.get("signals"), list)
-                or not isinstance(rows.get("positions"), dict)
-                or not isinstance(rows.get("fills"), list)
-                or any(item.get("date") != request["date"] for item in rows["signals"] + rows["fills"])
-            ):
-                raise ValueError("Validation detail response must match the requested trading date.")
-            resolution = {
-                "status": "completed",
-                "details": {field: rows[field] for field in ("signals", "positions", "fills")},
-            }
+        provenance = receipt["provenance"]
+        if receipt != validation_detail_receipt(
+            request, provenance["authorization_id"], provenance["partition_content_hash"], details,
+        ):
+            raise ValueError("Validation detail response must match the trusted receipt.")
+        resolution = {"status": receipt["status"], "provenance": provenance}
+        if details is not None:
+            resolution["details"] = details
         content = _json(resolution)
         if row["resolution_json"] is None:
             connection.execute(
@@ -667,6 +721,7 @@ def pending_validation_work(project: Path, round_id: str) -> dict[str, list[dict
         links = _proposal_results(connection, round_id)
         budget = _validation_budget(approved, evaluations)
         passed = _has_passed(evaluations)
+        versions = _version_fingerprints(project, approved["campaign_id"], evaluations)
         proposals = []
         for proposal in _proposals(connection, round_id):
             existing = links.get(proposal["proposal_id"])
@@ -675,8 +730,13 @@ def pending_validation_work(project: Path, round_id: str) -> dict[str, list[dict
                     proposals.append(proposal)
             elif not closed and budget["remaining"] and (not passed or proposal["selection_impact"]):
                 proposals.append(proposal)
+            elif evaluation_subject(project, approved["campaign_id"], proposal["submission_id"])[
+                "fingerprints"
+            ]["strategy_and_parameters"] in versions:
+                proposals.append(proposal)
         details = [
-            item for item in _detail_history(connection, round_id) if item["status"] == "queued"
+            {key: value for key, value in item.items() if key != "status"}
+            for item in _detail_history(connection, round_id) if item["status"] == "queued"
         ]
         return {"proposals": proposals, "details": details}
 
@@ -684,6 +744,16 @@ def pending_validation_work(project: Path, round_id: str) -> dict[str, list[dict
 def _assert_settled(evaluations: list[dict[str, Any]]) -> None:
     if any(evaluation["status"] == "reading" for evaluation in evaluations):
         raise ValueError("A Validation evaluation is awaiting recovery. Reconcile it before ending the round.")
+
+
+@contextmanager
+def _campaign_round(
+    project: Path, round_id: str,
+) -> Generator[tuple[dict[str, Any], sqlite3.Connection], None, None]:
+    with _round_lock(project, round_id), _project(project) as connection:
+        approved = _project_kickoff(connection, round_id)
+        with campaign_execution_lock(project, approved["campaign_id"]):
+            yield approved, connection
 
 
 def selected_candidate(project: Path, round_id: str) -> dict[str, Any]:
@@ -804,8 +874,7 @@ def freeze(
         "remaining_risks": remaining_risks, "eliminations": eliminations,
         "independence": selection_independence,
     })
-    with _round_lock(project, round_id), _project(project) as connection:
-        approved = _project_kickoff(connection, round_id)
+    with _campaign_round(project, round_id) as (approved, connection):
         previous = research_candidate_status(project, round_id)
         if previous is not None:
             if previous["research_selection"]["selection_request_hash"] == request_hash:
@@ -852,8 +921,7 @@ def retrospective(project: Path, round_id: str, source: object) -> dict[str, Any
     payload = _object(source, {"findings", "next_step"})
     findings = _text(payload["findings"], "findings")
     next_step = _text(payload["next_step"], "next_step")
-    with _round_lock(project, round_id), _project(project) as connection:
-        approved = _project_kickoff(connection, round_id)
+    with _campaign_round(project, round_id) as (approved, connection):
         previous = _finished_retrospective(connection, round_id)
         if previous is not None:
             if previous["findings"] == findings and previous["next_step"] == next_step:

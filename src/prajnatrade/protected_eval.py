@@ -3215,6 +3215,8 @@ def run_research_validation(
     from prajnatrade.research_direction import (
         load_kickoff,
         publish_validation,
+        require_open_round,
+        require_selection_impact,
         validation_submission,
     )
 
@@ -3254,11 +3256,18 @@ def run_research_validation(
             receipt = _reusable_validation_receipt(eval_store, row, kickoff, len(rows))
             publish(receipt)
             return receipt
+        require_open_round(project, round_id)
         if len(rows) >= kickoff["validation_budget"]:
             raise _reject(
                 "VALIDATION_BUDGET_EXHAUSTED", "run", "review",
                 "The authorized Validation budget is exhausted.",
             )
+        if not proposal["selection_impact"]:
+            previously_passed = any(
+                _reusable_validation_receipt(eval_store, row, kickoff, len(rows))["outcome"] == "passed"
+                for row in rows if row["status"] == "completed"
+            )
+            require_selection_impact(proposal, "run", passed=previously_passed)
 
         metadata = snapshot.manifest(snapshot_store, subject["snapshot_id"])
         body = _build_plan(
@@ -3346,26 +3355,49 @@ def selected_validation_evidence(
 
 
 def research_validation_details(
-    store: str | Path, round_id: str, evaluation_id: str, signal_date: str
-) -> dict[str, Any]:
-    """Return research-visible Validation signals, closing positions and fills for one date."""
+    store: str | Path, round_id: str, request: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Record a question before publishing its projection from committed Validation evidence."""
+    from prajnatrade.research_direction import validation_detail_receipt
+
+    store = _store(store)
     try:
-        _, record, _, _ = _selected_validation(_store(store), round_id, evaluation_id)
+        plan, record, authorization, query = _selected_validation(
+            store, round_id, request["evaluation_id"],
+        )
     except _EvidenceProblem as error:
         raise _reject(error.code, "detail", "inspect", error.message) from error
-    if signal_date not in record["curves"]["sessions"]:
-        raise _reject(
-            "VALIDATION_DATE_OUT_OF_RANGE", "detail", "correct",
-            "Choose a trading date within this Validation evaluation.",
-        )
-    candidate = record["candidate_run"]["base"]
-    positions = next(point["holdings"] for point in candidate["positions"] if point["date"] == signal_date)
-    return {
-        "date": signal_date,
-        "signals": [signal for signal in candidate["signals"] if signal["date"] == signal_date],
-        "positions": positions,
-        "fills": [fill for fill in candidate["fills"] if fill["date"] == signal_date],
+    expected = {
+        "round_id": round_id, "record_hash": record["record_hash"], "kickoff_id": plan["kickoff_id"],
+        "scope": plan["scope"], "data_kind": plan["data_kind"],
     }
+    if any(request.get(key) != value for key, value in expected.items()):
+        raise _reject(
+            "VALIDATION_DETAIL_REQUEST_MISMATCH", "detail", "inspect",
+            "The detail question does not match its trusted Validation evidence.",
+        )
+    details = None
+    signal_date = request["date"]
+    if signal_date in record["curves"]["sessions"]:
+        candidate = record["candidate_run"]["base"]
+        details = {
+            "signals": [signal for signal in candidate["signals"] if signal["date"] == signal_date],
+            "positions": next(
+                point["holdings"] for point in candidate["positions"] if point["date"] == signal_date
+            ),
+            "fills": [fill for fill in candidate["fills"] if fill["date"] == signal_date],
+        }
+    receipt = validation_detail_receipt(
+        request, authorization["authorization_id"], query["partition_content_hash"], details,
+    )
+    path = store / "validation-details" / f"{request['detail_access_id']}.json"
+    stored = write_trusted_record_once(path, receipt)
+    if stored != receipt:
+        raise _reject(
+            "VALIDATION_DETAIL_RECEIPT_MISMATCH", "detail", "inspect",
+            "The trusted receipt for the detail question differs from the new projection.",
+        )
+    return stored, details
 
 
 def create_research_holdout_plan(
@@ -3390,7 +3422,7 @@ def create_research_holdout_plan(
             "FINGERPRINT_MISMATCH", "plan", "inspect",
             "The sealed partitions differ from those in the selected Validation plan.",
         )
-    plan = _freeze_plan(eval_store, {
+    return _freeze_plan(eval_store, {
         **body,
         "round_id": round_id,
         "kickoff_id": evidence["plan"]["kickoff_id"],
@@ -3401,8 +3433,6 @@ def create_research_holdout_plan(
             **{key: evidence[key] for key in ("record_hash", "export_hash", "partition_content_hash")},
         },
     })
-    _register_plan(project, plan)
-    return plan
 
 
 def run_research_holdout_evaluation(

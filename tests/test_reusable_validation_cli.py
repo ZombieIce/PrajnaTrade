@@ -39,13 +39,12 @@ def test_validation_replays_one_version_and_spends_budget_on_another(tmp_path):
     submissions = (
         ("a", "equal_weight", {}),
         ("b", "momentum", {"lookback": 3, "top_k": 1, "cash_if_negative": False}),
+        ("a-queued", "equal_weight", {}),
+        ("a-after-budget", "equal_weight", {}),
     )
     proposals = {}
-    for submission_id, family, parameters in submissions:
-        submit_experiment(
-            project, campaign_id, tmp_path / "experiment.json", submission_id,
-            f"Test the {family} allocation on Discovery.", family, parameters,
-        )
+
+    def preregister(submission_id, family):
         proposal = write_json(tmp_path / "proposal.json", {
             "change": f"Evaluate the {family} allocation.",
             "question": "Does this allocation meet the preregistered performance thresholds?",
@@ -58,6 +57,14 @@ def test_validation_replays_one_version_and_spends_budget_on_another(tmp_path):
             "--submission-id", submission_id, "--input", str(proposal),
         ))["proposal_id"]
 
+    for submission_id, family, parameters in submissions:
+        submit_experiment(
+            project, campaign_id, tmp_path / "experiment.json", submission_id,
+            f"Test the {family} allocation on Discovery.", family, parameters,
+        )
+        if submission_id != "a-after-budget":
+            preregister(submission_id, family)
+
     def run_version(submission_id):
         return ok(cli(
             "validation", "run", "--store", str(store), "--snapshot-store", str(sealed["store"]),
@@ -67,7 +74,15 @@ def test_validation_replays_one_version_and_spends_budget_on_another(tmp_path):
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first, replay = executor.map(run_version, ["a", "a"])
+    assert first["outcome"] == "passed"
+    assert run_version("a-queued")["evaluation_id"] == first["evaluation_id"]
     second = run_version("b")
+    preregister("a-after-budget", "equal_weight")
+    serviced = ok(cli(
+        "validation", "service", "--project", str(project), "--store", str(store),
+        "--snapshot-store", str(sealed["store"]), "--round-id", round_id,
+    ))
+    assert [item["evaluation_id"] for item in serviced["results"]] == [first["evaluation_id"]]
     status = ok(cli("validation", "status", "--store", str(store), "--round-id", round_id))
     assert first["evaluation_id"] == replay["evaluation_id"]
     assert first["evaluation_id"] != second["evaluation_id"]

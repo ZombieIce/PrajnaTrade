@@ -42,14 +42,16 @@ def _calendar(root):
     })
 
 
-def _selected_round(root, store, sealed, key, *, independent=True, protocol=None):
+def _selected_round(
+    root, store, sealed, key, *, independent=True, protocol=None, family="equal_weight", parameters=None,
+):
     from test_protected_eval_cli import create_campaign, plan_input, submit_experiment
 
     project = root / "project"
     ok(cli("project", "init", "--project", str(project)))
     campaign = create_campaign(project, sealed["store"], sealed["snapshot_id"])
     kickoff = write_json(root / "kickoff.json", {
-        "objective": "Check an equal-weight research direction.",
+        "objective": f"Check the {family} strategy design.",
         "constraints": ["Use the Campaign's fixed fees and sealed snapshot."],
         "validation_budget": 2,
         "reviewer": "Research lead",
@@ -64,12 +66,12 @@ def _selected_round(root, store, sealed, key, *, independent=True, protocol=None
     ))
     submission = submit_experiment(
         project, campaign["campaign_id"], root / "discovery.json",
-        "equal", "Equal weights preserve value in this fixture.", "equal_weight", {},
+        "selected", f"Test {family} under fixed costs in this fixture.", family, parameters or {},
     )
     proposal = write_json(root / "proposal.json", {
-        "change": "Use an equal-weight allocation.",
+        "change": f"Evaluate the {family} allocation.",
         "question": "Does the version meet the return and drawdown floors?",
-        "expected_change": "The version should match the benchmark.",
+        "expected_change": "The version should meet the fixed evaluation criteria.",
         "related_experiment_ids": [],
     })
     ok(cli(
@@ -98,8 +100,8 @@ def _selected_round(root, store, sealed, key, *, independent=True, protocol=None
     }
 
 
-def _authorize(store, sealed, selection, calendar, *, evaluation_id=None, independent=True):
-    return cli(
+def _authorization_arguments(store, sealed, selection, calendar, *, evaluation_id=None, independent=True):
+    return (
         "holdout", "authorize", "--store", str(store), "--snapshot-store", str(sealed["store"]),
         "--project", str(selection["project"]), "--round-id", selection["round_id"],
         "--validation-evaluation-id", evaluation_id or selection["evaluation_id"],
@@ -108,6 +110,10 @@ def _authorize(store, sealed, selection, calendar, *, evaluation_id=None, indepe
         "--independence-reason", "Recorded lead review of previous results.",
         "--calendar", str(calendar),
     )
+
+
+def _authorize(store, sealed, selection, calendar, **options):
+    return cli(*_authorization_arguments(store, sealed, selection, calendar, **options))
 
 
 def _run(store, sealed, selection, plan_id):
@@ -125,18 +131,26 @@ def _agent_receipt(selection):
 
 
 @pytest.mark.isolation
-def test_independent_directions_share_a_range_and_retries_release_once(tmp_path: Path) -> None:
+def test_independent_directions_share_a_range_and_retries_release_once(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
     import json
     from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timedelta
 
+    from prajnatrade import research_holdout
+    from prajnatrade.cli import main
     from test_protected_eval_cli import seal_snapshot, synthetic_snapshot
 
     sealed = seal_snapshot(tmp_path, synthetic_snapshot())
     store = tmp_path / "operator"
     calendar = _calendar(tmp_path)
     first = _selected_round(tmp_path / "first", store, sealed, "Relative Strength")
-    second = _selected_round(tmp_path / "second", store, sealed, "Volatility")
+    second = _selected_round(tmp_path / "second", store, sealed, "Relative Momentum",
+                             family="momentum", parameters={"lookback": 3, "top_k": 1})
     baseline = _agent_receipt(first)
+    research_database = first["project"] / ".prajnatrade" / "project.sqlite"
+    baseline_database = research_database.read_bytes()
 
     wrong = rejected(_authorize(
         store, sealed, first, calendar, evaluation_id=second["evaluation_id"],
@@ -149,6 +163,7 @@ def test_independent_directions_share_a_range_and_retries_release_once(tmp_path:
             lambda _: ok(_authorize(store, sealed, first, calendar)), range(2),
         ))
         assert approved["authorization"]["auth_id"] == repeated["authorization"]["auth_id"]
+        assert research_database.read_bytes() == baseline_database
         first_result, retry = list(jobs.map(
             lambda _: ok(_run(store, sealed, first, approved["plan_id"])), range(2),
         ))
@@ -157,6 +172,7 @@ def test_independent_directions_share_a_range_and_retries_release_once(tmp_path:
     assert first_result["release"]["release_id"] == retry["release"]["release_id"]
     assert {first_result["query"]["reused"], retry["query"]["reused"]} == {False, True}
     assert _agent_receipt(first) == baseline
+    assert research_database.read_bytes() == baseline_database
 
     second_approval = ok(_authorize(store, sealed, second, calendar))
     previous, = second_approval["authorization"]["prior_exposures"]
@@ -170,7 +186,11 @@ def test_independent_directions_share_a_range_and_retries_release_once(tmp_path:
     from test_shadow_cli import shadow_feed
 
     sessions = json.loads(calendar.read_text())["sessions"]
-    feed = write_json(tmp_path / "daily-feed.json", shadow_feed(sessions))
+    prior_sessions = [
+        (datetime.fromisoformat(sessions[0]).date() - timedelta(days=offset)).isoformat()
+        for offset in (3, 2, 1)
+    ]
+    feed = write_json(tmp_path / "daily-feed.json", shadow_feed(prior_sessions + sessions))
     ledger = tmp_path / "shadow-ledger"
     first_date = first_result["release"]["effective_signal_date"]
     for _ in range(2):
@@ -193,8 +213,15 @@ def test_independent_directions_share_a_range_and_retries_release_once(tmp_path:
     assert report["query_receipts"]["final_holdout"]["evaluation_id"] == first_result["evaluation_id"]
     assert report["verdict"]["all_stages_passed"] is True
 
-    renamed = _selected_round(tmp_path / "renamed", store, sealed, "relative-strength!")
-    influence = _selected_round(tmp_path / "affected", store, sealed, "Prior feedback", independent=False)
+    renamed = _selected_round(
+        tmp_path / "renamed", store, sealed, "Completely New Label",
+        family="momentum", parameters={"lookback": 5, "top_k": 2},
+    )
+    assert renamed["round_id"] != second["round_id"]
+    influence = _selected_round(
+        tmp_path / "affected", store, sealed, "Prior feedback",
+        independent=False, family="trend_filter", parameters={"lookback": 3},
+    )
     for attempted, independent, expected in (
         (renamed, True, "DIRECTION_ALREADY_EVALUATED"),
         (influence, False, "UNSEEN_HOLDOUT_REQUIRED"),
@@ -206,6 +233,22 @@ def test_independent_directions_share_a_range_and_retries_release_once(tmp_path:
         assert blocked["error"]["code"] == expected
         assert blocked["query_debited"] is False
         assert blocked["opened_protected_source"] is False
+        if attempted == renamed:
+            matching, = [item for item in blocked["prior_exposures"] if
+                         item["evaluation_id"] == second_result["evaluation_id"]]
+            assert matching["direction_id"] != blocked["direction_id"]
+            assert matching["strategy_design_hash"] == blocked["strategy_design_hash"]
+
+    class ExpiredCalendarClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromisoformat(sessions[-1]).replace(tzinfo=tz) + timedelta(days=1)
+
+    monkeypatch.setattr(research_holdout, "datetime", ExpiredCalendarClock)
+    assert main(_authorization_arguments(store, sealed, first, calendar)) == 0
+    recovered = json.loads(capsys.readouterr().out)
+    assert recovered["reused"] is True
+    assert recovered["authorization"] == approved["authorization"]
 
 
 @pytest.mark.isolation

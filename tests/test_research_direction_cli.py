@@ -129,8 +129,18 @@ def run_validation(
     ))
 
 
+def next_experiment(project: Path, source: Path, submission_id: str):
+    import json
+
+    request = json.loads(source.read_text())
+    changed = write_json(source.with_name("next.json"), {**request, "submission_id": submission_id})
+    return agent_cli("experiment", "submit", "--project", str(project), "--input", str(changed))
+
+
 @pytest.mark.isolation
 def test_validation_details_and_feedback_are_recoverable_by_question(tmp_path: Path) -> None:
+    import json
+
     project, trusted, snapshot, campaign, approved = create_round(tmp_path, kickoff_input())
     experiment = submit_experiment(
         project, campaign["campaign_id"], tmp_path / "discovery.json", "base",
@@ -157,18 +167,30 @@ def test_validation_details_and_feedback_are_recoverable_by_question(tmp_path: P
     assert ok(agent_cli(
         "validation", "details", *round_flags, *evaluation_flags, *outside_flags,
     ))["status"] == "queued"
-    ok(cli(
+    results = ok(cli(
         "validation", "service", *round_flags, "--store", str(trusted),
-        "--snapshot-store", str(snapshot["store"]),
-    ))
+        "--snapshot-store", str(tmp_path / "snapshot-not-mounted"),
+    ))["results"]
     delivered = ok(agent_cli("validation", "details", *round_flags, *evaluation_flags, *detail_flags))
     assert delivered["status"] == "completed"
     assert delivered["detail_access_id"] == requested["detail_access_id"]
     assert set(delivered["details"]) == {"signals", "positions", "fills"}
     assert delivered["question"] == question
+    provenance = delivered["provenance"]
+    assert provenance["authorization_id"] == approved["authorization_id"]
+    assert provenance["validation_record_hash"] == evaluation["record_hash"]
+    assert provenance["partition_content_hash"] == snapshot["partitions"]["validation"]["content_hash"]
+    assert len(provenance["projection_hash"]) == 64
+    assert delivered in results
+    receipt_path = trusted / "validation-details" / f"{delivered['detail_access_id']}.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["request"]["question"] == question
+    assert receipt["request"]["date"] == "2024-01-13"
+    assert receipt["provenance"] == provenance
     outside = ok(agent_cli("validation", "details", *round_flags, *evaluation_flags, *outside_flags))
     assert outside["status"] == "unavailable"
     assert "details" not in outside
+    assert outside["provenance"]["receipt_id"] != provenance["receipt_id"]
 
     revision = submit_experiment(
         project, campaign["campaign_id"], tmp_path / "revised.json", "revision",
@@ -196,7 +218,7 @@ def test_round_freezes_with_remaining_budget_after_comparison_question(tmp_path:
         "Equal weights track the baseline.", "equal_weight", {},
     )
     challenger = submit_experiment(
-        project, campaign["campaign_id"], tmp_path / "discovery.json", "b",
+        project, campaign["campaign_id"], tmp_path / "challenger.json", "b",
         "Concentrated momentum might improve return.", "momentum",
         {"lookback": 3, "top_k": 1, "cash_if_negative": False},
     )
@@ -248,6 +270,10 @@ def test_round_freezes_with_remaining_budget_after_comparison_question(tmp_path:
     assert selection["summary"]["eliminations"] == {
         challenger["experiment_id"]: "Discovery showed unstable concentration."
     }
+    discovery = tmp_path / "discovery.json"
+    rejected(next_experiment(project, discovery, "after-freeze"), "RESEARCH_ROUND_CLOSED")
+    replayed = ok(agent_cli("experiment", "submit", "--project", str(project), "--input", str(discovery)))
+    assert replayed["experiment_id"] == selected["experiment_id"]
 
 
 @pytest.mark.isolation
@@ -272,6 +298,8 @@ def test_exhaustion_without_passing_version_records_retrospective(tmp_path: Path
     assert outcome["outcome"] == "rejected"
     round_flags = ("--project", str(project), "--round-id", approved["round_id"])
     assert ok(agent_cli("direction", "status", *round_flags))["status"] == "retrospective_required"
+    discovery = tmp_path / "discovery.json"
+    rejected(next_experiment(project, discovery, "after-exhaustion"), "VALIDATION_BUDGET_EXHAUSTED")
     source = write_json(tmp_path / "retrospective.json", {
         "findings": "The fixed target was never reached within the approved Validation budget.",
         "next_step": "Ask the research lead whether to reformulate the objective.",
@@ -284,3 +312,9 @@ def test_exhaustion_without_passing_version_records_retrospective(tmp_path: Path
     assert final["retrospective"] == review
     assert review["evaluations"][0]["evaluation_id"] == outcome["evaluation_id"]
     assert "selection" not in final
+    rejected(next_experiment(project, discovery, "after-retrospective"), "RESEARCH_ROUND_CLOSED")
+    existing = ok(agent_cli(
+        "experiment", "status", "--project", str(project), "--campaign-id", campaign["campaign_id"],
+        "--submission-id", experiment["submission_id"],
+    ))
+    assert existing["experiment_id"] == experiment["experiment_id"]

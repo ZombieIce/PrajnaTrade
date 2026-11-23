@@ -907,16 +907,9 @@ def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
             result = {"status": "rejected", "proposal_id": proposal["proposal_id"], "error": error.details}
         results.append(result)
     for request in queued["details"]:
-        try:
-            rows = evaluator.research_validation_details(
-                args.store, args.round_id, request["evaluation_id"], request["date"],
-            )
-        except EvaluationRejection as error:
-            if error.details["code"] != "VALIDATION_DATE_OUT_OF_RANGE":
-                raise
-            rows = None
+        receipt, details = evaluator.research_validation_details(args.store, args.round_id, request)
         results.append(direction.publish_validation_details(
-            args.project, args.round_id, request["detail_access_id"], rows,
+            args.project, args.round_id, request["detail_access_id"], receipt, details,
         ))
     return {"schema_version": 2, "status": "completed", "round_id": args.round_id, "results": results}
 

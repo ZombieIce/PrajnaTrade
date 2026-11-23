@@ -466,9 +466,10 @@ def _normalize_request(raw: object) -> dict[str, Any]:
 
 
 @contextmanager
-def _campaign_lock(
+def campaign_execution_lock(
     project: Path, campaign_id: str, *, blocking: bool = True
 ) -> Generator[None, None, None]:
+    """Serialize a Campaign's Discovery attempts with research round transitions."""
     filename = hashlib.sha256(campaign_id.encode()).hexdigest() + ".lock"
     with (project / ".prajnatrade" / filename).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
@@ -535,8 +536,10 @@ def _find_experiment(
 def _execute_request(
     project: Path, campaign_id: str, submission_id: str, request: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    from prajnatrade.research_direction import require_discovery_work
+
     project_id = project_status(project)["project_id"]
-    with _campaign_lock(project, campaign_id), _connection(project) as connection:
+    with campaign_execution_lock(project, campaign_id), _connection(project) as connection:
         campaign = _campaign(connection, campaign_id)
         _settle_interrupted(connection, campaign)
         campaign = _campaign(connection, campaign_id)
@@ -547,6 +550,7 @@ def _execute_request(
             receipt = _receipt(project_id, connection, campaign, previous)
             if receipt.get("error", {}).get("code") != "EXECUTION_INTERRUPTED":
                 return receipt
+            require_discovery_work(project, connection, campaign_id)
             remaining = _budget(connection, campaign)["execution_seconds_remaining"]
             if remaining <= 0:
                 raise ProtocolError("BUDGET_EXHAUSTED", "resume", "stop", "Execution time exhausted.")
@@ -564,6 +568,7 @@ def _execute_request(
                 if previous["request_json"] != canonical:
                     raise ProtocolError("SUBMISSION_CONFLICT", "admission", "use_new_submission_id", "Submission ID already has different content.")
                 return _receipt(project_id, connection, campaign, previous)
+            require_discovery_work(project, connection, campaign_id)
             _require_container_executor(campaign, request)
             budget = _budget(connection, campaign)
             remaining = budget["execution_seconds_remaining"]
@@ -781,7 +786,7 @@ def _run_attempt(
 def experiment_status(project: Path, campaign_id: str, submission_id: str) -> dict[str, Any]:
     project_id = project_status(project)["project_id"]
     try:
-        with _campaign_lock(project, campaign_id, blocking=False), _connection(project) as connection:
+        with campaign_execution_lock(project, campaign_id, blocking=False), _connection(project) as connection:
             _settle_interrupted(connection, _campaign(connection, campaign_id))
     except BlockingIOError:
         pass

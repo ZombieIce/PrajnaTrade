@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import hashlib
 import json
@@ -153,6 +154,15 @@ def _legacy_exposures(connection: sqlite3.Connection, store: Path, scope: str) -
     return result
 
 
+def _strategy_design_hash(plan: dict[str, Any]) -> str:
+    strategy = plan["candidate"]["strategy"]
+    family = strategy["family"]
+    design = {"family": family}
+    if family == "python":
+        design["syntax"] = ast.dump(ast.parse(strategy["source"]), include_attributes=False)
+    return _hash(design)
+
+
 def _overlapping_exposures(
     connection: sqlite3.Connection, store: Path, plan: dict,
 ) -> list[dict]:
@@ -172,6 +182,10 @@ def _overlapping_exposures(
         auth = _decode_authorization(auth_row["payload"])
         if auth["auth_id"] != row["authorization_id"] or auth["direction_id"] != row["direction_id"]:
             raise _rejection("AUTHORIZATION_INTEGRITY_FAILED", "Prior Holdout identity differs from its debit.")
+        prior_plan = protected_eval.load_plan(store, row["plan_id"])
+        design_hash = _strategy_design_hash(prior_plan)
+        if auth.get("strategy_design_hash", design_hash) != design_hash:
+            raise _rejection("AUTHORIZATION_INTEGRITY_FAILED", "Prior Holdout design differs from its plan.")
         exposures.append({
             key: row[key] for key in (
                 "scope", "direction_id", "plan_id", "evaluation_id", "start_date", "end_date",
@@ -179,6 +193,7 @@ def _overlapping_exposures(
             )
         } | {
             "workflow": WORKFLOW,
+            "strategy_design_hash": design_hash,
             "design_independence": auth["design_independence"],
             "selection_independence": auth["selection_independence"],
         })
@@ -190,7 +205,11 @@ def _overlapping_exposures(
 
 
 def _eligibility(direction: dict, exposures: list[dict]) -> tuple[str, str] | None:
-    if any(item["direction_id"] == direction["direction_id"] for item in exposures):
+    if any(
+        item["direction_id"] == direction["direction_id"]
+        or item.get("strategy_design_hash") == direction["strategy_design_hash"]
+        for item in exposures
+    ):
         return "DIRECTION_ALREADY_EVALUATED", "This direction has already used an overlapping Holdout range."
     if any(item["direction_id"] is None for item in exposures):
         return "UNSEEN_HOLDOUT_REQUIRED", "An overlapping legacy Holdout has no verifiable direction declaration."
@@ -211,6 +230,7 @@ def _block(
     body = {
         "schema_version": 2, "status": "blocked", "workflow": WORKFLOW,
         "plan_id": plan["plan_id"], "direction_id": direction["direction_id"],
+        "strategy_design_hash": direction["strategy_design_hash"],
         "round_id": direction["round_id"], "scope": plan["scope"],
         "candidate_id": plan["candidate_id"], "partition": plan["partitions"][STAGE],
         "error": {"code": code, "phase": "holdout", "next_action": "use_unseen_range", "message": message},
@@ -274,11 +294,9 @@ def authorize(
     calendar = shadow_calendar.validate_calendar(calendar)
     if calendar["data_kind"] != plan["scope"]:
         raise _rejection("INVALID_CALENDAR", "The authorization calendar must match the evaluation data scope.")
-    earliest = max(plan["partitions"][STAGE]["end"], datetime.now(CN_TZ).date().isoformat())
-    if not any(session > earliest for session in calendar["sessions"]):
-        raise _rejection("INVALID_CALENDAR", "The authorization calendar needs a trading session after the Holdout and approval date.")
     direction = {
         "direction_id": selection["direction_id"],
+        "strategy_design_hash": _strategy_design_hash(plan),
         "round_id": round_id,
         "kickoff_id": selection["kickoff_id"],
         "design_independence": selection["design_independence"],
@@ -320,9 +338,15 @@ def authorize(
         ).fetchone()
         if row:
             existing = _decode_authorization(row["payload"])
-            if any(existing.get(key) != value for key, value in body.items()):
+            if any(
+                existing.get(key) != value for key, value in body.items()
+                if key != "strategy_design_hash" or key in existing
+            ):
                 raise _rejection("AUTHORIZATION_CONFLICT", "The first Holdout approval already binds different instructions.")
             return {**_authorized(existing), "reused": True}
+        earliest = max(plan["partitions"][STAGE]["end"], datetime.now(CN_TZ).date().isoformat())
+        if not any(session > earliest for session in calendar["sessions"]):
+            raise _rejection("INVALID_CALENDAR", "The authorization calendar needs a trading session after the Holdout and approval date.")
         exposures = _overlapping_exposures(connection, store, plan)
         issue = _eligibility(direction, exposures)
         if issue:
@@ -354,10 +378,14 @@ def claim(store: Path, plan: dict, authorization: dict) -> dict:
             if previous["authorization_id"] != authorization["auth_id"]:
                 raise _rejection("AUTHORIZATION_INTEGRITY_FAILED", "The debit and authorization differ.")
             return {**dict(previous), "state": "existing"}
+        design_hash = _strategy_design_hash(plan)
+        if authorization.get("strategy_design_hash", design_hash) != design_hash:
+            raise _rejection("AUTHORIZATION_INTEGRITY_FAILED", "The Holdout design differs from its authorization.")
+        direction = {**authorization, "strategy_design_hash": design_hash}
         exposures = _overlapping_exposures(connection, store, plan)
-        issue = _eligibility(authorization, exposures)
+        issue = _eligibility(direction, exposures)
         if issue:
-            return {"state": "blocked", "blocker": _block(connection, plan, authorization, issue, exposures)}
+            return {"state": "blocked", "blocker": _block(connection, plan, direction, issue, exposures)}
         partition = plan["partitions"][STAGE]
         evaluation_id, debited_at = str(uuid.uuid4()), _now()
         connection.execute(
