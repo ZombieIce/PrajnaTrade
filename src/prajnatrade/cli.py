@@ -254,6 +254,8 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_tick.add_argument("--calendar", type=Path, required=True)
     shadow_tick.add_argument("--data", type=Path, required=True)
     shadow_tick.add_argument("--corrections-store", type=Path, required=True)
+    shadow_alerts = shadow_commands.add_parser("alerts", help="show recorded Shadow Live scheduler alerts")
+    shadow_alerts.add_argument("--ledger", type=Path, required=True)
     shadow_compare = shadow_commands.add_parser(
         "compare",
         help="compare the longest common committed forward interval of selected versions",
@@ -1031,9 +1033,13 @@ def _release_command(args: argparse.Namespace) -> int:
 
 def _shadow_command(args: argparse.Namespace) -> int:
     try:
-        if args.shadow_command == "tick":
+        if args.shadow_command in {"tick", "alerts"}:
             from prajnatrade import shadow_schedule
 
+            if args.shadow_command == "alerts":
+                result = {"status": "ok", "notifications": shadow_schedule.notifications(args.ledger)}
+                print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+                return 0
             result, blocked = shadow_schedule.tick(
                 args.ledger, args.store, args.calendar, args.data,
                 corrections_store=args.corrections_store,

@@ -4,7 +4,7 @@
 
 End-to-end MVP is NOT passed: the six-scenario rule was not met (4 of 6 required scenarios verified); 2 scenario(s) are blocked: independent_validation_reports, immutable_release_forward.
 
-Manifest SHA-256: `980103de72f6272add7fc039570a32fb8c0a69bf26a8abaac86b44dea78d0168`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
+Manifest SHA-256: `c9953e7d94ea33bbb7ed7d67a2fa9d46e28ef36c9bb89d1c481e3c216c6bad37`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
 
 ## Delivery
 
@@ -82,28 +82,30 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
 ### 5. Independent protected validation and controlled reports (`independent_validation_reports`) — BLOCKED
 
 - **Scope**: data=synthetic, agent=mock, period=historical
-- **Expected**: Immutable frozen plan and candidate fingerprints, single human authorizations, debit-before-read, one quota per sealed partition, Validation and separately authorized Final Holdout passes for a real-Agent candidate on real data, and a controlled report whose allowed and rejected paths are independently reviewable.
-- **Observed**: Protected evaluation, authorization, debit, rejection and controlled-report mechanics pass only on synthetic snapshots. The #24 real Discovery snapshot exists, but no real-Agent candidate has been validated on real data, no sealed real protected partition has been opened and no real restricted report exists.
+- **Expected**: A real-Agent candidate selected under a confirmed Validation budget on one snapshot, an immutable freeze linked to the exact passing Validation record, and a direction-bound human Final Holdout authorization before the single read. A controlled report documents the frozen protocol, scope, prior exposure, authorization, debit and outcome.
+- **Observed**: Legacy #17 tests cover one debit per sealed partition. Issue #37 fixture scenarios exercise reusable Validation, the selected Validation linkage and independent directions sharing a Holdout interval under separate approvals. The real-Agent #27 observations stop at historical Discovery. The #37 policy has no observed real research round, real Final Holdout approval or reviewed real controlled report.
 - **Evidence**:
   - `synthetic_mechanism` — `tests/test_protected_eval_cli.py, tests/test_holdout_report_cli.py`: Synthetic mechanism coverage only: frozen plans, single-use authorization, debit-before-read, rejection without debit, sealed-partition isolation and controlled report rendering. This does not verify a real protected evaluation.
+  - `synthetic_mechanism` — `tests/test_reusable_validation_cli.py; tests/test_research_direction_cli.py; tests/test_issue37_holdout_cli.py`: Issue #37 synthetic mechanism. The fixtures exercise a human-confirmed budget, linked Discovery versions, per-version debit and retries, a dated detail request, feedback, early freeze, budget exhaustion, and separate human authorization tied to the exact selected Validation and Holdout plan.
 - **Blockers**:
-  - Missing: A real protected Evaluation (Validation, then separately authorized Final Holdout) for a frozen real-Agent candidate on the real snapshot, with immutable plans, authorizations, query ledger and controlled report.
-    Unblock: Freeze the candidate and evaluation plan on the real snapshot, authorize and run Validation, obtain separate Final Holdout authorization and retain the immutable trusted records and controlled reports (issues #12/#13/#14).
+  - Missing: A direction-bound real research round from real-Agent Discovery through reusable Validation, frozen selection and human-authorized real Final Holdout.
+    Unblock: Record the observed software version, confirmed direction, Campaign, snapshot, Validation budget and selected evaluation. Retain the frozen Candidate, pre-read Holdout authorization, precise interval, controlled report and independent review without re-opening the Holdout.
   - Missing: Real independently validated candidate evidence: no real candidate has passed both protected stages, so there is no real controlled report to review.
     Unblock: Run the real protected evaluation successfully and have an independent reviewer verify frozen inputs, authorization, debit-before-read, coverage gaps, baseline, cost stress, parameter neighbourhood, thresholds and the allowed/rejected paths in the controlled report (issue #13).
 
 ### 6. Immutable releases and multi-strategy Shadow Live (`immutable_release_forward`) — BLOCKED
 
 - **Scope**: data=synthetic, agent=mock, period=historical
-- **Expected**: At least two real-data independently validated, human-approved immutable release versions, explicitly enabled at pre-registered after-close signal points, tracking at least two consecutive, common, committed real forward trading days, each recorded with its after-close signal_date, whether the resulting orders were persisted before the next session's open, the next_session where those orders reached a terminal state (filled/evidenced_not_filled), and the trusted ledger_day_id/result_hash, plus controlled synthetic boundary coverage.
-- **Observed**: Release approval/fetch/lifecycle, explicit immutable human rejection, Shadow Live atomic day commits, committed-time fill eligibility, one-time dividend corrections and multi-version comparison pass on synthetic fixtures. The #24 real snapshot exists, but there is no real approved release, no real forward Shadow Live ledger and no real forward day reconciliation.
+- **Expected**: At least two real-data independently evaluated, human-approved immutable releases. Under issue #37, the pre-read Holdout authorization gives conditional approval and fixes the enablement calendar. The versions track at least two consecutive, common, committed real forward trading days with signal date, pre-open persistence evidence, next-session terminal order state, ledger day ID and result hash.
+- **Observed**: Legacy synthetic evidence covers explicit approval, lifecycle, corrections and accounting. Issue #37 fixtures cover automatic release and scheduled Shadow Live, including the failure and retry paths. There are no recorded real releases under this policy and no reconciled real forward sessions.
 - **Evidence**:
   - `synthetic_mechanism` — `tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py, tests/test_correction_delta_cli.py, tests/test_impact_cli.py`: Synthetic mechanism coverage only: immutable release identity, explicit human rejection records, lifecycle, atomic Shadow Live days, reruns, missing-price and missed-deadline boundaries, committed-time fill eligibility, corrections and common-interval comparison. Synthetic replay is not real forward evidence.
+  - `synthetic_mechanism` — `tests/test_issue37_holdout_cli.py; tests/test_shadow_schedule.py`: Versioned synthetic mechanism on issue37-research-workflow. Conditional approval precedes the fixture Holdout, a trusted pass enables the exact immutable release on its approved calendar, and a scored rejection leaves no release. Scheduled retry, missing feed and missed deadlines are reconciled in the fixture ledger. Real forward coverage remains zero days.
 - **Blockers**:
   - Missing: At least two real candidates that independently passed real protected validation and received explicit human approval as immutable release versions; no real candidate has been approved.
-    Unblock: After the real protected evaluation evidence exists, obtain explicit human approval for two distinct real candidates and register their unique immutable release IDs and pre-registered enable times (issue #14).
+    Unblock: Retain two real independently evaluated release IDs and their pre-read approvals, immutable artifacts and effective signal dates. Verify that the actual pass fulfilled each conditional approval.
   - Missing: At least two consecutive, common, committed real forward trading days in a Shadow Live ledger, including one after-close signal submitted pre-open and reconciled to the next session's terminal order state.
-    Unblock: Enable the approved releases after the pre-registered signal point, run trusted manual Shadow Live updates on at least two consecutive real sessions and reconcile the forward ledger without reusing synthetic or backtest data (issues #9/#14).
+    Unblock: Operate the trading-day job with the approved real calendar and contemporaneous feed. Reconcile at least two consecutive common committed sessions and the pre-open persistence and terminal-order evidence.
 
 ## Real-chain checklist
 
@@ -165,17 +167,17 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
 ### Blockers
 
 - **`scenario:independent_validation_reports`**
-  - Missing: A real protected Evaluation (Validation, then separately authorized Final Holdout) for a frozen real-Agent candidate on the real snapshot, with immutable plans, authorizations, query ledger and controlled report.
-  - Unblock: Freeze the candidate and evaluation plan on the real snapshot, authorize and run Validation, obtain separate Final Holdout authorization and retain the immutable trusted records and controlled reports (issues #12/#13/#14).
+  - Missing: A direction-bound real research round from real-Agent Discovery through reusable Validation, frozen selection and human-authorized real Final Holdout.
+  - Unblock: Record the observed software version, confirmed direction, Campaign, snapshot, Validation budget and selected evaluation. Retain the frozen Candidate, pre-read Holdout authorization, precise interval, controlled report and independent review without re-opening the Holdout.
 - **`scenario:independent_validation_reports`**
   - Missing: Real independently validated candidate evidence: no real candidate has passed both protected stages, so there is no real controlled report to review.
   - Unblock: Run the real protected evaluation successfully and have an independent reviewer verify frozen inputs, authorization, debit-before-read, coverage gaps, baseline, cost stress, parameter neighbourhood, thresholds and the allowed/rejected paths in the controlled report (issue #13).
 - **`scenario:immutable_release_forward`**
   - Missing: At least two real candidates that independently passed real protected validation and received explicit human approval as immutable release versions; no real candidate has been approved.
-  - Unblock: After the real protected evaluation evidence exists, obtain explicit human approval for two distinct real candidates and register their unique immutable release IDs and pre-registered enable times (issue #14).
+  - Unblock: Retain two real independently evaluated release IDs and their pre-read approvals, immutable artifacts and effective signal dates. Verify that the actual pass fulfilled each conditional approval.
 - **`scenario:immutable_release_forward`**
   - Missing: At least two consecutive, common, committed real forward trading days in a Shadow Live ledger, including one after-close signal submitted pre-open and reconciled to the next session's terminal order state.
-  - Unblock: Enable the approved releases after the pre-registered signal point, run trusted manual Shadow Live updates on at least two consecutive real sessions and reconcile the forward ledger without reusing synthetic or backtest data (issues #9/#14).
+  - Unblock: Operate the trading-day job with the approved real calendar and contemporaneous feed. Reconcile at least two consecutive common committed sessions and the pre-open persistence and terminal-order evidence.
 - **`real_chain:six_scenarios_verified`**
   - Missing: The six-scenario rule is not met: not verified for independent_validation_reports, immutable_release_forward.
   - Unblock: Provide verifiable evidence for every required scenario; a synthetic-only result marks at most its synthetic scope and never satisfies the real criterion.
@@ -200,10 +202,10 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
 
 ### Unblock conditions
 
-1. Freeze the candidate and evaluation plan on the real snapshot, authorize and run Validation, obtain separate Final Holdout authorization and retain the immutable trusted records and controlled reports (issues #12/#13/#14).
+1. Record the observed software version, confirmed direction, Campaign, snapshot, Validation budget and selected evaluation. Retain the frozen Candidate, pre-read Holdout authorization, precise interval, controlled report and independent review without re-opening the Holdout.
 2. Run the real protected evaluation successfully and have an independent reviewer verify frozen inputs, authorization, debit-before-read, coverage gaps, baseline, cost stress, parameter neighbourhood, thresholds and the allowed/rejected paths in the controlled report (issue #13).
-3. After the real protected evaluation evidence exists, obtain explicit human approval for two distinct real candidates and register their unique immutable release IDs and pre-registered enable times (issue #14).
-4. Enable the approved releases after the pre-registered signal point, run trusted manual Shadow Live updates on at least two consecutive real sessions and reconcile the forward ledger without reusing synthetic or backtest data (issues #9/#14).
+3. Retain two real independently evaluated release IDs and their pre-read approvals, immutable artifacts and effective signal dates. Verify that the actual pass fulfilled each conditional approval.
+4. Operate the trading-day job with the approved real calendar and contemporaneous feed. Reconcile at least two consecutive common committed sessions and the pre-open persistence and terminal-order evidence.
 5. Provide verifiable evidence for every required scenario; a synthetic-only result marks at most its synthetic scope and never satisfies the real criterion.
 6. Run one real-Agent campaign, freeze the candidate, pass both protected stages under separate human authorizations, approve the immutable release and commit its real forward ledger days.
 7. Obtain explicit human approval for the frozen candidate and register the unique immutable release ID bound to the same protected-stage evidence.

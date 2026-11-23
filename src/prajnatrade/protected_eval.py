@@ -1416,6 +1416,18 @@ def evaluation_status(store: str | Path, plan_id: str) -> dict[str, Any]:
     """Operator view of the frozen plan, authorizations, ledger and records."""
     eval_store = _store(store)
     plan = _load_plan(eval_store, plan_id)
+    if plan.get("workflow") == RESEARCH_HOLDOUT:
+        from prajnatrade.evaluation_report import build_evaluation_report
+
+        report = build_evaluation_report(eval_store, plan_id)
+        return {
+            "schema_version": 2, "scope": plan["scope"], "plan_id": plan_id, "plan": plan,
+            "authorizations": report["authorizations"], "queries": report["query_receipts"],
+            "stages": report["stages"], "verdict": report["verdict"],
+            "blockers": report["holdout_blockers"],
+        }
+    if plan.get("workflow") == RESEARCH_VALIDATION:
+        return {**research_validation_status(eval_store, plan["round_id"]), "plan": plan}
     authorizations = []
     for stage in STAGES:
         authorizations.extend(_authorizations(eval_store, plan_id, stage))

@@ -776,10 +776,15 @@ prajnatrade shadow tick --ledger "$LEDGER" --store "$EVAL_STORE" \
 ```
 
 The clock records blocked inputs, failures, and missed next-open deadlines in
-the ledger. Its retry uses existing day commits and records missed fills
-according to the actual order persistence time. For a real run, keep the
-approved exchange calendar, contemporaneous feed, scheduler receipts, and
-reconciled forward ledger as separate acceptance evidence.
+the ledger. Use `prajnatrade shadow alerts --ledger "$LEDGER"` to inspect
+durable alerts. Its retry reuses existing day commits and records missed fills
+according to the actual order persistence time.
+
+For real feeds, use `schema_version: 2`, `data_kind: "real"`,
+`raw_price_basis: "unadjusted"`, and timezone-aware `open_available_at` and
+`close_available_at` on the raw-bar rows. Retain the approved exchange
+calendar, contemporaneous feed, scheduler receipts, and reconciled forward
+ledger as real acceptance evidence.
 
 ### Legacy protected Validation and Final Holdout (MVP-10/MVP-11)
 
@@ -1083,7 +1088,7 @@ debit state, evaluation outcome/`scoring` and the record path.
   `research_receipt` field and in `evaluation_receipts(plan_id,
   'final_holdout')` for audit, but it is never derived from the outcome.
 
-### Immutable release and lifecycle (MVP-12, synthetic only)
+### Legacy immutable release and lifecycle (MVP-12)
 
 `prajnatrade release ...` turns an explicitly human-approved frozen candidate
 into a uniquely identified, immutable release version and lets an operator
@@ -1367,7 +1372,7 @@ ranges (its pre-registered input scope) rather than by walking snapshot
 lineage. If lineage later proves the action never entered the evaluated
 evidence, an operator records `sustained` for that revision.
 
-### Shadow Live one-day ledger (MVP-13, synthetic only)
+### Shadow Live one-day ledger and synthetic feed (MVP-13)
 
 `prajnatrade shadow update` accounts **one manually triggered synthetic trading
 day** for every tracked immutable release version, `prajnatrade shadow report`
@@ -1895,10 +1900,11 @@ that the six-scenario rule was not met. The command is operator-only:
 `prajnatrade-agent` has no `acceptance` command.
 
 **The overall #17 verdict remains blocked.** The tests and CLI scenario and
-the real five-ETF historical Discovery baseline and bounded Mock campaign are
-verified (3 of 6).
+the historical real five-ETF baseline, bounded Mock campaign and controlled
+model iteration are verified (4 of 6).
 @ZombieIce accepted the two cost scenarios and both halt-related NAV gaps.
-Scenarios 4–6 remain blocked and the real candidate-to-release chain is empty.
+The real protected evaluation and real forward scenarios remain blocked. The
+real candidate-to-release chain is empty.
 See the [acceptance report](docs/acceptance/issue-17-report.md) and the
 [signed Discovery review](docs/research/issue-24-researcher-handoff.md).
 
