@@ -20,6 +20,7 @@ SYNTHETIC_STATUSES = ("trading", "suspended", "unknown")
 REAL_STATUSES = ("trading", "partial_halt", "suspended", "unknown")
 DERIVATION_METHOD = "cash_dividend_reinvested_at_ex_date_close"
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
+DISCOVERY_PRIOR_HISTORY = "discovery_prior_history"
 
 
 def _bytes(value: object) -> bytes:
@@ -415,6 +416,19 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
     start = next(day for day in dates if day >= start)
     end = complete[-1]
     sessions = [day for day in dates if start <= day <= end]
+    prior_history = None
+    if "discovery_start" in data:
+        discovery_start = _date(data["discovery_start"])
+        if discovery_start not in sessions:
+            raise ValueError("discovery_start must be a trading session in the common range.")
+        prior_days = {day for day in sessions if day < discovery_start}
+        if prior_days:
+            prior_history = {
+                kind: [row for row in records[kind] if row["date"] in prior_days]
+                for kind in ("calendar", "derived")
+            }
+        start = discovery_start
+        sessions = [day for day in sessions if day >= start]
     if len(sessions) < 5:
         raise ValueError("At least five common trading sessions are required.")
     gaps = {
@@ -467,6 +481,15 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
         manifest["raw_price_basis"] = "unadjusted"
         manifest["evidence"] = evidence
         manifest["derivation"] = derivation
+    if prior_history:
+        calendar = prior_history["calendar"]
+        manifest[DISCOVERY_PRIOR_HISTORY] = {
+            "start": calendar[0]["date"],
+            "end": calendar[-1]["date"],
+            "sessions": len(calendar),
+            "content_hash": _hash(prior_history),
+        }
+        partitions[DISCOVERY_PRIOR_HISTORY] = prior_history
     return manifest, partitions
 
 
@@ -719,11 +742,42 @@ def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | N
     if _hash(latest) != fingerprint:
         raise ValueError("Discovery partition integrity check failed.")
     content = latest if cutoff is None else _discovery_view(base, revisions, cutoff)
+    prior = _discovery_prior_history(store, snapshot_id, metadata, cutoff)
     return {
         "schema_version": metadata["schema_version"],
         "data_kind": metadata["data_kind"],
         "snapshot_id": snapshot_id, "partition": partition,
         "content_hash": _hash(content), "data": content,
+        **({"prior_history": prior, "prior_history_hash": _hash(prior)} if prior is not None else {}),
         **({"as_of": cutoff.isoformat(), "partition_content_hash": fingerprint}
            if cutoff is not None else {}),
     }
+
+
+def _discovery_prior_history(
+    store: Path, snapshot_id: str, metadata: dict, cutoff: datetime | None,
+) -> dict | None:
+    descriptor = metadata.get(DISCOVERY_PRIOR_HISTORY)
+    if descriptor is None:
+        return None
+    founding_snapshot = lineage_ids(store, snapshot_id)[-1] if "lineage" in metadata else snapshot_id
+    payload = _read_json(store / founding_snapshot / f"{DISCOVERY_PRIOR_HISTORY}.json")
+    if _hash(payload) != descriptor["content_hash"]:
+        raise ValueError("Discovery prior history integrity check failed.")
+    local_day = cutoff.astimezone(timezone(timedelta(hours=8))).date().isoformat() if cutoff else None
+    calendar = {
+        row["date"]: row for row in payload["calendar"]
+        if local_day is None or row["date"] <= local_day
+    }
+    rows = []
+    for row in payload["derived"]:
+        session = calendar.get(row["date"])
+        if session is None or any(
+            item["available_at"] is None or item["availability_evidence"] is None
+            for item in (session, row)
+        ):
+            continue
+        availability = max((session, row), key=lambda item: _instant(item["available_at"], "available_at"))
+        if cutoff is None or _known_at(availability, cutoff):
+            rows.append({**row, "available_at": availability["available_at"]})
+    return {"sessions": list(calendar), "derived": rows}

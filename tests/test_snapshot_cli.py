@@ -86,6 +86,42 @@ def test_snapshot_manifest_fixes_common_range_and_partition_contents(tmp_path: P
     assert all(len(value) == 64 for value in manifest["content_hashes"].values())
 
 
+def test_snapshot_can_seal_authorized_history_before_discovery(tmp_path: Path) -> None:
+    payload = _fixture()
+    payload["discovery_start"] = "2024-01-04"
+    late = next(row for row in payload["derived"] if row["date"] == "2024-01-03")
+    late["available_at"] = "2024-01-04T10:00:00+08:00"
+    source = tmp_path / "history.json"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    store = tmp_path / "store"
+    sealed = _cli(tmp_path, "snapshot", "seal", "--input", str(source), "--store", str(store))
+    assert sealed.returncode == 0, sealed.stderr
+    snapshot_id = json.loads(sealed.stdout)["snapshot_id"]
+    shown = _cli(tmp_path, "snapshot", "manifest", "--store", str(store), "--id", snapshot_id)
+    manifest = json.loads(shown.stdout)
+    assert manifest["common_range"]["start"] == "2024-01-04"
+    assert manifest["discovery_prior_history"]["sessions"] == 2
+    assert [(p["name"], p["sessions"]) for p in manifest["partitions"]] == [
+        ("discovery", 4), ("validation", 1), ("final_holdout", 3),
+    ]
+    args = ("snapshot", "read", "--store", str(store), "--id", snapshot_id, "--partition", "discovery")
+    full = json.loads(_cli(tmp_path, *args).stdout)
+    before_open = json.loads(_cli(tmp_path, *args, "--as-of", "2024-01-04T09:30:00+08:00").stdout)
+    assert full["prior_history"]["sessions"] == ["2024-01-02", "2024-01-03"]
+    assert before_open["prior_history"]["sessions"] == full["prior_history"]["sessions"]
+    assert len(full["prior_history"]["derived"]) == 10
+    assert len(before_open["prior_history"]["derived"]) == 9
+    assert before_open["prior_history_hash"] != full["prior_history_hash"]
+    assert full["data"]["calendar"][0]["date"] == "2024-01-04"
+
+    history = store / snapshot_id / "discovery_prior_history.json"
+    history.chmod(0o644)
+    history.write_text("{}", encoding="utf-8")
+    rejected = _cli(tmp_path, *args)
+    assert rejected.returncode != 0
+    assert "integrity" in rejected.stderr.lower()
+
+
 def test_projects_share_discovery_and_cannot_read_sealed_partitions(tmp_path: Path) -> None:
     source = tmp_path / "synthetic.json"
     source.write_text(json.dumps(_fixture()), encoding="utf-8")

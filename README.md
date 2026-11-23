@@ -95,6 +95,12 @@ any process with the trusted operator's filesystem permissions can bypass them.
 Protect the store with a separately enforced deployment boundary before using
 untrusted agents; this ticket does not verify that boundary.
 
+Set `discovery_start` in the seal input to reserve earlier common sessions for
+indicator input. Use a trading date in the declared common range. The usual
+partition split applies from that date. Discovery reads return the earlier
+calendar and derived observations as `prior_history` with a fingerprint of the
+authorized view. With `--as-of`, values unavailable at the cutoff remain gaps.
+
 The input object has `schema_version: 1`, `data_kind: "synthetic"`,
 `derivation_rule_version`, `sources`, `symbol_coverage`, and arrays `calendar`,
 `raw_bars`, `corporate_actions`, and `derived`. `tests/test_snapshot_cli.py`
