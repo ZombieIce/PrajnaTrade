@@ -23,6 +23,9 @@ CN_TZ = timezone(timedelta(hours=8))
 _CN_TZ = CN_TZ  # backward-compatible private alias
 _TARGET_WEIGHTS = {symbol: 1.0 / len(ETF_SYMBOLS) for symbol in ETF_SYMBOLS}
 _EPSILON = 1e-12
+NEXT_OPEN_RULES = "next-open-v1"
+RETRY_INITIAL_RULES = "retry-initial-v1"
+EXECUTION_RULE_VERSIONS = (NEXT_OPEN_RULES, RETRY_INITIAL_RULES)
 
 
 def run_discovery_strategy(
@@ -36,6 +39,7 @@ def run_discovery_strategy(
     initial_cash: float = 100_000.0,
     transaction_cost_bps: float = 5.0,
     slippage_bps: float = 0.0,
+    execution_rule_version: str = NEXT_OPEN_RULES,
 ) -> dict[str, Any]:
     """Run a strategy with point-in-time signals and formal Discovery accounting."""
     return run_partition_strategy(
@@ -50,6 +54,7 @@ def run_discovery_strategy(
         initial_cash=initial_cash,
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
+        execution_rule_version=execution_rule_version,
     )
 
 
@@ -66,6 +71,7 @@ def run_partition_strategy(
     initial_cash: float = 100_000.0,
     transaction_cost_bps: float = 5.0,
     slippage_bps: float = 0.0,
+    execution_rule_version: str = NEXT_OPEN_RULES,
 ) -> dict[str, Any]:
     """Run a strategy over one sealed partition with formal accounting.
 
@@ -76,6 +82,8 @@ def run_partition_strategy(
     session's 09:30 cutoff.
     """
     _validate_parameters(initial_cash, transaction_cost_bps, slippage_bps)
+    if execution_rule_version not in EXECUTION_RULE_VERSIONS:
+        raise ValueError(f"Unknown execution rules version: {execution_rule_version!r}.")
     if signal_window_sessions <= 0:
         raise ValueError("signal_window_sessions must be positive.")
     if not isinstance(partition_name, str) or not partition_name.strip():
@@ -108,6 +116,7 @@ def run_partition_strategy(
     order_attempts: list[dict[str, Any]] = []
     valuation_gaps: list[dict[str, str]] = []
     equity_curve: list[dict[str, Any]] = []
+    invested_sessions = 0
     fees_paid = slippage_paid = 0.0
     fee_rate = transaction_cost_bps / 10_000.0
     slippage_rate = slippage_bps / 10_000.0
@@ -124,6 +133,7 @@ def run_partition_strategy(
 
         if pending is not None:
             signal, weights = pending
+            pending = None
             open_cutoff = datetime.combine(
                 datetime.fromisoformat(day).date(), time(9, 30), tzinfo=_CN_TZ
             )
@@ -152,6 +162,8 @@ def run_partition_strategy(
             if missing_opens:
                 attempt["reason"] = "missing_or_unconfirmed_open"
                 attempt["missing_symbols"] = missing_opens
+                if execution_rule_version == RETRY_INITIAL_RULES and not invested_sessions:
+                    pending = (signal, weights)
             else:
                 open_equity = cash + math.fsum(
                     shares[symbol] * float(open_prices.get(symbol) or 0.0)
@@ -181,8 +193,8 @@ def run_partition_strategy(
                 fees_paid += costs["fees"]
                 slippage_paid += costs["slippage"]
             order_attempts.append(attempt)
-            pending = None
 
+        invested_sessions += any(quantity > _EPSILON for quantity in shares.values())
         nav_point, gaps = _valuation(
             day, raw_bars, shares, cash, receivables, unresolved_actions, data_kind=data_kind,
         )
@@ -270,6 +282,7 @@ def run_partition_strategy(
         "order_attempts": order_attempts,
         "fills": fills,
         "equity_curve": equity_curve,
+        "position_evidence": _position_evidence(signals, fills, invested_sessions),
         "metrics": metrics,
         "gaps": {
             "raw_bars": _data_gaps(sessions, raw_bars, "raw_bars", data_kind=data_kind),
@@ -278,6 +291,31 @@ def run_partition_strategy(
             ),
             "valuation": valuation_gaps,
         },
+    }
+
+
+def _position_evidence(
+    signals: list[dict[str, Any]], fills: list[dict[str, Any]], invested_sessions: int,
+) -> dict[str, Any]:
+    positive = [
+        signal for signal in signals
+        if any(signal["target_weights"][symbol] > _EPSILON for symbol in ETF_SYMBOLS)
+    ]
+    if invested_sessions:
+        state = "initial_position_established"
+    elif positive:
+        state = "initial_position_not_established"
+    elif signals:
+        state = "intentional_cash"
+    else:
+        state = "no_position_signal"
+    return {
+        "state": state,
+        "positive_target_signals": len(positive),
+        "cash_target_signals": len(signals) - len(positive),
+        "invested_sessions": invested_sessions,
+        "first_position_signal_date": positive[0]["date"] if positive else None,
+        "first_fill_date": fills[0]["date"] if fills else None,
     }
 
 
@@ -340,6 +378,7 @@ def run_discovery_equal_weight(
     initial_cash: float,
     transaction_cost_bps: float,
     slippage_bps: float,
+    execution_rule_version: str = NEXT_OPEN_RULES,
 ) -> dict[str, Any]:
     """Run the fixed equal-weight buy-and-hold comparator."""
     submitted = False
@@ -362,6 +401,7 @@ def run_discovery_equal_weight(
         initial_cash=initial_cash,
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
+        execution_rule_version=execution_rule_version,
     )
 
 

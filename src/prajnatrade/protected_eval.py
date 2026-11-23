@@ -50,6 +50,7 @@ from prajnatrade.experiment import (
 from prajnatrade.isolation import IsolationError, probe_isolation_evidence
 from prajnatrade.snapshot_baseline import (
     CN_TZ,
+    NEXT_OPEN_RULES,
     available_by,
     run_partition_strategy,
 )
@@ -749,7 +750,9 @@ def _build_plan(
     family = candidate["strategy"]["family"]
     neighbourhood = _neighbourhood(candidate)
     executor_config = evaluation.get("strategy_executor", {"kind": "none"})
-    if evaluation.get("runtime") != runtime_identity(executor_config):
+    if evaluation.get("runtime") != runtime_identity(
+        executor_config, execution_rules=evaluation["execution_rules"],
+    ):
         raise _invalid("The candidate's frozen runtime is unavailable for protected evaluation.")
     if family == "python":
         executor_from_config(executor_config)
@@ -1852,6 +1855,7 @@ def _equal_weight_run(
         initial_cash=plan["initial_cash"],
         transaction_cost_bps=costs["transaction_cost_bps"],
         slippage_bps=costs["slippage_bps"],
+        execution_rule_version=plan["execution_rules"].get("version", NEXT_OPEN_RULES),
     )
 
 
@@ -1896,6 +1900,7 @@ def _candidate_run(
         initial_cash=plan["initial_cash"],
         transaction_cost_bps=costs["transaction_cost_bps"],
         slippage_bps=costs["slippage_bps"],
+        execution_rule_version=plan["execution_rules"].get("version", NEXT_OPEN_RULES),
     )
 
 
@@ -2928,7 +2933,7 @@ def run_evaluation(
         )
     evaluation = candidate["evaluation"]
     executor_config = evaluation.get("strategy_executor", {"kind": "none"})
-    runtime = runtime_identity(executor_config)
+    runtime = runtime_identity(executor_config, execution_rules=evaluation["execution_rules"])
     if plan.get("runtime") != runtime or evaluation.get("runtime") != runtime:
         reject(
             "FINGERPRINT_MISMATCH",
@@ -3268,7 +3273,9 @@ def _research_run_context(
     snapshot_store: Path, plan: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any], ContainerStrategyExecutor | None]:
     evaluation = plan["candidate"]["evaluation"]
-    runtime = runtime_identity(evaluation.get("strategy_executor"))
+    runtime = runtime_identity(
+        evaluation.get("strategy_executor"), execution_rules=evaluation["execution_rules"],
+    )
     if runtime != plan["runtime"] or runtime != evaluation["runtime"]:
         raise _reject(
             "FINGERPRINT_MISMATCH", "run", "inspect",
