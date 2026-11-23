@@ -50,6 +50,10 @@ def test_kickoff_identity_survives_rename_and_campaign_change(tmp_path: Path) ->
         ))
 
     approved = kickoff(first, " Defensive Allocation ", "Original display name")
+    assert approved["validation_settings"]["scoring_prerequisites"] == {
+        "candidate": {"require_initial_position": False},
+        "baseline": {"require_initial_position": True},
+    }
     assert kickoff(first, "Defensive-allocation", "Original display name") == approved
     renamed = kickoff(second, "defensive_allocation", "Updated display name")
     assert renamed["direction_id"] == approved["direction_id"]
@@ -62,6 +66,33 @@ def test_kickoff_identity_survives_rename_and_campaign_change(tmp_path: Path) ->
     ))
     assert status["kickoff"] == approved
     assert status["status"] == "open"
+    assert status["budget"] == {"limit": 3, "used": 0, "remaining": 3}
+
+
+def test_kickoff_freezes_each_side_scoring_prerequisite(tmp_path: Path) -> None:
+    policy = kickoff_input()
+    prerequisites = {
+        "candidate": {"require_initial_position": False},
+        "baseline": {"require_initial_position": True},
+    }
+    policy["validation_settings"]["scoring_prerequisites"] = prerequisites
+    project, trusted, _, campaign, approved = create_round(tmp_path, policy)
+    assert approved["validation_settings"]["scoring_prerequisites"] == prerequisites
+
+    prerequisites["baseline"]["require_initial_position"] = False
+    changed = write_json(tmp_path / "kickoff.json", policy)
+    result = cli(
+        "direction", "kickoff", "--project", str(project), "--store", str(trusted),
+        "--campaign-id", campaign["campaign_id"], "--direction-key", "defensive allocation",
+        "--name", "Defensive allocation", "--input", str(changed),
+        "--authorization-id", campaign["campaign_id"],
+    )
+    assert result.returncode != 0
+    assert "already has an approved research kickoff" in result.stdout + result.stderr
+    status = ok(agent_cli(
+        "direction", "status", "--project", str(project), "--round-id", approved["round_id"],
+    ))
+    assert status["kickoff"] == approved
     assert status["budget"] == {"limit": 3, "used": 0, "remaining": 3}
 
 
@@ -174,7 +205,12 @@ def test_validation_details_and_feedback_are_recoverable_by_question(tmp_path: P
     delivered = ok(agent_cli("validation", "details", *round_flags, *evaluation_flags, *detail_flags))
     assert delivered["status"] == "completed"
     assert delivered["detail_access_id"] == requested["detail_access_id"]
-    assert set(delivered["details"]) == {"signals", "positions", "fills"}
+    details = delivered["details"]
+    assert set(details) == {
+        "signals", "positions", "fills", "cash", "unfilled_attempts", "position_evidence", "baseline",
+    }
+    assert details["cash"] == details["baseline"]["cash"] == 100_000
+    assert details["position_evidence"] == {"first_position_signal_date": "2024-01-13"}
     assert delivered["question"] == question
     provenance = delivered["provenance"]
     assert provenance["authorization_id"] == approved["authorization_id"]

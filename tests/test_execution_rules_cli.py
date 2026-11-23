@@ -103,3 +103,6 @@ def test_discovery_and_validation_match_the_same_retried_target(tmp_path):
     assert len(discovery_run["fills"]) == len(details["fills"]) == 5
     assert all(fill["date"] == "2024-01-18" and fill["raw_open"] == 12 for fill in details["fills"])
     assert [{**fill, "date": "2024-01-03"} for fill in details["fills"]] == discovery_run["fills"]
+    assert details["cash"] == discovery_run["equity_curve"][2]["cash"]
+    assert details["baseline"]["cash"] == details["cash"]
+    assert details["position_evidence"] == {"first_fill_date": "2024-01-18"}

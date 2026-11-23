@@ -85,12 +85,16 @@ BENCHMARK_THRESHOLD_METRICS = {"total_return", "sharpe", "max_drawdown"}
 REASON_THRESHOLD = "THRESHOLD_NOT_MET"
 REASON_COVERAGE = "COVERAGE_INSUFFICIENT"
 REASON_EVIDENCE = "EVIDENCE_INCOMPLETE"
+REASON_SCORING_PREREQUISITES = "SCORING_PREREQUISITES_NOT_MET"
+REASON_BENCHMARK_METRIC = "BENCHMARK_METRIC_UNAVAILABLE"
 EVIDENCED_OPEN_HALT_POLICY = "evidenced_open_halt_v1"
 COARSE_MESSAGES = {
     REASON_THRESHOLD: "At least one preregistered hard threshold was not met.",
     REASON_COVERAGE: "Required coverage or minimum samples were incomplete.",
     REASON_EVIDENCE: "Required evidence was unavailable or incomplete.",
+    REASON_SCORING_PREREQUISITES: "The preregistered scoring prerequisites were not met.",
 }
+SCORING_PARTICIPANTS = ("candidate", "baseline")
 
 PLAN_INPUT_FIELDS = frozenset({
     "schema_version",
@@ -304,6 +308,7 @@ def _record_matches(record: dict[str, Any], plan: dict[str, Any], stage: str) ->
         and partitions.get(HOLDOUT_STAGE)
         == plan["partitions"][HOLDOUT_STAGE]["content_hash"]
         and record.get("schema_version") == plan.get("schema_version")
+        and record.get("scoring_prerequisites") == plan.get("scoring_prerequisites")
     )
 
 
@@ -517,7 +522,10 @@ def _plan_input(
 ) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise _invalid("Plan input must be a JSON object.")
-    unknown = sorted(set(raw) - PLAN_INPUT_FIELDS - {"allow_discovery_halt_warmup"})
+    optional = {"allow_discovery_halt_warmup"}
+    if research_round:
+        optional.add("scoring_prerequisites")
+    unknown = sorted(set(raw) - PLAN_INPUT_FIELDS - optional)
     if unknown:
         raise _invalid(
             "Plan input cannot restate bound fields or add unknown fields: "
@@ -535,6 +543,16 @@ def _plan_input(
     allow_discovery_halt_warmup = raw.get("allow_discovery_halt_warmup", False)
     if type(allow_discovery_halt_warmup) is not bool:
         raise _invalid("allow_discovery_halt_warmup must be a boolean.")
+    scoring_prerequisites = {}
+    if "scoring_prerequisites" in raw:
+        scoring_prerequisites = _exact_object(
+            raw["scoring_prerequisites"], set(SCORING_PARTICIPANTS), "scoring_prerequisites",
+        )
+        for name, value in scoring_prerequisites.items():
+            field = f"scoring_prerequisites.{name}"
+            prerequisite = _exact_object(value, {"require_initial_position"}, field)
+            if type(prerequisite["require_initial_position"]) is not bool:
+                raise _invalid(f"{field}.require_initial_position must be a boolean.")
 
     minimum = _exact_object(
         raw["minimum_samples"], {"sessions", "valued_sessions"}, "minimum_samples"
@@ -631,6 +649,7 @@ def _plan_input(
         "stages": list(STAGES),
         "reason": reason,
         **({"allow_discovery_halt_warmup": True} if allow_discovery_halt_warmup else {}),
+        **({"scoring_prerequisites": scoring_prerequisites} if scoring_prerequisites else {}),
     }
 
 
@@ -643,7 +662,13 @@ def _base_costs(evaluation: dict[str, Any]) -> dict[str, float]:
 
 def normalize_validation_protocol(raw: object, campaign_evaluation: dict[str, Any]) -> dict[str, Any]:
     """Verify and normalize the frozen comparison protocol before kickoff."""
-    return _plan_input(raw, _base_costs(campaign_evaluation), research_round=True)
+    protocol = _plan_input(raw, _base_costs(campaign_evaluation), research_round=True)
+    if "version" in campaign_evaluation["execution_rules"]:
+        protocol.setdefault("scoring_prerequisites", {
+            "candidate": {"require_initial_position": False},
+            "baseline": {"require_initial_position": True},
+        })
+    return protocol
 
 
 def _read_plan_input(source: Path) -> object:
@@ -795,6 +820,10 @@ def _build_plan(
         },
         "thresholds": payload["thresholds"],
         "minimum_samples": payload["minimum_samples"],
+        **(
+            {"scoring_prerequisites": payload["scoring_prerequisites"]}
+            if "scoring_prerequisites" in payload else {}
+        ),
         "regimes": payload["regimes"],
         "neighborhood": neighbourhood,
         "reason": payload["reason"],
@@ -1904,20 +1933,24 @@ def _candidate_run(
     )
 
 
-def _run_summary(run: dict[str, Any], *, research: bool = False) -> dict[str, Any]:
+def _run_summary(
+    run: dict[str, Any], *, research: bool = False, position_evidence: bool = False,
+) -> dict[str, Any]:
     return {
         "metrics": run["metrics"],
+        **({"position_evidence": run["position_evidence"]} if position_evidence else {}),
         **({
             "positions": [
                 {
                     "date": point["date"],
+                    **({"cash": point["cash"]} if position_evidence else {}),
                     "holdings": {
                         symbol: holding["quantity"] for symbol, holding in point["holdings"].items()
                     },
                 }
                 for point in run["equity_curve"]
             ],
-        } if research else {}),
+        } if research or position_evidence else {}),
         "start_date": run["start_date"],
         "end_date": run["end_date"],
         "signals": [
@@ -1999,6 +2032,55 @@ def _compare(actual: float, operator: str, expected: float) -> bool:
     if operator == ">":
         return actual > expected
     return actual < expected
+
+
+def _position_prerequisite(state: str, require_initial_position: bool) -> str | None:
+    if state == "initial_position_established":
+        return None
+    if state == "intentional_cash":
+        return "INITIAL_POSITION_REQUIRED" if require_initial_position else None
+    if state == "initial_position_not_established":
+        return "INITIAL_POSITION_NOT_ESTABLISHED"
+    return "POSITION_SIGNAL_UNAVAILABLE"
+
+
+def _scoring_evidence(
+    plan: dict[str, Any], runs: dict[str, Any], participant_coverage: dict[str, bool],
+) -> dict[str, dict]:
+    thresholds = plan["thresholds"]
+    metrics = {entry["metric"] for entry in thresholds}
+    use_stress = {
+        "candidate": bool(metrics & {"stress_total_return", "stress_return_delta"}),
+        "baseline": "stress_return_delta" in metrics,
+    }
+    result = {}
+    for name in SCORING_PARTICIPANTS:
+        state = runs["base"][name]["position_evidence"]["state"]
+        required = plan["scoring_prerequisites"][name]["require_initial_position"]
+        reason = _position_prerequisite(state, required)
+        evidence = {"position_state": state}
+        if reason is None and use_stress[name]:
+            stress_state = runs["stress"][name]["position_evidence"]["state"]
+            reason = _position_prerequisite(stress_state, required)
+            if reason is not None:
+                evidence["stress_position_state"] = stress_state
+        if reason is None and not participant_coverage[name]:
+            reason = REASON_COVERAGE
+        result[name] = {**evidence, "satisfied": reason is None, "reason": reason}
+    baseline = result["baseline"]
+    if baseline["satisfied"]:
+        comparator_metrics = {
+            item["metric"] for item in thresholds if "benchmark_multiplier" in item
+        }
+        if "return_delta" in metrics:
+            comparator_metrics.add("total_return")
+        base_metrics = runs["base"]["baseline"]["metrics"]
+        stress_metrics = runs["stress"]["baseline"]["metrics"]
+        if any(base_metrics[metric] is None for metric in comparator_metrics) or (
+            use_stress["baseline"] and stress_metrics["total_return"] is None
+        ):
+            baseline.update(satisfied=False, reason=REASON_BENCHMARK_METRIC)
+    return result
 
 
 def _evaluate_thresholds(
@@ -2358,7 +2440,7 @@ def _evaluation_record(
     stress_metrics = runs["stress"]["candidate"]["metrics"]
     baseline_base = runs["base"]["baseline"]["metrics"]
     baseline_stress = runs["stress"]["baseline"]["metrics"]
-    thresholds = _evaluate_thresholds(plan, runs["base"], runs["stress"])
+    prerequisites = plan.get("scoring_prerequisites")
     minimum = plan["minimum_samples"]
     samples_sufficient = (
         base_metrics["sessions"] >= minimum["sessions"]
@@ -2379,34 +2461,66 @@ def _evaluation_record(
     baseline_runner = runs["base"]["baseline"]
     warmup_policy = plan["prior_history"][stage].get("halt_warmup")
     warmup_sessions = []
-    signal_coverage_complete = not runner["signal_gaps"]
+    candidate_signal_coverage = not runner["signal_gaps"]
+    baseline_warmup_coverage = True
     if warmup_policy:
         # A research round has a fixed one-session baseline regardless of candidate lookback.
         shared_window = plan["baseline"]["same_signal_window"]
         participants = [run for scenario in runs.values() for name, run in scenario.items()
                         if name == "candidate" or shared_window]
         warmup_sessions = _observed_warmup_sessions(participants, warmup_policy, plan["initial_cash"])
-        signal_coverage_complete = bool(warmup_sessions) and all(
+        candidate_signal_coverage = bool(warmup_sessions) and all(
             len(run["signal_gaps"]) == len(warmup_sessions) for run in participants
         )
         if not shared_window:
-            signal_coverage_complete &= all(not scenario["baseline"]["signal_gaps"] for scenario in runs.values())
-    coverage_complete = (
+            baseline_warmup_coverage = all(
+                not scenario["baseline"]["signal_gaps"] for scenario in runs.values()
+            )
+    candidate_coverage = (
         samples_sufficient
         and valuation_complete
         and bool(runner["signals"])
-        and bool(baseline_runner["signals"])
-        and signal_coverage_complete
+        and candidate_signal_coverage
         and not runner["gaps"]["valuation"]
         and not blocking_snapshot_gap
     )
+    coverage_complete = (
+        candidate_coverage and bool(baseline_runner["signals"]) and baseline_warmup_coverage
+    )
+    scoring_evidence = None
+    if prerequisites and stage == VALIDATION_STAGE:
+        baseline_coverage = (
+            baseline_base["sessions"] >= minimum["sessions"]
+            and baseline_base["valued_sessions"] >= minimum["valued_sessions"]
+            and baseline_base["valued_sessions"] == baseline_base["sessions"]
+            and bool(baseline_runner["signals"])
+            and not baseline_runner["signal_gaps"]
+            and baseline_warmup_coverage
+            and not baseline_runner["gaps"]["valuation"]
+            and not blocking_snapshot_gap
+        )
+        coverage_complete = candidate_coverage and baseline_coverage
+        scoring_evidence = _scoring_evidence(plan, runs, {
+            "candidate": candidate_coverage,
+            "baseline": baseline_coverage,
+        })
+    evidence_failures = {
+        evidence["reason"] for evidence in (scoring_evidence or {}).values()
+        if not evidence["satisfied"]
+    }
+    thresholds = (
+        _evaluate_thresholds(plan, runs["base"], runs["stress"])
+        if not evidence_failures else []
+    )
     failed = [item["id"] for item in thresholds if item["status"] == "failed"]
     unavailable = [item["id"] for item in thresholds if item["status"] == "unavailable"]
-    if failed:
+    if evidence_failures - {REASON_COVERAGE, REASON_BENCHMARK_METRIC}:
+        outcome, reason = "insufficient_evidence", REASON_SCORING_PREREQUISITES
+    elif failed:
         outcome, reason = "rejected", REASON_THRESHOLD
     elif not coverage_complete:
         outcome, reason = "insufficient_evidence", REASON_COVERAGE
-    elif unavailable:
+    elif unavailable or REASON_BENCHMARK_METRIC in evidence_failures:
         outcome, reason = "insufficient_evidence", REASON_EVIDENCE
     else:
         outcome, reason = "passed", None
@@ -2510,6 +2624,8 @@ def _evaluation_record(
             },
         },
         "baseline": plan["baseline"],
+        **({"scoring_prerequisites": prerequisites} if prerequisites is not None else {}),
+        **({"scoring_evidence": scoring_evidence} if scoring_evidence is not None else {}),
         "cost_stress": {
             "base": {
                 "candidate": base_metrics,
@@ -2543,11 +2659,13 @@ def _evaluation_record(
             },
         },
         "candidate_run": {
-            "base": _run_summary(runs["base"]["candidate"], research=research),
+            "base": _run_summary(
+                runner, research=research, position_evidence=scoring_evidence is not None,
+            ),
             "stress": _run_summary(runs["stress"]["candidate"]),
         },
         "baseline_run": {
-            "base": _run_summary(runs["base"]["baseline"]),
+            "base": _run_summary(baseline_runner, position_evidence=scoring_evidence is not None),
             "stress": _run_summary(runs["stress"]["baseline"]),
         },
         "thresholds": thresholds,
@@ -2681,6 +2799,10 @@ def _aborted_record(
             "stress_costs": plan["stress_costs"],
         },
         "baseline": plan["baseline"],
+        **(
+            {"scoring_prerequisites": plan["scoring_prerequisites"]}
+            if "scoring_prerequisites" in plan else {}
+        ),
         "thresholds": [],
         "minimum_samples": plan["minimum_samples"],
         "verdict": {
@@ -3164,6 +3286,8 @@ def _research_record(
         or plan.get("workflow") != RESEARCH_VALIDATION
         or plan.get("round_id") != kickoff["round_id"]
         or plan.get("kickoff_id") != kickoff["kickoff_id"]
+        or plan.get("scoring_prerequisites") != kickoff["validation_settings"].get("scoring_prerequisites")
+        or plan.get("execution_rules") != kickoff["evaluation"]["execution_rules"]
         or plan.get("strategy_fingerprint") != row["strategy_fingerprint"]
         or plan.get("proposal", {}).get("proposal_id") != row["proposal_id"]
         or candidate.get("submission_id") != row["submission_id"]
@@ -3184,6 +3308,8 @@ def _research_record(
 def _research_validation_receipt(
     row: dict[str, Any], kickoff: dict[str, Any], used: int, record: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    prerequisites = kickoff["validation_settings"].get("scoring_prerequisites")
+    rules = kickoff["evaluation"]["execution_rules"]
     if record and record.get("scoring"):
         base = record["cost_stress"]["base"]
         metrics = {
@@ -3217,6 +3343,12 @@ def _research_validation_receipt(
         "outcome": record["outcome"] if record else None,
         "reason": record["reason"] if record else None,
         "metrics": metrics,
+        **({"execution_rules": rules} if "version" in rules or prerequisites is not None else {}),
+        **({"scoring_prerequisites": prerequisites} if prerequisites is not None else {}),
+        **(
+            {"scoring_evidence": record["scoring_evidence"]}
+            if record and "scoring_evidence" in record else {}
+        ),
         "budget": _round_budget(kickoff, used),
     }
 
@@ -3233,6 +3365,48 @@ def _reusable_validation_receipt(
     return _research_validation_receipt(row, kickoff, used, record)
 
 
+def _validation_benchmark_scope(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "partition": plan["partitions"][VALIDATION_STAGE],
+        "baseline": plan["baseline"],
+        "execution_rules": plan["execution_rules"],
+        "scoring_prerequisite": plan.get("scoring_prerequisites", {}).get("baseline"),
+    }
+
+
+def _validation_benchmark_failures(
+    store: Path, kickoff: dict[str, Any], rows: list[dict[str, Any]],
+    *, plan: dict[str, Any] | None = None,
+) -> Generator[dict[str, Any], None, None]:
+    if "scoring_prerequisites" not in kickoff["validation_settings"]:
+        return
+    scope = _validation_benchmark_scope(plan) if plan is not None else None
+    for row in rows:
+        if row["status"] == "aborted" or (
+            scope is not None and row["partition_content_hash"] != scope["partition"]["content_hash"]
+        ):
+            continue
+        # A process can write the record and stop before updating its debit row.
+        if row["status"] == "reading" and not (
+            store / "records" / row["evaluation_id"] / "record.json"
+        ).is_file():
+            continue
+        try:
+            recorded_plan, record, _ = _research_record(store, row, kickoff)
+        except _EvidenceProblem as error:
+            phase = "run" if plan is not None else "status"
+            raise _reject(error.code, phase, "inspect", error.message) from error
+        evidence = record.get("scoring_evidence", {}).get("baseline", {})
+        if evidence.get("satisfied") is False:
+            recorded_scope = _validation_benchmark_scope(recorded_plan)
+            if scope is None or recorded_scope == scope:
+                yield {
+                    **recorded_scope,
+                    "evaluation_id": row["evaluation_id"],
+                    "reason": evidence["reason"],
+                }
+
+
 def research_validation_status(
     store: str | Path, round_id: str, evaluation_id: str | None = None
 ) -> dict[str, Any]:
@@ -3247,14 +3421,16 @@ def research_validation_status(
         if row is None:
             raise _reject("VALIDATION_NOT_FOUND", "status", "check_id", "Unknown Validation evaluation.")
         return _reusable_validation_receipt(store, row, kickoff, len(rows))
+    failures = list(_validation_benchmark_failures(store, kickoff, rows))
     return {
         "schema_version": RESEARCH_SCHEMA_VERSION,
         "round_id": round_id,
-        "status": "available",
+        "status": "paused" if failures else "available",
         "budget": _round_budget(kickoff, len(rows)),
         "evaluations": [
             _reusable_validation_receipt(store, row, kickoff, len(rows)) for row in rows
         ],
+        **({"benchmark_failures": failures} if failures else {}),
     }
 
 
@@ -3486,6 +3662,23 @@ def run_research_validation(
             kickoff["project_id"], subject, metadata, kickoff["validation_settings"],
             snapshot_store=snapshot_store, workflow=RESEARCH_VALIDATION,
         )
+        benchmark_failure = next(
+            _validation_benchmark_failures(eval_store, kickoff, rows, plan=body), None,
+        )
+        if benchmark_failure is not None:
+            return {
+                "schema_version": RESEARCH_SCHEMA_VERSION,
+                "stage": VALIDATION_STAGE,
+                "round_id": round_id,
+                "proposal_id": proposal_id,
+                "submission_id": submission_id,
+                "status": "paused",
+                "reason": "COMMON_BENCHMARK_FAILED",
+                "benchmark_failure": benchmark_failure,
+                "query_debited": False,
+                "opened_protected_source": False,
+                "budget": _round_budget(kickoff, len(rows)),
+            }
         plan = _freeze_plan(eval_store, {
             **body,
             "round_id": round_id,
@@ -3566,6 +3759,27 @@ def selected_validation_evidence(
         raise _reject(error.code, "selection", "inspect", error.message) from error
 
 
+def _validation_run_details(run: dict[str, Any], day: str) -> dict[str, Any]:
+    position = next(point for point in run["positions"] if point["date"] == day)
+    details = {
+        "signals": [signal for signal in run["signals"] if signal["date"] == day],
+        "positions": position["holdings"],
+        "fills": [fill for fill in run["fills"] if fill["date"] == day],
+    }
+    if "position_evidence" in run:
+        details.update(
+            cash=position["cash"],
+            unfilled_attempts=[
+                item for item in run["unfilled_attempts"] if item["date"] == day
+            ],
+            position_evidence={
+                field: day for field in ("first_position_signal_date", "first_fill_date")
+                if run["position_evidence"][field] == day
+            },
+        )
+    return details
+
+
 def research_validation_details(
     store: str | Path, round_id: str, request: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -3591,14 +3805,10 @@ def research_validation_details(
     details = None
     signal_date = request["date"]
     if signal_date in record["curves"]["sessions"]:
-        candidate = record["candidate_run"]["base"]
-        details = {
-            "signals": [signal for signal in candidate["signals"] if signal["date"] == signal_date],
-            "positions": next(
-                point["holdings"] for point in candidate["positions"] if point["date"] == signal_date
-            ),
-            "fills": [fill for fill in candidate["fills"] if fill["date"] == signal_date],
-        }
+        details = _validation_run_details(record["candidate_run"]["base"], signal_date)
+        baseline = record["baseline_run"]["base"]
+        if "position_evidence" in baseline:
+            details["baseline"] = _validation_run_details(baseline, signal_date)
     receipt = validation_detail_receipt(
         request, authorization["authorization_id"], query["partition_content_hash"], details,
     )

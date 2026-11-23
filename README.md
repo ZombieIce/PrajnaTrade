@@ -347,9 +347,9 @@ definitions. A follow-up uses a fresh `submission_id` and may include a
 Campaign settings. Submit/status/resume print versioned JSON on stdout; rejected and
 failed requests return a nonzero exit code with a stable error and next action.
 Results include only Discovery. Signals use the sealed total-return series and
-must be available before the next open; execution uses unadjusted opens with a
-single all-or-none rebalance attempt, while NAV uses unadjusted closes, cash,
-and dividend receivables. Missing required inputs produce signal gaps,
+must be available before the next open. Execution uses unadjusted opens and
+applies the Campaign's all-or-none execution rule. NAV uses unadjusted closes,
+cash, and dividend receivables. Missing required inputs produce signal gaps,
 unfilled orders, or unavailable NAV rather than substituted prices. Each
 experiment includes fills, order attempts, the NAV curve, fingerprints, and an
 equal-weight buy-and-hold comparison over the same Discovery interval and
@@ -694,6 +694,40 @@ plan input below), `independence` (an `independent` boolean and a `reason`),
 cost, slippage, initial cash, and Discovery execution budget. The Validation
 protocol fixes the comparator and scoring rules for the round.
 
+Select the sealed backtest rule when creating the Campaign. Both the candidate
+and the equal-weight benchmark use the selected rule in Discovery and
+Validation. Strategies supply target weights to the shared accounting engine.
+
+| `campaign create --execution-rules` | Initial entry | Subsequent rebalances |
+| --- | --- | --- |
+| `next-open-v1` (default) | Attempt the whole target once at the next session's open. A required unavailable open leaves it unfilled. | Attempt once at the next session's open. |
+| `retry-initial-v1` | Retry a blocked positive target at subsequent opens until the first position is established, the partition ends, or a new target replaces it. An explicit cash target cancels a pending entry. | Attempt once at the next session's open. |
+
+Campaigns created before the version flag keep the `next-open-v1` behavior.
+The selected rule is part of the Campaign evaluation fingerprint and is copied
+into the approved Research round and protected evaluation plan.
+
+To preregister separate scoring prerequisites, include this object under
+`validation_settings` in the kickoff JSON.
+
+```json
+{
+  "scoring_prerequisites": {
+    "candidate": {"require_initial_position": false},
+    "baseline": {"require_initial_position": true}
+  }
+}
+```
+
+`true` requires an established position. `false` also accepts explicit intent
+to hold cash. An unfilled positive target or the absence of a position signal
+provides insufficient evidence under either setting. A completed Validation
+keeps the calculated metrics, but reports `insufficient_evidence` when either
+side fails its preregistered requirement. Once both sides qualify, the existing
+sample and financial thresholds apply. When the object is omitted, a versioned
+Campaign uses the defaults shown above. Older rounds with an unversioned
+execution rule and no prerequisite object keep their recorded scoring rules.
+
 After a successful Discovery experiment, the research agent submits a
 Validation proposal. Its JSON records `change`, `question`, `expected_change`,
 and `related_experiment_ids`. Once a version meets the thresholds, any new
@@ -716,7 +750,20 @@ operator can also run one exact proposal with `validation run --project
 debits once in the trusted ledger before the sealed read. Checking status,
 retrying the same evaluation, and querying stored details preserve the budget.
 The agent sees default summaries including net return, return relative to the
-equal-weight baseline, drawdown, turnover, and fees.
+equal-weight baseline, drawdown, turnover, and fees. With preregistered scoring
+prerequisites, the receipt also summarizes each side's position state and which
+requirement was unmet. Dated execution evidence stays in the requested
+Validation details.
+
+When a completed Validation shows that the common benchmark failed its scoring
+prerequisite, the service pauses new evaluations in that round with the same
+partition, benchmark, and execution rules. A pause (`COMMON_BENCHMARK_FAILED`)
+identifies the triggering evaluation and leaves affected proposals queued before
+they can incur a debit or open protected data. The trusted `validation status
+--store "$EVAL_STORE" --round-id "$ROUND"` lists the benchmark failure and
+remaining budget with the evaluations already debited. Existing receipts and
+detail requests stay available. A candidate's own evidence failure or financial
+rejection allows the next comparable version to proceed.
 
 ```sh
 prajnatrade-agent validation details --project "$PROJECT" --round-id "$ROUND" \

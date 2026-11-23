@@ -463,6 +463,7 @@ _RECEIPT_FIELDS = (
     "proposal_id", "submission_id", "experiment_id", "evaluation_id", "plan_id",
     "record_hash", "status", "outcome", "reason", "metrics",
 )
+_OPTIONAL_RECEIPT_FIELDS = ("execution_rules", "scoring_prerequisites", "scoring_evidence")
 
 
 def publish_validation(
@@ -486,6 +487,7 @@ def publish_validation(
         )):
             raise ValueError("Validation receipt does not bind to its original proposal.")
         safe = {field: receipt.get(field) for field in _RECEIPT_FIELDS}
+        safe.update({field: receipt[field] for field in _OPTIONAL_RECEIPT_FIELDS if field in receipt})
         safe.update({
             "direction_id": approved["direction_id"],
             "kickoff_id": approved["kickoff_id"],

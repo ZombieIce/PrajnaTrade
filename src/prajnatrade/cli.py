@@ -920,7 +920,8 @@ def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
         results.append(direction.publish_validation_details(
             args.project, args.round_id, request["detail_access_id"], receipt, details,
         ))
-    return {"schema_version": 2, "status": "completed", "round_id": args.round_id, "results": results}
+    status = "paused" if any(result["status"] == "paused" for result in results) else "completed"
+    return {"schema_version": 2, "status": status, "round_id": args.round_id, "results": results}
 
 
 def _holdout_action(args: argparse.Namespace) -> dict:
