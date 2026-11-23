@@ -1,7 +1,7 @@
 """Exercise frozen execution rules through the public research flow."""
 
 import pytest
-from cli_helpers import agent_cli, cli, ok, write_json
+from cli_helpers import agent_cli, cli, ok, validation_service, write_json
 from test_protected_eval_cli import create_campaign, seal_snapshot, submit_experiment, synthetic_snapshot
 from test_research_direction_cli import approve_round, kickoff_input, propose, run_validation
 
@@ -80,6 +80,7 @@ def test_discovery_and_validation_match_the_same_retried_target(tmp_path):
         "related_experiment_ids": [],
     }), discovery)
     validation = run_validation(project, store, sealed, proposal)
+    assert validation["scoring_evidence"]["baseline"]["satisfied"] is True
     plan = ok(cli(
         "evaluation", "status", "--store", str(store), "--plan-id", validation["plan_id"],
     ))["plan"]
@@ -93,10 +94,7 @@ def test_discovery_and_validation_match_the_same_retried_target(tmp_path):
         "--date", "2024-01-18", "--question", "What filled at the first unblocked open?",
     )
     assert ok(agent_cli("validation", "details", *detail_flags, *date_flags))["status"] == "queued"
-    ok(cli(
-        "validation", "service", "--store", str(store), "--snapshot-store", str(sealed["store"]),
-        "--project", str(project), "--round-id", kickoff["round_id"],
-    ))
+    validation_service(project, store, sealed["store"], kickoff["round_id"])
     details = ok(agent_cli("validation", "details", *detail_flags, *date_flags))["details"]
     discovery_run = discovery["discovery"]
     assert discovery_run["order_attempts"][1]["signal_date"] == "2024-01-01"

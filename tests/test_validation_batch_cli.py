@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import pytest
-from cli_helpers import cli, ok, write_json
+from cli_helpers import cli, ok, validation_service, write_json
 from test_protected_eval_cli import submit_experiment, synthetic_snapshot
 from test_research_direction_cli import create_round, kickoff_input, propose, run_validation
 
@@ -37,29 +37,25 @@ def _submit(
     return propose(project, round_id, source, experiment)
 
 
-def _service(project: Path, store: Path, snapshots: Path, round_id: str) -> dict:
-    return ok(cli(
-        "validation", "service", "--project", str(project), "--store", str(store),
-        "--snapshot-store", str(snapshots), "--round-id", round_id,
-    ))
-
-
-def test_failed_common_benchmark_pauses_batch_before_next_debit(tmp_path: Path) -> None:
+@pytest.mark.parametrize("budget", [1, 3])
+def test_failed_common_benchmark_pauses_batch_before_next_debit(tmp_path: Path, budget: int) -> None:
     snapshot = synthetic_snapshot()
-    first_validation_open = snapshot["calendar"][13]["date"]
+    validation_opens = {session["date"] for session in snapshot["calendar"][13:16]}
     for row in snapshot["raw_bars"]:
-        if row["date"] == first_validation_open:
+        if row["date"] in validation_opens and row["symbol"] == "511260":
             row.update(trading_status="suspended", open=None, high=None, low=None, close=None, volume=None)
-    project, store, sealed, campaign, approved = create_round(tmp_path, kickoff_input(), snapshot_input=snapshot)
+    policy = {**kickoff_input(), "validation_budget": budget}
+    project, store, sealed, campaign, approved = create_round(tmp_path, policy, snapshot_input=snapshot)
     round_id = approved["round_id"]
     first = _submit(tmp_path, project, campaign, round_id, "first", "equal_weight", {})
     second = _submit(tmp_path, project, campaign, round_id, "second", "momentum", {
         "lookback": 3, "top_k": 1, "cash_if_negative": False,
     })
 
-    batch = _service(project, store, sealed["store"], round_id)
+    batch = validation_service(project, store, sealed["store"], round_id)
     evaluated, paused = batch["results"]
     assert batch["status"] == "paused"
+    assert batch["scope"] == paused["scope"] == "synthetic"
     assert evaluated["proposal_id"] == first["proposal_id"]
     assert evaluated["status"] == "completed"
     assert evaluated["outcome"] == "insufficient_evidence"
@@ -79,13 +75,12 @@ def test_failed_common_benchmark_pauses_batch_before_next_debit(tmp_path: Path) 
     assert "evaluation_id" not in paused
 
     status = ok(cli("validation", "status", "--store", str(store), "--round-id", round_id))
-    assert status["budget"] == paused["budget"] == {"limit": 3, "used": 1, "remaining": 2}
+    assert status["budget"] == paused["budget"] == {"limit": budget, "used": 1, "remaining": budget - 1}
     assert status["evaluations"] == [evaluated]
     assert status["benchmark_failures"] == [paused["benchmark_failure"]]
-    payload = sealed["store"] / sealed["snapshot_id"] / "validation.json"
-    payload.rename(payload.with_suffix(".offline"))
-    assert _service(project, store, sealed["store"], round_id)["results"] == [paused]
-    assert run_validation(project, store, {"store": tmp_path / "unavailable"}, first) == evaluated
+    unavailable = tmp_path / "unavailable"
+    assert validation_service(project, store, unavailable, round_id)["results"] == [paused]
+    assert run_validation(project, store, {"store": unavailable}, first) == evaluated
 
 
 def test_candidate_only_failure_does_not_pause_the_batch(tmp_path: Path) -> None:
@@ -95,7 +90,7 @@ def test_candidate_only_failure_does_not_pause_the_batch(tmp_path: Path) -> None
         "lookback": 3, "top_k": 1, "cash_if_negative": True,
     })
     second = _submit(tmp_path, project, campaign, round_id, "second", "equal_weight", {})
-    batch = _service(project, store, sealed["store"], round_id)
+    batch = validation_service(project, store, sealed["store"], round_id)
     assert batch["status"] == "completed"
     failed, passed = batch["results"]
     assert failed["proposal_id"] == first["proposal_id"]

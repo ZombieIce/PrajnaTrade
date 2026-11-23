@@ -720,13 +720,14 @@ To preregister separate scoring prerequisites, include this object under
 ```
 
 `true` requires an established position. `false` also accepts explicit intent
-to hold cash. An unfilled positive target or the absence of a position signal
-provides insufficient evidence under either setting. A completed Validation
-keeps the calculated metrics, but reports `insufficient_evidence` when either
+to hold cash. A strategy that requests entry and never establishes a position,
+or never emits a target, provides insufficient evidence under either setting.
+A completed Validation keeps the calculated metrics and reports
+`insufficient_evidence` when either
 side fails its preregistered requirement. Once both sides qualify, the existing
-sample and financial thresholds apply. When the object is omitted, a versioned
-Campaign uses the defaults shown above. Older rounds with an unversioned
-execution rule and no prerequisite object keep their recorded scoring rules.
+sample and financial thresholds apply. A new kickoff uses the defaults shown
+above when the object is omitted. Rounds approved before this change keep
+their recorded scoring rules.
 
 After a successful Discovery experiment, the research agent submits a
 Validation proposal. Its JSON records `change`, `question`, `expected_change`,
