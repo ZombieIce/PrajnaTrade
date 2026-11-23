@@ -733,7 +733,9 @@ The selection JSON contains `selection_reason`, a `remaining_risks` list,
 an `eliminations` map keyed by experiment ID, and the agent's `independence`
 declaration. A passed version can be frozen before the budget is exhausted.
 If the budget runs out without one, use `direction retrospective` with a JSON
-`findings` and `next_step` for the lead to review.
+`findings` and `next_step` for the lead to review. If the lead wants further
+research after a freeze, open another approved round using the same direction
+key.
 
 The lead authorizes one frozen selection and reaffirms whether selection
 remained independent. The trusted authorization verifies the exact selected
@@ -1878,9 +1880,13 @@ prajnatrade acceptance report \
   --output docs/acceptance/issue-17-report.md   # or report.json
 ```
 
-The version-1 manifest has exactly `delivery`, the six required scenarios and
-`real_chain`; unknown fields are rejected so sealed diagnostics or credentials
-cannot be smuggled into the public checklist. Each scenario records status
+The manifest contains `delivery`, the six required scenarios and `real_chain`.
+Version 2 records each release's policy, direction ID, Holdout range,
+authorization ID, independence confirmation and an evidence reference. Its
+forward rows carry the corresponding release ID, signal date, next session,
+terminal order state and ledger hash. The real-chain gate checks the
+consecutive common sessions for a qualifying pair of releases. Version 1
+remains readable for historical evidence. Each scenario records status
 (`verified`, `blocked`, `failed`, `not_run`), scope (synthetic/real, Mock/real
 Agent, historical/forward), expected/observed, evidence references and
 missing/unblock blockers. A `verified` scenario needs evidence and non-empty

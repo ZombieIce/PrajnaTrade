@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+DIRECTION_SCHEMA_VERSION = 2
 REPORT_KIND = "issue_17_acceptance_report"
 REPORT_SCHEMA_VERSION = 1
 
@@ -104,6 +105,10 @@ _RELEASE_KEYS = {
     "validation_id",
     "holdout_id",
     "approved",
+}
+_DIRECTION_RELEASE_KEYS = {
+    "policy", "direction_id", "authorization_id", "holdout_start", "holdout_end",
+    "independence_confirmed", "evidence_reference",
 }
 #: A forward day must record the reconciliation the real-chain rule requires:
 #: the after-close signal date, the next session whose open executes the signal,
@@ -413,14 +418,34 @@ def _validate_candidate(value: object) -> dict[str, Any] | None:
     return result
 
 
-def _validate_releases(value: object) -> list[dict[str, Any]]:
+def _validate_release_provenance(release: dict, label: str) -> dict:
+    policy = release["policy"]
+    if policy not in ("legacy_partition", "research_holdout"):
+        raise _reject("REAL_CHAIN_INVALID", f"{label}.policy must name the recorded evaluation policy.")
+    direction_id = _text(
+        release["direction_id"], f"{label}.direction_id", required=policy == "research_holdout",
+    )
+    start = _iso_date(release["holdout_start"], f"{label}.holdout_start")
+    end = _iso_date(release["holdout_end"], f"{label}.holdout_end")
+    if end < start:
+        raise _reject("REAL_CHAIN_INVALID", f"{label} has a reversed Holdout range.")
+    return {
+        "policy": policy, "direction_id": direction_id, "holdout_start": start, "holdout_end": end,
+        "authorization_id": _text(release["authorization_id"], f"{label}.authorization_id"),
+        "independence_confirmed": _boolean(release["independence_confirmed"], f"{label}.independence_confirmed"),
+        "evidence_reference": _text(release["evidence_reference"], f"{label}.evidence_reference"),
+    }
+
+
+def _validate_releases(value: object, *, direction_policy: bool) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise _reject("REAL_CHAIN_INVALID", "real_chain.approved_releases must be a list.")
     releases: list[dict[str, Any]] = []
     seen: set[str] = set()
+    keys = _RELEASE_KEYS | _DIRECTION_RELEASE_KEYS if direction_policy else _RELEASE_KEYS
     for index, entry in enumerate(value):
         label = f"real_chain.approved_releases[{index}]"
-        release = _mapping(entry, label, allowed=_RELEASE_KEYS, required=_RELEASE_KEYS)
+        release = _mapping(entry, label, allowed=keys, required=keys)
         result = {
             "release_id": _text(
                 release["release_id"], f"{label}.release_id", required=False
@@ -434,6 +459,8 @@ def _validate_releases(value: object) -> list[dict[str, Any]]:
             ),
             "approved": _boolean(release["approved"], f"{label}.approved"),
         }
+        if direction_policy:
+            result.update(_validate_release_provenance(release, label))
         if result["release_id"] and result["release_id"] in seen:
             raise _reject(
                 "REAL_CHAIN_INVALID",
@@ -445,14 +472,16 @@ def _validate_releases(value: object) -> list[dict[str, Any]]:
     return releases
 
 
-def _validate_forward_days(value: object) -> list[dict[str, Any]]:
+def _validate_forward_days(value: object, *, direction_policy: bool) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise _reject("REAL_CHAIN_INVALID", "real_chain.forward_days must be a list.")
     days: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    ledger_ids: set[str] = set()
+    keys = _FORWARD_DAY_KEYS | {"release_id"} if direction_policy else _FORWARD_DAY_KEYS
     for index, entry in enumerate(value):
         label = f"real_chain.forward_days[{index}]"
-        day = _mapping(entry, label, allowed=_FORWARD_DAY_KEYS, required=_FORWARD_DAY_KEYS)
+        day = _mapping(entry, label, allowed=keys, required=keys)
         result = {
             "date": _iso_date(day["date"], f"{label}.date"),
             "signal_date": _iso_date(day["signal_date"], f"{label}.signal_date"),
@@ -497,27 +526,42 @@ def _validate_forward_days(value: object) -> list[dict[str, Any]]:
                 f"{label}.result_hash must be a 64-character lowercase SHA-256 "
                 "content address of the committed ledger day.",
             )
-        if result["date"] in seen:
-            raise _reject(
-                "REAL_CHAIN_INVALID",
-                f"Duplicate forward day {result['date']!r}.",
-            )
-        seen.add(result["date"])
+        if direction_policy:
+            result["release_id"] = _text(day["release_id"], f"{label}.release_id")
+            ledger_id = result["ledger_day_id"]
+            if ledger_id in ledger_ids:
+                raise _reject("REAL_CHAIN_INVALID", f"Duplicate forward ledger day ID {ledger_id!r}.")
+            ledger_ids.add(ledger_id)
+        identity = (result["date"], result.get("release_id", ""))
+        if identity in seen:
+            raise _reject("REAL_CHAIN_INVALID", f"Duplicate forward day {result['date']!r} for one release.")
+        seen.add(identity)
         days.append(result)
     return days
 
 
-def _validate_real_chain(value: object) -> dict[str, Any]:
+def _validate_real_chain(value: object, *, direction_policy: bool) -> dict[str, Any]:
     chain = _mapping(
         value,
         "real_chain",
         allowed=_REAL_CHAIN_KEYS,
         required=_REAL_CHAIN_KEYS,
     )
+    releases = _validate_releases(chain["approved_releases"], direction_policy=direction_policy)
+    forward_days = _validate_forward_days(chain["forward_days"], direction_policy=direction_policy)
+    if direction_policy:
+        by_release = {release["release_id"]: release for release in releases}
+        for day in forward_days:
+            release = by_release.get(day["release_id"])
+            if release is None or day["date"] <= release["holdout_end"]:
+                raise _reject(
+                    "REAL_CHAIN_INVALID",
+                    "Each forward day must follow its attributable approved release's Holdout interval.",
+                )
     return {
         "agent_candidate": _validate_candidate(chain["agent_candidate"]),
-        "approved_releases": _validate_releases(chain["approved_releases"]),
-        "forward_days": _validate_forward_days(chain["forward_days"]),
+        "approved_releases": releases,
+        "forward_days": forward_days,
     }
 
 
@@ -530,16 +574,15 @@ def validate_manifest(value: object) -> dict[str, Any]:
         required={"schema_version", "delivery", "scenarios", "real_chain"},
     )
     schema_version = manifest["schema_version"]
-    if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
-        raise _reject(
-            "SCHEMA_VERSION_UNSUPPORTED",
-            f"schema_version must be the integer {SCHEMA_VERSION}.",
-        )
+    if type(schema_version) is not int or schema_version not in (SCHEMA_VERSION, DIRECTION_SCHEMA_VERSION):
+        raise _reject("SCHEMA_VERSION_UNSUPPORTED", "schema_version must be the integer 1 or 2.")
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "delivery": _validate_delivery(manifest["delivery"]),
         "scenarios": _validate_scenarios(manifest["scenarios"]),
-        "real_chain": _validate_real_chain(manifest["real_chain"]),
+        "real_chain": _validate_real_chain(
+            manifest["real_chain"], direction_policy=schema_version == DIRECTION_SCHEMA_VERSION,
+        ),
     }
 
 
@@ -608,18 +651,29 @@ def _approved_releases_are_real(entry: dict[str, Any]) -> bool:
     )
 
 
-def _real_release_pair(releases: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    real = [entry for entry in releases if _approved_releases_are_real(entry)]
-    for index, first in enumerate(real):
-        for second in real[index + 1 :]:
-            if first["release_id"] == second["release_id"]:
-                continue
-            if first["validation_id"] == second["validation_id"]:
-                continue
-            if first["holdout_id"] == second["holdout_id"]:
-                continue
-            return first, second
-    return None
+def _release_pair_is_independent(first: dict, second: dict) -> bool:
+    if any(first[key] == second[key] for key in ("release_id", "validation_id", "holdout_id")):
+        return False
+    if "policy" not in first:
+        return True
+    if first["authorization_id"] == second["authorization_id"]:
+        return False
+    disjoint = first["holdout_end"] < second["holdout_start"] or second["holdout_end"] < first["holdout_start"]
+    return disjoint or (
+        first["policy"] == second["policy"] == "research_holdout"
+        and first["direction_id"] != second["direction_id"]
+        and first["independence_confirmed"]
+        and second["independence_confirmed"]
+    )
+
+
+def _real_release_pairs(releases: list[dict[str, Any]]) -> list[tuple[dict, dict]]:
+    return [
+        (first, second)
+        for index, first in enumerate(releases)
+        for second in releases[index + 1 :]
+        if _release_pair_is_independent(first, second)
+    ]
 
 
 def _forward_day_reconciled(day: dict[str, Any]) -> bool:
@@ -650,6 +704,26 @@ def _consecutive_real_forward_days(
         ):
             return first["date"], second["date"]
     return None
+
+
+def _common_forward_window(
+    days: list[dict[str, Any]], pairs: list[tuple[dict, dict]],
+) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
+    by_release: dict[str, dict[str, dict]] = {}
+    for day in days:
+        if _forward_day_reconciled(day):
+            by_release.setdefault(day["release_id"], {})[day["date"]] = day
+    for first, second in pairs:
+        first_id, second_id = first["release_id"], second["release_id"]
+        left, right = by_release.get(first_id, {}), by_release.get(second_id, {})
+        common = [
+            day for day_date, day in left.items()
+            if day_date in right and day["next_session"] == right[day_date]["next_session"]
+        ]
+        window = _consecutive_real_forward_days(common)
+        if window:
+            return window, (first_id, second_id)
+    return None, None
 
 
 def _real_chain_checklist(
@@ -741,8 +815,10 @@ def _real_chain_checklist(
         )
     )
 
-    pair = _real_release_pair(releases)
     real_releases = [entry for entry in releases if _approved_releases_are_real(entry)]
+    pairs = _real_release_pairs(real_releases)
+    pair = pairs[0] if pairs else None
+    direction_policy = manifest["schema_version"] == DIRECTION_SCHEMA_VERSION
     checklist.append(
         _checklist_item(
             "two_real_approved_releases",
@@ -757,13 +833,20 @@ def _real_chain_checklist(
             ),
             "At least two real, independently validated, human-approved immutable "
             "releases, each with its own Validation and Final Holdout evidence.",
+            "Retain two distinct real release IDs with their own authorized evaluations. "
+            "For overlapping Holdout intervals under the direction policy, retain the "
+            "distinct direction identities and independence declarations."
+            if direction_policy else
             "Independently validate and approve two distinct real candidates; "
             "each must consume its own protected intervals and be registered as a "
             "unique immutable release.",
         )
     )
 
-    window = _consecutive_real_forward_days(forward_days)
+    if direction_policy:
+        window, window_releases = _common_forward_window(forward_days, pairs)
+    else:
+        window, window_releases = _consecutive_real_forward_days(forward_days), None
     reconciled_days = [
         day for day in forward_days if _forward_day_reconciled(day)
     ]
@@ -777,7 +860,8 @@ def _real_chain_checklist(
             f"{len(forward_days)} forward day(s); "
             f"{len(reconciled_days)} reconciled (signal pre-open, terminal state "
             "recorded); consecutive real committed common "
-            + (f"window: {window[0]} → {window[1]}." if window else "window: none."),
+            + (f"window: {window[0]} → {window[1]}." if window else "window: none.")
+            + (f" Releases: {window_releases[0]} and {window_releases[1]}." if window_releases else ""),
             "At least two consecutive, common, committed real forward trading days "
             "in the trusted Shadow Live ledger with pre-open persisted orders and "
             "a recorded next-session terminal order state.",
@@ -790,7 +874,9 @@ def _real_chain_checklist(
     )
 
     qualifying_days = {
-        day["date"] for day in forward_days if _forward_day_reconciled(day)
+        day["date"] for day in forward_days
+        if _forward_day_reconciled(day)
+        and (not direction_policy or day["release_id"] == candidate_ids.get("release_id"))
     }
     candidate_days_satisfied = (
         bool(candidate_days) and all(day in qualifying_days for day in candidate_days)
@@ -928,7 +1014,10 @@ def build_report(manifest: dict[str, Any], *, manifest_sha256: str) -> dict[str,
     unblock_conditions = list(dict.fromkeys(blocker["unblock"] for blocker in blockers))
 
     return {
-        "schema_version": REPORT_SCHEMA_VERSION,
+        "schema_version": (
+            DIRECTION_SCHEMA_VERSION if manifest["schema_version"] == DIRECTION_SCHEMA_VERSION
+            else REPORT_SCHEMA_VERSION
+        ),
         "kind": REPORT_KIND,
         "manifest_sha256": manifest_sha256,
         "delivery": manifest["delivery"],
@@ -988,6 +1077,43 @@ def _md(value: object) -> str:
 def _md_or_dash(value: object) -> str:
     text = str(value)
     return text if text.strip() else "—"
+
+
+def _render_direction_evidence(chain: dict) -> list[str]:
+    lines = ["## Direction policy evidence", ""]
+    releases = chain["approved_releases"]
+    if releases:
+        lines.extend((
+            "| Release | Policy | Direction | Holdout range | Authorization | Independent | Evidence |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ))
+        for entry in releases:
+            interval = f"{entry['holdout_start']} → {entry['holdout_end']}"
+            independent = "yes" if entry["independence_confirmed"] else "no"
+            row = [
+                entry["release_id"], entry["policy"], entry["direction_id"] or "—",
+                interval, entry["authorization_id"], independent, entry["evidence_reference"],
+            ]
+            lines.append("| " + " | ".join(_md(value) for value in row) + " |")
+    else:
+        lines.append("No real release evidence recorded.")
+    lines.extend(("", "### Release-specific forward evidence", ""))
+    days = chain["forward_days"]
+    if not days:
+        lines.extend(("No real forward trading days recorded.", ""))
+        return lines
+    lines.extend((
+        "| Signal date | Release | Pre-open persistence | Next session | Terminal state | Ledger day | Result hash |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ))
+    for day in sorted(days, key=lambda row: (row["date"], row["release_id"])):
+        row = [
+            day["signal_date"], day["release_id"], "yes" if day["orders_persisted_before_open"] else "no",
+            day["next_session"], day["order_terminal_state"], day["ledger_day_id"], day["result_hash"],
+        ]
+        lines.append("| " + " | ".join(_md(value) for value in row) + " |")
+    lines.append("")
+    return lines
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -1083,6 +1209,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         if scenario["deviation"]:
             lines.append(f"- **Deviation**: {_md(scenario['deviation'])}")
     lines.append("")
+    if report["schema_version"] == DIRECTION_SCHEMA_VERSION:
+        lines.extend(_render_direction_evidence(report["real_chain"]))
     lines.append("## Real-chain checklist")
     lines.append("")
     lines.append("| Check | Result | Detail |")
@@ -1220,7 +1348,7 @@ def write_acceptance_report(
         text = json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"
     _write_text(output, text)
     return {
-        "schema_version": 1,
+        "schema_version": report["schema_version"],
         "status": "generated",
         "kind": REPORT_KIND,
         "output": str(output),

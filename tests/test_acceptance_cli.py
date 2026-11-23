@@ -733,3 +733,44 @@ def test_synthetic_scope_verified_scenarios_never_satisfy_the_real_chain(
     assert "synthetic" in checklist["real_scope_evidence"]["detail"]
     assert "NOT passed" in report["verdict"]["statement"]
     assert "real-chain gate" in report["verdict"]["statement"]
+
+
+def test_direction_policy_requires_attributable_release_and_common_days(tmp_path: Path) -> None:
+    value = _complete_real_chain_manifest()
+    value["schema_version"] = 2
+    chain = value["real_chain"]
+    original_days = chain["forward_days"]
+    chain["forward_days"] = []
+    release_ids = []
+    for index, release in enumerate(chain["approved_releases"], start=1):
+        release_id = release["release_id"]
+        release_ids.append(release_id)
+        release.update({
+            "policy": "research_holdout",
+            "direction_id": f"fixture-direction-{index}",
+            "authorization_id": f"fixture-authorization-{index}",
+            "holdout_start": "2025-01-01",
+            "holdout_end": "2025-01-04",
+            "independence_confirmed": True,
+            "evidence_reference": f"fixture-controlled-evidence-{index}",
+        })
+        chain["forward_days"].extend(
+            {**day, "release_id": release_id, "ledger_day_id": f"{release_id}-{day['date']}"}
+            for day in original_days
+        )
+
+    payload, _, output = _run_report(tmp_path, value, suffix=".md")
+    assert payload["end_to_end_passed"] is True
+    rendered = output.read_text()
+    assert "fixture-authorization-2" in rendered
+    assert "fixture-release-002-2030-01-03" in rendered
+
+    chain["forward_days"] = [day for day in chain["forward_days"] if day["release_id"] == release_ids[0]]
+    payload, _, _ = _run_report(tmp_path, value)
+    assert payload["end_to_end_passed"] is False
+
+    chain["approved_releases"][1]["direction_id"] = chain["approved_releases"][0]["direction_id"]
+    _, _, output = _run_report(tmp_path, value)
+    report = json.loads(output.read_text())
+    checklist = {item["id"]: item for item in report["real_chain_checklist"]}
+    assert checklist["two_real_approved_releases"]["satisfied"] is False
