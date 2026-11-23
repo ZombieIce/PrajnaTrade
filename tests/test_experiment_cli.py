@@ -121,6 +121,134 @@ def test_operator_creates_locked_synthetic_campaign(tmp_path: Path) -> None:
     assert campaign["budget"]["attempts_remaining"] == 2
 
 
+def test_discovery_warmup_freezes_one_scoring_start_for_versions_and_benchmark(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "strategy-a"
+    source = tmp_path / "snapshot.json"
+    snapshot_file(source, day_count=15)
+    assert cli("project", "init", "--project", str(project)).returncode == 0
+    result = cli(
+        *campaign_options(project, source, attempts=3), "--discovery-warmup-sessions", "4",
+        "--transaction-cost-bps", "0",
+    )
+    assert result.returncode == 0, result.stderr
+    campaign = json.loads(result.stdout)
+    assert campaign["history_policy"] == {
+        "schema_version": 1, "warmup_sessions": 4, "scoring_start": "2024-01-05",
+    }
+
+    for lookback in (2, 3, 4):
+        request = tmp_path / f"momentum-{lookback}.json"
+        request.write_text(json.dumps({
+            "schema_version": 1, "campaign_id": campaign["campaign_id"],
+            "submission_id": f"momentum-{lookback}",
+            "hypothesis": "Score comparable versions from the same opening account.",
+            "strategy": {"family": "momentum"},
+            "parameters": {"lookback": lookback, "cash_if_negative": False},
+        }), encoding="utf-8")
+        response = cli("experiment", "submit", "--project", str(project), "--input", str(request))
+        experiment = json.loads(response.stdout)
+        if lookback == 4:
+            assert response.returncode == 2
+            assert experiment["status"] == "failed"
+            assert experiment["error"]["code"] == "INSUFFICIENT_HISTORY"
+            continue
+        assert response.returncode == 0, response.stdout
+        assert experiment["status"] == "succeeded", experiment
+        discovery = experiment["discovery"]
+        benchmark = discovery["baseline_comparison"]["baseline"]
+        for run in (discovery, benchmark):
+            assert run["start_date"] == "2024-01-05"
+            assert run["end_date"] == "2024-01-09"
+            assert run["initial_cash"] == 100_000
+            assert run["fills"][0]["date"] == "2024-01-05"
+            assert run["equity_curve"][0]["date"] == "2024-01-05"
+            assert run["equity_curve"][0]["nav"] == 100_000
+            assert run["equity_curve"][0]["dividend_receivables"] == 0
+        assert discovery["signals"][0]["window"][-1] == "2024-01-04"
+        assert benchmark["signals"][0]["window"] == []
+
+
+def test_indicator_free_discovery_can_trade_the_first_open(tmp_path: Path) -> None:
+    project = tmp_path / "strategy-a"
+    source = tmp_path / "snapshot.json"
+    snapshot_file(source)
+    assert cli("project", "init", "--project", str(project)).returncode == 0
+    response = cli(*campaign_options(project, source), "--discovery-warmup-sessions", "0")
+    assert response.returncode == 0, response.stderr
+    campaign = json.loads(response.stdout)
+    request = tmp_path / "equal-weight.json"
+    request.write_text(json.dumps({
+        "schema_version": 1, "campaign_id": campaign["campaign_id"],
+        "submission_id": "equal-weight", "hypothesis": "Equal weights require no indicators.",
+        "strategy": {"family": "equal_weight"}, "parameters": {},
+    }), encoding="utf-8")
+    submitted = cli("experiment", "submit", "--project", str(project), "--input", str(request))
+    assert submitted.returncode == 0, submitted.stdout
+    result = json.loads(submitted.stdout)
+    assert result["strategy"]["history_requirements"] == []
+    assert result["discovery"]["fills"][0]["date"] == "2024-01-01"
+    assert result["discovery"]["baseline_comparison"]["baseline"]["fills"][0]["date"] == "2024-01-01"
+
+
+def test_discovery_freezes_canonical_requirements_with_sealed_prior_history(tmp_path: Path) -> None:
+    project = tmp_path / "strategy-a"
+    source = tmp_path / "snapshot.json"
+    source.write_text(json.dumps({
+        **sealed_snapshot_input(), "discovery_start": "2024-01-04",
+    }), encoding="utf-8")
+    assert cli("project", "init", "--project", str(project)).returncode == 0
+    created = cli(*campaign_options(project, source), "--discovery-warmup-sessions", "0")
+    assert created.returncode == 0, created.stderr
+    campaign = json.loads(created.stdout)
+    assert campaign["history_policy"]["scoring_start"] == "2024-01-04"
+    assert len(campaign["history_policy"]["prior_history_hash"]) == 64
+    (tmp_path / "strategy-a-snapshot-store").rename(tmp_path / "detached-sealed-store")
+
+    requirements = [
+        {"id": "momentum", "observations": 3, "mode": "valid_observations"},
+        {"id": "streak", "observations": 2, "mode": "consecutive_sessions"},
+    ]
+    payload = {
+        "schema_version": 1, "campaign_id": campaign["campaign_id"],
+        "submission_id": "history", "hypothesis": "Use the frozen total-return history.",
+        "strategy": {"family": "momentum", "history_requirements": requirements[::-1]},
+        "parameters": {"lookback": 2, "cash_if_negative": False},
+    }
+    request = tmp_path / "history.json"
+    submission = ("experiment", "submit", "--project", str(project), "--input", str(request))
+    request.write_text(json.dumps(payload), encoding="utf-8")
+    submitted = cli(*submission, agent=True)
+    assert submitted.returncode == 0, submitted.stdout
+    result = json.loads(submitted.stdout)
+    assert result["strategy"]["history_requirements"] == requirements
+    assert result["discovery"]["start_date"] == "2024-01-04"
+    assert result["discovery"]["signals"][0]["window"] == ["2024-01-01", "2024-01-02", "2024-01-03"]
+
+    payload["strategy"]["history_requirements"] = requirements
+    request.write_text(json.dumps(payload), encoding="utf-8")
+    replay = cli(*submission, agent=True)
+    assert replay.returncode == 0, replay.stdout
+    assert json.loads(replay.stdout)["experiment_id"] == result["experiment_id"]
+
+    frozen = cli(
+        "candidate", "freeze", "--project", str(project),
+        "--campaign-id", campaign["campaign_id"], "--submission-id", "history",
+        "--name", "momentum-a", "--conclusion", "Retain the frozen history requirements.",
+    )
+    assert frozen.returncode == 0, frozen.stderr
+    candidate = json.loads(frozen.stdout)
+    assert candidate["strategy"]["history_requirements"] == requirements
+    assert candidate["evaluation"]["history_policy"] == campaign["history_policy"]
+
+    payload["strategy"]["history_requirements"] = [requirements[1]]
+    request.write_text(json.dumps(payload), encoding="utf-8")
+    rejected = cli(*submission, agent=True)
+    assert rejected.returncode == 2
+    assert json.loads(rejected.stdout)["error"]["code"] == "INVALID_SUBMISSION"
+
+
 def test_submit_and_status_report_same_discovery_experiment(tmp_path: Path) -> None:
     project = tmp_path / "strategy-a"
     source = tmp_path / "discovery.json"

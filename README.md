@@ -355,6 +355,28 @@ experiment includes fills, order attempts, the NAV curve, fingerprints, and an
 equal-weight buy-and-hold comparison over the same Discovery interval and
 evaluation settings.
 
+Create a Campaign with `--discovery-warmup-sessions N` to freeze one scoring
+start for every strategy version and the equal-weight benchmark. The first
+`N` Discovery sessions supply indicator observations. At the next opening,
+each account starts with the same initial cash and empty holdings. `N=0` scores
+from the first Discovery opening. History-dependent strategies need sufficient
+sealed pre-Discovery observations at that opening. The Campaign receipt reports
+`history_policy.scoring_start` and the fingerprint of any sealed pre-Discovery
+history used in the Campaign.
+
+In this mode, `strategy.history_requirements` can declare each required history
+window. For example, a momentum strategy with `parameters.lookback: 20` can
+declare `{"id": "momentum", "observations": 21, "mode": "valid_observations"}`
+in that array. Each entry has a unique ID and requests a positive number of
+completed, available total-return observations across the universe.
+`valid_observations` looks back through gaps and `consecutive_sessions` requires
+the immediately preceding sessions. When the array is omitted, the Campaign
+derives the window from the strategy family and parameters. Equal weight needs
+no observations. Submitted
+requirements are canonicalized by ID and included in the strategy fingerprint
+and frozen Candidate. An experiment that cannot satisfy its declaration at the
+fixed scoring start returns `INSUFFICIENT_HISTORY`.
+
 The same Campaign/submission ID and normalized content reuse one experiment;
 changed content conflicts, and invalid or conflicting requests do not consume
 an attempt. Accepted failures do consume one. Only
