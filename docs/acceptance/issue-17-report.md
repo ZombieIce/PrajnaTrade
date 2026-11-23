@@ -4,18 +4,18 @@
 
 End-to-end MVP is NOT passed: the six-scenario rule was not met (4 of 6 required scenarios verified); 2 scenario(s) are blocked: independent_validation_reports, immutable_release_forward.
 
-Manifest SHA-256: `c9953e7d94ea33bbb7ed7d67a2fa9d46e28ef36c9bb89d1c481e3c216c6bad37`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
+Manifest SHA-256: `09eb18ef3ef4043ccb3bee92eaec337019a60c150bb481bb8315d95b7d955bda`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
 
 ## Delivery
 
 | Field | Value |
 | --- | --- |
-| version | 0.1.0 (issue #17 synthetic workflow + #24 real snapshot/baseline) |
+| version | 0.1.0 (#17 historical evidence through #27; #37 mechanism on issue37-research-workflow) |
 | branch | zombieice-issue-17-implementation |
 | tested_at | 2026-11-22T15:49:55+08:00 |
 | environment | macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. The later #24 reconciliation used a verified Discovery-only Colima container. |
 | test_command | PYTHONPATH=src python -m pytest -q |
-| test_result | 325 passed in 700.28s (0:11:40), exit 0 |
+| test_result | Historical #17 baseline at 96d4733: 325 passed (700.28s). Issue #37 focused integration at 8852b5c: 12 passed. |
 
 ## Scenario summary
 
@@ -107,6 +107,14 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
   - Missing: At least two consecutive, common, committed real forward trading days in a Shadow Live ledger, including one after-close signal submitted pre-open and reconciled to the next session's terminal order state.
     Unblock: Operate the trading-day job with the approved real calendar and contemporaneous feed. Reconcile at least two consecutive common committed sessions and the pre-open persistence and terminal-order evidence.
 
+## Direction policy evidence
+
+No real release evidence recorded.
+
+### Release-specific forward evidence
+
+No real forward trading days recorded.
+
 ## Real-chain checklist
 
 | Check | Result | Detail |
@@ -139,7 +147,7 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
 **`two_real_approved_releases`** — At least two real, independently validated, human-approved immutable releases.
 
 - Missing: At least two real, independently validated, human-approved immutable releases, each with its own Validation and Final Holdout evidence.
-- Unblock: Independently validate and approve two distinct real candidates; each must consume its own protected intervals and be registered as a unique immutable release.
+- Unblock: Retain two distinct real release IDs with their own authorized evaluations. For overlapping Holdout intervals under the direction policy, retain the distinct direction identities and independence declarations.
 
 **`real_forward_days`** — At least two consecutive, common, committed real forward trading days, each with an after-close signal persisted pre-open and reconciled to the next session's order terminal state.
 
@@ -189,7 +197,7 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
   - Unblock: Obtain explicit human approval for the frozen candidate and register the unique immutable release ID bound to the same protected-stage evidence.
 - **`real_chain:two_real_approved_releases`**
   - Missing: At least two real, independently validated, human-approved immutable releases, each with its own Validation and Final Holdout evidence.
-  - Unblock: Independently validate and approve two distinct real candidates; each must consume its own protected intervals and be registered as a unique immutable release.
+  - Unblock: Retain two distinct real release IDs with their own authorized evaluations. For overlapping Holdout intervals under the direction policy, retain the distinct direction identities and independence declarations.
 - **`real_chain:real_forward_days`**
   - Missing: At least two consecutive, common, committed real forward trading days in the trusted Shadow Live ledger with pre-open persisted orders and a recorded next-session terminal order state.
   - Unblock: Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable, then record each day's after-close signal, pre-open persisted orders, next session, order terminal state and ledger day result hash in the acceptance manifest.
@@ -209,7 +217,7 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
 5. Provide verifiable evidence for every required scenario; a synthetic-only result marks at most its synthetic scope and never satisfies the real criterion.
 6. Run one real-Agent campaign, freeze the candidate, pass both protected stages under separate human authorizations, approve the immutable release and commit its real forward ledger days.
 7. Obtain explicit human approval for the frozen candidate and register the unique immutable release ID bound to the same protected-stage evidence.
-8. Independently validate and approve two distinct real candidates; each must consume its own protected intervals and be registered as a unique immutable release.
+8. Retain two distinct real release IDs with their own authorized evaluations. For overlapping Holdout intervals under the direction policy, retain the distinct direction identities and independence declarations.
 9. Commit the same consecutive real forward sessions for the approved releases in the trusted Shadow Live ledger after a pre-registered enable, then record each day's after-close signal, pre-open persisted orders, next session, order terminal state and ledger day result hash in the acceptance manifest.
 10. Record the candidate's release ID in the trusted forward ledger and commit its real forward days.
 11. Complete scenarios 2–6 with real evidence; synthetic mechanism tests never satisfy the real-chain gate.
