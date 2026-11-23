@@ -31,9 +31,9 @@ def test_holdout_requires_an_existing_frozen_selection(tmp_path: Path) -> None:
 def _calendar(root):
     from datetime import datetime, timedelta
 
-    from prajnatrade.snapshot_baseline import CN_TZ
+    from zoneinfo import ZoneInfo
 
-    today = datetime.now(CN_TZ).date()
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     return write_json(root / "calendar.json", {
         "schema_version": 1,
         "data_kind": "synthetic",
@@ -164,6 +164,25 @@ def test_independent_directions_share_a_range_and_retries_release_once(tmp_path:
     second_result = ok(_run(store, sealed, second, second_approval["plan_id"]))
     assert second_result["outcome"] == "passed"
     assert second_result["release"]["release_id"] != first_result["release"]["release_id"]
+
+    from prajnatrade import shadow, shadow_schedule
+    from prajnatrade.shadow_calendar import session_close
+    from test_shadow_cli import shadow_feed
+
+    sessions = json.loads(calendar.read_text())["sessions"]
+    feed = write_json(tmp_path / "daily-feed.json", shadow_feed(sessions))
+    ledger = tmp_path / "shadow-ledger"
+    first_date = first_result["release"]["effective_signal_date"]
+    for _ in range(2):
+        scheduled, blocked = shadow_schedule.tick(
+            ledger, store, calendar, feed, corrections_store=sealed["store"],
+            now=session_close(first_date),
+        )
+        assert not blocked, scheduled
+    for completed in (first_result, second_result):
+        release_id = completed["release"]["release_id"]
+        committed, = shadow.iter_committed_days(ledger, release_id)
+        assert committed["date"] == first_date
 
     output = tmp_path / "controlled.json"
     ok(cli("evaluation", "report", "--store", str(store), "--plan-id", approved["plan_id"],
