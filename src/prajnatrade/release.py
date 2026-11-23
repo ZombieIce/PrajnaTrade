@@ -648,7 +648,7 @@ def _stage_authorization(
             "authorize",
             f"No {label} authorization is stored for this frozen plan.",
         )
-    if len(records) != 1 or not protected_eval._authorization_matches(
+    if len(records) != 1 or not protected_eval.authorization_matches(
         records[0], plan, stage
     ):
         raise _reject(
@@ -838,7 +838,7 @@ def _stage_evidence(
     if authorization is None:
         authorization = _stage_authorization(store, plan, stage, record)
     elif (
-        not protected_eval._authorization_matches(authorization, plan, stage)
+        not protected_eval.authorization_matches(authorization, plan, stage)
         or record.get("authorization") != authorization
         or record.get("scope") != plan.get("scope")
         or (record.get("query_receipt") or {}).get("debited_at") != row.get("debited_at")
@@ -1344,13 +1344,10 @@ def _conditional_admission(plan: dict[str, Any], holdout: dict[str, Any]) -> dic
         if not isinstance(terms, dict) or set(terms) != {"calendar"}:
             raise ValueError("The preread authorization must bind an automatic release calendar.")
         calendar = shadow_calendar.validate_calendar(terms["calendar"])
-        authorized = datetime.fromisoformat(authorization["authorized_at"])
-        debited = datetime.fromisoformat(holdout["debited_at"])
-        completed = datetime.fromisoformat(holdout["record"]["completed_at"])
-        if (
-            any(instant.utcoffset() is None for instant in (authorized, debited, completed))
-            or not authorized <= debited <= completed
-        ):
+        authorized = shadow_calendar.parse_timestamp(authorization["authorized_at"], "authorized_at")
+        debited = shadow_calendar.parse_timestamp(holdout["debited_at"], "debited_at")
+        completed = shadow_calendar.parse_timestamp(holdout["record"]["completed_at"], "completed_at")
+        if not authorized <= debited <= completed:
             raise ValueError("The authorization must precede the trusted Holdout read.")
         if calendar["data_kind"] != plan["data_kind"]:
             raise ValueError("The calendar scope must match the frozen plan.")

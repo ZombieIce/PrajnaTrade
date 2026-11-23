@@ -126,7 +126,7 @@ class _Tick:
                     )
                     continue
                 first_index = sessions.index(first)
-                self._verify_release_calendar(store, release_id, sessions, first_index)
+                self._verify_release_calendar(store, release_id, sessions, first)
                 self._record_deadlines(release_id, status["timeline"], sessions, first_index, through)
                 last = progress["last_committed_date"] if progress else None
                 if last is None or last < target:
@@ -210,17 +210,14 @@ class _Tick:
         return True
 
     def _verify_release_calendar(
-        self, store: Path, release_id: str, sessions: list[str], first_index: int
+        self, store: Path, release_id: str, sessions: list[str], first: str,
     ) -> None:
         admission = release.fetch(store, release_id)["artifact"]["admission"]
         if not admission["automatic_enable"]:
             return
-        authorized = admission["calendar"]["sessions"]
-        first = sessions[first_index]
-        through = min(sessions[-1], authorized[-1])
-        if [day for day in sessions[first_index:] if day <= through] != [
-            day for day in authorized if first <= day <= through
-        ]:
+        if not shadow_calendar.authorized_sessions_match(
+            sessions, admission["calendar"]["sessions"], first,
+        ):
             raise shadow.ShadowRejection(
                 "AUTHORIZED_CALENDAR_MISMATCH", "schedule", "restore-authorized-calendar",
                 "The scheduled trading dates differ from the calendar bound to this release.",

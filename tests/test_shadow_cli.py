@@ -711,13 +711,22 @@ def test_historical_backfill_records_missed_deadline_and_creates_a_new_order(
 
 
 def test_fill_eligibility_uses_the_actual_committed_persistence_time(
-    releases: dict, tmp_path: Path
+    releases: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from datetime import datetime
+
+    from prajnatrade import shadow
+
     entry = releases["equal_weight"]
     release_id = entry["release_id"]
     sessions = FUTURE[:3]
 
-    def run(name: str, committed_at: str) -> dict:
+    class BeforeOpenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromisoformat(f"{sessions[1]}T01:00:00+00:00").astimezone(tz)
+
+    def run(name: str, committed_at: str, *, timely: bool) -> dict:
         root = tmp_path / name
         store = isolated_store(root, entry)
         ledger = root / "ledger"
@@ -729,26 +738,18 @@ def test_fill_eligibility_uses_the_actual_committed_persistence_time(
             ),
         )
         ok(lifecycle("enable", store, release_id, sessions[0]))
-        ok(shadow_update(ledger, store, feed, sessions[0]))
-
-        # Rewrite only the durable persistence instant of the signal day.  The
-        # committed day content and its result hash are untouched.
-        with sqlite3.connect(ledger / "shadow.sqlite") as connection:
-            connection.execute(
-                "UPDATE days SET committed_at = ? WHERE version_id = ? AND date = ?",
-                (committed_at, release_id, sessions[0]),
-            )
+        with monkeypatch.context() as clock:
+            clock.setattr(shadow, "datetime", BeforeOpenClock)
+            clock.setattr(shadow, "_now", lambda: committed_at)
+            report, blocked = shadow.update(ledger, store, feed, sessions[0], [release_id])
+            assert not blocked, report
+        signal_day = day_record(ledger, release_id, root / "signal.json", sessions[0])
+        assert signal_day["committed_at"] == committed_at
+        pending = signal_day["result"]["next_orders"]
+        assert pending
+        assert all(order["persisted_before_deadline"] is timely for order in pending)
 
         ok(shadow_update(ledger, store, feed, sessions[1]))
-        with sqlite3.connect(ledger / "shadow.sqlite") as connection:
-            row = connection.execute(
-                "SELECT input_json FROM input_snapshots "
-                "WHERE version_id = ? AND date = ?",
-                (release_id, sessions[1]),
-            ).fetchone()
-        # The prior day's persistence instant is carried into the next frozen
-        # input, so settlement does not have to trust the wall clock.
-        assert json.loads(row[0])["previous"]["committed_at"] == committed_at
 
         result = day_record(
             ledger, release_id, root / "report.json", sessions[1]
@@ -758,11 +759,11 @@ def test_fill_eligibility_uses_the_actual_committed_persistence_time(
         assert again["versions"][0]["status"] == "already_committed"
         return {"result": result, "ledger": ledger, "feed": feed, "store": store}
 
-    early = run("before-open", f"{sessions[1]}T01:00:00+00:00")  # 09:00 Shanghai
+    early = run("before-open", f"{sessions[1]}T01:00:00+00:00", timely=True)
     assert early["result"]["orders"]
     assert all(order["status"] == "filled" for order in early["result"]["orders"])
 
-    late = run("after-open", f"{sessions[1]}T02:00:00+00:00")  # 10:00 Shanghai
+    late = run("after-open", f"{sessions[1]}T02:00:00+00:00", timely=False)
     assert late["result"]["orders"]
     for order in late["result"]["orders"]:
         assert order["status"] == "missed_deadline"

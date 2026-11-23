@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,29 @@ def load_calendar(path: str | Path) -> dict[str, Any]:
     """Read a trading calendar from an operator-provided JSON file."""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     return validate_calendar(payload)
+
+
+def authorized_sessions_match(
+    sessions: Sequence[str], authorized: Sequence[str], first: str,
+) -> bool:
+    """Compare trading dates from enablement through the shared calendar horizon."""
+    through = min(sessions[-1], authorized[-1])
+    return [day for day in sessions if first <= day <= through] == [
+        day for day in authorized if first <= day <= through
+    ]
+
+
+def parse_timestamp(value: object, field: str) -> datetime:
+    """Read a timezone-aware timestamp from Shadow Live operator data."""
+    if not isinstance(value, str):
+        raise ValueError(f"Missing or invalid {field}; expected an ISO timestamp.")
+    try:
+        instant = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"Invalid {field}.") from error
+    if instant.utcoffset() is None:
+        raise ValueError(f"{field} must include a timezone.")
+    return instant
 
 
 def session_open(session: str) -> datetime:

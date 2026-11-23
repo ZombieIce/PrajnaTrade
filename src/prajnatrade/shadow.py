@@ -198,7 +198,7 @@ def _signal_point(session: str) -> str:
 
 
 def _evidence(row: dict[str, Any], label: str) -> None:
-    snapshot._instant(row.get("available_at"), f"{label}.available_at")
+    shadow_calendar.parse_timestamp(row.get("available_at"), f"{label}.available_at")
     evidence = row.get("availability_evidence")
     if not isinstance(evidence, str) or not evidence.strip():
         raise ValueError(f"{label} requires nonempty availability_evidence.")
@@ -427,7 +427,7 @@ def _real_raw_timestamps(row: dict[str, Any]) -> None:
         if timestamp not in row:
             raise ValueError(f"A real raw bar requires {timestamp}.")
         if row[field] is not None or row[timestamp] is not None:
-            snapshot._instant(row[timestamp], timestamp)
+            shadow_calendar.parse_timestamp(row[timestamp], timestamp)
 
 
 def _before(value: str | None, cutoff: datetime) -> bool:
@@ -695,13 +695,12 @@ class Ledger:
         release_id: str,
         session: str,
         result: dict[str, Any],
-        result_hash: str,
         expected_previous: str | None,
         start_date: str,
         state: str,
         committed_at: str | None = None,
-    ) -> str:
-        """Commit one whole day and return the ledger's persistence timestamp."""
+    ) -> tuple[dict[str, Any], str]:
+        """Return the committed day with its persistence timestamp and deadline evidence."""
         self._begin()
         try:
             existing = self.connection.execute(
@@ -724,20 +723,6 @@ class Ledger:
                     f"Progress for the version is {current!r}, not the expected "
                     f"{expected_previous!r}; refusing to skip or rewrite a session.",
                 )
-            persisted_at = committed_at if committed_at is not None else _now()
-            self.connection.execute(
-                "INSERT INTO days "
-                "(version_id, date, result_json, result_hash, committed_at, status) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    version_id,
-                    session,
-                    _canonical(result),
-                    result_hash,
-                    persisted_at,
-                    result["status"],
-                ),
-            )
             if progress is None:
                 self.connection.execute(
                     "INSERT INTO progress "
@@ -751,8 +736,27 @@ class Ledger:
                     "WHERE version_id = ?",
                     (session, state, version_id),
                 )
+            persisted_at = committed_at if committed_at is not None else _now()
+            committed = {
+                **result,
+                "next_orders": [
+                    {
+                        **order,
+                        "persisted_before_deadline": _before(
+                            persisted_at, datetime.fromisoformat(order["deadline"]),
+                        ),
+                    }
+                    for order in result["next_orders"]
+                ],
+            }
+            self.connection.execute(
+                "INSERT INTO days "
+                "(version_id, date, result_json, result_hash, committed_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (version_id, session, _canonical(committed), _hash(committed), persisted_at, committed["status"]),
+            )
             self.connection.execute("COMMIT")
-            return persisted_at
+            return committed, persisted_at
         except BaseException:
             self._rollback()
             raise
@@ -844,7 +848,7 @@ def first_uncommitted_signal_date(
         reference = datetime.now(UTC)
         if after is not None:
             try:
-                filed = snapshot._instant(after, "filed_at")
+                filed = shadow_calendar.parse_timestamp(after, "filed_at")
             except ValueError as error:
                 raise _reject(
                     "INVALID_DATE", "disposition", "correct", str(error)
@@ -1677,10 +1681,7 @@ def _check_authorized_sessions(
         return
     # Verify the prospective dates bound before the first read, including the
     # deadline date used to size and persist the next orders.
-    last_verified = min(feed.sessions[-1], authorized[-1])
-    actual = [day for day in feed.sessions if first <= day <= last_verified]
-    expected = [day for day in authorized if first <= day <= last_verified]
-    if actual != expected:
+    if not shadow_calendar.authorized_sessions_match(feed.sessions, authorized, first):
         raise _Blocked(
             "AUTHORIZED_CALENDAR_MISMATCH",
             "The feed calendar differs from the trading dates bound to this release.",
@@ -1987,19 +1988,17 @@ def _process_session(
                     f"The concurrent input snapshot differs for {session}; retry the update.",
                 )
 
-    now = datetime.now(UTC)
     try:
-        result = _compute_day(body, execution, now)
+        result = _compute_day(body, execution)
     except _Blocked as error:
         if frozen_now or error.code == "missing_close":
             database.delete_input(release_id, session, input_hash)
         raise
-    committed_at = database.commit_day(
+    result, committed_at = database.commit_day(
         version_id=release_id,
         release_id=release_id,
         session=session,
         result=result,
-        result_hash=_hash(result),
         expected_previous=prior["last_committed_date"],
         start_date=result["progress"]["start_date"],
         state=state,
@@ -2247,7 +2246,7 @@ def _correction_decisions(
         if ex_date > session:
             continue
         try:
-            filed = snapshot._instant(record["filed_at"], "filed_at")
+            filed = shadow_calendar.parse_timestamp(record["filed_at"], "filed_at")
         except ValueError:  # pragma: no cover - the loader already validated it
             continue
         if filed > close_cutoff:
@@ -2429,9 +2428,7 @@ def _cash_tolerance(cash: float) -> float:
     return 1e-9 * max(1.0, abs(cash))
 
 
-def _compute_day(
-    body: dict[str, Any], execution: dict[str, Any], now: datetime
-) -> dict[str, Any]:
+def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
     data_kind = body.get("data_kind", DATA_KIND)
     session = body["date"]
     prior = body["previous"]
@@ -2911,7 +2908,6 @@ def _compute_day(
                     cash + market_value,
                     fee_rate,
                     slippage_rate,
-                    now,
                 )
 
     status = "committed"
@@ -2979,7 +2975,6 @@ def _next_orders(
     close_equity: float,
     fee_rate: float,
     slippage_rate: float,
-    now: datetime,
 ) -> list[dict[str, Any]]:
     """Size the next session's orders at the signal close and persist them.
 
@@ -3058,7 +3053,6 @@ def _next_orders(
                 "execution_date": next_session,
                 "submitted_at": submitted_at,
                 "deadline": deadline.isoformat(),
-                "persisted_before_deadline": now < deadline,
             }
         )
     return orders

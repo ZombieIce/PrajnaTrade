@@ -1122,9 +1122,10 @@ def authorize(
     }
 
 
-def _authorization_matches(
+def authorization_matches(
     record: dict[str, Any], plan: dict[str, Any], stage: str
 ) -> bool:
+    """Check whether a stored authorization matches the trusted plan for its stage."""
     matched = (
         record.get("plan_id") == plan["plan_id"]
         and record.get("plan_hash") == plan["plan_id"]
@@ -2756,7 +2757,7 @@ def run_evaluation(
             )
 
     authorizations = _authorizations(eval_store, plan_id, stage)
-    if len(authorizations) != 1 or not _authorization_matches(
+    if len(authorizations) != 1 or not authorization_matches(
         authorizations[0], plan, stage
     ):
         reject(
@@ -3459,7 +3460,7 @@ def run_research_holdout_evaluation(
         reject("FINGERPRINT_MISMATCH", "The project and frozen candidate must match the Holdout plan.")
     if (
         research_holdout.load_authorization(store, plan["plan_id"]) != authorization
-        or not _authorization_matches(authorization, plan, HOLDOUT_STAGE)
+        or not authorization_matches(authorization, plan, HOLDOUT_STAGE)
     ):
         reject("AUTHORIZATION_REQUIRED", "The saved Holdout authorization must match the frozen plan.")
     selection = candidate["research_selection"]
