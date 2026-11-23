@@ -3,14 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from decimal import Decimal
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from prajnatrade.backtest import Strategy, equal_weight_buy_and_hold
+from prajnatrade.container_executor import ContainerStrategyExecutor
 from prajnatrade.data import CASH, ETF_SYMBOLS
+from prajnatrade.isolation import (
+    IsolationError,
+    IsolationLimits,
+    run_isolated_strategy,
+)
 
 STRATEGY_FAMILIES = (
     "equal_weight",
@@ -193,36 +200,45 @@ def strategy_fingerprint(spec: Mapping[str, object]) -> str:
 
 
 def require_execution_permission(
-    spec: Mapping[str, object], *, trusted_local_python: bool
+    spec: Mapping[str, object], *, isolated_python: bool
 ) -> None:
-    if spec.get("family") == "python" and not trusted_local_python:
+    if spec.get("family") == "python" and not isolated_python:
         raise ValueError(
-            "Generated Python requires explicit trusted-local opt-in; it is not sandboxed."
+            "Generated Python requires --isolated-generated-python; local execution is disabled."
         )
 
 
 def make_strategy(
-    spec: Mapping[str, object], *, trusted_local_python: bool = False
+    spec: Mapping[str, object],
+    *,
+    isolated_python: bool = False,
+    isolation_limits: IsolationLimits | None = None,
+    evidence_callback: Callable[[dict[str, Any]], None] | None = None,
+    container_executor: ContainerStrategyExecutor | None = None,
 ) -> Strategy:
     normalized = normalize_strategy_spec(spec)
     family = normalized["family"]
     params = normalized["parameters"]
     if family == "python":
-        require_execution_permission(normalized, trusted_local_python=trusted_local_python)
-        namespace = {"ETF_SYMBOLS": ETF_SYMBOLS, "CASH": CASH, "parameters": params}
-        try:
-            exec(compile(normalized["source"], "<generated-strategy>", "exec"), namespace)
-        except Exception as error:
-            raise ValueError(f"Generated strategy initialization failed: {error}") from error
-        generated = namespace.get("strategy")
-        if not callable(generated):
-            raise ValueError("Generated Python must define strategy(history, state).")
+        if container_executor is not None:
+            return _container_python_strategy(
+                str(normalized["source"]),
+                dict(params),
+                container_executor,
+                evidence_callback,
+            )
+        require_execution_permission(normalized, isolated_python=isolated_python)
 
         def strategy(history: pd.DataFrame, state: Mapping[str, object]):
-            try:
-                return generated(history, state)
-            except Exception as error:
-                raise ValueError(f"Generated strategy failed: {error}") from error
+            return run_isolated_strategy(
+                str(normalized["source"]),
+                dict(params),
+                history,
+                dict(state),
+                symbols=ETF_SYMBOLS,
+                limits=isolation_limits,
+                evidence_callback=evidence_callback,
+            )
 
         return strategy
     if family == "equal_weight":
@@ -238,6 +254,28 @@ def make_strategy(
     if family == "inverse_volatility":
         return _inverse_volatility_strategy(int(params["lookback"]))
     raise ValueError(f"Unsupported strategy family: {family!r}.")
+
+
+def _container_python_strategy(
+    source: str,
+    parameters: dict[str, Any],
+    executor: ContainerStrategyExecutor,
+    evidence_callback: Callable[[dict[str, Any]], None] | None,
+) -> Strategy:
+    """Run the generated strategy in the verified container boundary."""
+
+    def strategy(history: pd.DataFrame, state: Mapping[str, object]):
+        try:
+            result = executor.run(source, parameters, history, dict(state))
+        except IsolationError as error:
+            if evidence_callback is not None and error.evidence is not None:
+                evidence_callback(dict(error.evidence))
+            raise
+        if evidence_callback is not None:
+            evidence_callback(dict(result.evidence))
+        return result.weights
+
+    return strategy
 
 
 def _integer_parameter(

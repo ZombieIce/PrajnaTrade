@@ -1,0 +1,2675 @@
+"""Protected Validation and Final Holdout over sealed synthetic snapshots.
+
+The workflow freezes a candidate, both protected partition fingerprints, the
+execution rules, costs, thresholds, minimum samples, regimes and parameter
+neighbourhood **before** opening Validation; requires a matching human
+authorization and a verified OS-isolation probe; debits the sealed range in an
+atomic SQLite ledger **before** the read; records the trusted evidence in an
+immutable record; and publishes only a coarse receipt to the research project.
+
+Final Holdout requires a *second*, separate human authorization that is only
+granted after the same frozen plan's Validation evaluation passed.  Its warm-up
+history comes from Discovery (research-visible) plus a derived export stored in
+the Validation record, so the sealed Validation payload is never read twice.
+The research-side receipt for Holdout is a constant, outcome-independent
+document.
+
+Everything in this module is synthetic engineering evidence.  It does not grant
+strategy admission and does not validate real market data.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import sqlite3
+import statistics
+import uuid
+from datetime import UTC, date, datetime
+from datetime import time as clock_time
+from pathlib import Path
+from typing import Any
+
+from prajnatrade import snapshot
+from prajnatrade.backtest import equal_weight_buy_and_hold
+from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.experiment import _runtime_identity, candidate_status, project_status
+from prajnatrade.isolation import probe_isolation_evidence
+from prajnatrade.snapshot_baseline import (
+    CN_TZ,
+    available_by,
+    run_partition_strategy,
+)
+from prajnatrade.strategies import make_strategy
+from prajnatrade.validation import make_robustness_plan
+
+SCHEMA_VERSION = 1
+SCOPE = "synthetic"
+VALIDATION_STAGE = "validation"
+HOLDOUT_STAGE = "final_holdout"
+STAGES = (VALIDATION_STAGE, HOLDOUT_STAGE)
+
+THRESHOLD_METRICS = (
+    "sessions",
+    "valued_sessions",
+    "total_return",
+    "max_drawdown",
+    "sharpe",
+    "return_delta",
+    "stress_total_return",
+    "stress_return_delta",
+    "fees_paid",
+    "slippage_paid",
+    "unfilled_orders",
+)
+THRESHOLD_OPERATORS = (">=", "<=", ">", "<", "==")
+
+REASON_THRESHOLD = "THRESHOLD_NOT_MET"
+REASON_COVERAGE = "COVERAGE_INSUFFICIENT"
+REASON_EVIDENCE = "EVIDENCE_INCOMPLETE"
+COARSE_MESSAGES = {
+    REASON_THRESHOLD: "At least one preregistered hard threshold was not met.",
+    REASON_COVERAGE: "Required coverage or minimum samples were incomplete.",
+    REASON_EVIDENCE: "Required evidence was unavailable or incomplete.",
+}
+
+PLAN_INPUT_FIELDS = frozenset({
+    "schema_version",
+    "minimum_samples",
+    "thresholds",
+    "stress_costs",
+    "regimes",
+    "stages",
+    "reason",
+})
+
+NOT_ADMISSION_STATEMENT = (
+    "This synthetic trusted record is engineering evidence only; it does not "
+    "grant admission, approve a release, or prove real-market performance."
+)
+
+#: The research side learns exactly one thing about Final Holdout: the request
+#: was received.  It is identical for completed, rejected, aborted, unauthorized
+#: and re-submitted requests, and contains no outcome, timing or diagnostics.
+HOLDOUT_RECEIPT = {
+    "schema_version": SCHEMA_VERSION,
+    "stage": HOLDOUT_STAGE,
+    "status": "accepted",
+    "message": "Request received.",
+}
+
+_QUERIES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS consumed_queries (
+  partition_name TEXT NOT NULL,
+  partition_content_hash TEXT NOT NULL,
+  plan_id TEXT NOT NULL,
+  candidate_hash TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  evaluation_id TEXT,
+  status TEXT NOT NULL,
+  authorization_id TEXT NOT NULL,
+  debited_at TEXT NOT NULL,
+  PRIMARY KEY (partition_name, partition_content_hash)
+);
+CREATE TABLE IF NOT EXISTS evaluations (
+  evaluation_id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  candidate_hash TEXT NOT NULL,
+  partition_content_hash TEXT NOT NULL,
+  outcome TEXT,
+  record_path TEXT,
+  created_at TEXT NOT NULL,
+  completed_at TEXT
+);
+"""
+
+_PROJECT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS evaluation_plans (
+  plan_id TEXT PRIMARY KEY,
+  candidate_id TEXT,
+  plan_hash TEXT,
+  created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS evaluation_receipts (
+  plan_id TEXT,
+  stage TEXT,
+  candidate_id TEXT,
+  payload_json TEXT,
+  published_at TEXT,
+  PRIMARY KEY(plan_id, stage)
+);
+"""
+
+
+class EvaluationRejection(Exception):
+    """A machine-readable request rejection (never a strategy failure)."""
+
+    def __init__(
+        self,
+        code: str,
+        phase: str,
+        next_action: str,
+        message: str,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.details = {
+            "code": code,
+            "phase": phase,
+            "next_action": next_action,
+            "message": message,
+        }
+        self.context = dict(context or {})
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _hash(value: object) -> str:
+    return snapshot._hash(value)
+
+
+def _bytes(value: object) -> bytes:
+    return snapshot._bytes(value)
+
+
+def _store(path: str | Path) -> Path:
+    resolved = snapshot._store_path(Path(path))
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _file_once(path: Path, record: dict) -> dict:
+    """Create an immutable file once; return the already-stored object if present."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(dir=path.parent) as staged:
+        staged.write(_bytes(record))
+        staged.flush()
+        os.fsync(staged.fileno())
+        os.chmod(staged.name, 0o400)
+        try:
+            os.link(staged.name, path)
+        except FileExistsError:
+            value = snapshot._read_json(path)
+            return value if isinstance(value, dict) else {}
+    return record
+
+
+# ---------------------------------------------------------------------------
+# Immutable record integrity
+# ---------------------------------------------------------------------------
+
+
+def _record_hash(record: dict[str, Any]) -> str:
+    """Content address of a trusted record (the hash field itself excluded)."""
+    return _hash({key: value for key, value in record.items() if key != "record_hash"})
+
+
+def _verify_record(record: object) -> dict[str, Any]:
+    """Verify a trusted record's content address; never fall back to a re-run."""
+    if not isinstance(record, dict):
+        raise ValueError("The stored evaluation record is not an object.")
+    stored = record.get("record_hash")
+    if not isinstance(stored, str) or stored != _record_hash(record):
+        raise ValueError(
+            "The stored evaluation record failed its integrity check "
+            "(record_hash missing or mismatched)."
+        )
+    return record
+
+
+def _record_matches(record: dict[str, Any], plan: dict[str, Any], stage: str) -> bool:
+    fingerprints = record.get("fingerprints")
+    if not isinstance(fingerprints, dict):
+        return False
+    partitions = fingerprints.get("partitions")
+    expected = plan["partitions"][stage]["content_hash"]
+    evaluated = fingerprints.get("evaluated_partition")
+    if evaluated is None:
+        # Aborted records never opened a scored partition descriptor; the
+        # planned partition fingerprint is still bound in ``partitions``.
+        staged = record.get("partitions")
+        evaluated = (
+            staged.get(stage, {}).get("content_hash")
+            if isinstance(staged, dict) and isinstance(staged.get(stage), dict)
+            else None
+        )
+    return (
+        record.get("plan_id") == plan["plan_id"]
+        and record.get("candidate_hash") == plan["candidate_hash"]
+        and record.get("snapshot_id") == plan["snapshot_id"]
+        and record.get("stage") == stage
+        and record.get("partition") == stage
+        and evaluated == expected
+        and isinstance(partitions, dict)
+        and partitions.get(VALIDATION_STAGE)
+        == plan["partitions"][VALIDATION_STAGE]["content_hash"]
+        and partitions.get(HOLDOUT_STAGE)
+        == plan["partitions"][HOLDOUT_STAGE]["content_hash"]
+        and record.get("schema_version") == SCHEMA_VERSION
+    )
+
+
+class _EvidenceProblem(Exception):
+    """A validation-evidence problem with a stable public error code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _read_ledger_row(
+    store: Path, partition: str, content_hash: str
+) -> dict[str, Any] | None:
+    """Read one consumed-query row without creating or modifying the ledger."""
+    database = store / "queries.sqlite"
+    if not database.is_file():
+        return None
+    connection = sqlite3.connect(database, timeout=30)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT * FROM consumed_queries "
+            "WHERE partition_name = ? AND partition_content_hash = ?",
+            (partition, content_hash),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        connection.close()
+    return None if row is None else dict(row)
+
+
+def _load_stored_record(store: Path, evaluation_id: str) -> dict[str, Any]:
+    path = store / "records" / evaluation_id / "record.json"
+    if not path.is_file():
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The stored Validation evaluation record is missing.",
+        )
+    try:
+        record = snapshot._read_json(path)
+        return _verify_record(record)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            f"The stored Validation evaluation record is unusable: {error}",
+        ) from error
+
+
+def _validation_prior_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    """Load and verify the Validation record that unlocks Final Holdout.
+
+    This reads only the trusted Validation *record* (which carries the derived
+    prior export for Holdout); it never opens the sealed Validation payload.
+    """
+    content_hash = plan["partitions"][VALIDATION_STAGE]["content_hash"]
+    row = _read_ledger_row(store, VALIDATION_STAGE, content_hash)
+    if row is None:
+        raise _EvidenceProblem(
+            "VALIDATION_NOT_PASSED",
+            "No completed Validation evaluation exists for this frozen plan; "
+            "Final Holdout cannot be authorized.",
+        )
+    if (
+        row.get("plan_id") != plan["plan_id"]
+        or row.get("candidate_hash") != plan["candidate_hash"]
+        or row.get("stage") != VALIDATION_STAGE
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_NOT_PASSED",
+            "The Validation evaluation for this sealed range belongs to another "
+            "frozen plan or candidate.",
+        )
+    if row.get("status") != "completed":
+        raise _EvidenceProblem(
+            "VALIDATION_NOT_PASSED",
+            "The Validation evaluation did not complete; it can never authorize "
+            "Final Holdout.",
+        )
+    evaluation_id = row.get("evaluation_id")
+    if not isinstance(evaluation_id, str) or not evaluation_id:
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation ledger row does not reference an evaluation record.",
+        )
+    record = _load_stored_record(store, evaluation_id)
+    if record.get("evaluation_id") != evaluation_id or not _record_matches(
+        record, plan, VALIDATION_STAGE
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The stored Validation record is not bound to this frozen plan, "
+            "candidate, snapshot and partition fingerprint.",
+        )
+    if (
+        record.get("outcome") != "passed"
+        or record.get("scoring") is not True
+        or record.get("aborted") is not False
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_NOT_PASSED",
+            "Only a passed, fully scored Validation evaluation can authorize "
+            "Final Holdout.",
+        )
+    export = record.get("prior_export_for_holdout")
+    if not isinstance(export, dict):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The stored Validation record predates the derived prior export "
+            "required by Final Holdout; it is rejected rather than re-reading the "
+            "sealed Validation payload.",
+        )
+    body = {key: value for key, value in export.items() if key != "export_hash"}
+    if export.get("export_hash") != _hash(body):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation prior export failed its integrity check.",
+        )
+    if (
+        export.get("source_stage") != VALIDATION_STAGE
+        or export.get("evaluation_id") != evaluation_id
+        or export.get("plan_id") != plan["plan_id"]
+        or export.get("candidate_hash") != plan["candidate_hash"]
+        or export.get("snapshot_id") != plan["snapshot_id"]
+        or export.get("partition_content_hash") != content_hash
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation prior export is not bound to this frozen plan and "
+            "sealed Validation range.",
+        )
+    sessions = export.get("sessions")
+    derived = export.get("derived")
+    if (
+        not isinstance(sessions, list)
+        or not sessions
+        or not all(isinstance(day, str) for day in sessions)
+        or sessions != sorted(set(sessions))
+        or not isinstance(derived, list)
+        or not derived
+        or export.get("signal_window_sessions") != plan["signal_window_sessions"]
+        or export.get("regime_lookback") != plan["regimes"]["lookback"]
+    ):
+        raise _EvidenceProblem(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation prior export is incomplete for this plan's signal "
+            "window and regime lookback.",
+        )
+    return {
+        "evaluation_id": evaluation_id,
+        "record_hash": record["record_hash"],
+        "export": export,
+        "export_hash": export["export_hash"],
+        "partition_content_hash": content_hash,
+        "record": record,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plan freeze
+# ---------------------------------------------------------------------------
+
+
+def _reject(code: str, phase: str, next_action: str, message: str) -> EvaluationRejection:
+    return EvaluationRejection(code, phase, next_action, message)
+
+
+def _invalid(message: str) -> EvaluationRejection:
+    return _reject("INVALID_PLAN_INPUT", "plan", "correct", message)
+
+
+def _number(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _invalid(f"{field} must be a number.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise _invalid(f"{field} must be finite.")
+    return number
+
+
+def _integer(value: object, field: str) -> int:
+    if type(value) is not int:
+        raise _invalid(f"{field} must be an integer.")
+    return value
+
+
+def _text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise _invalid(f"{field} must be a non-empty string.")
+    return value.strip()
+
+
+def _exact_object(value: object, fields: set[str], name: str) -> dict:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise _invalid(f"{name} must contain exactly: {', '.join(sorted(fields))}.")
+    return value
+
+
+def _plan_input(raw: object, base_costs: dict[str, float]) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise _invalid("Plan input must be a JSON object.")
+    unknown = sorted(set(raw) - PLAN_INPUT_FIELDS)
+    if unknown:
+        raise _invalid(
+            "Plan input cannot restate bound fields or add unknown fields: "
+            + ", ".join(unknown)
+            + "."
+        )
+    missing = sorted(PLAN_INPUT_FIELDS - set(raw))
+    if missing:
+        raise _invalid("Plan input is missing: " + ", ".join(missing) + ".")
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != SCHEMA_VERSION:
+        raise _invalid("Plan input must use schema_version 1.")
+    if raw["stages"] != list(STAGES):
+        raise _invalid("The plan must fix exactly the validation and final_holdout stages.")
+    reason = _text(raw["reason"], "reason")
+
+    minimum = _exact_object(
+        raw["minimum_samples"], {"sessions", "valued_sessions"}, "minimum_samples"
+    )
+    sessions_min = _integer(minimum["sessions"], "minimum_samples.sessions")
+    valued_min = _integer(minimum["valued_sessions"], "minimum_samples.valued_sessions")
+    if sessions_min < 1 or valued_min < 1 or valued_min > sessions_min:
+        raise _invalid(
+            "minimum_samples requires 1 <= valued_sessions <= sessions."
+        )
+
+    if not isinstance(raw["thresholds"], list):
+        raise _invalid("thresholds must be a list (possibly empty).")
+    thresholds = []
+    seen: set[str] = set()
+    for entry in raw["thresholds"]:
+        item = _exact_object(entry, {"id", "metric", "op", "value"}, "each threshold")
+        identifier = _text(item["id"], "threshold.id")
+        if identifier in seen:
+            raise _invalid(f"Duplicate threshold id: {identifier}.")
+        seen.add(identifier)
+        if item["metric"] not in THRESHOLD_METRICS:
+            raise _invalid(
+                f"Threshold metric {item['metric']!r} is not in the frozen registry."
+            )
+        if item["op"] not in THRESHOLD_OPERATORS:
+            raise _invalid(f"Threshold operator {item['op']!r} is not supported.")
+        _number(item["value"], "threshold.value")
+        thresholds.append(
+            {
+                "id": identifier,
+                "metric": item["metric"],
+                "op": item["op"],
+                "value": item["value"],
+            }
+        )
+
+    stress = _exact_object(
+        raw["stress_costs"],
+        {"transaction_cost_bps", "slippage_bps"},
+        "stress_costs",
+    )
+    stress_costs = {
+        "transaction_cost_bps": _number(
+            stress["transaction_cost_bps"], "stress_costs.transaction_cost_bps"
+        ),
+        "slippage_bps": _number(stress["slippage_bps"], "stress_costs.slippage_bps"),
+    }
+    for name, value in stress_costs.items():
+        if value < 0 or value >= 10_000:
+            raise _invalid(f"stress_costs.{name} must be between 0 and 10,000.")
+        if value < base_costs[name]:
+            raise _invalid(
+                f"stress_costs.{name} must be at least the frozen base cost."
+            )
+
+    regimes = _exact_object(
+        raw["regimes"],
+        {"method", "lookback", "volatility_threshold", "labels"},
+        "regimes",
+    )
+    if regimes["method"] != "trailing_volatility":
+        raise _invalid("regimes.method must be 'trailing_volatility'.")
+    lookback = _integer(regimes["lookback"], "regimes.lookback")
+    if lookback < 2:
+        raise _invalid("regimes.lookback must be at least 2.")
+    volatility = _number(regimes["volatility_threshold"], "regimes.volatility_threshold")
+    if volatility <= 0:
+        raise _invalid("regimes.volatility_threshold must be positive.")
+    labels = regimes["labels"]
+    if (
+        not isinstance(labels, list)
+        or len(labels) != 2
+        or any(not isinstance(label, str) or not label.strip() for label in labels)
+        or len(set(labels)) != 2
+    ):
+        raise _invalid("regimes.labels must declare exactly two distinct labels.")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "minimum_samples": {
+            "sessions": sessions_min,
+            "valued_sessions": valued_min,
+        },
+        "thresholds": thresholds,
+        "stress_costs": stress_costs,
+        "regimes": {
+            "method": "trailing_volatility",
+            "lookback": lookback,
+            "volatility_threshold": volatility,
+            "labels": [label.strip() for label in labels],
+        },
+        "stages": list(STAGES),
+        "reason": reason,
+    }
+
+
+def _read_plan_input(source: Path) -> object:
+    try:
+        return snapshot._read_json(Path(source))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise _invalid(f"Plan input could not be read: {error}") from error
+
+
+def _signal_window_for(family: str, parameters: dict[str, Any]) -> int:
+    """Trailing sessions needed to fill a signal window for these parameters."""
+    lookback = int(parameters.get("lookback", 1))
+    return lookback + 1 if family in {"momentum", "inverse_volatility"} else lookback
+
+
+def _signal_window(candidate: dict[str, Any]) -> int:
+    return _signal_window_for(candidate["strategy"]["family"], candidate["parameters"])
+
+
+def _neighbourhood(candidate: dict[str, Any]) -> dict[str, Any]:
+    plan = make_robustness_plan(
+        {
+            "family": candidate["strategy"]["family"],
+            "parameters": candidate["parameters"],
+        },
+        None,
+    )
+    if plan.get("status") == "not_applicable":
+        return {"no_tunable_parameters": True}
+    return plan
+
+
+def _plan_mapping(project: Path, plan_id: str) -> str | None:
+    database = Path(project) / ".prajnatrade" / "project.sqlite"
+    try:
+        with sqlite3.connect(database, timeout=30) as connection:
+            row = connection.execute(
+                "SELECT candidate_id FROM evaluation_plans WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return None if row is None else str(row[0])
+
+
+def _register_plan(project: Path, plan: dict[str, Any]) -> None:
+    database = Path(project) / ".prajnatrade" / "project.sqlite"
+    with sqlite3.connect(database, timeout=30) as connection:
+        connection.executescript(_PROJECT_SCHEMA)
+        row = connection.execute(
+            "SELECT candidate_id FROM evaluation_plans WHERE plan_id = ?",
+            (plan["plan_id"],),
+        ).fetchone()
+        if row is not None and row[0] != plan["candidate_id"]:
+            raise ValueError("The stored evaluation plan binding conflicts with this plan.")
+        connection.execute(
+            "INSERT OR IGNORE INTO evaluation_plans "
+            "(plan_id, candidate_id, plan_hash, created_at) VALUES (?, ?, ?, ?)",
+            (
+                plan["plan_id"],
+                plan["candidate_id"],
+                plan["plan_id"],
+                plan["frozen_at"],
+            ),
+        )
+
+
+def _plan_fingerprint(plan: dict[str, Any]) -> str:
+    body = {
+        key: value
+        for key, value in plan.items()
+        if key not in {"plan_id", "frozen_at"}
+    }
+    return _hash(body)
+
+
+def create_plan(
+    store: str | Path,
+    snapshot_store: str | Path,
+    project: str | Path,
+    candidate_id: str,
+    source: str | Path,
+) -> dict[str, Any]:
+    """Freeze the evaluation plan before Validation is opened."""
+    eval_store = _store(store)
+    project = Path(project)
+    project_id = str(project_status(project)["project_id"])
+    candidate = candidate_status(project, candidate_id)
+    snapshot_id = candidate.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not snapshot_id:
+        raise ValueError("The frozen candidate does not reference a sealed snapshot.")
+    evaluation = candidate.get("evaluation")
+    if not isinstance(evaluation, dict):
+        raise ValueError("The frozen candidate is missing its evaluation settings.")
+    if evaluation.get("snapshot_id") != snapshot_id:
+        raise ValueError("The frozen candidate snapshot reference is inconsistent.")
+    metadata = snapshot.manifest(Path(snapshot_store), snapshot_id)
+    if metadata.get("data_kind") != SCOPE:
+        raise ValueError("Protected evaluation requires an explicitly synthetic snapshot.")
+    partitions = {
+        name: snapshot.partition_descriptor(metadata, name) for name in STAGES
+    }
+    discovery = snapshot.partition_descriptor(metadata, "discovery")
+    if evaluation.get("partition_content_hash") != discovery["content_hash"]:
+        raise ValueError(
+            "The frozen candidate Discovery fingerprint is not this snapshot's Discovery content."
+        )
+    base_costs = {
+        "transaction_cost_bps": float(evaluation["transaction_cost_bps"]),
+        "slippage_bps": float(evaluation["slippage_bps"]),
+    }
+    payload = _plan_input(_read_plan_input(Path(source)), base_costs)
+    plan: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "scope": SCOPE,
+        "data_kind": SCOPE,
+        "project_id": project_id,
+        "candidate_id": candidate_id,
+        "candidate_hash": candidate["candidate_hash"],
+        "candidate": candidate,
+        "snapshot_id": snapshot_id,
+        "partitions": partitions,
+        "prior_history": {
+            VALIDATION_STAGE: {
+                "partitions": ["discovery"],
+                "discovery_content_hash": discovery["content_hash"],
+                "as_of": evaluation.get("as_of"),
+            },
+            HOLDOUT_STAGE: {"partitions": ["discovery", VALIDATION_STAGE]},
+        },
+        "stages": list(STAGES),
+        "conclusion": candidate["conclusion"],
+        "runtime": candidate["fingerprints"]["runtime_dependencies"],
+        "signal_window_sessions": _signal_window(candidate),
+        "initial_cash": float(evaluation["initial_cash"]),
+        "base_costs": base_costs,
+        "stress_costs": payload["stress_costs"],
+        "execution_rules": candidate["execution_rules"],
+        "baseline": {
+            "method": "equal_weight_buy_and_hold",
+            "weights": "equal",
+            "same_signal_window": True,
+            "same_execution_rules": True,
+            "same_costs": True,
+        },
+        "thresholds": payload["thresholds"],
+        "minimum_samples": payload["minimum_samples"],
+        "regimes": payload["regimes"],
+        "neighborhood": _neighbourhood(candidate),
+        "reason": payload["reason"],
+    }
+    plan_id = _plan_fingerprint(plan)
+    frozen = {**plan, "plan_id": plan_id, "frozen_at": _now()}
+    stored = _file_once(eval_store / "plans" / f"{plan_id}.json", frozen)
+    if stored.get("plan_id") != plan_id or _plan_fingerprint(stored) != plan_id:
+        raise ValueError("Existing frozen plan integrity check failed.")
+    _register_plan(project, stored)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "planned",
+        "scope": SCOPE,
+        "data_kind": SCOPE,
+        "plan_id": plan_id,
+        "plan_hash": plan_id,
+        "candidate_id": candidate_id,
+        "candidate_hash": candidate["candidate_hash"],
+        "snapshot_id": snapshot_id,
+        "stages": list(STAGES),
+        "fingerprints": {
+            "plan": plan_id,
+            "candidate": candidate["candidate_hash"],
+            "snapshot_manifest": snapshot_id,
+            "partitions": {
+                "validation": partitions[VALIDATION_STAGE]["content_hash"],
+                "final_holdout": partitions[HOLDOUT_STAGE]["content_hash"],
+            },
+        },
+        "partitions": partitions,
+        "base_costs": base_costs,
+        "stress_costs": stored["stress_costs"],
+        "thresholds": stored["thresholds"],
+        "minimum_samples": stored["minimum_samples"],
+        "regimes": stored["regimes"],
+        "neighborhood": stored["neighborhood"],
+        "signal_window_sessions": stored["signal_window_sessions"],
+        "initial_cash": stored["initial_cash"],
+        "execution_rules": stored["execution_rules"],
+        "baseline": stored["baseline"],
+        "conclusion": stored["conclusion"],
+        "reason": stored["reason"],
+        "frozen_at": stored["frozen_at"],
+        "plan": stored,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Authorization
+# ---------------------------------------------------------------------------
+
+
+def _load_plan(store: Path, plan_id: str) -> dict[str, Any]:
+    if not isinstance(plan_id, str) or not plan_id:
+        raise _reject("PLAN_NOT_FOUND", "plan", "check_id", "Unknown evaluation plan.")
+    path = store / "plans" / f"{plan_id}.json"
+    if not path.is_file():
+        raise _reject("PLAN_NOT_FOUND", "plan", "check_id", "Unknown evaluation plan.")
+    plan = snapshot._read_json(path)
+    if not isinstance(plan, dict):
+        raise _reject(
+            "FINGERPRINT_MISMATCH", "plan", "inspect", "The frozen plan is not an object."
+        )
+    if plan.get("plan_id") != plan_id or _plan_fingerprint(plan) != plan_id:
+        raise _reject(
+            "FINGERPRINT_MISMATCH",
+            "plan",
+            "inspect",
+            "The frozen plan does not match its content address.",
+        )
+    return plan
+
+
+def load_plan(store: Path, plan_id: str) -> dict[str, Any]:
+    """Public trusted loader for one frozen plan (no sealed read, no debit)."""
+    return _load_plan(store, plan_id)
+
+
+def _authorization_files(directory: Path, stage: str) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return sorted(directory.glob(f"{stage}-*.json"))
+
+
+def _verified_authorization(path: Path) -> dict[str, Any]:
+    record = snapshot._read_json(path)
+    if not isinstance(record, dict):
+        raise _reject(
+            "AUTHORIZATION_REQUIRED",
+            "run",
+            "authorize",
+            "The stored authorization is not an object.",
+        )
+    auth_id = record.get("auth_id")
+    body = {key: value for key, value in record.items() if key != "auth_id"}
+    if not isinstance(auth_id, str) or _hash(body) != auth_id:
+        raise _reject(
+            "AUTHORIZATION_REQUIRED",
+            "run",
+            "authorize",
+            "The stored authorization failed its integrity check.",
+        )
+    return record
+
+
+def _authorizations(store: Path, plan_id: str, stage: str) -> list[dict[str, Any]]:
+    directory = store / "authorizations" / plan_id
+    marker = directory / f"{stage}.authorized.json"
+    if marker.is_file():
+        claim = snapshot._read_json(marker)
+        if not isinstance(claim, dict) or claim.get("stage") != stage:
+            raise _reject(
+                "AUTHORIZATION_REQUIRED",
+                "run",
+                "authorize",
+                "The authorization marker is invalid.",
+            )
+        name = claim.get("file")
+        if not isinstance(name, str):
+            raise _reject(
+                "AUTHORIZATION_REQUIRED",
+                "run",
+                "authorize",
+                "The authorization marker is invalid.",
+            )
+        path = directory / name
+        if not path.is_file():
+            raise _reject(
+                "AUTHORIZATION_REQUIRED",
+                "run",
+                "authorize",
+                "The authorized record is missing.",
+            )
+        record = _verified_authorization(path)
+        expected_id = name[len(stage) + 1 : -len(".json")]
+        if record.get("auth_id") != expected_id:
+            raise _reject(
+                "AUTHORIZATION_REQUIRED",
+                "run",
+                "authorize",
+                "The authorized record does not match its file name.",
+            )
+        return [record]
+    return [
+        _verified_authorization(path)
+        for path in _authorization_files(directory, stage)
+    ]
+
+
+def authorize(
+    store: str | Path,
+    plan_id: str,
+    stage: str,
+    reviewer: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Freeze one immutable stage authorization.
+
+    Validation may be authorized any time after the plan is frozen.  Final
+    Holdout additionally requires the same plan's completed, fully scored and
+    **passed** Validation record, and refuses a second Holdout authorization.
+    A rejected or insufficient Validation never authorizes Holdout.
+    """
+    if stage not in STAGES:
+        raise _reject("UNSUPPORTED_STAGE", "authorization", "correct", "Unknown stage.")
+    reviewer = reviewer.strip()
+    reason = reason.strip()
+    if not reviewer or not reason:
+        raise _reject(
+            "INVALID_AUTHORIZATION",
+            "authorization",
+            "correct",
+            "Authorization requires a reviewer and a reason.",
+        )
+    eval_store = _store(store)
+    plan = _load_plan(eval_store, plan_id)
+    directory = eval_store / "authorizations" / plan_id
+    context = {
+        "plan_id": plan_id,
+        "stage": stage,
+        "candidate_id": plan.get("candidate_id"),
+        "candidate_hash": plan.get("candidate_hash"),
+        "snapshot_id": plan.get("snapshot_id"),
+        "partition": stage,
+        "partition_content_hash": plan["partitions"][stage]["content_hash"],
+    }
+
+    def reject(
+        code: str, message: str, *, next_action: str = "inspect"
+    ) -> None:
+        audit_id = _audit(
+            eval_store,
+            context,
+            code,
+            message,
+            command="evaluation authorize",
+            phase="authorization",
+        )
+        raise EvaluationRejection(
+            code,
+            "authorization",
+            next_action,
+            message,
+            context={
+                "audit_id": audit_id,
+                "opened_protected_source": False,
+                "query_debited": False,
+            },
+        )
+
+    if stage == HOLDOUT_STAGE and plan.get("stages") != list(STAGES):
+        reject(
+            "UNSUPPORTED_STAGE",
+            "The frozen plan does not fix the Final Holdout stage.",
+            next_action="stop",
+        )
+    marker = directory / f"{stage}.authorized.json"
+    if marker.is_file() or _authorization_files(directory, stage):
+        raise _reject(
+            "AUTHORIZATION_CONFLICT",
+            "authorization",
+            "stop",
+            "This stage already has an authorization; the first one is the one used.",
+        )
+
+    validation_binding = None
+    if stage == HOLDOUT_STAGE:
+        try:
+            evidence = _validation_prior_evidence(eval_store, plan)
+        except _EvidenceProblem as problem:
+            reject(
+                problem.code,
+                problem.message,
+                next_action=(
+                    "run-validation"
+                    if problem.code == "VALIDATION_NOT_PASSED"
+                    else "inspect"
+                ),
+            )
+        validation_binding = {
+            "evaluation_id": evidence["evaluation_id"],
+            "record_hash": evidence["record_hash"],
+            "outcome": "passed",
+            "partition": VALIDATION_STAGE,
+            "partition_content_hash": evidence["partition_content_hash"],
+            "export_hash": evidence["export_hash"],
+        }
+
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "scope": SCOPE,
+        "plan_id": plan_id,
+        "plan_hash": plan_id,
+        "candidate_id": plan["candidate_id"],
+        "candidate_hash": plan["candidate_hash"],
+        "snapshot_id": plan["snapshot_id"],
+        "stage": stage,
+        "partition": stage,
+        "partition_content_hash": plan["partitions"][stage]["content_hash"],
+        "reviewer": reviewer,
+        "reason": reason,
+        "authorized_at": _now(),
+    }
+    if validation_binding is not None:
+        body["validation"] = validation_binding
+    auth_id = _hash(body)
+    record = {**body, "auth_id": auth_id}
+    name = f"{stage}-{auth_id}.json"
+    stored = _file_once(directory / name, record)
+    if stored != record:
+        raise _reject(
+            "AUTHORIZATION_CONFLICT",
+            "authorization",
+            "stop",
+            "A different authorization with the same identity is already stored.",
+        )
+    claim = _file_once(
+        directory / f"{stage}.authorized.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "stage": stage,
+            "plan_id": plan_id,
+            "authorization_id": auth_id,
+            "file": name,
+        },
+    )
+    if claim.get("authorization_id") != auth_id:
+        try:
+            (directory / name).unlink()
+        except FileNotFoundError:
+            pass
+        raise _reject(
+            "AUTHORIZATION_CONFLICT",
+            "authorization",
+            "stop",
+            "This stage already has an authorization; the first one is the one used.",
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "authorized",
+        "scope": SCOPE,
+        "plan_id": plan_id,
+        "stage": stage,
+        "authorization": stored,
+    }
+
+
+def _authorization_matches(
+    record: dict[str, Any], plan: dict[str, Any], stage: str
+) -> bool:
+    matched = (
+        record.get("plan_id") == plan["plan_id"]
+        and record.get("plan_hash") == plan["plan_id"]
+        and record.get("candidate_id") == plan["candidate_id"]
+        and record.get("candidate_hash") == plan["candidate_hash"]
+        and record.get("snapshot_id") == plan["snapshot_id"]
+        and record.get("stage") == stage
+        and record.get("partition_content_hash")
+        == plan["partitions"][stage]["content_hash"]
+    )
+    if not matched or stage != HOLDOUT_STAGE:
+        return matched
+    binding = record.get("validation")
+    return (
+        isinstance(binding, dict)
+        and binding.get("outcome") == "passed"
+        and binding.get("partition") == VALIDATION_STAGE
+        and binding.get("partition_content_hash")
+        == plan["partitions"][VALIDATION_STAGE]["content_hash"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ledger
+# ---------------------------------------------------------------------------
+
+
+def _ledger(database: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(database, timeout=30, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.executescript(_QUERIES_SCHEMA)
+    return connection
+
+
+def _claim_partition(
+    store: Path, plan: dict[str, Any], stage: str, authorization: dict[str, Any]
+) -> dict[str, Any]:
+    """Atomically reserve the sealed range before the protected read."""
+    content_hash = plan["partitions"][stage]["content_hash"]
+    evaluation_id = str(uuid.uuid4())
+    debited_at = _now()
+    connection = _ledger(store / "queries.sqlite")
+    try:
+        row = None
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM consumed_queries "
+                "WHERE partition_name = ? AND partition_content_hash = ?",
+                (stage, content_hash),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO consumed_queries "
+                    "(partition_name, partition_content_hash, plan_id, candidate_hash, "
+                    " stage, evaluation_id, status, authorization_id, debited_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'reading', ?, ?)",
+                    (
+                        stage,
+                        content_hash,
+                        plan["plan_id"],
+                        plan["candidate_hash"],
+                        stage,
+                        evaluation_id,
+                        authorization["auth_id"],
+                        debited_at,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO evaluations "
+                    "(evaluation_id, plan_id, stage, candidate_hash, "
+                    " partition_content_hash, outcome, record_path, created_at, completed_at) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL)",
+                    (
+                        evaluation_id,
+                        plan["plan_id"],
+                        stage,
+                        plan["candidate_hash"],
+                        content_hash,
+                        debited_at,
+                    ),
+                )
+                connection.execute("COMMIT")
+                return {
+                    "state": "debited",
+                    "evaluation_id": evaluation_id,
+                    "debited_at": debited_at,
+                }
+            connection.execute("ROLLBACK")
+        except sqlite3.IntegrityError:
+            connection.execute("ROLLBACK")
+            row = connection.execute(
+                "SELECT * FROM consumed_queries "
+                "WHERE partition_name = ? AND partition_content_hash = ?",
+                (stage, content_hash),
+            ).fetchone()
+        if row is None:
+            raise ValueError("The query ledger could not be read after a concurrent debit.")
+        return _existing_claim(connection, store, row, plan, stage)
+    finally:
+        connection.close()
+
+
+def _existing_claim(
+    connection: sqlite3.Connection,
+    store: Path,
+    row: sqlite3.Row,
+    plan: dict[str, Any],
+    stage: str,
+) -> dict[str, Any]:
+    same = (
+        row["plan_id"] == plan["plan_id"]
+        and row["candidate_hash"] == plan["candidate_hash"]
+        and row["stage"] == stage
+    )
+    evaluation = None
+    if row["evaluation_id"]:
+        evaluation = connection.execute(
+            "SELECT * FROM evaluations WHERE evaluation_id = ?",
+            (row["evaluation_id"],),
+        ).fetchone()
+    record_path = None
+    if evaluation is not None:
+        for candidate_path in (
+            Path(evaluation["record_path"]) if evaluation["record_path"] else None,
+            store / "records" / str(row["evaluation_id"]) / "record.json"
+            if row["evaluation_id"]
+            else None,
+        ):
+            if candidate_path is not None and candidate_path.is_file():
+                record_path = candidate_path
+                break
+    if same and record_path is not None:
+        record = snapshot._read_json(record_path)
+        if isinstance(record, dict):
+            return {
+                "state": "reuse",
+                "evaluation_id": row["evaluation_id"],
+                "debited_at": row["debited_at"],
+                "record": record,
+                "record_path": record_path,
+            }
+    if same:
+        return {
+            "state": "in_progress" if row["status"] == "reading" else "unrecorded",
+            "evaluation_id": row["evaluation_id"],
+            "debited_at": row["debited_at"],
+        }
+    return {"state": "consumed", "evaluation_id": row["evaluation_id"]}
+
+
+def _mark_state(
+    store: Path,
+    evaluation_id: str,
+    stage: str,
+    content_hash: str,
+    *,
+    status: str,
+    outcome: str,
+    record_path: Path,
+    completed_at: str,
+) -> None:
+    connection = _ledger(store / "queries.sqlite")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE consumed_queries SET status = ?, evaluation_id = ? "
+            "WHERE partition_name = ? AND partition_content_hash = ?",
+            (status, evaluation_id, stage, content_hash),
+        )
+        connection.execute(
+            "UPDATE evaluations SET outcome = ?, record_path = ?, completed_at = ? "
+            "WHERE evaluation_id = ?",
+            (outcome, str(record_path), completed_at, evaluation_id),
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Research receipt
+# ---------------------------------------------------------------------------
+
+
+def _coarse_receipt(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "stage": record["stage"],
+        "status": record["outcome"],
+        "reason": record["reason"],
+        "message": record["message"],
+    }
+
+
+def _receipt_for_record(record: dict[str, Any]) -> dict[str, Any]:
+    """The research-side receipt for one trusted record.
+
+    Validation publishes its coarse, outcome-bearing receipt.  Final Holdout
+    publishes the same constant document for every outcome, so the research side
+    cannot distinguish completed, rejected, aborted, unauthorized or replayed
+    requests.
+    """
+    if record.get("stage") == HOLDOUT_STAGE:
+        return dict(HOLDOUT_RECEIPT)
+    return _coarse_receipt(record)
+
+
+def _project_database(project: Path) -> sqlite3.Connection:
+    database = Path(project) / ".prajnatrade" / "project.sqlite"
+    connection = sqlite3.connect(database, timeout=30)
+    connection.executescript(_PROJECT_SCHEMA)
+    return connection
+
+
+def _publish_receipt(
+    project: Path, plan: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    with _project_database(project) as connection:
+        # The research receipt is the coarse view of the latest completed
+        # evaluation of this frozen plan.  It is normally unchanged on replay
+        # because a replay reuses the stored record instead of re-evaluating.
+        connection.execute(
+            "INSERT INTO evaluation_receipts "
+            "(plan_id, stage, candidate_id, payload_json, published_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(plan_id, stage) DO UPDATE SET "
+            "payload_json = excluded.payload_json, "
+            "candidate_id = excluded.candidate_id, "
+            "published_at = excluded.published_at "
+            "WHERE evaluation_receipts.payload_json != excluded.payload_json",
+            (
+                plan["plan_id"],
+                payload["stage"],
+                plan["candidate_id"],
+                json.dumps(payload, sort_keys=True, allow_nan=False),
+                _now(),
+            ),
+        )
+        row = connection.execute(
+            "SELECT payload_json FROM evaluation_receipts "
+            "WHERE plan_id = ? AND stage = ?",
+            (plan["plan_id"], payload["stage"]),
+        ).fetchone()
+    return json.loads(row[0]) if row else payload
+
+
+def agent_evaluation_status(project: str | Path, candidate_id: str) -> dict[str, Any]:
+    """Research-side view: a coarse Validation receipt and a constant Holdout receipt.
+
+    Nothing from a trusted record is exposed here.  The Final Holdout value is
+    the same four-key document for pending, authorized, completed, rejected,
+    aborted and re-submitted requests.
+    """
+    project = Path(project)
+    project_status(project)
+    validation: dict[str, Any] = {"status": "pending"}
+    database = project / ".prajnatrade" / "project.sqlite"
+    try:
+        with sqlite3.connect(database, timeout=30) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM evaluation_receipts "
+                "WHERE candidate_id = ? AND stage = ? "
+                "ORDER BY published_at DESC LIMIT 1",
+                (candidate_id, VALIDATION_STAGE),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    if row is not None:
+        validation = json.loads(row[0])
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "candidate_id": candidate_id,
+        "validation": validation,
+        "final_holdout": dict(HOLDOUT_RECEIPT),
+    }
+
+
+#: Backwards-compatible name for the MVP-10 caller.
+agent_validation_status = agent_evaluation_status
+
+
+def evaluation_status(store: str | Path, plan_id: str) -> dict[str, Any]:
+    """Operator view of the frozen plan, authorizations, ledger and records."""
+    eval_store = _store(store)
+    plan = _load_plan(eval_store, plan_id)
+    authorizations = []
+    for stage in STAGES:
+        authorizations.extend(_authorizations(eval_store, plan_id, stage))
+    connection = _ledger(eval_store / "queries.sqlite")
+    try:
+        queries = [
+            {
+                "partition": row["partition_name"],
+                "content_hash": row["partition_content_hash"],
+                "plan_id": row["plan_id"],
+                "candidate_hash": row["candidate_hash"],
+                "status": row["status"],
+                "authorization_id": row["authorization_id"],
+                "evaluation_id": row["evaluation_id"],
+                "debited_at": row["debited_at"],
+            }
+            for row in connection.execute(
+                "SELECT * FROM consumed_queries WHERE plan_id = ? ORDER BY debited_at",
+                (plan_id,),
+            )
+        ]
+        evaluations = []
+        for row in connection.execute(
+            "SELECT * FROM evaluations WHERE plan_id = ? ORDER BY created_at",
+            (plan_id,),
+        ):
+            record = None
+            integrity = "unavailable"
+            if row["record_path"] and Path(row["record_path"]).is_file():
+                try:
+                    record = _verify_record(
+                        snapshot._read_json(Path(row["record_path"]))
+                    )
+                    integrity = "valid"
+                except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+                    record = None
+                    integrity = "invalid"
+            evaluations.append(
+                {
+                    "evaluation_id": row["evaluation_id"],
+                    "stage": row["stage"],
+                    "outcome": row["outcome"],
+                    "record_path": row["record_path"],
+                    "created_at": row["created_at"],
+                    "completed_at": row["completed_at"],
+                    "scoring": record.get("scoring") if isinstance(record, dict) else None,
+                    "record_hash": (
+                        record.get("record_hash") if isinstance(record, dict) else None
+                    ),
+                    "record_integrity": integrity,
+                }
+            )
+    finally:
+        connection.close()
+    stages = {}
+    for stage in STAGES:
+        stage_authorization = next(
+            (item for item in authorizations if item.get("stage") == stage), None
+        )
+        stage_query = next(
+            (item for item in queries if item["partition"] == stage), None
+        )
+        stage_evaluation = next(
+            (item for item in evaluations if item["stage"] == stage), None
+        )
+        stages[stage] = {
+            "authorization": stage_authorization,
+            "query": stage_query,
+            "evaluation": stage_evaluation,
+            "authorized": stage_authorization is not None,
+            "query_debited": stage_query is not None,
+            "record_path": (
+                stage_evaluation["record_path"] if stage_evaluation else None
+            ),
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "scope": SCOPE,
+        "plan_id": plan_id,
+        "plan": plan,
+        "authorizations": authorizations,
+        "queries": queries,
+        "evaluations": evaluations,
+        "stages": stages,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+
+def _audit(
+    store: Path,
+    context: dict[str, Any],
+    code: str,
+    message: str,
+    *,
+    command: str = "evaluation run",
+    phase: str = "run",
+) -> str | None:
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "scope": SCOPE,
+        "received_at": _now(),
+        "command": command,
+        **context,
+        "error": {
+            "code": code,
+            "phase": phase,
+            "next_action": "inspect",
+            "message": message,
+        },
+        "opened_protected_source": False,
+        "query_debited": False,
+    }
+    audit_id = _hash(body)
+    record = {**body, "audit_id": audit_id}
+    try:
+        _file_once(store / "audit" / f"{audit_id}.json", record)
+    except OSError:
+        return None
+    return audit_id
+
+
+def audit(
+    store: Path,
+    context: dict[str, Any],
+    code: str,
+    message: str,
+    *,
+    command: str = "evaluation run",
+    phase: str = "run",
+) -> str | None:
+    """Public trusted-side refusal audit writer (no sealed read, no debit)."""
+    return _audit(store, context, code, message, command=command, phase=phase)
+
+
+def _failpoint(name: str) -> None:
+    if os.environ.get("PRAJNATRADE_TEST_FAILPOINT") == name:
+        raise RuntimeError(f"synthetic test failpoint {name!r} reached")
+
+
+def _partition_gaps(metadata: dict[str, Any], descriptor: dict[str, Any]) -> dict[str, list]:
+    gaps = metadata.get("gaps")
+    if not isinstance(gaps, dict):
+        gaps = metadata.get("base_gaps")
+    if not isinstance(gaps, dict):
+        gaps = {}
+    start, end = descriptor["start"], descriptor["end"]
+    return {
+        kind: [
+            gap
+            for gap in gaps.get(kind, [])
+            if isinstance(gap, dict) and start <= str(gap.get("date", "")) <= end
+        ]
+        for kind in ("raw_bars", "derived", "corporate_actions", "availability")
+    }
+
+
+def _prior_discovery(
+    snapshot_store: Path,
+    plan: dict[str, Any],
+    reject,
+) -> tuple[list[str], list[dict], str]:
+    rule = plan["prior_history"][VALIDATION_STAGE]
+    try:
+        receipt = snapshot.read_discovery(
+            snapshot_store,
+            plan["snapshot_id"],
+            "discovery",
+            rule.get("as_of"),
+        )
+    except ValueError as error:
+        reject(
+            "FINGERPRINT_MISMATCH",
+            f"The frozen Discovery prior history could not be verified: {error}",
+        )
+    content_hash = receipt.get("partition_content_hash", receipt["content_hash"])
+    if content_hash != rule["discovery_content_hash"]:
+        reject(
+            "FINGERPRINT_MISMATCH",
+            "The frozen Discovery prior history differs from the sealed snapshot.",
+        )
+    sessions = sorted({row["date"] for row in receipt["data"]["calendar"]})
+    return sessions, receipt["data"]["derived"], content_hash
+
+
+def _validation_export(
+    plan: dict[str, Any], protected: dict[str, Any], evaluation_id: str
+) -> dict[str, Any]:
+    """Derived Validation rows needed later as Holdout warm-up.
+
+    Only the tail required by the frozen signal window and regime lookback is
+    kept.  This export lives in the trusted Validation record so the Holdout run
+    never has to re-open the sealed Validation payload.
+    """
+    data = protected["data"]
+    sessions = sorted({row["date"] for row in data["calendar"]})
+    needed = max(
+        int(plan["signal_window_sessions"]), int(plan["regimes"]["lookback"]) + 1, 1
+    )
+    export_sessions = sessions[-needed:]
+    keep = set(export_sessions)
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "source_stage": VALIDATION_STAGE,
+        "evaluation_id": evaluation_id,
+        "plan_id": plan["plan_id"],
+        "candidate_hash": plan["candidate_hash"],
+        "snapshot_id": plan["snapshot_id"],
+        "partition": VALIDATION_STAGE,
+        "partition_content_hash": protected["content_hash"],
+        "sessions": export_sessions,
+        "derived": [row for row in data["derived"] if row["date"] in keep],
+        "signal_window_sessions": plan["signal_window_sessions"],
+        "regime_lookback": plan["regimes"]["lookback"],
+    }
+    return {**body, "export_hash": _hash(body)}
+
+
+def _prior_holdout(
+    snapshot_store: Path,
+    plan: dict[str, Any],
+    evidence: dict[str, Any],
+    descriptor: dict[str, Any],
+    reject,
+) -> tuple[tuple[list[str], list[dict]], dict[str, Any]]:
+    """Discovery (research-visible) plus the stored Validation export as prior."""
+    discovery_sessions, discovery_rows, discovery_hash = _prior_discovery(
+        snapshot_store, plan, reject
+    )
+    export = evidence["export"]
+    previous = export["sessions"]
+    if previous[-1] >= descriptor["start"]:
+        reject(
+            "VALIDATION_EVIDENCE_INVALID",
+            "The Validation prior export overlaps the sealed Holdout range.",
+        )
+    sessions = [*discovery_sessions, *previous]
+    rows = [*discovery_rows, *export["derived"]]
+    prior_evidence = {
+        "partitions": list(plan["prior_history"][HOLDOUT_STAGE]["partitions"]),
+        "discovery_content_hash": discovery_hash,
+        "validation": {
+            "evaluation_id": evidence["evaluation_id"],
+            "record_hash": evidence["record_hash"],
+            "partition_content_hash": evidence["partition_content_hash"],
+            "export_hash": evidence["export_hash"],
+            "sessions": len(previous),
+            "derived_rows": len(export["derived"]),
+        },
+    }
+    return (sessions, rows), prior_evidence
+
+
+def _equal_weight_run(
+    data: dict[str, list[dict]],
+    plan: dict[str, Any],
+    stage: str,
+    content_hash: str,
+    prior: tuple[list[str], list[dict]],
+    costs: dict[str, float],
+) -> dict[str, Any]:
+    submitted = False
+
+    def equal_weight(history, state):
+        nonlocal submitted
+        if submitted:
+            return None
+        weights = equal_weight_buy_and_hold(history, state)
+        submitted = weights is not None
+        return weights
+
+    return run_partition_strategy(
+        data,
+        plan["snapshot_id"],
+        content_hash,
+        equal_weight,
+        partition_name=stage,
+        signal_window_sessions=plan["signal_window_sessions"],
+        prior_history=prior,
+        initial_cash=plan["initial_cash"],
+        transaction_cost_bps=costs["transaction_cost_bps"],
+        slippage_bps=costs["slippage_bps"],
+    )
+
+
+def _candidate_run(
+    data: dict[str, list[dict]],
+    plan: dict[str, Any],
+    stage: str,
+    content_hash: str,
+    prior: tuple[list[str], list[dict]],
+    costs: dict[str, float],
+    *,
+    parameters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    candidate = plan["candidate"]
+    family = candidate["strategy"]["family"]
+    variant_parameters = (
+        candidate["parameters"] if parameters is None else parameters
+    )
+    spec = {"family": family, "parameters": variant_parameters}
+    # The frozen original candidate keeps the plan's window; a neighbourhood
+    # variant must use the window implied by its own parameters.
+    window = (
+        plan["signal_window_sessions"]
+        if parameters is None
+        else _signal_window_for(family, parameters)
+    )
+    return run_partition_strategy(
+        data,
+        plan["snapshot_id"],
+        content_hash,
+        make_strategy(spec),
+        partition_name=stage,
+        signal_window_sessions=window,
+        prior_history=prior,
+        initial_cash=plan["initial_cash"],
+        transaction_cost_bps=costs["transaction_cost_bps"],
+        slippage_bps=costs["slippage_bps"],
+    )
+
+
+def _run_summary(run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "metrics": run["metrics"],
+        "start_date": run["start_date"],
+        "end_date": run["end_date"],
+        "signals": [
+            {
+                "date": signal["date"],
+                "execution_date": signal["execution_date"],
+                "target_weights": signal["target_weights"],
+            }
+            for signal in run["signals"]
+        ],
+        "fills": run["fills"],
+        "unfilled_attempts": [
+            attempt
+            for attempt in run["order_attempts"]
+            if attempt["status"] != "filled"
+        ],
+        "signal_gaps": run["signal_gaps"],
+        "valuation_gaps": run["gaps"]["valuation"],
+        "data_gaps": {
+            "raw_bars": run["gaps"]["raw_bars"],
+            "derived": run["gaps"]["derived"],
+        },
+    }
+
+
+def _nav_curve(run: dict[str, Any]) -> list[dict[str, Any]]:
+    points = []
+    peak: float | None = None
+    for point in run["equity_curve"]:
+        nav = point["nav"]
+        drawdown = None
+        if nav is not None:
+            peak = nav if peak is None or nav > peak else peak
+            drawdown = nav / peak - 1.0 if peak else None
+        points.append({"date": point["date"], "nav": nav, "drawdown": drawdown})
+    return points
+
+
+def _delta(left: float | None, right: float | None) -> float | None:
+    if left is None or right is None:
+        return None
+    return left - right
+
+
+def _threshold_values(
+    base: dict[str, Any], stress: dict[str, Any]
+) -> dict[str, float | int | None]:
+    candidate_base = base["candidate"]["metrics"]
+    baseline_base = base["baseline"]["metrics"]
+    candidate_stress = stress["candidate"]["metrics"]
+    baseline_stress = stress["baseline"]["metrics"]
+    return {
+        "sessions": candidate_base["sessions"],
+        "valued_sessions": candidate_base["valued_sessions"],
+        "total_return": candidate_base["total_return"],
+        "max_drawdown": candidate_base["max_drawdown"],
+        "sharpe": candidate_base["sharpe"],
+        "fees_paid": candidate_base["fees_paid"],
+        "slippage_paid": candidate_base["slippage_paid"],
+        "unfilled_orders": candidate_base["orders_unfilled"],
+        "return_delta": _delta(
+            candidate_base["total_return"], baseline_base["total_return"]
+        ),
+        "stress_total_return": candidate_stress["total_return"],
+        "stress_return_delta": _delta(
+            candidate_stress["total_return"], baseline_stress["total_return"]
+        ),
+    }
+
+
+def _compare(actual: float, operator: str, expected: float) -> bool:
+    if operator == "==":
+        return math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-12)
+    if operator == ">=":
+        return actual >= expected
+    if operator == "<=":
+        return actual <= expected
+    if operator == ">":
+        return actual > expected
+    return actual < expected
+
+
+def _evaluate_thresholds(
+    plan: dict[str, Any], base: dict[str, Any], stress: dict[str, Any]
+) -> list[dict[str, Any]]:
+    values = _threshold_values(base, stress)
+    results = []
+    for entry in plan["thresholds"]:
+        actual = values.get(entry["metric"])
+        if actual is None:
+            status = "unavailable"
+            message = f"{entry['metric']} is unavailable for this partition."
+        elif _compare(float(actual), entry["op"], float(entry["value"])):
+            status = "passed"
+            message = f"{entry['metric']} met the frozen threshold."
+        else:
+            status = "failed"
+            message = f"{entry['metric']} did not meet the frozen threshold."
+        results.append(
+            {
+                "id": entry["id"],
+                "metric": entry["metric"],
+                "op": entry["op"],
+                "value": entry["value"],
+                "actual": actual,
+                "status": status,
+                "message": message,
+            }
+        )
+    return results
+
+
+def _neighbourhood_result(
+    plan: dict[str, Any],
+    data: dict[str, list[dict]],
+    stage: str,
+    content_hash: str,
+    prior: tuple[list[str], list[dict]],
+    base_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    definition = plan["neighborhood"]
+    counts = {"variants": 0, "stable": 0, "degraded": 0, "not_evaluable": 0, "excluded": 0}
+    if definition.get("no_tunable_parameters") is True:
+        return {
+            "definition": definition,
+            "applicable": False,
+            "reason": "no_tunable_parameters",
+            "variants": [],
+            "excluded": [],
+            "counts": counts,
+            "diagnostic_only": True,
+        }
+    if definition.get("status") != "planned":
+        return {
+            "definition": definition,
+            "applicable": False,
+            "reason": definition.get("status", "not_planned"),
+            "variants": [],
+            "excluded": list(definition.get("excluded", [])),
+            "counts": counts,
+            "diagnostic_only": True,
+        }
+    thresholds = definition["thresholds"]
+    original_sharpe = base_metrics["sharpe"]
+    original_drawdown = (
+        abs(base_metrics["max_drawdown"])
+        if base_metrics["max_drawdown"] is not None
+        else None
+    )
+    variants = []
+    for entry in definition.get("variants", []):
+        variant = {
+            "changed_parameters": entry["changed_parameters"],
+            "parameters": entry["parameters"],
+            "requested_delta": entry.get("requested_delta"),
+            "applied_delta": entry.get("applied_delta"),
+        }
+        if entry.get("reason") is not None:
+            variant.update(status="invalid_config", reason=entry["reason"])
+            variants.append(variant)
+            continue
+        variant["signal_window_sessions"] = _signal_window_for(
+            plan["candidate"]["strategy"]["family"], entry["parameters"]
+        )
+        try:
+            run = _candidate_run(
+                data,
+                plan,
+                stage,
+                content_hash,
+                prior,
+                plan["base_costs"],
+                parameters=entry["parameters"],
+            )
+        except ValueError as error:
+            variant.update(status="not_evaluable", reason="execution_failed", error=str(error))
+        else:
+            metrics = run["metrics"]
+            variant["metrics"] = metrics
+            if (
+                original_sharpe is None
+                or metrics["sharpe"] is None
+                or original_drawdown is None
+                or metrics["max_drawdown"] is None
+            ):
+                variant.update(status="not_evaluable", reason="metric_unavailable")
+            else:
+                sharpe_drop = original_sharpe - metrics["sharpe"]
+                drawdown_increase = abs(metrics["max_drawdown"]) - original_drawdown
+                degraded = (
+                    sharpe_drop
+                    >= max(
+                        thresholds["sharpe_absolute"],
+                        thresholds["sharpe_relative"] * max(original_sharpe, 0.0),
+                    )
+                    or drawdown_increase
+                    >= max(
+                        thresholds["drawdown_absolute"],
+                        thresholds["drawdown_relative"] * original_drawdown,
+                    )
+                )
+                variant.update(
+                    status="degraded" if degraded else "stable",
+                    sharpe_drop=sharpe_drop,
+                    drawdown_increase=drawdown_increase,
+                )
+        variants.append(variant)
+    counts["variants"] = len(variants)
+    for variant in variants:
+        if variant["status"] in counts:
+            counts[variant["status"]] += 1
+    excluded = list(definition.get("excluded", []))
+    counts["excluded"] = len(excluded)
+    return {
+        "definition": definition,
+        "applicable": True,
+        "variants": variants,
+        "excluded": excluded,
+        "counts": counts,
+        "diagnostic_only": True,
+    }
+
+
+def _equal_weight_index(
+    days: list[str], derived: dict[tuple[str, str], dict]
+) -> dict[str, float]:
+    index: dict[str, float] = {}
+    for day in days:
+        values = []
+        for symbol in ETF_SYMBOLS:
+            row = derived.get((day, symbol))
+            if row is None or row.get("value") is None:
+                values = []
+                break
+            values.append(float(row["value"]))
+        if values:
+            index[day] = sum(values) / len(values)
+    return index
+
+
+def _day_available(
+    day: str, cutoff: datetime, derived: dict[tuple[str, str], dict]
+) -> bool:
+    for symbol in ETF_SYMBOLS:
+        row = derived.get((day, symbol))
+        if row is None or row.get("value") is None or not available_by(row, cutoff):
+            return False
+    return True
+
+
+def _regime_labels(
+    plan: dict[str, Any],
+    sessions: list[str],
+    prior: tuple[list[str], list[dict]],
+    data: dict[str, list[dict]],
+) -> dict[str, str | None]:
+    definition = plan["regimes"]
+    prior_sessions, prior_rows = prior
+    days = sorted({*[day for day in prior_sessions if day < sessions[0]], *sessions})
+    derived = {
+        (row["date"], row["symbol"]): row for row in [*prior_rows, *data["derived"]]
+    }
+    index = _equal_weight_index(days, derived)
+    ordered = [day for day in days if day in index]
+    calm, volatile = definition["labels"]
+    labels: dict[str, str | None] = {}
+    for day in sessions:
+        cutoff = datetime.combine(
+            date.fromisoformat(day), clock_time(9, 30), tzinfo=CN_TZ
+        )
+        prior_days = [candidate for candidate in ordered if candidate < day]
+        if len(prior_days) < definition["lookback"] + 1:
+            labels[day] = None
+            continue
+        window = prior_days[-(definition["lookback"] + 1) :]
+        if not all(_day_available(candidate, cutoff, derived) for candidate in window):
+            labels[day] = None
+            continue
+        returns = [
+            index[right] / index[left] - 1.0
+            for left, right in zip(window, window[1:], strict=False)
+        ]
+        volatility = statistics.stdev(returns)
+        labels[day] = volatile if volatility >= definition["volatility_threshold"] else calm
+    return labels
+
+
+def _session_returns(curve: list[dict[str, Any]]) -> dict[str, float]:
+    returns: dict[str, float] = {}
+    previous: float | None = None
+    for point in curve:
+        nav = point["nav"]
+        if nav is None:
+            continue
+        if previous is not None:
+            returns[point["date"]] = float(nav) / previous - 1.0
+        previous = float(nav)
+    return returns
+
+
+def _regime_groups(
+    plan: dict[str, Any],
+    sessions: list[str],
+    labels: dict[str, str | None],
+    candidate_curve: list[dict[str, Any]],
+    baseline_curve: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidate_returns = _session_returns(candidate_curve)
+    baseline_returns = _session_returns(baseline_curve)
+    groups = []
+    for label in [*plan["regimes"]["labels"], "unclassified"]:
+        if label == "unclassified":
+            days = [day for day in sessions if labels.get(day) is None]
+        else:
+            days = [day for day in sessions if labels.get(day) == label]
+        candidate_samples = [
+            candidate_returns[day] for day in days if day in candidate_returns
+        ]
+        baseline_samples = [
+            baseline_returns[day] for day in days if day in baseline_returns
+        ]
+        relative = [
+            candidate_returns[day] - baseline_returns[day]
+            for day in days
+            if day in candidate_returns and day in baseline_returns
+        ]
+        groups.append(
+            {
+                "label": label,
+                "sessions": len(days),
+                "candidate_samples": len(candidate_samples),
+                "baseline_samples": len(baseline_samples),
+                "candidate_mean_return": (
+                    sum(candidate_samples) / len(candidate_samples)
+                    if candidate_samples
+                    else None
+                ),
+                "baseline_mean_return": (
+                    sum(baseline_samples) / len(baseline_samples)
+                    if baseline_samples
+                    else None
+                ),
+                "mean_relative_return": (
+                    sum(relative) / len(relative) if relative else None
+                ),
+            }
+        )
+    return {
+        "definition": plan["regimes"],
+        "session_labels": [
+            {"date": day, "label": labels.get(day)} for day in sessions
+        ],
+        "groups": groups,
+        "diagnostic_only": True,
+    }
+
+
+def _evaluation_record(
+    *,
+    plan: dict[str, Any],
+    stage: str,
+    protected: dict[str, Any],
+    prior: tuple[list[str], list[dict]],
+    prior_evidence: dict[str, Any],
+    isolation: dict[str, Any],
+    authorization: dict[str, Any],
+    metadata: dict[str, Any],
+    project_id: str,
+    evaluation_id: str,
+    debited_at: str,
+) -> dict[str, Any]:
+    data = protected["data"]
+    descriptor = protected["descriptor"]
+    content_hash = protected["content_hash"]
+    runs = {}
+    for label, costs in (
+        ("base", plan["base_costs"]),
+        ("stress", plan["stress_costs"]),
+    ):
+        runs[label] = {
+            "candidate": _candidate_run(
+                data, plan, stage, content_hash, prior, costs
+            ),
+            "baseline": _equal_weight_run(
+                data, plan, stage, content_hash, prior, costs
+            ),
+        }
+
+    base_metrics = runs["base"]["candidate"]["metrics"]
+    stress_metrics = runs["stress"]["candidate"]["metrics"]
+    baseline_base = runs["base"]["baseline"]["metrics"]
+    baseline_stress = runs["stress"]["baseline"]["metrics"]
+    thresholds = _evaluate_thresholds(plan, runs["base"], runs["stress"])
+    minimum = plan["minimum_samples"]
+    samples_sufficient = (
+        base_metrics["sessions"] >= minimum["sessions"]
+        and base_metrics["valued_sessions"] >= minimum["valued_sessions"]
+    )
+    valuation_complete = base_metrics["valued_sessions"] == base_metrics["sessions"]
+    partition_gaps = _partition_gaps(metadata, descriptor)
+    runner = runs["base"]["candidate"]
+    baseline_runner = runs["base"]["baseline"]
+    coverage_complete = (
+        samples_sufficient
+        and valuation_complete
+        and bool(runner["signals"])
+        and bool(baseline_runner["signals"])
+        and not runner["signal_gaps"]
+        and not runner["gaps"]["valuation"]
+        and not partition_gaps["raw_bars"]
+        and not partition_gaps["derived"]
+    )
+    failed = [item["id"] for item in thresholds if item["status"] == "failed"]
+    unavailable = [item["id"] for item in thresholds if item["status"] == "unavailable"]
+    if failed:
+        outcome, reason = "rejected", REASON_THRESHOLD
+    elif not coverage_complete:
+        outcome, reason = "insufficient_evidence", REASON_COVERAGE
+    elif unavailable:
+        outcome, reason = "insufficient_evidence", REASON_EVIDENCE
+    else:
+        outcome, reason = "passed", None
+    message = (
+        "All preregistered thresholds and minimum samples were met."
+        if outcome == "passed"
+        else COARSE_MESSAGES[reason]
+    )
+    sessions = [point["date"] for point in runner["equity_curve"]]
+    neighbourhood = _neighbourhood_result(
+        plan, data, stage, content_hash, prior, base_metrics
+    )
+    labels = _regime_labels(plan, sessions, prior, data)
+    regimes = _regime_groups(
+        plan,
+        sessions,
+        labels,
+        runs["base"]["candidate"]["equity_curve"],
+        runs["base"]["baseline"]["equity_curve"],
+    )
+    prior_export = (
+        _validation_export(plan, protected, evaluation_id)
+        if stage == VALIDATION_STAGE
+        else None
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "scope": SCOPE,
+        "data_kind": SCOPE,
+        "evaluation_id": evaluation_id,
+        "plan_id": plan["plan_id"],
+        "project_id": project_id,
+        "candidate_id": plan["candidate_id"],
+        "candidate_hash": plan["candidate_hash"],
+        "snapshot_id": plan["snapshot_id"],
+        "stage": stage,
+        "partition": stage,
+        "outcome": outcome,
+        "reason": reason,
+        "message": message,
+        "scoring": True,
+        "aborted": False,
+        "not_admission": True,
+        "not_admission_statement": NOT_ADMISSION_STATEMENT,
+        "fingerprints": {
+            "plan": plan["plan_id"],
+            "candidate": plan["candidate_hash"],
+            "snapshot_manifest": plan["snapshot_id"],
+            "partitions": {
+                name: plan["partitions"][name]["content_hash"] for name in STAGES
+            },
+            "evaluated_partition": content_hash,
+            "runtime_dependencies": plan["candidate"].get("runtime_dependencies"),
+        },
+        "partitions": {
+            name: plan["partitions"][name] for name in STAGES
+        },
+        "partition_descriptor": descriptor,
+        "lineage": protected["lineage"],
+        "prior_evidence": prior_evidence,
+        **(
+            {"prior_export_for_holdout": prior_export}
+            if prior_export is not None
+            else {}
+        ),
+        "authorization": authorization,
+        "query_receipt": {
+            "partition": stage,
+            "partition_content_hash": content_hash,
+            "plan_id": plan["plan_id"],
+            "candidate_hash": plan["candidate_hash"],
+            "authorization_id": authorization["auth_id"],
+            "debited": True,
+            "debited_at": debited_at,
+            "status": "completed",
+        },
+        "isolation": isolation,
+        "isolation_verified": isolation.get("verified") is True,
+        "memory_limit_enforced": isolation.get("memory_limit_enforced"),
+        "isolation_failure_reason": isolation.get("failure_reason"),
+        "opened_protected_source": True,
+        "availability": {
+            "timezone": "Asia/Shanghai (UTC+08:00)",
+            "signal_cutoff": "next_session_open_09:30",
+            "valuation_cutoff": "session_close_end_of_day",
+            "regime_cutoff": "target_session_open_09:30_excluding_target_and_future",
+            "prior_history_rule": plan["prior_history"][stage],
+        },
+        "execution": {
+            "rules": plan["execution_rules"],
+            "initial_cash": plan["initial_cash"],
+            "signal_window_sessions": plan["signal_window_sessions"],
+            "base_costs": plan["base_costs"],
+            "stress_costs": plan["stress_costs"],
+            "partitions": {
+                "validation": plan["partitions"]["validation"],
+                "final_holdout": plan["partitions"]["final_holdout"],
+            },
+        },
+        "baseline": plan["baseline"],
+        "cost_stress": {
+            "base": {
+                "candidate": base_metrics,
+                "baseline": baseline_base,
+                "return_delta": _delta(
+                    base_metrics["total_return"], baseline_base["total_return"]
+                ),
+                "fees_delta": base_metrics["fees_paid"] - baseline_base["fees_paid"],
+                "slippage_delta": (
+                    base_metrics["slippage_paid"] - baseline_base["slippage_paid"]
+                ),
+            },
+            "stress": {
+                "candidate": stress_metrics,
+                "baseline": baseline_stress,
+                "return_delta": _delta(
+                    stress_metrics["total_return"], baseline_stress["total_return"]
+                ),
+                "fees_delta": stress_metrics["fees_paid"] - baseline_stress["fees_paid"],
+                "slippage_delta": (
+                    stress_metrics["slippage_paid"] - baseline_stress["slippage_paid"]
+                ),
+            },
+            "stress_minus_base": {
+                "candidate_return_delta": _delta(
+                    stress_metrics["total_return"], base_metrics["total_return"]
+                ),
+                "baseline_return_delta": _delta(
+                    baseline_stress["total_return"], baseline_base["total_return"]
+                ),
+            },
+        },
+        "candidate_run": {
+            "base": _run_summary(runs["base"]["candidate"]),
+            "stress": _run_summary(runs["stress"]["candidate"]),
+        },
+        "baseline_run": {
+            "base": _run_summary(runs["base"]["baseline"]),
+            "stress": _run_summary(runs["stress"]["baseline"]),
+        },
+        "thresholds": thresholds,
+        "minimum_samples": minimum,
+        "verdict": {
+            "outcome": outcome,
+            "reason": reason,
+            "message": message,
+            "failed_thresholds": failed,
+            "unavailable_thresholds": unavailable,
+            "samples_sufficient": samples_sufficient,
+            "coverage_complete": coverage_complete,
+        },
+        "coverage": {
+            "sessions": base_metrics["sessions"],
+            "valued_sessions": base_metrics["valued_sessions"],
+            "minimum_samples": minimum,
+            "samples_sufficient": samples_sufficient,
+            "candidate_signals": len(runner["signals"]),
+            "baseline_signals": len(baseline_runner["signals"]),
+            "snapshot_gaps": partition_gaps,
+            "runner_gaps": {
+                "raw_bars": runner["gaps"]["raw_bars"],
+                "derived": runner["gaps"]["derived"],
+                "valuation": runner["gaps"]["valuation"],
+                "signal_gaps": runner["signal_gaps"],
+            },
+            "complete": coverage_complete,
+        },
+        "curves": {
+            "sessions": sessions,
+            "candidate": {
+                "base": _nav_curve(runs["base"]["candidate"]),
+                "stress": _nav_curve(runs["stress"]["candidate"]),
+            },
+            "baseline": {
+                "base": _nav_curve(runs["base"]["baseline"]),
+                "stress": _nav_curve(runs["stress"]["baseline"]),
+            },
+        },
+        "neighbourhood": neighbourhood,
+        "regimes": regimes,
+        "created_at": _now(),
+        "completed_at": _now(),
+    }
+
+
+def _aborted_record(
+    *,
+    plan: dict[str, Any],
+    stage: str,
+    project_id: str,
+    evaluation_id: str,
+    authorization: dict[str, Any],
+    isolation: dict[str, Any],
+    protected: dict[str, Any] | None,
+    opened: bool | str,
+    debited_at: str,
+    error: BaseException,
+    prior_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    message = COARSE_MESSAGES[REASON_EVIDENCE]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "scope": SCOPE,
+        "data_kind": SCOPE,
+        "evaluation_id": evaluation_id,
+        "plan_id": plan["plan_id"],
+        "project_id": project_id,
+        "candidate_id": plan["candidate_id"],
+        "candidate_hash": plan["candidate_hash"],
+        "snapshot_id": plan["snapshot_id"],
+        "stage": stage,
+        "partition": stage,
+        "outcome": "insufficient_evidence",
+        "reason": REASON_EVIDENCE,
+        "message": message,
+        "scoring": False,
+        "aborted": True,
+        "not_admission": True,
+        "not_admission_statement": NOT_ADMISSION_STATEMENT,
+        "fingerprints": {
+            "plan": plan["plan_id"],
+            "candidate": plan["candidate_hash"],
+            "snapshot_manifest": plan["snapshot_id"],
+            "partitions": {
+                name: plan["partitions"][name]["content_hash"] for name in STAGES
+            },
+        },
+        "partitions": {name: plan["partitions"][name] for name in STAGES},
+        "partition_descriptor": (
+            protected["descriptor"] if protected is not None else None
+        ),
+        "lineage": protected["lineage"] if protected is not None else None,
+        "prior_evidence": prior_evidence,
+        "authorization": authorization,
+        "query_receipt": {
+            "partition": stage,
+            "partition_content_hash": plan["partitions"][stage]["content_hash"],
+            "plan_id": plan["plan_id"],
+            "candidate_hash": plan["candidate_hash"],
+            "authorization_id": authorization["auth_id"],
+            "debited": True,
+            "debited_at": debited_at,
+            "status": "aborted",
+        },
+        "isolation": isolation,
+        "isolation_verified": isolation.get("verified") is True,
+        "memory_limit_enforced": isolation.get("memory_limit_enforced"),
+        "isolation_failure_reason": isolation.get("failure_reason"),
+        "opened_protected_source": opened,
+        "availability": {
+            "timezone": "Asia/Shanghai (UTC+08:00)",
+            "signal_cutoff": "next_session_open_09:30",
+            "valuation_cutoff": "session_close_end_of_day",
+            "regime_cutoff": "target_session_open_09:30_excluding_target_and_future",
+            "prior_history_rule": plan["prior_history"][stage],
+        },
+        "execution": {
+            "rules": plan["execution_rules"],
+            "initial_cash": plan["initial_cash"],
+            "signal_window_sessions": plan["signal_window_sessions"],
+            "base_costs": plan["base_costs"],
+            "stress_costs": plan["stress_costs"],
+        },
+        "baseline": plan["baseline"],
+        "thresholds": [],
+        "minimum_samples": plan["minimum_samples"],
+        "verdict": {
+            "outcome": "insufficient_evidence",
+            "reason": REASON_EVIDENCE,
+            "message": message,
+            "failed_thresholds": [],
+            "unavailable_thresholds": [],
+            "samples_sufficient": False,
+            "coverage_complete": False,
+        },
+        "failure": {
+            "phase": "evaluation",
+            "type": type(error).__name__,
+            "message": str(error),
+        },
+        "created_at": _now(),
+        "completed_at": _now(),
+    }
+
+
+def _write_record(store: Path, evaluation_id: str, record: dict[str, Any]) -> Path:
+    """Write the trusted record once, binding its content address."""
+    record["record_hash"] = _record_hash(record)
+    path = store / "records" / evaluation_id / "record.json"
+    stored = _file_once(path, record)
+    if (
+        stored.get("evaluation_id") != evaluation_id
+        or stored.get("record_hash") != _record_hash(stored)
+    ):
+        raise ValueError("Existing evaluation record integrity check failed.")
+    return path
+
+
+def _isolation_evidence_summary(isolation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "verified": isolation.get("verified") is True,
+        "memory_limit_enforced": isolation.get("memory_limit_enforced"),
+        "failure_reason": isolation.get("failure_reason"),
+    }
+
+
+def _isolation_summary(record: dict[str, Any]) -> dict[str, Any]:
+    isolation = record.get("isolation")
+    if not isinstance(isolation, dict):
+        isolation = {}
+    return {
+        "verified": (
+            record.get("isolation_verified", isolation.get("verified")) is True
+        ),
+        "memory_limit_enforced": record.get(
+            "memory_limit_enforced", isolation.get("memory_limit_enforced")
+        ),
+        "failure_reason": record.get(
+            "isolation_failure_reason", isolation.get("failure_reason")
+        ),
+    }
+
+
+def _run_response(
+    store: Path, record: dict[str, Any], *, reused: bool
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "completed" if record.get("scoring") else "aborted",
+        "scope": SCOPE,
+        "plan_id": record["plan_id"],
+        "stage": record["stage"],
+        "evaluation_id": record["evaluation_id"],
+        "outcome": record["outcome"],
+        "reason": record["reason"],
+        "scoring": record["scoring"],
+        "query": {
+            **record["query_receipt"],
+            "reused": reused,
+            "opened_protected_source": record.get("opened_protected_source") is True,
+        },
+        "receipt": record["research_receipt"],
+        "isolation": _isolation_summary(record),
+        "record_path": str(store / "records" / record["evaluation_id"] / "record.json"),
+        "record": record,
+    }
+
+
+def run_evaluation(
+    store: str | Path,
+    snapshot_store: str | Path,
+    project: str | Path,
+    plan_id: str,
+    stage: str = VALIDATION_STAGE,
+) -> dict[str, Any]:
+    """Run one authorized, isolated, debited Validation or Final Holdout evaluation."""
+    eval_store = _store(store)
+    snapshot_store = Path(snapshot_store)
+    project = Path(project)
+    project_id = str(project_status(project)["project_id"])
+    plan = _load_plan(eval_store, plan_id)
+    label = "Validation" if stage == VALIDATION_STAGE else "Final Holdout"
+    context = {
+        "plan_id": plan.get("plan_id"),
+        "stage": stage,
+        "candidate_id": plan.get("candidate_id"),
+        "candidate_hash": plan.get("candidate_hash"),
+        "snapshot_id": plan.get("snapshot_id"),
+        "project_id": project_id,
+        "partition": stage,
+        "partition_content_hash": (
+            plan.get("partitions", {}).get(stage, {}).get("content_hash")
+            if isinstance(plan.get("partitions"), dict)
+            else None
+        ),
+    }
+
+    def reject(
+        code: str,
+        message: str,
+        *,
+        next_action: str = "inspect",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        extra = dict(details or {})
+        audit_id = _audit(eval_store, {**context, **extra}, code, message)
+        raise EvaluationRejection(
+            code,
+            "run",
+            next_action,
+            message,
+            context={
+                "audit_id": audit_id,
+                "opened_protected_source": False,
+                "query_debited": False,
+                **extra,
+            },
+        )
+
+    if stage not in STAGES:
+        reject("UNSUPPORTED_STAGE", "Unknown evaluation stage.", next_action="correct")
+    if plan.get("scope") != SCOPE or plan.get("data_kind") != SCOPE:
+        reject("FINGERPRINT_MISMATCH", "The plan is not bound to synthetic data.")
+    if plan.get("stages") != list(STAGES):
+        reject("FINGERPRINT_MISMATCH", "The frozen plan does not fix both protected stages.")
+    if plan.get("project_id") != project_id:
+        reject("FINGERPRINT_MISMATCH", "The frozen plan is bound to another project.")
+    if _plan_mapping(project, plan_id) != plan["candidate_id"]:
+        reject(
+            "FINGERPRINT_MISMATCH",
+            "The frozen plan is not registered to this project's candidate.",
+        )
+    try:
+        candidate = candidate_status(project, plan["candidate_id"])
+    except ValueError as error:
+        reject("FINGERPRINT_MISMATCH", f"The frozen candidate failed verification: {error}")
+    if (
+        candidate.get("candidate_hash") != plan["candidate_hash"]
+        or candidate != plan["candidate"]
+    ):
+        reject(
+            "FINGERPRINT_MISMATCH",
+            "The frozen candidate differs from the plan's frozen candidate.",
+        )
+    if plan.get("runtime") != _runtime_identity():
+        reject(
+            "FINGERPRINT_MISMATCH",
+            "The trusted accounting engine differs from the plan's frozen runtime.",
+        )
+    try:
+        metadata = snapshot.manifest(snapshot_store, plan["snapshot_id"])
+        descriptors = {
+            name: snapshot.partition_descriptor(metadata, name) for name in STAGES
+        }
+    except ValueError as error:
+        reject(
+            "FINGERPRINT_MISMATCH",
+            f"The frozen snapshot manifest could not be verified: {error}",
+        )
+    if metadata.get("data_kind") != SCOPE:
+        reject("FINGERPRINT_MISMATCH", "The sealed snapshot is not synthetic.")
+    for name in STAGES:
+        if descriptors[name] != plan["partitions"][name]:
+            reject(
+                "FINGERPRINT_MISMATCH",
+                f"The sealed {name} descriptor differs from the frozen plan.",
+            )
+
+    authorizations = _authorizations(eval_store, plan_id, stage)
+    if len(authorizations) != 1 or not _authorization_matches(
+        authorizations[0], plan, stage
+    ):
+        reject(
+            "AUTHORIZATION_REQUIRED",
+            f"A matching {label} authorization is required before opening the "
+            "sealed partition.",
+            next_action="authorize",
+        )
+    authorization = authorizations[0]
+
+    validation_evidence: dict[str, Any] | None = None
+    if stage == HOLDOUT_STAGE:
+        # The authorization is only valid while the Validation evidence it was
+        # granted against still exists and still passes.  This reads the trusted
+        # Validation record, never the sealed Validation payload.
+        try:
+            validation_evidence = _validation_prior_evidence(eval_store, plan)
+        except _EvidenceProblem as problem:
+            reject(
+                problem.code,
+                problem.message,
+                next_action=(
+                    "run-validation"
+                    if problem.code == "VALIDATION_NOT_PASSED"
+                    else "inspect"
+                ),
+            )
+        binding = authorization.get("validation")
+        if (
+            not isinstance(binding, dict)
+            or binding.get("evaluation_id") != validation_evidence["evaluation_id"]
+            or binding.get("record_hash") != validation_evidence["record_hash"]
+        ):
+            reject(
+                "AUTHORIZATION_REQUIRED",
+                "The stored Final Holdout authorization does not match the "
+                "completed Validation record; authorize again after inspecting.",
+                next_action="authorize",
+            )
+
+    isolation = probe_isolation_evidence()
+    if isolation.get("verified") is not True:
+        reject(
+            "ISOLATION_UNAVAILABLE",
+            "OS isolation could not be verified ("
+            + str(isolation.get("failure_reason"))
+            + "); the sealed partition was not opened.",
+            next_action="stop",
+            details={"isolation": _isolation_evidence_summary(isolation)},
+        )
+
+    if stage == VALIDATION_STAGE:
+        discovery_sessions, discovery_rows, discovery_hash = _prior_discovery(
+            snapshot_store, plan, reject
+        )
+        prior = (discovery_sessions, discovery_rows)
+        prior_evidence = {
+            "partitions": list(plan["prior_history"][VALIDATION_STAGE]["partitions"]),
+            "discovery_content_hash": discovery_hash,
+        }
+    else:
+        prior, prior_evidence = _prior_holdout(
+            snapshot_store,
+            plan,
+            validation_evidence,
+            descriptors[HOLDOUT_STAGE],
+            reject,
+        )
+
+    claim = _claim_partition(eval_store, plan, stage, authorization)
+    if claim["state"] == "consumed":
+        reject(
+            "QUERY_ALREADY_CONSUMED",
+            f"This sealed {label} range was already consumed by another frozen "
+            "plan or candidate.",
+            next_action="stop",
+        )
+    if claim["state"] in {"in_progress", "unrecorded"}:
+        reject(
+            "EVALUATION_IN_PROGRESS",
+            f"This sealed {label} range is already reserved; no second read is allowed.",
+            next_action="inspect",
+        )
+    if claim["state"] == "reuse":
+        record = claim["record"]
+        try:
+            _verify_record(record)
+            if not _record_matches(record, plan, stage):
+                raise ValueError(
+                    "The stored evaluation record is not bound to this frozen plan, "
+                    "candidate, snapshot and partition fingerprint."
+                )
+        except ValueError as error:
+            reject("RECORD_INTEGRITY_FAILED", str(error), next_action="inspect")
+        receipt = _publish_receipt(
+            project, plan, _receipt_for_record(record)
+        )
+        _mark_state(
+            eval_store,
+            record["evaluation_id"],
+            stage,
+            plan["partitions"][stage]["content_hash"],
+            status="completed" if record.get("scoring") else "aborted",
+            outcome=record["outcome"],
+            record_path=claim["record_path"],
+            completed_at=record.get("completed_at") or _now(),
+        )
+        record["research_receipt"] = receipt
+        return _run_response(eval_store, record, reused=True)
+
+    evaluation_id = claim["evaluation_id"]
+    protected: dict[str, Any] | None = None
+    opened: bool | str = "unverified"
+    try:
+        protected = snapshot.read_protected(
+            snapshot_store, plan["snapshot_id"], stage
+        )
+        opened = True
+        _failpoint("evaluation_after_read")
+        record = _evaluation_record(
+            plan=plan,
+            stage=stage,
+            protected=protected,
+            prior=prior,
+            prior_evidence=prior_evidence,
+            isolation=isolation,
+            authorization=authorization,
+            metadata=metadata,
+            project_id=project_id,
+            evaluation_id=evaluation_id,
+            debited_at=claim["debited_at"],
+        )
+        record["research_receipt"] = _receipt_for_record(record)
+        record_path = _write_record(eval_store, evaluation_id, record)
+        ledger_status = "completed"
+    except Exception as error:  # noqa: BLE001 - abort after read must never score
+        record = _aborted_record(
+            plan=plan,
+            stage=stage,
+            project_id=project_id,
+            evaluation_id=evaluation_id,
+            authorization=authorization,
+            isolation=isolation,
+            protected=protected,
+            opened=opened,
+            debited_at=claim["debited_at"],
+            error=error,
+            prior_evidence=prior_evidence,
+        )
+        record["research_receipt"] = _receipt_for_record(record)
+        record_path = _write_record(eval_store, evaluation_id, record)
+        ledger_status = "aborted"
+
+    receipt = _publish_receipt(project, plan, record["research_receipt"])
+    record["research_receipt"] = receipt
+    _mark_state(
+        eval_store,
+        evaluation_id,
+        stage,
+        plan["partitions"][stage]["content_hash"],
+        status=ledger_status,
+        outcome=record["outcome"],
+        record_path=record_path,
+        completed_at=record["completed_at"],
+    )
+    return _run_response(eval_store, record, reused=False)

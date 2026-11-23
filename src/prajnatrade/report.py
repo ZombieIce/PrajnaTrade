@@ -107,9 +107,13 @@ def write_campaign_report(
         "<ul><li>Discovery results are exploratory and selected from multiple attempts.</li>",
         "<li>Validation uses a separate interval; the final holdout is one-use and requires explicit confirmation.</li>",
         "<li>Mock provider runs test orchestration, not AI novelty. Synthetic data is never market evidence.</li>",
-        "<li>Generated Python requires explicit trusted-local opt-in and is not sandboxed; "
-        "it can access files, credentials and the network. Keep holdout data inaccessible "
-        "to the process until confirmation.</li>",
+        "<li>Generated Python requires --isolated-generated-python and runs only when the "
+        "supported macOS sandbox and configured resource limits pass preflight. The tested "
+        "boundary denies protected-file access, network access, and process creation; "
+        "unsupported platforms or unavailable limits refuse execution. CPU time and "
+        "peak resident memory usage are not captured. The public CLI "
+        "blocks generated-Python validation and holdout until their results can be kept "
+        "outside the research side. There is no trusted-local fallback.</li>",
         "<li>Historical backtests do not establish future profitability.</li></ul>",
         "</section>",
         "</main></body></html>",
@@ -198,6 +202,7 @@ def _experiment_table(experiments: list[dict[str, Any]]) -> str:
             "parameters": experiment["parameters"],
             "rationale": experiment["rationale"],
             "reflection": experiment["reflection"],
+            "execution_evidence": experiment["execution_evidence"],
             "provider_usage": experiment["provider_usage"],
             "metrics": {
                 key: value
@@ -316,7 +321,7 @@ def _equity_and_drawdown(curve: list[dict[str, Any]], title: str) -> str:
     for equity in equities:
         peak = max(peak, equity)
         peaks.append(peak)
-    drawdowns = [equity / peak - 1.0 for equity, peak in zip(equities, peaks)]
+    drawdowns = [equity / peak - 1.0 for equity, peak in zip(equities, peaks, strict=True)]
     return (
         f"<h5>{html.escape(title)} equity</h5>{_svg_plot(equities, "#2665a8", "Equity")}"
         f"<h5>{html.escape(title)} drawdown</h5>{_svg_plot(drawdowns, "#c14444", "Drawdown")}"

@@ -1,6 +1,13 @@
-import json
+"""Research CLI and campaign-loop tests (synthetic only).
+
+Most tests here exercise pure bookkeeping and are safe in the fast suite.  The
+tests that actually execute generated Python through the real macOS sandbox are
+marked ``isolation`` individually so ``-m "not isolation"`` still covers the
+rest of the campaign loop.
+"""
+
 import html
-import os
+import json
 import subprocess
 import sys
 import time
@@ -8,16 +15,36 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-import prajnatrade.research as research
+import pandas as pd
 import pytest
+
+from cli_helpers import cli as _run_cli
+import prajnatrade.isolation as isolation
+import prajnatrade.research as research
+import prajnatrade.strategies as strategies
 from prajnatrade.data import load_bars
-from prajnatrade.providers import MockProvider, Proposal, ProviderBudgetExceeded, ProviderError, Reflection
+from prajnatrade.providers import (
+    MockProvider,
+    Proposal,
+    ProviderBudgetExceeded,
+    ProviderError,
+    Reflection,
+)
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
 from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import make_strategy
 from prajnatrade.validation import freeze_candidate, validate_candidate
 
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
+
+
+@pytest.fixture(autouse=True)
+def use_test_only_memory_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        isolation,
+        "DEFAULT_ISOLATION_LIMITS",
+        isolation.IsolationLimits(address_space_bytes=1_000_000_000_000_000),
+    )
 
 
 def _write_bars(path: Path, day_count: int = 12, start_day: int = 0) -> None:
@@ -32,19 +59,6 @@ def _write_bars(path: Path, day_count: int = 12, start_day: int = 0) -> None:
                 "1000,total_return"
             )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        (str(Path(__file__).parents[1] / "src"), env.get("PYTHONPATH", ""))
-    )
-    return subprocess.run(
-        [sys.executable, "-m", "prajnatrade", *args],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
 
 
 def test_holdout_is_imported_only_after_confirmation(tmp_path: Path) -> None:
@@ -597,7 +611,7 @@ def test_time_budget_is_checked_before_backtest(tmp_path: Path) -> None:
         initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
         token_budget=100, cost_budget_usd=1, steps=None,
         holdout_start="2025-01-01", holdout_end="2025-01-31",
-        trusted_local_python=True,
+        isolated_python=True,
     )
     experiment = campaign_status(database, result["campaign_id"])["experiments"][0]
     assert result["stop_reason"] == "time_budget"
@@ -606,24 +620,91 @@ def test_time_budget_is_checked_before_backtest(tmp_path: Path) -> None:
     assert experiment["error"] == "Backtest not completed: time_budget."
 
 
-def test_generated_python_requires_explicit_opt_in_before_execution(tmp_path: Path) -> None:
+@pytest.mark.isolation
+def test_generated_python_requires_explicit_isolation_before_execution(tmp_path: Path) -> None:
     marker = tmp_path / "executed"
     spec = {
         "family": "python",
         "parameters": {},
         "source": (
-            f"open({str(marker)!r}, 'w').write('executed')\n"
+            "try:\n"
+            f"    open({str(marker)!r}, 'w').write('executed')\n"
+            "except OSError:\n"
+            "    pass\n"
             "def strategy(history, state):\n"
             "    return {'CASH': 1.0}\n"
         ),
     }
 
-    with pytest.raises(ValueError, match="trusted-local"):
+    with pytest.raises(ValueError, match="--isolated-generated-python"):
         make_strategy(spec)
     assert not marker.exists()
-    strategy = make_strategy(spec, trusted_local_python=True)
-    assert marker.read_text(encoding="utf-8") == "executed"
-    assert strategy(None, {}) == {"CASH": 1.0}
+    strategy = make_strategy(spec, isolated_python=True)
+    assert strategy(pd.DataFrame(), {}) == {"CASH": 1.0}
+    assert not marker.exists()
+
+
+def test_isolation_failure_is_unscored_and_stops_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingProvider(MockProvider):
+        def __init__(self) -> None:
+            super().__init__(seed=1)
+            self.proposals = 0
+            self.reflections = 0
+
+        def propose(self, iteration, context):
+            self.proposals += 1
+            return super().propose(iteration, context)
+
+        def reflect(self, proposal, result, context):
+            self.reflections += 1
+            raise AssertionError("Isolation failures must not be sent for reflection.")
+
+    def reject_isolation(*args, evidence_callback=None, **kwargs):
+        evidence = {
+            "run_id": "synthetic-run",
+            "strategy_started": False,
+            "opened_protected_input": False,
+            "output_destination": "trusted controller pipe",
+        }
+        if evidence_callback is not None:
+            evidence_callback(evidence)
+        raise isolation.IsolationError("synthetic isolation rejection", evidence=evidence)
+
+    monkeypatch.setattr(strategies, "run_isolated_strategy", reject_isolation)
+    bars = tmp_path / "bars.csv"
+    database = tmp_path / "research.sqlite"
+    _write_bars(bars, day_count=20)
+    provider = CountingProvider()
+    result = start_campaign(
+        database=database,
+        dataset=load_bars(bars, "total_return"),
+        data_path=bars,
+        data_kind="synthetic",
+        provider=provider,
+        seed=1,
+        experiment_budget=2,
+        max_consecutive_failures=2,
+        max_seconds=60,
+        initial_cash=10_000,
+        transaction_cost_bps=0,
+        slippage_bps=0,
+        token_budget=5000,
+        cost_budget_usd=1,
+        steps=None,
+        holdout_start="2025-01-01",
+        holdout_end="2025-01-31",
+        isolated_python=True,
+    )
+
+    experiment = campaign_status(database, result["campaign_id"])["experiments"][0]
+    assert result["stop_reason"] == "isolation_unavailable"
+    assert experiment["status"] == "failed"
+    assert experiment["metrics"] is None
+    assert experiment["execution_evidence"][0]["strategy_started"] is False
+    assert provider.proposals == 1
+    assert provider.reflections == 0
 
 
 def test_exhausted_reflection_budget_retains_newly_completed_backtest(tmp_path: Path) -> None:
@@ -650,13 +731,13 @@ def test_exhausted_reflection_budget_retains_newly_completed_backtest(tmp_path: 
     freeze_candidate(database, started["campaign_id"], experiment["experiment_id"], "candidate", "Frozen")
 
 
+@pytest.mark.isolation
 @pytest.mark.parametrize("budget_kind", ["token_budget", "cost_budget"])
 def test_exhausted_proposal_budget_resumes_backtest_without_another_request(
-    tmp_path: Path, budget_kind: str,
+    tmp_path: Path, budget_kind: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bars = tmp_path / "bars.csv"
     database = tmp_path / "research.sqlite"
-    marker = tmp_path / "interrupted"
     _write_bars(bars, day_count=20)
     started = _run_cli(
         "research", "run", "--db", str(database), "--data", str(bars),
@@ -683,10 +764,6 @@ def test_exhausted_proposal_budget_resumes_backtest_without_another_request(
                 strategy={
                     "family": "python", "parameters": {},
                     "source": (
-                        f"from pathlib import Path\nmarker = Path({str(marker)!r})\n"
-                        "if not marker.exists():\n"
-                        "    marker.write_text('interrupted')\n"
-                        "    raise KeyboardInterrupt\n"
                         "def strategy(history, state):\n    return {CASH: 1.0}\n"
                     ),
                 },
@@ -698,16 +775,27 @@ def test_exhausted_proposal_budget_resumes_backtest_without_another_request(
             raise AssertionError("A reflection must not be sent after budget exhaustion")
 
     provider = InterruptedProposal()
+    run_isolated_strategy = strategies.run_isolated_strategy
+    interrupt_first_run = True
+
+    def interrupt_once(*args: object, **kwargs: object):
+        nonlocal interrupt_first_run
+        if interrupt_first_run:
+            interrupt_first_run = False
+            raise KeyboardInterrupt
+        return run_isolated_strategy(*args, **kwargs)
+
+    monkeypatch.setattr(strategies, "run_isolated_strategy", interrupt_once)
     with pytest.raises(KeyboardInterrupt):
         resume_campaign(
             database=database, campaign_id=campaign_id, provider=provider,
-            trusted_local_python=True,
+            isolated_python=True,
         )
     pending = campaign_status(database, campaign_id)["experiments"][1]
     assert pending["status"] == "running"
     result = resume_campaign(
         database=database, campaign_id=campaign_id, provider=provider,
-        trusted_local_python=True,
+        isolated_python=True,
     )
     experiment = campaign_status(database, campaign_id)["experiments"][1]
     assert result["stop_reason"] == budget_kind
@@ -719,6 +807,7 @@ def test_exhausted_proposal_budget_resumes_backtest_without_another_request(
     assert provider.reflections == 0
 
 
+@pytest.mark.isolation
 def test_time_budget_exhaustion_finalizes_unfinished_backtest(tmp_path: Path) -> None:
     bars = tmp_path / "bars.csv"
     database = tmp_path / "research.sqlite"
@@ -751,11 +840,11 @@ def test_time_budget_exhaustion_finalizes_unfinished_backtest(tmp_path: Path) ->
     with pytest.raises(KeyboardInterrupt):
         resume_campaign(
             database=database, campaign_id=campaign_id, provider=provider,
-            trusted_local_python=True,
+            isolated_python=True,
         )
     resumed = resume_campaign(
         database=database, campaign_id=campaign_id, provider=provider,
-        trusted_local_python=True,
+        isolated_python=True,
     )
     experiment = campaign_status(database, campaign_id)["experiments"][1]
     assert resumed["stop_reason"] == "time_budget"
@@ -773,9 +862,10 @@ def test_generated_strategy_cannot_declare_non_numeric_parameters_absent() -> No
                 "parameters": {}, "constraints": [], "no_tunable_parameters": True,
             },
             "source": "def strategy(history, state):\n    return {CASH: 1.0}\n",
-        }, trusted_local_python=True)
+        }, isolated_python=True)
 
 
+@pytest.mark.isolation
 @pytest.mark.parametrize("fail_variant,minimum", [(False, 2), (True, 2), (False, 10)])
 def test_generated_strategy_freezes_and_evaluates_declared_parameter_plan(
     tmp_path: Path, fail_variant: bool, minimum: int,
@@ -824,14 +914,18 @@ def test_generated_strategy_freezes_and_evaluates_declared_parameter_plan(
         initial_cash=10_000, transaction_cost_bps=5, slippage_bps=0,
         token_budget=5000, cost_budget_usd=1, steps=None,
         holdout_start="2025-01-01", holdout_end="2025-01-31",
-        trusted_local_python=True, max_drawdown_limit=0.0,
+        isolated_python=True, max_drawdown_limit=0.0,
     )
     experiment = campaign_status(database, started["campaign_id"])["experiments"][0]
+    assert experiment["execution_evidence"]
+    assert all(item["strategy_started"] for item in experiment["execution_evidence"])
+    assert all(item["output_destination"] == "trusted controller pipe"
+               for item in experiment["execution_evidence"])
     frozen = freeze_candidate(database, started["campaign_id"], experiment["experiment_id"],
                               "candidate", "Fixed before validation")
     result = validate_candidate(
         database, frozen["candidate_id"], bars, "synthetic", "total_return",
-        trusted_local_python=True,
+        isolated_python=True,
     )["result"]["parameter_robustness"]
     assert frozen["robustness_plan"]["hard_risk_limit"] == {"max_drawdown": 0.0}
     assert [item["parameters"]["window"] for item in result["variants"]] == (
@@ -849,6 +943,7 @@ def test_generated_strategy_freezes_and_evaluates_declared_parameter_plan(
         assert all(item["risk_limit_breach"] for item in result["variants"])
 
 
+@pytest.mark.isolation
 @pytest.mark.parametrize("operator", ["<=", "=="])
 def test_joint_parameter_perturbation_is_frozen_before_validation(
     tmp_path: Path, operator: str,
@@ -888,7 +983,7 @@ def test_joint_parameter_perturbation_is_frozen_before_validation(
         initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
         token_budget=5000, cost_budget_usd=1, steps=None,
         holdout_start="2025-01-01", holdout_end="2025-01-31",
-        trusted_local_python=True,
+        isolated_python=True,
     )
     experiment = campaign_status(database, started["campaign_id"])["experiments"][0]
     frozen = freeze_candidate(database, started["campaign_id"], experiment["experiment_id"],
@@ -900,12 +995,13 @@ def test_joint_parameter_perturbation_is_frozen_before_validation(
     assert joint[0]["selection_reason"] == "Preserve ordering"
     result = validate_candidate(
         database, frozen["candidate_id"], bars, "synthetic", "total_return",
-        trusted_local_python=True,
+        isolated_python=True,
     )["result"]["parameter_robustness"]
     assert result["plan"] == plan
     assert len(result["variants"]) == (3 if operator == "<=" else 1)
 
 
+@pytest.mark.isolation
 def test_frozen_plan_covers_all_six_parameters_before_second_perturbations(tmp_path: Path) -> None:
     class SixParameterProvider(MockProvider):
         def propose(self, iteration, context):
@@ -940,7 +1036,7 @@ def test_frozen_plan_covers_all_six_parameters_before_second_perturbations(tmp_p
         initial_cash=10_000, transaction_cost_bps=0, slippage_bps=0,
         token_budget=5000, cost_budget_usd=1, steps=None,
         holdout_start="2025-01-01", holdout_end="2025-01-31",
-        trusted_local_python=True,
+        isolated_python=True,
     )
     experiment = campaign_status(database, started["campaign_id"])["experiments"][0]
     plan = freeze_candidate(
@@ -954,16 +1050,16 @@ def test_frozen_plan_covers_all_six_parameters_before_second_perturbations(tmp_p
 
 def test_mock_generated_revision_uses_recorded_feedback() -> None:
     provider = MockProvider(seed=0)
-    original = provider.propose(1, {"trusted_local_python": True})
+    original = provider.propose(1, {"isolated_generated_python": True})
     kept = provider.propose(
         2, {
-            "trusted_local_python": True,
+            "isolated_generated_python": True,
             "experiments": [{"strategy": original.strategy, "decision": "keep"}],
         },
     )
     rejected = provider.propose(
         2, {
-            "trusted_local_python": True,
+            "isolated_generated_python": True,
             "experiments": [{"strategy": original.strategy, "decision": "reject"}],
         },
     )
@@ -974,7 +1070,7 @@ def test_mock_generated_revision_uses_recorded_feedback() -> None:
     assert "scores = []" not in rejected.strategy["source"]
     assert provider.propose(
         2, {
-            "trusted_local_python": True,
+            "isolated_generated_python": True,
             "experiments": [{"strategy": original.strategy, "decision": "keep"}],
         },
     ) == kept
@@ -997,74 +1093,42 @@ def test_mock_generated_revision_uses_recorded_feedback() -> None:
     assert stopped.decision == "stop"
 
 
-def test_mock_generated_code_is_persisted_and_can_be_evaluated_only_with_opt_in(
+@pytest.mark.isolation
+def test_cli_refuses_generated_python_when_memory_limit_is_unavailable(
     tmp_path: Path,
 ) -> None:
-    bars = tmp_path / "bars.csv"
-    holdout = tmp_path / "holdout.csv"
     database = tmp_path / "research.sqlite"
-    _write_bars(bars, day_count=18)
-    _write_bars(holdout, day_count=6, start_day=18)
     started = _run_cli(
-        "research", "run", "--db", str(database), "--data", str(bars),
+        "research", "run", "--db", str(database), "--data", str(tmp_path / "missing.csv"),
         "--price-basis", "total_return", "--data-kind", "synthetic",
         "--provider", "mock", "--seed", "11", "--experiments", "2",
-        "--trusted-local-generated-python",
+        "--isolated-generated-python",
         "--holdout-start", "2024-01-19", "--holdout-end", "2024-01-24",
     )
-    assert started.returncode == 0, started.stderr
-    campaign_id = json.loads(started.stdout)["campaign_id"]
-    experiments = campaign_status(database, campaign_id)["experiments"]
-    assert len(experiments) == 2
-    assert all(item["status"] == "succeeded" for item in experiments)
-    assert all(item["strategy"]["family"] == "python" for item in experiments)
-    assert len({item["strategy_hash"] for item in experiments}) == 2
+    assert started.returncode == 2
+    assert "memory_limit_unavailable" in started.stderr
+    assert not database.exists()
 
-    frozen = _run_cli(
-        "research", "freeze", "--db", str(database), "--campaign-id", campaign_id,
-        "--experiment-id", experiments[0]["experiment_id"], "--name", "candidate",
-        "--conclusion", "Frozen before validation.",
-    )
-    assert frozen.returncode == 0, frozen.stderr
-    frozen_result = json.loads(frozen.stdout)
-    candidate_id = frozen_result["candidate_id"]
-    assert frozen_result["candidate_hash"]
-    args = [
-        "research", "validate", "--db", str(database), "--candidate-id", candidate_id,
-        "--data", str(bars), "--price-basis", "total_return", "--data-kind", "synthetic",
+
+def test_cli_blocks_generated_python_validation_and_holdout_before_loading_data(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "research.sqlite"
+    common = [
+        "--db", str(database), "--candidate-id", "missing-candidate",
+        "--data", str(tmp_path / "missing.csv"), "--price-basis", "total_return",
+        "--data-kind", "synthetic", "--isolated-generated-python",
     ]
-    denied = _run_cli(*args)
-    assert denied.returncode == 2
-    assert "trusted-local" in denied.stderr
-    allowed = _run_cli(*args, "--trusted-local-generated-python")
-    assert allowed.returncode == 0, allowed.stderr
-    robustness = json.loads(allowed.stdout)["result"]["parameter_robustness"]
-    assert robustness["plan"]["parameters"] == ["lookback"]
-    assert robustness["status"] in {"passed", "failed", "inconclusive"}
-    holdout_args = [
-        "research", "holdout", "--db", str(database), "--candidate-id", candidate_id,
-        "--data", str(holdout), "--price-basis", "total_return", "--data-kind", "synthetic",
+    validate = _run_cli("research", "validate", *common)
+    holdout = _run_cli(
+        "research", "holdout", *common,
         "--confirmation", "I CONFIRM THE CANDIDATE AND CONCLUSIONS ARE FROZEN",
-    ]
-    denied_holdout = _run_cli(*holdout_args)
-    assert denied_holdout.returncode == 2
-    assert "trusted-local" in denied_holdout.stderr
-    assert SQLiteStore(database).get_holdout_receipt(campaign_id) is None
-    allowed_holdout = _run_cli(*holdout_args, "--trusted-local-generated-python")
-    assert allowed_holdout.returncode == 0, allowed_holdout.stderr
-    report_path = tmp_path / "report.html"
-    rendered = _run_cli(
-        "research", "report", "--db", str(database), "--campaign-id", campaign_id,
-        "--output", str(report_path),
     )
-    assert rendered.returncode == 0, rendered.stderr
-    report = report_path.read_text(encoding="utf-8")
-    assert "not sandboxed" in report
-    assert "No generated Python is executed" not in report
-    assert experiments[0]["strategy_hash"] in report
-    assert html.escape(json.dumps(experiments[0]["strategy"]["source"])) in report
-    assert html.escape(experiments[0]["reflection"]) in report
-    assert "provider_usage" in report
+
+    for result in (validate, holdout):
+        assert result.returncode == 2
+        assert "results can be kept outside the research CLI" in result.stderr
+    assert not database.exists()
 
 
 def test_frozen_candidate_validation_holdout_gate_and_report(

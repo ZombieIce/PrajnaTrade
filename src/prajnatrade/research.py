@@ -5,18 +5,19 @@ import json
 import math
 import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from prajnatrade.backtest import equal_weight_buy_and_hold, run_backtest
 from prajnatrade.data import ValidatedData, load_bars
+from prajnatrade.isolation import IsolationError
 from prajnatrade.providers import (
     MockProvider,
     OpenAICompatibleProvider,
+    Proposal,
     ProviderBudgetExceeded,
     ProviderError,
-    Proposal,
     ResearchProvider,
     combine_usage,
     recent_experiment_context,
@@ -25,7 +26,6 @@ from prajnatrade.store import SQLiteStore
 from prajnatrade.strategies import (
     make_strategy,
     normalize_strategy_spec,
-    strategy_fingerprint,
 )
 
 RESEARCH_OBJECTIVE = (
@@ -53,7 +53,7 @@ def start_campaign(
     holdout_start: str,
     holdout_end: str,
     provider_config: dict[str, Any] | None = None,
-    trusted_local_python: bool = False,
+    isolated_python: bool = False,
     max_drawdown_limit: float | None = None,
 ) -> dict[str, Any]:
     _validate_campaign_limits(
@@ -119,7 +119,7 @@ def start_campaign(
     )
     return advance_campaign(
         store, campaign_id, dataset, provider, steps=steps,
-        trusted_local_python=trusted_local_python,
+        isolated_python=isolated_python,
     )
 
 
@@ -130,7 +130,7 @@ def resume_campaign(
     provider: ResearchProvider | None = None,
     data_path: str | Path | None = None,
     steps: int | None = None,
-    trusted_local_python: bool = False,
+    isolated_python: bool = False,
 ) -> dict[str, Any]:
     if steps is not None and steps <= 0:
         raise ValueError("steps must be greater than zero.")
@@ -155,7 +155,7 @@ def resume_campaign(
         raise ValueError("Resume provider does not match the original campaign.")
     return advance_campaign(
         store, campaign_id, dataset, provider, steps=steps,
-        trusted_local_python=trusted_local_python,
+        isolated_python=isolated_python,
     )
 
 
@@ -166,7 +166,7 @@ def advance_campaign(
     provider: ResearchProvider,
     *,
     steps: int | None,
-    trusted_local_python: bool = False,
+    isolated_python: bool = False,
 ) -> dict[str, Any]:
     campaign = store.get_campaign(campaign_id)
     _require_external_holdout(campaign)
@@ -183,7 +183,7 @@ def advance_campaign(
             checkpoint = campaign["updated_at"]
         try:
             checkpoint_time = datetime.fromisoformat(checkpoint)
-            recovery_seconds = (datetime.now(timezone.utc) - checkpoint_time).total_seconds()
+            recovery_seconds = (datetime.now(UTC) - checkpoint_time).total_seconds()
         except (TypeError, ValueError) as error:
             raise ValueError("Invalid interrupted campaign time checkpoint.") from error
         if recovery_seconds < 0:
@@ -201,7 +201,7 @@ def advance_campaign(
     try:
         result = _advance_active_campaign(
             store, campaign_id, campaign, dataset, provider, steps=steps,
-            trusted_local_python=trusted_local_python, prior_elapsed=prior_elapsed,
+            isolated_python=isolated_python, prior_elapsed=prior_elapsed,
             started=started,
         )
         finished = True
@@ -225,7 +225,7 @@ def _advance_active_campaign(
     provider: ResearchProvider,
     *,
     steps: int | None,
-    trusted_local_python: bool,
+    isolated_python: bool,
     prior_elapsed: float,
     started: float,
 ) -> dict[str, Any]:
@@ -281,7 +281,7 @@ def _advance_active_campaign(
             "data_hash": campaign["data_hash"],
             "baseline": campaign["baseline"]["metrics"],
             "experiments": recent_experiment_context(experiments),
-            "trusted_local_python": trusted_local_python,
+            "isolated_generated_python": isolated_python,
             "limits": {
                 "remaining_experiments": campaign["experiment_budget"] - len(experiments),
                 "remaining_seconds": max(0.0, campaign["max_seconds"] - elapsed),
@@ -335,6 +335,7 @@ def _advance_active_campaign(
                 "decision": "pending",
                 "reflection": "",
                 "error": None,
+                "execution_evidence_json": [],
                 "provider_usage_json": proposal.usage,
                 "created_at": _now(),
             }
@@ -348,6 +349,7 @@ def _advance_active_campaign(
                 strategy=pending["strategy"],
                 usage=pending["provider_usage"],
             )
+        execution_evidence = list(pending["execution_evidence"])
 
         if (
             pending["metrics"] is None and pending["error"] is None
@@ -365,9 +367,14 @@ def _advance_active_campaign(
             }
         else:
             raw_strategy = proposal.strategy
+            isolation_failure = False
             try:
                 strategy_spec = normalize_strategy_spec(raw_strategy)
-                strategy = make_strategy(strategy_spec, trusted_local_python=trusted_local_python)
+                strategy = make_strategy(
+                    strategy_spec,
+                    isolated_python=isolated_python,
+                    evidence_callback=execution_evidence.append,
+                )
                 backtest = run_backtest(
                     dataset,
                     strategy,
@@ -388,20 +395,38 @@ def _advance_active_campaign(
                     "unavailable_prices": backtest.unavailable_prices,
                 }
                 outcome = {"status": "succeeded", "metrics": metrics, "error": None}
+            except IsolationError as error:
+                strategy_spec = raw_strategy if isinstance(raw_strategy, dict) else {}
+                metrics = None
+                outcome = {"status": "failed", "metrics": None, "error": str(error)}
+                isolation_failure = True
             except (ValueError, KeyError, TypeError) as error:
                 strategy_spec = raw_strategy if isinstance(raw_strategy, dict) else {}
                 metrics = None
                 outcome = {"status": "failed", "metrics": None, "error": str(error)}
+            experiment_updates = {
+                "strategy_json": strategy_spec,
+                "strategy_hash": _strategy_hash(strategy_spec),
+                "parameters_json": strategy_spec.get("parameters", {}),
+                "metrics_json": metrics,
+                "error": outcome["error"],
+                "execution_evidence_json": execution_evidence,
+            }
+            if isolation_failure:
+                experiment_updates.update(
+                    status="failed",
+                    decision="stop",
+                    reflection="Isolation unavailable; backtest was not scored.",
+                )
             store.update_experiment(
                 pending["experiment_id"],
-                strategy_json=strategy_spec,
-                strategy_hash=_strategy_hash(strategy_spec),
-                parameters_json=strategy_spec.get("parameters", {}),
-                metrics_json=metrics,
-                error=outcome["error"],
+                **experiment_updates,
             )
             pending = store.get_experiment(campaign_id, pending["experiment_id"])
             _save_progress(store, campaign_id, prior_elapsed, started)
+            if isolation_failure:
+                stop_reason = "isolation_unavailable"
+                break
 
         reflection_context = dict(context)
         reflection_limits = dict(context["limits"])
@@ -496,6 +521,7 @@ def _advance_active_campaign(
                 usage=provider_usage,
                 strategy_hash=strategy_hash,
             )
+            experiment["execution_evidence_json"] = execution_evidence
         else:
             experiment = {
                 "experiment_id": str(uuid.uuid4()),
@@ -512,6 +538,7 @@ def _advance_active_campaign(
                 "decision": decision,
                 "reflection": reflection_text,
                 "error": reflection_error,
+                "execution_evidence_json": execution_evidence,
                 "provider_usage_json": provider_usage,
                 "created_at": _now(),
             }
@@ -527,6 +554,7 @@ def _advance_active_campaign(
             decision=experiment["decision"],
             reflection=experiment["reflection"],
             error=experiment["error"],
+            execution_evidence_json=experiment["execution_evidence_json"],
             provider_usage_json=experiment["provider_usage_json"],
         )
         experiments.append(_decode_experiment(experiment))
@@ -720,6 +748,7 @@ def _failed_experiment(
         "decision": decision,
         "reflection": reflection,
         "error": error,
+        "execution_evidence_json": [],
         "provider_usage_json": usage,
         "created_at": _now(),
     }
@@ -736,6 +765,7 @@ def _decode_experiment(experiment: dict[str, Any]) -> dict[str, Any]:
         ("strategy_json", "strategy"),
         ("parameters_json", "parameters"),
         ("metrics_json", "metrics"),
+        ("execution_evidence_json", "execution_evidence"),
         ("provider_usage_json", "provider_usage"),
     ):
         value = result.pop(column)
@@ -760,4 +790,4 @@ def _save_progress(
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
