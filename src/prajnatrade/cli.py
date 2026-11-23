@@ -862,7 +862,7 @@ def _direction_action(args: argparse.Namespace, direction) -> dict:
     if action == "kickoff":
         prepared = direction.prepare_kickoff(
             args.project, args.campaign_id, args.direction_key, args.name, args.authorization_id,
-            json.loads(args.input.read_text(encoding="utf-8")),
+            json.loads(args.input.read_text(encoding="utf-8")), store=args.store,
         )
         return direction.kickoff(args.project, args.store, prepared)
     if action == "status":
@@ -904,7 +904,11 @@ def _validation_action(args: argparse.Namespace, direction) -> dict:
 
 
 def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
-    queued = direction.pending_validation_work(args.project, args.round_id)
+    round_status = evaluator.research_validation_status(args.store, args.round_id)
+    benchmark_failed = round_status["status"] == "paused"
+    queued = direction.pending_validation_work(
+        args.project, args.round_id, benchmark_failed=benchmark_failed,
+    )
     results = []
     for proposal in queued["proposals"]:
         try:
@@ -920,8 +924,19 @@ def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
         results.append(direction.publish_validation_details(
             args.project, args.round_id, request["detail_access_id"], receipt, details,
         ))
-    status = "paused" if any(result["status"] == "paused" for result in results) else "completed"
-    return {"schema_version": 2, "status": status, "round_id": args.round_id, "results": results}
+    paused = benchmark_failed or any(
+        result["status"] == "paused"
+        or result.get("scoring_evidence", {}).get("baseline", {}).get("satisfied") is False
+        for result in results
+    )
+    return {
+        "schema_version": 2,
+        "scope": round_status["scope"],
+        "data_kind": round_status["data_kind"],
+        "status": "paused" if paused else "completed",
+        "round_id": args.round_id,
+        "results": results,
+    }
 
 
 def _holdout_action(args: argparse.Namespace) -> dict:

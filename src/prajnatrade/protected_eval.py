@@ -660,10 +660,12 @@ def _base_costs(evaluation: dict[str, Any]) -> dict[str, float]:
     }
 
 
-def normalize_validation_protocol(raw: object, campaign_evaluation: dict[str, Any]) -> dict[str, Any]:
+def normalize_validation_protocol(
+    raw: object, campaign_evaluation: dict[str, Any], *, replay_legacy_kickoff: bool = False,
+) -> dict[str, Any]:
     """Verify and normalize the frozen comparison protocol before kickoff."""
     protocol = _plan_input(raw, _base_costs(campaign_evaluation), research_round=True)
-    if "version" in campaign_evaluation["execution_rules"]:
+    if not replay_legacy_kickoff:
         protocol.setdefault("scoring_prerequisites", {
             "candidate": {"require_initial_position": False},
             "baseline": {"require_initial_position": True},
@@ -2144,6 +2146,13 @@ def _observed_warmup_sessions(runs: list[dict], policy: dict, initial_cash: floa
     return first_dates
 
 
+def _baseline_signal_coverage(run: dict[str, Any]) -> bool:
+    # The buy-and-hold baseline needs signal inputs only through its one target.
+    return bool(run["signals"]) and not any(
+        gap["date"] < run["signals"][0]["date"] for gap in run["signal_gaps"]
+    )
+
+
 def _neighbourhood_result(
     plan: dict[str, Any],
     data: dict[str, list[dict]],
@@ -2441,6 +2450,7 @@ def _evaluation_record(
     baseline_base = runs["base"]["baseline"]["metrics"]
     baseline_stress = runs["stress"]["baseline"]["metrics"]
     prerequisites = plan.get("scoring_prerequisites")
+    check_scoring_prerequisites = bool(prerequisites) and stage == VALIDATION_STAGE
     minimum = plan["minimum_samples"]
     samples_sufficient = (
         base_metrics["sessions"] >= minimum["sessions"]
@@ -2474,7 +2484,11 @@ def _evaluation_record(
         )
         if not shared_window:
             baseline_warmup_coverage = all(
-                not scenario["baseline"]["signal_gaps"] for scenario in runs.values()
+                (
+                    _baseline_signal_coverage(scenario["baseline"])
+                    if check_scoring_prerequisites else not scenario["baseline"]["signal_gaps"]
+                )
+                for scenario in runs.values()
             )
     candidate_coverage = (
         samples_sufficient
@@ -2488,13 +2502,12 @@ def _evaluation_record(
         candidate_coverage and bool(baseline_runner["signals"]) and baseline_warmup_coverage
     )
     scoring_evidence = None
-    if prerequisites and stage == VALIDATION_STAGE:
+    if check_scoring_prerequisites:
         baseline_coverage = (
             baseline_base["sessions"] >= minimum["sessions"]
             and baseline_base["valued_sessions"] >= minimum["valued_sessions"]
             and baseline_base["valued_sessions"] == baseline_base["sessions"]
-            and bool(baseline_runner["signals"])
-            and not baseline_runner["signal_gaps"]
+            and _baseline_signal_coverage(baseline_runner)
             and baseline_warmup_coverage
             and not baseline_runner["gaps"]["valuation"]
             and not blocking_snapshot_gap
@@ -3286,6 +3299,12 @@ def _research_record(
         or plan.get("workflow") != RESEARCH_VALIDATION
         or plan.get("round_id") != kickoff["round_id"]
         or plan.get("kickoff_id") != kickoff["kickoff_id"]
+        or plan.get("snapshot_id") != kickoff["snapshot_id"]
+        or plan.get("scope") != kickoff["scope"]
+        or plan.get("data_kind") != kickoff["data_kind"]
+        or row["partition_content_hash"] != auth["partition_content_hash"]
+        or any(plan["baseline"].get(key) != value for key, value in kickoff["baseline"].items())
+        or record.get("baseline") != plan["baseline"]
         or plan.get("scoring_prerequisites") != kickoff["validation_settings"].get("scoring_prerequisites")
         or plan.get("execution_rules") != kickoff["evaluation"]["execution_rules"]
         or plan.get("strategy_fingerprint") != row["strategy_fingerprint"]
@@ -3365,26 +3384,14 @@ def _reusable_validation_receipt(
     return _research_validation_receipt(row, kickoff, used, record)
 
 
-def _validation_benchmark_scope(plan: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "partition": plan["partitions"][VALIDATION_STAGE],
-        "baseline": plan["baseline"],
-        "execution_rules": plan["execution_rules"],
-        "scoring_prerequisite": plan.get("scoring_prerequisites", {}).get("baseline"),
-    }
-
-
 def _validation_benchmark_failures(
     store: Path, kickoff: dict[str, Any], rows: list[dict[str, Any]],
-    *, plan: dict[str, Any] | None = None,
+    *, phase: str,
 ) -> Generator[dict[str, Any], None, None]:
     if "scoring_prerequisites" not in kickoff["validation_settings"]:
         return
-    scope = _validation_benchmark_scope(plan) if plan is not None else None
     for row in rows:
-        if row["status"] == "aborted" or (
-            scope is not None and row["partition_content_hash"] != scope["partition"]["content_hash"]
-        ):
+        if row["status"] == "aborted":
             continue
         # A process can write the record and stop before updating its debit row.
         if row["status"] == "reading" and not (
@@ -3394,17 +3401,19 @@ def _validation_benchmark_failures(
         try:
             recorded_plan, record, _ = _research_record(store, row, kickoff)
         except _EvidenceProblem as error:
-            phase = "run" if plan is not None else "status"
             raise _reject(error.code, phase, "inspect", error.message) from error
         evidence = record.get("scoring_evidence", {}).get("baseline", {})
         if evidence.get("satisfied") is False:
-            recorded_scope = _validation_benchmark_scope(recorded_plan)
-            if scope is None or recorded_scope == scope:
-                yield {
-                    **recorded_scope,
-                    "evaluation_id": row["evaluation_id"],
-                    "reason": evidence["reason"],
-                }
+            yield {
+                "partition": recorded_plan["partitions"][VALIDATION_STAGE],
+                "baseline": recorded_plan["baseline"],
+                "execution_rules": recorded_plan["execution_rules"],
+                "scoring_prerequisite": recorded_plan["scoring_prerequisites"]["baseline"],
+                "scope": kickoff["scope"],
+                "data_kind": kickoff["data_kind"],
+                "evaluation_id": row["evaluation_id"],
+                "reason": evidence["reason"],
+            }
 
 
 def research_validation_status(
@@ -3421,10 +3430,12 @@ def research_validation_status(
         if row is None:
             raise _reject("VALIDATION_NOT_FOUND", "status", "check_id", "Unknown Validation evaluation.")
         return _reusable_validation_receipt(store, row, kickoff, len(rows))
-    failures = list(_validation_benchmark_failures(store, kickoff, rows))
+    failures = list(_validation_benchmark_failures(store, kickoff, rows, phase="status"))
     return {
         "schema_version": RESEARCH_SCHEMA_VERSION,
         "round_id": round_id,
+        "scope": kickoff["scope"],
+        "data_kind": kickoff["data_kind"],
         "status": "paused" if failures else "available",
         "budget": _round_budget(kickoff, len(rows)),
         "evaluations": [
@@ -3645,6 +3656,25 @@ def run_research_validation(
             publish(receipt)
             return receipt
         require_open_round(project, round_id)
+        benchmark_failure = next(
+            _validation_benchmark_failures(eval_store, kickoff, rows, phase="run"), None,
+        )
+        if benchmark_failure is not None:
+            return {
+                "schema_version": RESEARCH_SCHEMA_VERSION,
+                "stage": VALIDATION_STAGE,
+                "round_id": round_id,
+                "scope": kickoff["scope"],
+                "data_kind": kickoff["data_kind"],
+                "proposal_id": proposal_id,
+                "submission_id": submission_id,
+                "status": "paused",
+                "reason": "COMMON_BENCHMARK_FAILED",
+                "benchmark_failure": benchmark_failure,
+                "query_debited": False,
+                "opened_protected_source": False,
+                "budget": _round_budget(kickoff, len(rows)),
+            }
         if len(rows) >= kickoff["validation_budget"]:
             raise _reject(
                 "VALIDATION_BUDGET_EXHAUSTED", "run", "review",
@@ -3662,23 +3692,6 @@ def run_research_validation(
             kickoff["project_id"], subject, metadata, kickoff["validation_settings"],
             snapshot_store=snapshot_store, workflow=RESEARCH_VALIDATION,
         )
-        benchmark_failure = next(
-            _validation_benchmark_failures(eval_store, kickoff, rows, plan=body), None,
-        )
-        if benchmark_failure is not None:
-            return {
-                "schema_version": RESEARCH_SCHEMA_VERSION,
-                "stage": VALIDATION_STAGE,
-                "round_id": round_id,
-                "proposal_id": proposal_id,
-                "submission_id": submission_id,
-                "status": "paused",
-                "reason": "COMMON_BENCHMARK_FAILED",
-                "benchmark_failure": benchmark_failure,
-                "query_debited": False,
-                "opened_protected_source": False,
-                "budget": _round_budget(kickoff, len(rows)),
-            }
         plan = _freeze_plan(eval_store, {
             **body,
             "round_id": round_id,
