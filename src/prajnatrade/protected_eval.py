@@ -28,7 +28,7 @@ import os
 import sqlite3
 import statistics
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from datetime import time as clock_time
@@ -3169,7 +3169,7 @@ def _recover_validation(
 
 
 @contextmanager
-def _trusted_validation_lock(store: Path, round_id: str) -> Iterator[None]:
+def _trusted_validation_lock(store: Path, round_id: str) -> Generator[None, None, None]:
     # Multiple project copies referencing the same kickoff share this lock.
     directory = store / "validation-locks"
     directory.mkdir(mode=0o700, exist_ok=True)

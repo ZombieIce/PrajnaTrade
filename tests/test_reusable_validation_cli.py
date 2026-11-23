@@ -24,6 +24,8 @@ def test_validation_replays_one_version_and_spends_budget_on_another(tmp_path):
         "objective": "Compare equal weights with a concentrated momentum strategy.",
         "constraints": ["Use the same fees and equal-weight benchmark for each version."],
         "validation_budget": 2,
+        "reviewer": "Research lead",
+        "approval_reason": "Approve up to two versions under the frozen comparison protocol.",
         "validation_settings": plan_input(),
         "independence": {"independent": True, "reason": "No prior Holdout results informed the design."},
     })
