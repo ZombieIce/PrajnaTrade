@@ -4,18 +4,18 @@
 
 End-to-end MVP is NOT passed: the six-scenario rule was not met (4 of 6 required scenarios verified); 2 scenario(s) are blocked: independent_validation_reports, immutable_release_forward.
 
-Manifest SHA-256: `09eb18ef3ef4043ccb3bee92eaec337019a60c150bb481bb8315d95b7d955bda`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
+Manifest SHA-256: `a2cf86345d8fc97cc96af73ed263871207633c2106244cdc4ee1f02dac2a2883`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
 
 ## Delivery
 
 | Field | Value |
 | --- | --- |
-| version | 0.1.0 (#17 historical evidence through #27; #37 mechanism on issue37-research-workflow) |
-| branch | zombieice-issue-17-implementation |
-| tested_at | 2026-11-22T15:49:55+08:00 |
-| environment | macOS 26.2 (arm64), Python 3.12.15, pytest 9.2.0; tests run offline on synthetic fixtures with the macOS sandbox boundary; the #24 real snapshot was acquired from researched vendor/official sources and sealed outside Git. The later #24 reconciliation used a verified Discovery-only Colima container. |
-| test_command | PYTHONPATH=src python -m pytest -q |
-| test_result | Historical #17 baseline at 96d4733: 325 passed (700.28s). Issue #37 focused integration at 8852b5c: 12 passed. |
+| version | 0.1.0 (#37 workflow verified at 2f65994; historical #17 evidence through #27) |
+| branch | issue37-research-workflow |
+| tested_at | 2026-11-23T09:08:52+08:00 |
+| environment | macOS arm64, Python 3.12.15, pytest 9.2.0, local Docker/Colima runner; independent test checkout with no real market or forward inputs. Historical real Discovery evidence comes from the signed #24 reconciliation and recorded #26 and #27 runs. |
+| test_command | PYTHONPATH=src python -m pytest -q (all 30 test modules in six parallel batches) |
+| test_result | #37 final code at 2f65994: 341 passed, including macOS and Docker isolation tests. Historical #17 baseline at 96d4733: 325 passed. |
 
 ## Scenario summary
 
@@ -36,9 +36,9 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
 
 - **Scope**: data=synthetic, agent=mock, period=historical
 - **Expected**: The same delivery version runs the deterministic test suite and the public CLI workflows in a clean environment, with the operator/research split enforced and synthetic fixtures covering success, invalid input, replay, budget refusal, failure evidence and interrupted-resume paths.
-- **Observed**: The recorded full-suite command passes in this delivery. The operator-only acceptance report validates the strict manifest and renders deterministic Markdown/JSON; prajnatrade-agent rejects the acceptance command. Synthetic scope only: this proves the synthetic test/CLI path, not real market data, real model access, deployed OS isolation, protected real evaluations or real forward tracking.
+- **Observed**: All 341 tests passed on the direction-workflow delivery. The acceptance CLI renders deterministic Markdown and JSON, verifies the manifest's release-specific evidence linkage, and is operator-only. The workflow tests use synthetic market inputs and include the macOS and Docker isolation checks.
 - **Evidence**:
-  - `test_suite` — `PYTHONPATH=src python -m pytest -q`: Full deterministic suite, exit 0; machine result is recorded in delivery.test_result. Synthetic fixtures only, no network and no broker.
+  - `test_suite` — `PYTHONPATH=src python -m pytest -q`: All test modules passed in an isolated checkout of 2f65994, with the local Colima runner enabled. The test fixtures provide mechanism evidence.
   - `test_file` — `tests/test_acceptance_cli.py`: Public-CLI tests for strict manifest validation, stable rejection codes, verdict rules, deterministic rendering, no-store report generation and rejection of the operator command by prajnatrade-agent.
   - `test_file` — `tests/test_experiment_cli.py, tests/test_research_cli.py, tests/test_protected_eval_cli.py, tests/test_holdout_report_cli.py, tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py`: Public-CLI workflow tests for the experiment protocol, protected evaluation, release lifecycle, Shadow Live and comparison, all subprocess-based on synthetic fixtures.
 - **Blockers**: none
