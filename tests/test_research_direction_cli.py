@@ -153,6 +153,10 @@ def test_validation_details_and_feedback_are_recoverable_by_question(tmp_path: P
     detail_flags = ("--date", "2024-01-13", "--question", question)
     requested = ok(agent_cli("validation", "details", *round_flags, *evaluation_flags, *detail_flags))
     assert requested["status"] == "queued"
+    outside_flags = ("--date", "2024-01-17", "--question", "Check an adjacent session.")
+    assert ok(agent_cli(
+        "validation", "details", *round_flags, *evaluation_flags, *outside_flags,
+    ))["status"] == "queued"
     ok(cli(
         "validation", "service", *round_flags, "--store", str(trusted),
         "--snapshot-store", str(snapshot["store"]),
@@ -162,6 +166,9 @@ def test_validation_details_and_feedback_are_recoverable_by_question(tmp_path: P
     assert delivered["detail_access_id"] == requested["detail_access_id"]
     assert set(delivered["details"]) == {"signals", "positions", "fills"}
     assert delivered["question"] == question
+    outside = ok(agent_cli("validation", "details", *round_flags, *evaluation_flags, *outside_flags))
+    assert outside["status"] == "unavailable"
+    assert "details" not in outside
 
     revision = submit_experiment(
         project, campaign["campaign_id"], tmp_path / "revised.json", "revision",
