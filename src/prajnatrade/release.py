@@ -1181,7 +1181,7 @@ def _audit(
     """Persist a refusal without creating any release object."""
     body = {
         "schema_version": SCHEMA_VERSION,
-        "scope": SCOPE,
+        "scope": context.get("scope", SCOPE),
         "received_at": _now(),
         "command": command,
         **context,
@@ -2333,7 +2333,7 @@ def disposition(
     sequence = _next_disposition_sequence(eval_store, release_id)
     body = {
         "schema_version": SCHEMA_VERSION,
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "kind": DISPOSITION_KIND,
         "disposition_version": DISPOSITION_VERSION,
         "sequence": sequence,
@@ -2416,7 +2416,7 @@ def disposition(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "recorded",
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "kind": DISPOSITION_RESULT_KIND,
         "release_id": release_id,
         "revision_id": revision_id,
