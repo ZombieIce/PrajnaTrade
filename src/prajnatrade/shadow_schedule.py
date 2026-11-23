@@ -41,7 +41,7 @@ class _Tick:
         release_id: str = "",
         blocked: bool = True,
     ) -> None:
-        notice = self.database.notify_schedule({
+        notice, first_observation = self.database.notify_schedule({
             "scope": self.scope,
             "release_id": release_id,
             "date": session or self.today,
@@ -50,7 +50,7 @@ class _Tick:
             "next_action": next_action,
             "observed_at": self.clock.astimezone(UTC).isoformat(),
         })
-        if notice not in self.alerts:
+        if (first_observation or blocked) and notice not in self.alerts:
             self.alerts.append(notice)
         self.blocked |= blocked
 
@@ -101,7 +101,7 @@ class _Tick:
             return report
 
         requested: list[str] = []
-        first_by_release: dict[str, str] = {}
+        next_by_release: dict[str, int] = {}
         start_index = through
         for release_id in ids:
             try:
@@ -131,8 +131,12 @@ class _Tick:
                 last = progress["last_committed_date"] if progress else None
                 if last is None or last < target:
                     requested.append(release_id)
-                    first_by_release[release_id] = first
+                    next_by_release[release_id] = (
+                        sessions.index(last) + 1 if last in sessions else first_index
+                    )
                     start_index = min(start_index, first_index)
+                elif last == target:
+                    self._notice_committed_day(release_id, target)
             except (release.ReleaseRejection, shadow.ShadowRejection) as error:
                 self.error(error, target, release_id)
 
@@ -166,24 +170,44 @@ class _Tick:
         report["update"] = update
         for version in update["versions"]:
             release_id = version["release_id"]
+            index = next_by_release[release_id]
+            for session in sessions[index:through]:
+                if not self._notice_committed_day(release_id, session):
+                    break
             if version["status"] == "blocked":
                 last = version["last_committed_date"]
-                session = (
-                    sessions[sessions.index(last) + 1] if last in sessions
-                    else first_by_release[release_id]
-                )
+                if last in sessions and last < target:
+                    index = sessions.index(last) + 1
                 self.notify(
                     version["reason_code"], version["reason"],
                     "Inspect the version's input availability, then retry.",
-                    session=session, release_id=release_id,
-                )
-            if any(order["status"] == "missing_open" for order in version["unfilled_orders"]):
-                self.notify(
-                    "MISSING_EXECUTION_OPEN", "An order expired because its unadjusted open was unavailable.",
-                    "Review the unfilled orders and feed evidence in the Shadow Live ledger.",
-                    session=target, release_id=release_id, blocked=False,
+                    session=sessions[index], release_id=release_id,
                 )
         return report
+
+    def _notice_committed_day(self, release_id: str, session: str) -> bool:
+        try:
+            day = self.database.verified_day(release_id, session)
+        except shadow.ShadowRejection as error:
+            self.error(error, session, release_id)
+            return False
+        if day is None:
+            return False
+        day_result = day["result"]
+        if any(item["code"] == "signal_window_incomplete" for item in day_result["anomalies"]):
+            self.notify(
+                "SIGNAL_WINDOW_INCOMPLETE", f"The {session} signal had insufficient history.",
+                "Load the frozen strategy's required history before the next close.",
+                session=session, release_id=release_id, blocked=False,
+            )
+        if any(order["status"] == "missing_open" for order in day_result["orders"]):
+            self.notify(
+                "MISSING_EXECUTION_OPEN",
+                "An order expired because its unadjusted open was unavailable.",
+                "Review the unfilled orders and feed evidence in the Shadow Live ledger.",
+                session=session, release_id=release_id, blocked=False,
+            )
+        return True
 
     def _verify_release_calendar(
         self, store: Path, release_id: str, sessions: list[str], first_index: int

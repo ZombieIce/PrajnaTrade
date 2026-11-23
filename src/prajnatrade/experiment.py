@@ -63,6 +63,11 @@ def _runtime_identity(strategy_executor: dict[str, Any] | None = None) -> str:
     return _fingerprint(_runtime_components(strategy_executor))
 
 
+def runtime_identity(strategy_executor: dict[str, Any] | None = None) -> str:
+    """Return the dependency and executor fingerprint used by frozen strategies."""
+    return _runtime_identity(strategy_executor)
+
+
 def _executor_config(config: Mapping[str, Any]) -> dict[str, Any]:
     candidate = config.get("strategy_executor")
     return dict(candidate) if isinstance(candidate, Mapping) else {"kind": "none"}
