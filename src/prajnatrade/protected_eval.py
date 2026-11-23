@@ -652,7 +652,13 @@ def create_plan(
     eval_store = _store(store)
     project = Path(project)
     project_id = str(project_status(project)["project_id"])
+    from prajnatrade.research_direction import campaign_has_kickoff
+
     candidate = candidate_status(project, candidate_id)
+    if candidate.get("research_selection") or campaign_has_kickoff(
+        eval_store, project_id, candidate["campaign_id"],
+    ):
+        raise _invalid("This Campaign uses the direction-bound research workflow.")
     snapshot_id = candidate.get("snapshot_id")
     if not isinstance(snapshot_id, str) or not snapshot_id:
         raise ValueError("The frozen candidate does not reference a sealed snapshot.")
@@ -1076,6 +1082,11 @@ def _claim_partition(
                 (stage, content_hash),
             ).fetchone()
             if row is None:
+                from prajnatrade.research_holdout import legacy_conflict
+
+                if legacy_conflict(connection, plan, stage):
+                    connection.execute("ROLLBACK")
+                    return {"state": "consumed"}
                 connection.execute(
                     "INSERT INTO consumed_queries "
                     "(partition_name, partition_content_hash, plan_id, candidate_hash, "
@@ -2673,3 +2684,105 @@ def run_evaluation(
         completed_at=record["completed_at"],
     )
     return _run_response(eval_store, record, reused=False)
+
+
+def run_research_holdout_evaluation(
+    store: Path,
+    snapshot_store: Path,
+    project: Path,
+    plan: dict[str, Any],
+    authorization: dict[str, Any],
+) -> dict[str, Any]:
+    """Score a direction-bound Holdout with the pre-authorized Validation proof."""
+    from prajnatrade import research_holdout
+
+    def reject(code: str, message: str) -> None:
+        audit_id = _audit(store, {
+            "plan_id": plan["plan_id"], "stage": HOLDOUT_STAGE,
+            "candidate_id": plan["candidate_id"], "snapshot_id": plan["snapshot_id"],
+        }, code, message, command="holdout run")
+        raise EvaluationRejection(code, "holdout_run", "inspect", message, context={
+            "audit_id": audit_id, "opened_protected_source": False, "query_debited": False,
+        })
+
+    candidate = candidate_status(project, plan["candidate_id"])
+    if candidate != plan["candidate"] or str(project_status(project)["project_id"]) != plan["project_id"]:
+        reject("FINGERPRINT_MISMATCH", "The project and frozen candidate must match the Holdout plan.")
+    if (
+        research_holdout.load_authorization(store, plan["plan_id"]) != authorization
+        or not _authorization_matches(authorization, plan, HOLDOUT_STAGE)
+    ):
+        reject("AUTHORIZATION_REQUIRED", "The saved Holdout authorization must match the frozen plan.")
+    selection = candidate["research_selection"]
+    evidence = selected_validation_evidence(
+        store, selection["round_id"], selection["validation_evaluation_id"], candidate,
+    )
+    binding = authorization["validation"]
+    if (
+        evidence["evaluation_id"] != binding["evaluation_id"]
+        or evidence["record_hash"] != binding["record_hash"]
+        or evidence["plan"]["plan_id"] != binding["plan_id"]
+        or evidence["export_hash"] != binding["export_hash"]
+        or authorization["direction_id"] != selection["direction_id"]
+        or authorization["round_id"] != selection["round_id"]
+    ):
+        reject("VALIDATION_SELECTION_MISMATCH", "Holdout is bound to different selected Validation evidence.")
+
+    existing = research_holdout.load_holdout_claim(store, plan["plan_id"])
+    if existing:
+        return _recover_research_holdout(store, plan, authorization, existing)
+
+    metadata, isolation, executor = _research_run_context(snapshot_store, plan)
+    if not any(
+        (snapshot_store / version / f"{HOLDOUT_STAGE}.json").is_file()
+        for version in snapshot.lineage_ids(snapshot_store, plan["snapshot_id"])
+    ):
+        reject("SOURCE_MISSING", "The authorized sealed Holdout payload is unavailable.")
+    prior, prior_evidence = _prior_holdout(
+        snapshot_store, plan, evidence, plan["partitions"][HOLDOUT_STAGE], reject,
+    )
+    claim = research_holdout.claim(store, plan, authorization)
+    if claim["state"] == "blocked":
+        return claim["blocker"]
+    if claim["state"] == "existing":
+        return _recover_research_holdout(store, plan, authorization, claim)
+    record, _, status = _score_claim(
+        store, snapshot_store, plan, HOLDOUT_STAGE, authorization, claim, metadata,
+        prior, prior_evidence, isolation, executor,
+    )
+    research_holdout.finish(
+        store, plan["plan_id"], record["evaluation_id"], status, record["completed_at"],
+    )
+    return {**_run_response(store, record, reused=False), "schema_version": 2, "scope": plan["scope"]}
+
+
+def _recover_research_holdout(store: Path, plan: dict, authorization: dict, query: dict) -> dict:
+    from prajnatrade import research_holdout
+
+    evaluation_id = query["evaluation_id"]
+    if query["authorization_id"] != authorization["auth_id"]:
+        raise _reject("AUTHORIZATION_INTEGRITY_FAILED", "holdout_run", "inspect", "The authorization and debit differ.")
+    path = store / "records" / evaluation_id / "record.json"
+    if not path.is_file() and query["status"] in {"reading", "interrupted"}:
+        research_holdout.finish(store, plan["plan_id"], evaluation_id, "interrupted", _now())
+        return {
+            "schema_version": 2, "scope": plan["scope"], "status": "interrupted",
+            "plan_id": plan["plan_id"], "evaluation_id": evaluation_id,
+            "query_debited": True, "opened_protected_source": "unverified",
+            "message": "The reserved Holdout has no committed record. The read cannot be retried.",
+        }
+    try:
+        record = _load_stored_record(store, evaluation_id)
+    except _EvidenceProblem as problem:
+        raise _reject(problem.code, "holdout_run", "inspect", problem.message) from problem
+    if (
+        not _record_matches(record, plan, HOLDOUT_STAGE)
+        or record["authorization"] != authorization
+        or record["query_receipt"]["debited_at"] != query["debited_at"]
+    ):
+        raise _reject("RECORD_INTEGRITY_FAILED", "holdout_run", "inspect", "The stored Holdout record differs from its debit.")
+    research_holdout.finish(
+        store, plan["plan_id"], evaluation_id, "completed" if record["scoring"] else "aborted",
+        record["completed_at"],
+    )
+    return {**_run_response(store, record, reused=True), "schema_version": 2, "scope": plan["scope"]}
