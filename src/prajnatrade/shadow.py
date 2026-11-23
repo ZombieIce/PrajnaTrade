@@ -79,17 +79,16 @@ import os
 import re
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from prajnatrade import dividend, release, snapshot
+from prajnatrade import dividend, release, shadow_calendar, snapshot
 from prajnatrade.backtest import _validate_weights
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot_baseline import (
-    CN_TZ,
     _is_executable_open,
     _valid_price,
     available_by,
@@ -119,8 +118,6 @@ ORDER_STATUSES = (
 )
 FAILPOINTS = ("shadow_after_fills", "shadow_after_commit_before_report")
 
-_OPEN = time(9, 30)
-_CLOSE = time(15, 0)
 _EPSILON = 1e-9
 _RELEASE_ID = re.compile(r"[0-9a-f]{64}")
 
@@ -185,15 +182,11 @@ def _failpoint(name: str) -> None:
 
 
 def _session_open(session: str) -> datetime:
-    return datetime.combine(
-        datetime.fromisoformat(session).date(), _OPEN, tzinfo=CN_TZ
-    )
+    return shadow_calendar.session_open(session)
 
 
 def _session_close(session: str) -> datetime:
-    return datetime.combine(
-        datetime.fromisoformat(session).date(), _CLOSE, tzinfo=CN_TZ
-    )
+    return shadow_calendar.session_close(session)
 
 
 def _signal_point(session: str) -> str:
@@ -471,6 +464,16 @@ CREATE TABLE IF NOT EXISTS progress (
   last_committed_date TEXT,
   state TEXT
 );
+CREATE TABLE IF NOT EXISTS schedule_notifications (
+  scope TEXT NOT NULL,
+  release_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  next_action TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY (scope, release_id, date, code)
+);
 """
 
 
@@ -493,6 +496,29 @@ class Ledger:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA busy_timeout = 30000")
         self.connection.executescript(_SCHEMA)
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def schedule_notifications(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM schedule_notifications ORDER BY observed_at, date, release_id, code"
+        )
+        return [dict(row) for row in rows]
+
+    def notify_schedule(self, notice: dict[str, Any]) -> dict[str, Any]:
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schedule_notifications "
+            "(scope, release_id, date, code, message, next_action, observed_at) "
+            "VALUES (:scope, :release_id, :date, :code, :message, :next_action, :observed_at)",
+            notice,
+        )
+        row = self.connection.execute(
+            "SELECT * FROM schedule_notifications "
+            "WHERE scope = :scope AND release_id = :release_id AND date = :date AND code = :code",
+            notice,
+        ).fetchone()
+        return dict(row)
 
     # -- reads ---------------------------------------------------------
 
@@ -814,6 +840,8 @@ def update(
     release_ids: list[str] | tuple[str, ...] | None = None,
     *,
     corrections_store: str | Path | None = None,
+    expected_sessions: tuple[str, ...] | None = None,
+    expected_data_kind: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Process every tracked version up to ``target_date``; return (report, blocked).
 
@@ -828,6 +856,22 @@ def update(
     deliberately run without the journal; such a run applies no correction.
     """
     feed = load_feed(data)
+    if expected_data_kind is not None and expected_data_kind != DATA_KIND:
+        raise _reject(
+            "FEED_SCOPE_MISMATCH", "schedule", "correct",
+            f"The trading calendar requires a {expected_data_kind} Shadow Live feed.",
+        )
+    if expected_sessions:
+        expected_start, expected_end = expected_sessions[0], expected_sessions[-1]
+        feed_sessions = tuple(
+            session for session in feed.sessions if expected_start <= session <= expected_end
+        )
+        if feed_sessions != expected_sessions:
+            raise _reject(
+                "FEED_CALENDAR_MISMATCH", "schedule", "correct",
+                "The feed must include every scheduled session through the next open "
+                "in the operator's trading calendar.",
+            )
     try:
         target = snapshot._date(target_date)
     except ValueError as error:
