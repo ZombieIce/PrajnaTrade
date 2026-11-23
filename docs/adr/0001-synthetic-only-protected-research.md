@@ -19,7 +19,41 @@ Two failure modes drove this decision:
 2. A checklist that treats synthetic mechanism coverage as real evidence can
    claim end-to-end acceptance without any real data, model or forward ledger.
 
-## Decision
+## Direction-bound policy (issue #37)
+
+The following policy applies to research rounds created with an approved
+kickoff. The original decision below records the meaning of legacy plans,
+authorizations, debits and releases under issue #17. Their original evidence
+remains readable under its recorded rules.
+
+1. The research lead confirms the direction, independence declaration,
+   Campaign, objective, constraints, evaluation protocol and Validation budget.
+   The comparison budget covers one debit per newly evaluated strategy version
+   in the round. Discovery and Validation are development evidence. The
+   research side receives summary metrics and can request dated Validation
+   details by recording a question. Holdout evidence stays operator-only.
+2. A frozen Candidate binds the selected passing Validation record and its
+   selection rationale. Holdout authorization fixes the candidate, that
+   Validation record, the snapshot, the Holdout interval, the evaluation
+   protocol and the lead's independence declaration. Reusing a direction key
+   across Campaigns or renaming the direction preserves its Holdout history.
+3. Different directions can use an overlapping Holdout interval with recorded
+   independence at kickoff and selection. Prior use by the same direction or
+   declared influence from an overlapping evaluation requires an unseen
+   interval. An overlapping legacy debit has unknown direction provenance.
+   The evaluator checks exposure atomically before committing a debit.
+4. The Holdout authorization gives conditional consent for automatic release.
+   A verified pass creates one immutable release and enables the first eligible
+   after-close signal session from the authorized calendar. A scored failure
+   ends the round with a controlled retrospective. An aborted or interrupted
+   read preserves the debit and leaves approval unfulfilled.
+5. Recurring trusted jobs can process research requests and update Shadow Live.
+   The trading-day clock retains the ledger's order cutoffs and records
+   availability, runtime and deadline alerts. Scope follows the documented
+   inputs and observed execution. The acceptance requirements for real research
+   and reconciled real forward evidence continue to apply.
+
+## Original decision (issue #17)
 
 1. **Synthetic only.** Every sealed snapshot, evaluation, release, forward
    ledger and acceptance scenario in this build is synthetic or a replay.

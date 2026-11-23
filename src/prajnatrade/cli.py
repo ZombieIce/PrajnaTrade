@@ -843,7 +843,7 @@ def _direction_workflow_command(args: argparse.Namespace) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
-    return 2 if result["status"] in {"rejected", "blocked", "failed", "aborted", "interrupted"} else 0
+    return 2 if result.get("status") in {"rejected", "blocked", "failed", "aborted", "interrupted"} else 0
 
 
 def _direction_action(args: argparse.Namespace, direction) -> dict:
@@ -899,7 +899,7 @@ def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
                 args.store, args.snapshot_store, args.project, round_id=args.round_id,
                 submission_id=proposal["submission_id"], proposal_id=proposal["proposal_id"],
             )
-        except EvaluationRejection as error:
+        except (EvaluationRejection, ProtocolError) as error:
             result = {"status": "rejected", "proposal_id": proposal["proposal_id"], "error": error.details}
         results.append(result)
     for request in queued["details"]:
