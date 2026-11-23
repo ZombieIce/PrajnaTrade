@@ -293,10 +293,8 @@ def _verdict(
     }
 
 
-def build_evaluation_report(store: str | Path, plan_id: str) -> dict[str, Any]:
-    """Assemble the controlled report data from immutable stored evidence."""
-    eval_store = protected_eval._store(store)
-    plan = protected_eval.load_plan(eval_store, plan_id)
+def _legacy_report_evidence(eval_store: Path, plan: dict) -> tuple[dict, dict, dict]:
+    plan_id = plan["plan_id"]
     ledger = _ledger_rows(eval_store)
     authorizations = _authorizations(eval_store, plan_id)
 
@@ -304,7 +302,6 @@ def build_evaluation_report(store: str | Path, plan_id: str) -> dict[str, Any]:
         row for row in ledger["evaluations"] if row.get("plan_id") == plan_id
     ]
     stages: dict[str, dict[str, Any]] = {}
-    records: dict[str, dict[str, Any]] = {}
     for stage in STAGES:
         candidates = sorted(
             (row for row in plan_evaluations if row.get("stage") == stage),
@@ -315,37 +312,85 @@ def build_evaluation_report(store: str | Path, plan_id: str) -> dict[str, Any]:
             continue
         latest = candidates[-1]
         record, path = _load_record(eval_store, plan, latest, stage)
-        records[stage] = record
         stages[stage] = _stage_section(plan, record, path)
 
-    query_receipts: dict[str, dict[str, Any]] = {}
+    debits = {}
     for stage in STAGES:
         matching = [
             row
             for row in ledger["consumed"]
             if row.get("plan_id") == plan_id and row.get("partition_name") == stage
         ]
-        if not matching:
-            query_receipts[stage] = {
-                "debited": False,
-                "partition": stage,
-                "status": None,
-                "debited_at": None,
-                "evaluation_id": None,
-                "authorization_id": None,
-                "partition_content_hash": plan["partitions"][stage]["content_hash"],
-            }
-            continue
-        row = matching[0]
-        query_receipts[stage] = {
-            "debited": True,
-            "partition": stage,
-            "partition_content_hash": row.get("partition_content_hash"),
-            "status": row.get("status"),
-            "debited_at": row.get("debited_at"),
-            "evaluation_id": row.get("evaluation_id"),
-            "authorization_id": row.get("authorization_id"),
-        }
+        debits[stage] = matching[0] if matching else None
+    return stages, authorizations, debits
+
+
+def _research_report_evidence(store: Path, plan: dict) -> tuple[dict, dict, dict, dict]:
+    from prajnatrade import research_holdout
+
+    validation_stage = protected_eval.VALIDATION_STAGE
+    holdout_stage = protected_eval.HOLDOUT_STAGE
+    selected = plan["candidate"]["research_selection"]
+    proof = protected_eval.selected_validation_evidence(
+        store, selected["round_id"], selected["validation_evaluation_id"], plan["candidate"],
+    )
+    validation = proof["record"]
+    authorization = research_holdout.load_authorization(store, plan["plan_id"])
+    claim = research_holdout.load_holdout_claim(store, plan["plan_id"])
+    stages = {
+        validation_stage: _stage_section(
+            proof["plan"], validation, store / "records" / validation["evaluation_id"] / "record.json",
+        ),
+        holdout_stage: _missing_stage_section(holdout_stage),
+    }
+    if claim:
+        record_path = store / "records" / claim["evaluation_id"] / "record.json"
+        if record_path.is_file() or claim["status"] in {"completed", "aborted"}:
+            record, path = _load_record(store, plan, claim, holdout_stage)
+            if (
+                authorization is None
+                or record["authorization"] != authorization
+                or claim["authorization_id"] != authorization["auth_id"]
+                or record["query_receipt"]["debited_at"] != claim["debited_at"]
+            ):
+                raise _rejection("RECORD_INTEGRITY_FAILED", "The Holdout authorization and debit differ.")
+            stages[holdout_stage] = _stage_section(plan, record, path)
+    authorizations = {validation_stage: validation["authorization"], holdout_stage: authorization}
+    debits = {validation_stage: proof["debit"], holdout_stage: claim}
+    context = {
+        "workflow": research_holdout.WORKFLOW,
+        "direction_id": selected["direction_id"],
+        "round_id": selected["round_id"],
+        "selection_summary": selected["summary"],
+        "validation_binding": plan["validation_binding"],
+        "holdout_blockers": research_holdout.blockers(store, plan["plan_id"]),
+    }
+    return stages, authorizations, debits, context
+
+
+def _query_receipt(plan: dict, stage: str, debit: dict | None) -> dict:
+    row = debit or {}
+    return {
+        "debited": debit is not None,
+        "partition": stage,
+        "partition_content_hash": plan["partitions"][stage]["content_hash"],
+        "status": row.get("status"),
+        "debited_at": row.get("debited_at"),
+        "evaluation_id": row.get("evaluation_id"),
+        "authorization_id": row.get("authorization_id"),
+    }
+
+
+def build_evaluation_report(store: str | Path, plan_id: str) -> dict[str, Any]:
+    """Assemble the controlled report data from immutable stored evidence."""
+    eval_store = protected_eval._store(store)
+    plan = protected_eval.load_plan(eval_store, plan_id)
+    context = {}
+    if plan.get("workflow") == "research_holdout":
+        stages, authorizations, debits, context = _research_report_evidence(eval_store, plan)
+    else:
+        stages, authorizations, debits = _legacy_report_evidence(eval_store, plan)
+    query_receipts = {stage: _query_receipt(plan, stage, debits[stage]) for stage in STAGES}
 
     rejected_requests = []
     audit_directory = eval_store / "audit"
@@ -386,10 +431,17 @@ def build_evaluation_report(store: str | Path, plan_id: str) -> dict[str, Any]:
         }
 
     verdict = _verdict(plan, stages, authorizations, query_receipts)
+    if context:
+        verdict["evidence_complete"] = not verdict["incomplete"]
+        verdict["statement"] = (
+            "The report records the selected Validation and direction-bound Holdout. "
+            "The pre-read human authorization governs release on a trusted pass."
+        )
     body: dict[str, Any] = {
-        "schema_version": REPORT_SCHEMA_VERSION,
+        **context,
+        "schema_version": 2 if context else REPORT_SCHEMA_VERSION,
         "kind": REPORT_KIND,
-        "scope": protected_eval.SCOPE,
+        "scope": plan["scope"],
         "plan_id": plan["plan_id"],
         "plan_hash": plan["plan_id"],
         "candidate_id": plan["candidate_id"],
@@ -855,7 +907,8 @@ def render_report_html(report: dict[str, Any]) -> str:
         "</head><body><main>",
         "<header>",
         "<h1>PrajnaTrade controlled evaluation report</h1>",
-        '<p class="badge">SYNTHETIC DATA — ENGINEERING EVIDENCE ONLY</p>',
+        '<p class="badge">SYNTHETIC DATA — ENGINEERING EVIDENCE ONLY</p>'
+        if report["scope"] == "synthetic" else '<p class="badge">REAL HISTORICAL DATA</p>',
         f'<p class="statement">{_esc(report["verdict"]["statement"])}</p>',
         f'<p class="verdict">{state} · {stages_state} · '
         "Admission: not granted</p>",
@@ -881,6 +934,20 @@ def render_report_html(report: dict[str, Any]) -> str:
     else:
         parts.append("<p>No blocking evidence gaps were found in the stored records.</p>")
     parts.append("</section>")
+
+    if report.get("workflow") == "research_holdout":
+        parts.extend((
+            "<section><h2>Research selection</h2>",
+            _definition_list([
+                ("Workflow", report["workflow"]),
+                ("Direction ID", report["direction_id"]),
+                ("Round ID", report["round_id"]),
+                ("Selection summary", report["selection_summary"]),
+                ("Validation binding", report["validation_binding"]),
+                ("Holdout eligibility blockers", report["holdout_blockers"]),
+            ]),
+            "</section>",
+        ))
 
     parts.append("<section><h2>Fingerprints</h2>")
     fingerprint_items = [
@@ -1015,9 +1082,9 @@ def write_evaluation_report(
         text = json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"
     _write_text(output, text)
     return {
-        "schema_version": 1,
+        "schema_version": report["schema_version"],
         "status": "generated",
-        "scope": protected_eval.SCOPE,
+        "scope": report["scope"],
         "plan_id": report["plan_id"],
         "output": str(output),
         "format": report_format,
