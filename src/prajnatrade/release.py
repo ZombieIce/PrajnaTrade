@@ -1,20 +1,13 @@
 """Human approval, immutable release artifacts, and tracked-version lifecycle (#30).
 
-A *release* is the only trusted object that makes a frozen candidate a runnable
-version.  It is created by an explicit human `approve` over the two completed,
-passed and scored protected-evaluation records of the same frozen plan, and it
-is written once as a content-addressed artifact.  It is never created
-implicitly, never overwritten, and never replaced by a re-run.
+A release is a write-once, content-addressed artifact for one frozen candidate
+and plan. Legacy plans require a distinct human approval and enablement event.
+Research Holdout plans use a pre-read authorization which takes effect after
+the two selected protected stages have passed and verified evidence is stored.
 
-Approval does **not** enable tracking.  Operators opt in through append-only
-lifecycle events (`enable`, `pause`, `resume`, `retire`), each effective at a
-pre-registered after-close signal date.  State at a signal date is derived from
-the event timeline, so a historical replay sees the version and state that were
-registered for that date rather than today's state.
-
-Everything in this module is synthetic engineering evidence.  It does not
-approve a real strategy, does not prove real-market performance, and does not
-implement Shadow Live (#32).
+Enablement, pause, resume and retirement are append-only events effective on
+registered after-close signal dates. Replays use the state registered for the
+signal date.
 
 Store layout (the same trusted store used by ``protected_eval``)::
 
@@ -38,11 +31,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from prajnatrade import dividend, protected_eval, snapshot
+from prajnatrade import dividend, protected_eval, shadow_calendar, snapshot
+from prajnatrade.snapshot_baseline import CN_TZ
 
 SCHEMA_VERSION = 1
 SCOPE = "synthetic"
 RELEASE_VERSION = "release-v1"
+RESEARCH_HOLDOUT = "research_holdout"
 ARTIFACT_KIND = "immutable_release_artifact"
 STATUS_KIND = "immutable_release_status"
 REJECTION_KIND = "immutable_release_rejection"
@@ -95,6 +90,16 @@ ADMISSION_STATEMENT = (
     "performance, does not validate a real strategy, and does not enable "
     "tracking. Enablement is a separate operator lifecycle event registered at "
     "a pre-registered after-close signal date."
+)
+REAL_ADMISSION_STATEMENT = (
+    "This artifact records the human admission decision for this frozen candidate "
+    "and both verified protected stages. Enablement is a separate operator "
+    "lifecycle event at a pre-registered after-close signal date."
+)
+
+CONDITIONAL_ADMISSION_STATEMENT = (
+    "The reviewer authorized this frozen candidate and its scheduled Shadow Live "
+    "enablement before Final Holdout. The trusted passing evidence activated that decision."
 )
 
 _RELEASE_ID = re.compile(r"[0-9a-f]{64}")
@@ -256,6 +261,11 @@ def _load_verified_artifact(path: Path, release_id: str) -> dict[str, Any]:
             "inspect",
             "The release artifact uses an unsupported release version.",
         )
+    if artifact.get("scope") not in shadow_calendar.DATA_KINDS:
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED", "fetch", "inspect",
+            "The release artifact has an unsupported data scope.",
+        )
     if (
         _release_id(artifact.get("candidate_hash"), artifact.get("plan_id"))
         != release_id
@@ -267,6 +277,24 @@ def _load_verified_artifact(path: Path, release_id: str) -> dict[str, Any]:
             "The release ID is not the content address of the bound candidate "
             "and plan.",
         )
+    scope = artifact.get("scope")
+    if artifact.get("workflow") == RESEARCH_HOLDOUT:
+        terms = artifact.get("admission")
+        try:
+            calendar = shadow_calendar.validate_calendar(terms["calendar"])
+            if (
+                terms["automatic_enable"] is not True
+                or calendar["data_kind"] != scope
+                or terms["calendar_hash"] != _hash(calendar)
+                or terms["effective_signal_date"] not in calendar["sessions"]
+                or terms["authorization_id"] != artifact["approval"]["authorization_id"]
+            ):
+                raise ValueError("Automatic admission bindings differ.")
+        except (KeyError, TypeError, ValueError) as error:
+            raise _reject(
+                "RELEASE_INTEGRITY_FAILED", "fetch", "inspect",
+                f"The stored conditional admission is incomplete: {error}",
+            ) from error
     return artifact
 
 
@@ -396,7 +424,7 @@ def _rejection_response(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "rejection_recorded",
-        "scope": SCOPE,
+        "scope": record["scope"],
         "release_id": record["release_id"],
         "release_version": record["release_version"],
         "candidate_id": record.get("candidate_id"),
@@ -455,6 +483,11 @@ def reject(
             _phase_rejection(error, "rejection"),
             command="release reject",
         ) from error
+    if plan.get("workflow") is not None:
+        raise _reject(
+            "CONDITIONAL_DECISION_REQUIRED", "rejection", "review-holdout",
+            "Research Holdout plans use the reviewer's preread conditional decision.",
+        )
     release_id = _release_id(plan["candidate_hash"], plan["plan_id"])
     if not release_id:
         raise _refusal(
@@ -469,6 +502,7 @@ def reject(
             command="release reject",
         )
     context = {
+        "scope": plan["scope"],
         "plan_id": plan["plan_id"],
         "release_id": release_id,
         "candidate_id": plan.get("candidate_id"),
@@ -500,7 +534,7 @@ def reject(
     body = {
         "schema_version": SCHEMA_VERSION,
         "kind": REJECTION_KIND,
-        "scope": SCOPE,
+        "scope": plan["scope"],
         "release_version": RELEASE_VERSION,
         "release_id": release_id,
         "decision": "rejected",
@@ -618,7 +652,7 @@ def _stage_authorization(
             "authorize",
             f"No {label} authorization is stored for this frozen plan.",
         )
-    if len(records) != 1 or not protected_eval._authorization_matches(
+    if len(records) != 1 or not protected_eval.authorization_matches(
         records[0], plan, stage
     ):
         raise _reject(
@@ -645,11 +679,16 @@ def _stage_authorization(
 
 
 def _stage_evidence(
-    store: Path, plan: dict[str, Any], stage: str
+    store: Path,
+    plan: dict[str, Any],
+    stage: str,
+    *,
+    debit: dict[str, Any] | None = None,
+    authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     label = "Validation" if stage == protected_eval.VALIDATION_STAGE else "Final Holdout"
     content_hash = plan["partitions"][stage]["content_hash"]
-    row = protected_eval._read_ledger_row(store, stage, content_hash)
+    row = debit if debit is not None else protected_eval._read_ledger_row(store, stage, content_hash)
     if row is None:
         raise _reject(
             "EVIDENCE_MISSING",
@@ -800,7 +839,18 @@ def _stage_evidence(
             "inspect",
             f"The {label} verdict still lists failed or unavailable thresholds.",
         )
-    authorization = _stage_authorization(store, plan, stage, record)
+    if authorization is None:
+        authorization = _stage_authorization(store, plan, stage, record)
+    elif (
+        not protected_eval.authorization_matches(authorization, plan, stage)
+        or record.get("authorization") != authorization
+        or record.get("scope") != plan.get("scope")
+        or (record.get("query_receipt") or {}).get("debited_at") != row.get("debited_at")
+    ):
+        raise _reject(
+            "AUTHORIZATION_INVALID", "approval", "inspect",
+            f"The {label} record is not bound to the trusted plan and authorization.",
+        )
     if row.get("authorization_id") != authorization["auth_id"]:
         raise _reject(
             "AUTHORIZATION_INVALID",
@@ -827,12 +877,14 @@ def _stage_evidence(
 
 def _approval_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
     """Verify the complete trusted evidence a human approval must rest on."""
-    if plan.get("scope") != SCOPE or plan.get("data_kind") != SCOPE:
+    research = plan.get("workflow") == RESEARCH_HOLDOUT
+    data_kind = plan.get("data_kind")
+    if data_kind not in shadow_calendar.DATA_KINDS or plan.get("scope") != data_kind:
         raise _reject(
             "EVIDENCE_INVALID",
             "approval",
             "inspect",
-            "Only a synthetic frozen plan can produce a release in this build.",
+            "The frozen plan has an unsupported data scope.",
         )
     if plan.get("stages") != list(STAGES):
         raise _reject(
@@ -862,6 +914,7 @@ def _approval_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
         candidate.get("snapshot_id") != plan.get("snapshot_id")
         or not isinstance(evaluation, dict)
         or evaluation.get("snapshot_id") != plan.get("snapshot_id")
+        or evaluation.get("data_kind", SCOPE) != data_kind
     ):
         raise _reject(
             "EVIDENCE_INVALID",
@@ -869,7 +922,10 @@ def _approval_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
             "inspect",
             "The frozen candidate is not bound to the plan's sealed snapshot.",
         )
-    stages = {stage: _stage_evidence(store, plan, stage) for stage in STAGES}
+    stages = (
+        _research_stage_evidence(store, plan)
+        if research else {stage: _stage_evidence(store, plan, stage) for stage in STAGES}
+    )
     validation = stages[protected_eval.VALIDATION_STAGE]
     holdout = stages[protected_eval.HOLDOUT_STAGE]
 
@@ -923,6 +979,48 @@ def _approval_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _research_stage_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    from prajnatrade import research_holdout
+
+    reference = plan["validation_binding"]
+    try:
+        selected = protected_eval.selected_validation_evidence(
+            store, reference["round_id"], reference["evaluation_id"], plan["candidate"]
+        )
+        authorization = research_holdout.load_authorization(store, plan["plan_id"])
+        claim = research_holdout.load_holdout_claim(store, plan["plan_id"])
+    except protected_eval.EvaluationRejection as error:
+        raise _phase_rejection(error, "approval") from error
+    if authorization is None or claim is None:
+        raise _reject(
+            "EVIDENCE_MISSING", "approval", "run-holdout",
+            "The trusted Holdout authorization and debit are required.",
+        )
+    actual = {
+        "round_id": reference["round_id"],
+        "evaluation_id": selected["evaluation_id"],
+        "plan_id": selected["plan"]["plan_id"],
+        "record_hash": selected["record_hash"],
+        "export_hash": selected["export_hash"],
+        "partition_content_hash": selected["partition_content_hash"],
+    }
+    if reference != actual or selected["plan"]["scope"] != plan["scope"]:
+        raise _reject(
+            "EVIDENCE_INVALID", "approval", "inspect",
+            "The Holdout plan differs from the selected Validation evidence.",
+        )
+    validation_stage, holdout_stage = STAGES
+    return {
+        validation_stage: _stage_evidence(
+            store, selected["plan"], validation_stage,
+            debit=selected["debit"], authorization=selected["authorization"],
+        ),
+        holdout_stage: _stage_evidence(
+            store, plan, holdout_stage, debit=claim, authorization=authorization,
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # The immutable release artifact
 # ---------------------------------------------------------------------------
@@ -933,6 +1031,8 @@ def _artifact(
     evidence: dict[str, Any],
     reviewer: str,
     reason: str,
+    *,
+    automatic_admission: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stages = evidence["stages"]
     candidate = plan["candidate"]
@@ -1007,7 +1107,7 @@ def _artifact(
     body = {
         "schema_version": SCHEMA_VERSION,
         "kind": ARTIFACT_KIND,
-        "scope": SCOPE,
+        "scope": plan["scope"],
         "release_version": RELEASE_VERSION,
         "release_id": _release_id(plan["candidate_hash"], plan["plan_id"]),
         "candidate_id": plan["candidate_id"],
@@ -1026,7 +1126,7 @@ def _artifact(
         "approval": approval,
         "admission": {
             "decision": "approved",
-            "statement": ADMISSION_STATEMENT,
+            "statement": ADMISSION_STATEMENT if plan["scope"] == SCOPE else REAL_ADMISSION_STATEMENT,
             "automatic_enable": False,
             "enablement": (
                 "a separate operator lifecycle event registered at a "
@@ -1034,6 +1134,14 @@ def _artifact(
             ),
         },
     }
+    if automatic_admission is not None:
+        holdout = stages[protected_eval.HOLDOUT_STAGE]
+        approval["approved_at"] = holdout["record"]["completed_at"]
+        approval["authorization_id"] = holdout["authorization_id"]
+        body["admission"] = automatic_admission
+        body["workflow"] = RESEARCH_HOLDOUT
+        body["validation_binding"] = plan["validation_binding"]
+        body["direction_id"] = holdout["authorization"].get("direction_id")
     return {**body, "artifact_hash": _hash(body)}
 
 
@@ -1045,7 +1153,7 @@ def _approval_response(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "approved",
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "release_id": artifact["release_id"],
         "release_version": artifact["release_version"],
         "artifact_hash": artifact["artifact_hash"],
@@ -1077,7 +1185,7 @@ def _audit(
     """Persist a refusal without creating any release object."""
     body = {
         "schema_version": SCHEMA_VERSION,
-        "scope": SCOPE,
+        "scope": context.get("scope", SCOPE),
         "received_at": _now(),
         "command": command,
         **context,
@@ -1174,6 +1282,11 @@ def approve(
             {"plan_id": plan_id},
             _phase_rejection(error, "approval"),
         ) from error
+    if plan.get("workflow") is not None:
+        raise _reject(
+            "CONDITIONAL_DECISION_REQUIRED", "approval", "review-holdout",
+            "Research Holdout plans require the stored pre-read conditional authorization and trusted pass.",
+        )
     release_id = _release_id(plan["candidate_hash"], plan["plan_id"])
     if not release_id:
         raise _reject(
@@ -1183,6 +1296,7 @@ def approve(
             "The frozen plan does not carry a usable candidate fingerprint.",
         )
     context = {
+        "scope": plan["scope"],
         "plan_id": plan["plan_id"],
         "release_id": release_id,
         "candidate_id": plan.get("candidate_id"),
@@ -1228,6 +1342,120 @@ def approve(
     return _approval_response(artifact, path, reused=False)
 
 
+def _conditional_admission(plan: dict[str, Any], holdout: dict[str, Any]) -> dict[str, Any]:
+    authorization = holdout["authorization"]
+    terms = authorization.get("automatic_release")
+    try:
+        if not isinstance(terms, dict) or set(terms) != {"calendar"}:
+            raise ValueError("The preread authorization must bind an automatic release calendar.")
+        calendar = shadow_calendar.validate_calendar(terms["calendar"])
+        authorized = shadow_calendar.parse_timestamp(authorization["authorized_at"], "authorized_at")
+        debited = shadow_calendar.parse_timestamp(holdout["debited_at"], "debited_at")
+        completed = shadow_calendar.parse_timestamp(holdout["record"]["completed_at"], "completed_at")
+        if not authorized <= debited <= completed:
+            raise ValueError("The authorization must precede the trusted Holdout read.")
+        if calendar["data_kind"] != plan["data_kind"]:
+            raise ValueError("The calendar scope must match the frozen plan.")
+    except (KeyError, TypeError, ValueError) as error:
+        raise _reject(
+            "CONDITIONAL_AUTHORIZATION_INVALID", "approval", "inspect",
+            str(error),
+        ) from error
+    after = max(
+        completed.astimezone(CN_TZ).date().isoformat(),
+        plan["partitions"][protected_eval.HOLDOUT_STAGE]["end"],
+    )
+    first = next((session for session in calendar["sessions"] if session > after), None)
+    if first is None:
+        raise _reject(
+            "RELEASE_CALENDAR_EXHAUSTED", "approval", "review-holdout",
+            f"The authorized calendar has no scheduled session after {after}.",
+        )
+    return {
+        "decision": "approved",
+        "statement": CONDITIONAL_ADMISSION_STATEMENT,
+        "automatic_enable": True,
+        "authorization_id": authorization["auth_id"],
+        "effective_signal_date": first,
+        "calendar": calendar,
+        "calendar_hash": _hash(calendar),
+    }
+
+
+def settle_authorized_release(store: str | Path, plan_id: str) -> dict[str, Any]:
+    """Apply a prior conditional approval using complete, trusted passing evidence."""
+    eval_store = _store(store)
+    try:
+        plan = protected_eval.load_plan(eval_store, plan_id)
+    except protected_eval.EvaluationRejection as error:
+        raise _phase_rejection(error, "approval") from error
+    if plan.get("workflow") != RESEARCH_HOLDOUT:
+        raise _reject(
+            "CONDITIONAL_DECISION_REQUIRED", "approval", "inspect",
+            "An automatic release requires a Research Holdout plan.",
+        )
+    evidence = _approval_evidence(eval_store, plan)
+    holdout = evidence["stages"][protected_eval.HOLDOUT_STAGE]
+    admission = _conditional_admission(plan, holdout)
+    authorization = holdout["authorization"]
+    artifact = _artifact(
+        plan, evidence, authorization["reviewer"], authorization["reason"],
+        automatic_admission=admission,
+    )
+    release_id = artifact["release_id"]
+    path = _artifact_location(eval_store, release_id)
+    written = _write_immutable(path, artifact)
+    stored = _verified_artifact(path, release_id)
+    if stored != artifact:
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED", "approval", "inspect",
+            "The stored release differs from the verified conditional decision.",
+        )
+    event = _authorized_enablement(eval_store, stored)
+    return {
+        **_approval_response(stored, path, reused=not written),
+        "status": "enabled",
+        "effective_signal_date": admission["effective_signal_date"],
+        "enablement_event": event,
+    }
+
+
+def _authorized_enablement(store: Path, artifact: dict[str, Any]) -> dict[str, Any]:
+    release_id = artifact["release_id"]
+    terms = artifact["admission"]
+    timeline = _timeline(store, release_id)
+    if not timeline:
+        try:
+            return _append_event(
+                "enable", store, release_id, terms["effective_signal_date"],
+                "Trusted Final Holdout pass activated the reviewer's authorization.",
+                authorization_id=terms["authorization_id"],
+            )["event"]
+        except ReleaseRejection:
+            timeline = _timeline(store, release_id)
+            if not timeline:
+                raise
+    _verify_enablement(artifact, timeline)
+    return timeline[0]
+
+
+def _verify_enablement(artifact: dict[str, Any], timeline: list[dict[str, Any]]) -> None:
+    if artifact.get("workflow") != RESEARCH_HOLDOUT or not timeline:
+        return
+    terms = artifact["admission"]
+    event = timeline[0]
+    if (
+        event["action"] != "enable"
+        or event.get("authorization_id") != terms["authorization_id"]
+        or event["effective_signal_date"] != terms["effective_signal_date"]
+        or event.get("scope") != artifact["scope"]
+    ):
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED", "lifecycle", "inspect",
+            "The first lifecycle event does not match the stored conditional decision.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Fetch and operator status
 # ---------------------------------------------------------------------------
@@ -1241,7 +1469,7 @@ def fetch(store: str | Path, release_id: str) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "fetched",
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "kind": ARTIFACT_KIND,
         "release_id": artifact["release_id"],
         "artifact_hash": artifact["artifact_hash"],
@@ -1642,6 +1870,7 @@ def _bound_plan(store: Path, artifact: dict[str, Any]) -> dict[str, Any]:
         plan.get("candidate_hash") != artifact.get("candidate_hash")
         or plan.get("snapshot_id") != artifact.get("snapshot_id")
         or plan.get("partitions") != artifact.get("partition_fingerprints")
+        or plan.get("scope") != artifact.get("scope")
     ):
         raise _reject(
             "RELEASE_INTEGRITY_FAILED",
@@ -1922,6 +2151,7 @@ def disposition(
         ) from error
     context = {
         **context,
+        "scope": artifact["scope"],
         "candidate_id": artifact.get("candidate_id"),
         "candidate_hash": artifact.get("candidate_hash"),
         "plan_id": artifact.get("plan_id"),
@@ -2009,6 +2239,7 @@ def disposition(
     invalidating = recorded_impact in INVALIDATING_IMPACTS
 
     events = _timeline(eval_store, release_id)
+    _verify_enablement(artifact, events)
     state = _current_state(events)
     pause_date: str | None = None
     if invalidating and state == "enabled":
@@ -2106,7 +2337,7 @@ def disposition(
     sequence = _next_disposition_sequence(eval_store, release_id)
     body = {
         "schema_version": SCHEMA_VERSION,
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "kind": DISPOSITION_KIND,
         "disposition_version": DISPOSITION_VERSION,
         "sequence": sequence,
@@ -2189,7 +2420,7 @@ def disposition(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "recorded",
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "kind": DISPOSITION_RESULT_KIND,
         "release_id": release_id,
         "revision_id": revision_id,
@@ -2235,6 +2466,7 @@ def _verify_bindings(store: Path, artifact: dict[str, Any]) -> None:
         plan.get("candidate_hash") != artifact.get("candidate_hash")
         or plan.get("snapshot_id") != artifact.get("snapshot_id")
         or plan.get("partitions") != artifact.get("partition_fingerprints")
+        or plan.get("scope") != artifact.get("scope")
     ):
         raise _reject(
             "RELEASE_INTEGRITY_FAILED",
@@ -2250,6 +2482,18 @@ def _verify_bindings(store: Path, artifact: dict[str, Any]) -> None:
             "inspect",
             "The release artifact does not bind both protected stages.",
         )
+    if artifact.get("workflow") == RESEARCH_HOLDOUT:
+        verified = _approval_evidence(store, plan)["stages"]
+        if any(
+            verified[stage][key] != evaluations[stage].get(key)
+            for stage in STAGES
+            for key in ("evaluation_id", "record_hash", "authorization_id")
+        ):
+            raise _reject(
+                "EVIDENCE_INVALID", "lifecycle", "inspect",
+                "The bound research evidence no longer matches the release artifact.",
+            )
+        return
     for stage in STAGES:
         entry = evaluations[stage]
         label = "Validation" if stage == protected_eval.VALIDATION_STAGE else "Final Holdout"
@@ -2308,6 +2552,8 @@ def _append_event(
     release_id: str,
     effective_signal_date: str,
     reason: str,
+    *,
+    authorization_id: str | None = None,
 ) -> dict[str, Any]:
     if action not in ACTIONS:
         raise _reject(
@@ -2317,6 +2563,7 @@ def _append_event(
     path = _artifact_location(eval_store, release_id)
     artifact = _verified_artifact(path, release_id)
     events = _timeline(eval_store, release_id)
+    _verify_enablement(artifact, events)
     state = _current_state(events)
     command = f"release {action}"
     reason = reason.strip() if isinstance(reason, str) else ""
@@ -2329,6 +2576,7 @@ def _append_event(
         state_before: str | None = state,
     ) -> None:
         context = {
+            "scope": artifact["scope"],
             "release_id": release_id,
             "action": action,
             "effective_signal_date": effective_signal_date,
@@ -2358,6 +2606,18 @@ def _append_event(
             },
         )
 
+    if not events and artifact.get("workflow") == RESEARCH_HOLDOUT:
+        terms = artifact["admission"]
+        if (
+            action != "enable"
+            or authorization_id != terms["authorization_id"]
+            or effective_signal_date != terms["effective_signal_date"]
+        ):
+            refuse(
+                "CONDITIONAL_DECISION_REQUIRED",
+                "Enablement is bound to the stored conditional authorization and session.",
+                next_action="settle-holdout",
+            )
     if state not in ALLOWED_FROM[action]:
         refuse("INVALID_TRANSITION", _transition_message(action, state), next_action="stop")
     try:
@@ -2403,7 +2663,7 @@ def _append_event(
     state_after = STATE_FOR_ACTION[action]
     body = {
         "schema_version": SCHEMA_VERSION,
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "release_id": release_id,
         "seq": len(events) + 1,
         "action": action,
@@ -2414,6 +2674,8 @@ def _append_event(
         "state_before": state,
         "state_after": state_after,
     }
+    if authorization_id is not None:
+        body["authorization_id"] = authorization_id
     event = {**body, "event_hash": _hash(body)}
     event_path = _release_dir(eval_store, release_id) / "events" / f"{body['seq']}.json"
     if not _write_immutable(event_path, event):
@@ -2426,7 +2688,7 @@ def _append_event(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": state_after,
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "action": action,
         "release_id": release_id,
         "artifact_hash": artifact["artifact_hash"],
@@ -2469,8 +2731,9 @@ def retire(
 # ---------------------------------------------------------------------------
 
 
-def _release_ids(store: Path) -> list[str]:
-    directory = store / "releases"
+def release_ids(store: str | Path) -> list[str]:
+    """List release artifact addresses without loading individual artifacts."""
+    directory = Path(store) / "releases"
     if not directory.is_dir():
         return []
     ids = []
@@ -2499,7 +2762,7 @@ def _rejection_status(
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
         "kind": REJECTION_STATUS_KIND,
-        "scope": SCOPE,
+        "scope": rejection["scope"],
         "release_id": rejection["release_id"],
         "release_version": rejection.get("release_version"),
         "artifact_hash": None,
@@ -2547,6 +2810,7 @@ def status(
         return _rejection_status(eval_store, release_id, as_of)
     artifact = _verified_artifact(path, release_id)
     events = _timeline(eval_store, release_id)
+    _verify_enablement(artifact, events)
     current = _current_state(events)
     as_of_date = _as_of_date(as_of) if as_of is not None else None
     state = current if as_of_date is None else _state_at(events, as_of_date)
@@ -2557,7 +2821,7 @@ def status(
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
         "kind": STATUS_KIND,
-        "scope": SCOPE,
+        "scope": artifact["scope"],
         "release_id": artifact["release_id"],
         "release_version": artifact["release_version"],
         "artifact_hash": artifact["artifact_hash"],
@@ -2586,11 +2850,10 @@ def status(
 def state_at(store: str | Path, release_id: str, signal_date: str) -> str:
     """The tracked state of one release at an after-close signal date (#32)."""
     eval_store = _store(store)
-    _verified_artifact(_artifact_location(eval_store, release_id), release_id)
-    return _state_at(
-        _timeline(eval_store, release_id),
-        _signal_date(signal_date, phase="status"),
-    )
+    artifact = _verified_artifact(_artifact_location(eval_store, release_id), release_id)
+    events = _timeline(eval_store, release_id)
+    _verify_enablement(artifact, events)
+    return _state_at(events, _signal_date(signal_date, phase="status"))
 
 
 def releases_active_at(store: str | Path, signal_date: str) -> list[dict[str, Any]]:
@@ -2603,11 +2866,13 @@ def releases_active_at(store: str | Path, signal_date: str) -> list[dict[str, An
     eval_store = _store(store)
     as_of = _signal_date(signal_date, phase="status")
     active = []
-    for release_id in _release_ids(eval_store):
+    for release_id in release_ids(eval_store):
         artifact = _verified_artifact(
             _artifact_location(eval_store, release_id), release_id
         )
-        if _state_at(_timeline(eval_store, release_id), as_of) != "enabled":
+        events = _timeline(eval_store, release_id)
+        _verify_enablement(artifact, events)
+        if _state_at(events, as_of) != "enabled":
             continue
         active.append(
             {
@@ -2627,11 +2892,12 @@ def list_releases(store: str | Path) -> list[dict[str, Any]]:
     """Every stored release or explicit rejection with its current state."""
     eval_store = _store(store)
     summaries = []
-    for release_id in _release_ids(eval_store):
+    for release_id in release_ids(eval_store):
         artifact = _verified_artifact(
             _artifact_location(eval_store, release_id), release_id
         )
         events = _timeline(eval_store, release_id)
+        _verify_enablement(artifact, events)
         approval = artifact.get("approval")
         approval = approval if isinstance(approval, dict) else {}
         summaries.append(

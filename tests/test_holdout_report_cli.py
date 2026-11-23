@@ -12,10 +12,11 @@ also passes when selected alone with ``pytest -k``.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-
 from cli_helpers import cli, cli_env, ok, rejected, write_json
 from test_protected_eval_cli import (
     authorize,
@@ -30,6 +31,7 @@ from test_protected_eval_cli import (
     submit_experiment,
     synthetic_snapshot,
 )
+from test_real_snapshot import make_partial_halt, raw_row, schema_v2_fixture
 
 pytestmark = pytest.mark.isolation
 
@@ -187,6 +189,108 @@ def audit_records(store: Path) -> list[dict]:
     return [
         json.loads(path.read_text()) for path in sorted((store / "audit").glob("*.json"))
     ]
+
+
+@pytest.mark.parametrize("validation_passes", [True, False])
+def test_schema_v2_holdout_preserves_authorization_and_query_boundaries(
+    tmp_path: Path, validation_passes: bool,
+) -> None:
+    # All prices and evidence below are generated in the schema-v2 format.
+    payload = schema_v2_fixture(session_count=25)
+    halt_day = payload["calendar"][22]["date"]
+    make_partial_halt(raw_row(payload, halt_day, payload["raw_bars"][0]["symbol"]), halt_day)
+    base = build_scenario(
+        tmp_path, payload, "v2", family="trend_filter", parameters={"lookback": 3},
+    )
+    store = eval_store(base, "v2")
+    source = plan_input()
+    source["regimes"]["lookback"] = 2
+    if not validation_passes:
+        source["thresholds"][1]["value"] = 0.5
+    plan = create_plan(base, store, base["candidate"], source, name="plan-v2")
+    plan_id = plan["plan_id"]
+    refusal = rejected(authorize_holdout(store, plan_id), "VALIDATION_NOT_PASSED")
+    assert refusal["opened_protected_source"] is refusal["query_debited"] is False
+    assert consumed_rows(store) == []
+    ok(authorize(store, plan_id))
+    validation = ok(run_evaluation(base, store, plan_id))
+    assert validation["outcome"] == ("passed" if validation_passes else "rejected")
+    if not validation_passes:
+        refusal = rejected(authorize_holdout(store, plan_id), "VALIDATION_NOT_PASSED")
+        assert refusal["opened_protected_source"] is refusal["query_debited"] is False
+        assert [row[0] for row in consumed_rows(store)] == ["validation"]
+        return
+
+    refusal = rejected(run_evaluation(base, store, plan_id, stage="final_holdout"), "AUTHORIZATION_REQUIRED")
+    assert refusal["opened_protected_source"] is refusal["query_debited"] is False
+    export = validation["record"]["prior_export_for_holdout"]
+    assert export["sessions"] == [row["date"] for row in payload["calendar"][16:20]]
+    grant = ok(authorize_holdout(store, plan_id))["authorization"]
+    assert grant["validation"]["record_hash"] == validation["record"]["record_hash"]
+    assert grant["validation"]["export_hash"] == export["export_hash"]
+    rejected(authorize_holdout(store, plan_id), "AUTHORIZATION_CONFLICT")
+
+    # Stop the test run if it tries to reopen Validation, or opens Holdout before commit.
+    directory = base["snapshot_store"] / base["snapshot_id"]
+    directory.chmod(0o755)
+    (directory / "validation.json").unlink()
+    directory.chmod(0o555)
+    reader = """
+import sqlite3
+import sys
+from prajnatrade import snapshot
+from prajnatrade.cli import main
+database, authorization_id = sys.argv[1:3]
+read = snapshot.read_protected
+
+def observe(store, snapshot_id, partition):
+    assert partition == 'final_holdout'
+    with sqlite3.connect(database) as conn:
+        assert conn.execute(
+            'SELECT authorization_id, status FROM consumed_queries WHERE partition_name = ?',
+            (partition,),
+        ).fetchall() == [(authorization_id, 'reading')]
+    return read(store, snapshot_id, partition)
+
+snapshot.read_protected = observe
+sys.argv[1:3] = []
+raise SystemExit(main())
+"""
+    args = [
+        "evaluation", "run", "--store", str(store), "--snapshot-store",
+        str(base["snapshot_store"]), "--plan-id", plan_id, "--project",
+        str(base["project"]), "--stage", "final_holdout",
+    ]
+    holdout = ok(subprocess.run(
+        [sys.executable, "-c", reader, str(store / "queries.sqlite"), grant["auth_id"], *args],
+        capture_output=True, text=True, env=cli_env(), timeout=60, check=False,
+    ))
+    assert holdout["outcome"] == "passed"
+    assert holdout["receipt"] == HOLDOUT_RECEIPT
+    record = holdout["record"]
+    assert record["data_kind"] == "real"
+    assert record["prior_evidence"]["partitions"] == ["validation"]
+    assert record["prior_evidence"]["validation"]["export_hash"] == export["export_hash"]
+    assert record["coverage"]["evidenced_open_halts"][0]["date"] == halt_day
+    assert record["candidate_run"]["base"]["metrics"]["orders_unfilled"] == 1
+
+    directory.chmod(0o755)
+    (directory / "final_holdout.json").unlink()
+    directory.chmod(0o555)
+    replay = ok(run_evaluation(base, store, plan_id, stage="final_holdout"))
+    assert replay["query"]["reused"] is True
+    assert replay["record"] == record
+    assert len(consumed_rows(store)) == 2
+    assert len(evaluation_rows(store)) == 2
+
+    output = tmp_path / "report.json"
+    rendered = ok(report(store, plan_id, output))
+    assert rendered["scope"] == "real"
+    assert rendered["all_stages_passed"] is True
+    stages = json.loads(output.read_text())["stages"]
+    assert stages["final_holdout"]["record_hash"] == record["record_hash"]
+    observed = {"canonical": None, "payloads": [], "stdouts": []}
+    assert observe(observed, base["project"], plan["candidate_id"])["final_holdout"] == HOLDOUT_RECEIPT
 
 
 def test_holdout_authorization_is_refused_without_a_passed_validation(

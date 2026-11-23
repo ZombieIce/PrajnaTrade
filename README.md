@@ -672,23 +672,136 @@ The Mock provider can emit deterministic Python when opted in, but a Mock
 campaign is never evidence of model novelty or investable performance. Results
 are research evidence, not investment advice or a guarantee of future returns.
 
-### Protected Validation and Final Holdout (MVP-10/MVP-11, synthetic only)
+### Direction-bound research (#37)
 
-`prajnatrade evaluation ...` performs one preregistered, human-authorized,
-OS-isolated evaluation of a frozen candidate against sealed synthetic
-Validation **and** Final Holdout partitions, each debited once. Validation and
-Final Holdout have separate human authorizations; Final Holdout is only
-authorized after the same frozen plan's Validation passed, and the controlled
-report is rendered from the immutable records. **This is synthetic engineering
-evidence only.** It does not consume real market data, does not validate a real
-strategy, does not prove independent out-of-sample evidence for real markets,
-and does not grant admission, approve a release, or replace human review.
+The research lead creates a Campaign on a sealed snapshot, then approves its
+direction, objective, constraints, Validation protocol, and maximum number of
+new Validation evaluations. Use one stable direction key for the same design
+across display-name changes, Campaigns, and parameter revisions. The kickoff
+declares whether prior Holdout feedback influenced the design.
+
+```sh
+prajnatrade direction kickoff --project "$PROJECT" --store "$EVAL_STORE" \
+  --campaign-id "$CAMPAIGN" --direction-key "cross-sectional-relative-strength" \
+  --name "ETF relative strength" --authorization-id "$KICKOFF_APPROVAL" \
+  --input kickoff.json
+```
+
+The kickoff JSON contains `objective`, `constraints` (a list of strings),
+`validation_budget` (a positive integer), `validation_settings` (the evaluation
+plan input below), `independence` (an `independent` boolean and a `reason`),
+`reviewer`, and `approval_reason`. The Campaign fixes the snapshot, transaction
+cost, slippage, initial cash, and Discovery execution budget. The Validation
+protocol fixes the comparator and scoring rules for the round.
+
+After a successful Discovery experiment, the research agent submits a
+Validation proposal. Its JSON records `change`, `question`, `expected_change`,
+and `related_experiment_ids`. Once a version meets the thresholds, any new
+evaluation needs `selection_impact` explaining how the answer could change the
+selection.
+
+```sh
+prajnatrade-agent validation propose --project "$PROJECT" --round-id "$ROUND" \
+  --submission-id "$SUBMISSION" --input proposal.json
+prajnatrade validation service --project "$PROJECT" --store "$EVAL_STORE" \
+  --snapshot-store "$SNAPSHOTS" --round-id "$ROUND"
+prajnatrade-agent direction status --project "$PROJECT" --round-id "$ROUND"
+```
+
+The trusted operator can run `validation service` as a recurring job. It
+processes proposals and detail requests under the kickoff approval. The
+operator can also run one exact proposal with `validation run --project
+"$PROJECT" --store "$EVAL_STORE" --snapshot-store "$SNAPSHOTS" --round-id
+"$ROUND" --submission-id "$SUBMISSION" --proposal-id "$PROPOSAL"`. A new version
+debits once in the trusted ledger before the sealed read. Checking status,
+retrying the same evaluation, and querying stored details preserve the budget.
+The agent sees default summaries including net return, return relative to the
+equal-weight baseline, drawdown, turnover, and fees.
+
+```sh
+prajnatrade-agent validation details --project "$PROJECT" --round-id "$ROUND" \
+  --evaluation-id "$VALIDATION" --date "$TRADING_DATE" --question "$QUESTION"
+prajnatrade-agent validation feedback --project "$PROJECT" --round-id "$ROUND" \
+  --evaluation-id "$VALIDATION" --detail-access-id "$DETAIL" --impact "$IMPACT"
+prajnatrade-agent direction freeze --project "$PROJECT" --round-id "$ROUND" \
+  --evaluation-id "$VALIDATION" --name "ETF relative strength v2" --input selection.json
+```
+
+Repeat the detail request after the trusted service has run to retrieve its
+signals, positions, and fills. Feedback can reference `--next-experiment-id`.
+The selection JSON contains `selection_reason`, a `remaining_risks` list,
+an `eliminations` map keyed by experiment ID, and the agent's `independence`
+declaration. A passed version can be frozen before the budget is exhausted.
+If the budget runs out without one, use `direction retrospective` with a JSON
+`findings` and `next_step` for the lead to review. If the lead wants further
+research after a freeze, open another approved round using the same direction
+key.
+
+The lead authorizes one frozen selection and reaffirms whether selection
+remained independent. The trusted authorization verifies the exact selected
+Validation ID and records consent to automatically release and enable the
+frozen version on a trusted Holdout pass.
+
+```sh
+prajnatrade holdout authorize --project "$PROJECT" --store "$EVAL_STORE" \
+  --snapshot-store "$SNAPSHOTS" --round-id "$ROUND" \
+  --validation-evaluation-id "$VALIDATION" --reviewer "$REVIEWER" \
+  --reason "$APPROVAL_REASON" --selection-independent yes \
+  --independence-reason "$INDEPENDENCE_REASON" --calendar trading-calendar.json
+prajnatrade holdout run --project "$PROJECT" --store "$EVAL_STORE" \
+  --snapshot-store "$SNAPSHOTS" --plan-id "$HOLDOUT_PLAN"
+prajnatrade evaluation report --store "$EVAL_STORE" \
+  --plan-id "$HOLDOUT_PLAN" --output controlled-report.html
+```
+
+The calendar JSON includes `schema_version: 1`, `data_kind` matching the
+snapshot, a `source`, and an ordered list of ISO trading dates in `sessions`.
+Include the planned first eligible after-close signal date and subsequent
+trading days. An overlapping Holdout range can be used for another direction
+when both declarations and the recorded selection support independence.
+Prior use by the same direction, an overlapping legacy Holdout with unknown
+direction, or declared influence on an overlapping range records an
+eligibility blocker. A scored Holdout rejection ends the round and returns a
+controlled retrospective. Aborted or incomplete evidence leaves the release
+disabled.
+
+On a pass, the release begins with the first authorized trading session after
+the Holdout interval and completion date in Asia/Shanghai. Use the operator's
+recurring job to run the trading-day clock with the current feed. For example,
+a cron job can call this command every few minutes and route its output and
+nonzero exit to the operator's job monitor.
+
+```sh
+prajnatrade shadow tick --ledger "$LEDGER" --store "$EVAL_STORE" \
+  --calendar trading-calendar.json --data "$DAILY_FEED" \
+  --corrections-store "$SNAPSHOTS"
+```
+
+The clock records blocked inputs, failures, and missed next-open deadlines in
+the ledger. Use `prajnatrade shadow alerts --ledger "$LEDGER"` to inspect
+durable alerts. Its retry reuses existing day commits and records missed fills
+according to the actual order persistence time.
+
+For real feeds, use `schema_version: 2`, `data_kind: "real"`,
+`raw_price_basis: "unadjusted"`, and timezone-aware `open_available_at` and
+`close_available_at` on the raw-bar rows. Retain the approved exchange
+calendar, contemporaneous feed, scheduler receipts, and reconciled forward
+ledger as real acceptance evidence.
+
+### Legacy protected Validation and Final Holdout (MVP-10/MVP-11)
+
+`prajnatrade evaluation ...` runs preregistered, human-authorized, OS-isolated
+Validation and Final Holdout for a frozen candidate on sealed synthetic or
+schema-v2 real snapshots. Final Holdout requires its own human authorization
+after the same frozen plan's Validation passes. The controlled report is
+rendered from immutable records. Synthetic runs verify the mechanism. Admission
+requires both protected stages and a separate human decision.
 
 The trusted store is one directory outside Git (the same store is reused by
 later release/Shadow Live workflows). The evaluation ledger in
-`queries.sqlite` is the budget boundary: use one trusted store per project and
-operator, because a copy of the store is a separate deployment with its own
-ledger.
+`queries.sqlite` is the budget boundary. All projects and operators with access
+to a given sealed interval must use the same canonical trusted evaluation
+store and ledger.
 
 ```text
 <store>/
@@ -741,9 +854,10 @@ rejected). Metrics are a fixed registry: `sessions`, `valued_sessions`,
 `stress_return_delta`, `fees_paid`, `slippage_paid`, `unfilled_orders`.
 Operators are `>=`, `<=`, `>`, `<`, `==`. Stress costs must be at least the
 frozen base costs, `minimum_samples.sessions >= 1`, and `stages` must be exactly
-`["validation", "final_holdout"]`. The parameter neighbourhood is the existing
-declarative robustness plan (or an explicit `no_tunable_parameters`), frozen
-with its variants, exclusions, and thresholds.
+`["validation", "final_holdout"]`. Real Validation requires at least one hard
+threshold. The plan freezes the legal parameter neighbourhood with its variants,
+exclusions, and thresholds. A Python candidate supplies its frozen parameter
+schema, including an explicit `no_tunable_parameters` declaration if applicable.
 
 `plan_id` is the SHA-256 of the canonical plan without `plan_id`/`frozen_at`.
 Re-planning the same candidate with different rules creates a new plan; the
@@ -775,24 +889,18 @@ prajnatrade evaluation run --store /trusted/evaluations \
 Checks run **before** the sealed read: the plan's content address, the frozen
 candidate (re-read and hash-checked from the project), the sealed manifest and
 both protected descriptors, the project binding, the matching authorization,
-and the real macOS isolation probe. On any failure the request is rejected with
+the source's presence, and the isolation probe. On any failure the request is rejected with
 a stable `error.code` (`FINGERPRINT_MISMATCH`, `AUTHORIZATION_REQUIRED`,
 `ISOLATION_UNAVAILABLE`, ...), a matching `audit/<audit_id>.json` with
 `opened_protected_source: false`, and no debit. There is no fallback to local
 execution and no bypass flag.
 
-Protected Validation checks the **macOS sandbox boundary only**: it evaluates
-declarative strategies in the trusted controller and never executes untrusted
-or generated Python. On a host where the generated-Python worker's 2 GiB
-address-space limit cannot be enforced, the probe retries the boundary without
-RLIMIT_AS and records `memory_limit_enforced: false` together with
-`failure_reason: "memory_limit_unavailable"`; `verified` still requires
-`sandbox_init`, protected read/write denial, network denial and process-creation
-denial to pass. A passed Validation therefore does **not** imply that
-generated-Python memory, time or process isolation is verified: that claim
-remains blocked by #12/#18/#27, and the generated-Python gate
-(`--isolated-generated-python`) still refuses to execute when the memory limit
-is unavailable.
+Declarative strategies run in the trusted controller and use the macOS sandbox
+boundary probe. If the probe has to retry without RLIMIT_AS, the record includes
+`memory_limit_enforced: false` and `failure_reason: "memory_limit_unavailable"`.
+Generated Python uses the container runner, limits, and image digest from the
+frozen candidate. The runner is probed with empty input before the debit, and
+the trusted record includes boundary checks for each strategy invocation.
 
 Only then is the debit written: one SQLite `BEGIN IMMEDIATE` inserts the
 `(partition_name, partition_content_hash)` row and the evaluation row, keyed by
@@ -832,6 +940,24 @@ sample counts below the frozen minimum, or an unavailable threshold metric mean
 `passed`. The parameter neighbourhood is diagnostic, not a hard threshold, and
 no plan can add a generic return threshold after the fact.
 
+For `total_return`, `sharpe` and `max_drawdown`, a threshold can set
+`benchmark_multiplier`. The comparison target is that multiplier times the
+same-stage base-cost equal-weight metric plus `value`. The controlled report
+records the benchmark metric and the computed target.
+
+`allow_discovery_halt_warmup: true` preregisters cash-only Validation sessions
+caused exclusively by confirmed full halts in the approved Discovery tail.
+The plan binds the exact affected inputs and initial window count. All days
+remain in the NAV and metric calculations for both candidate and benchmark.
+Additional signal gaps still make coverage incomplete.
+
+New schema-v2 Validation plans treat a documented halt covering 09:30 as
+evidence of a non-executable open when the resumed session has a confirmed close
+and complete remaining bar fields. An order attempted at that open remains
+unfilled, and the controlled report retains the halt and its source evidence.
+An unconfirmed open, missing close or missing required input still affects the
+coverage verdict.
+
 #### 4. Authorize Final Holdout separately
 
 ```sh
@@ -868,11 +994,11 @@ the frozen thresholds, minimum samples, parameter neighbourhood and point-in-tim
 regimes.
 
 **Warm-up history without a second sealed read.** Holdout signals need trailing
-total-return values from earlier partitions. The Holdout prior is Discovery
-(research-visible) plus a derived export written into the Validation record
-(`prior_export_for_holdout`: the tail of Validation sessions needed by the
-frozen signal window and regime lookback, bound to the Validation evaluation id,
-plan, candidate, snapshot and partition hash). The Holdout run loads that export
+total-return values from earlier partitions. The Validation record exports the
+trailing sessions needed by the frozen signal window, legal parameter variants
+and regime lookback, bound to the Validation evaluation id, plan, candidate,
+snapshot and partition hash. Holdout can prepend Discovery when the export
+covers all Validation sessions. The Holdout run loads that export
 from the stored Validation record and verifies its hash; it never re-opens the
 sealed Validation payload. A Validation record that predates the export (or a
 changed record) is rejected with `VALIDATION_EVIDENCE_INVALID` rather than
@@ -974,15 +1100,15 @@ debit state, evaluation outcome/`scoring` and the record path.
   `research_receipt` field and in `evaluation_receipts(plan_id,
   'final_holdout')` for audit, but it is never derived from the outcome.
 
-### Immutable release and lifecycle (MVP-12, synthetic only)
+### Legacy immutable release and lifecycle (MVP-12)
 
 `prajnatrade release ...` turns an explicitly human-approved frozen candidate
 into a uniquely identified, immutable release version and lets an operator
 enable, pause, resume and retire tracking of that version at pre-registered
-after-close signal dates. **This is synthetic mechanism evidence only.** It does
-not approve a real strategy, does not prove real-market performance, does not
-read real market data. Shadow Live accounting is built on top of these
-artifacts (see the next section). The research side (`prajnatrade-agent`) has
+after-close signal dates. Synthetic v1 and real v2 plans use the same evidence
+and human approval requirements. Release artifacts inherit the frozen plan's
+scope. Shadow Live accounting is built on top of these artifacts. The research
+side (`prajnatrade-agent`) has
 no release, admission or lifecycle command at all, so admission state cannot
 flow back to a research Agent.
 
@@ -1152,10 +1278,9 @@ verifies it again.
   as not approving: this ticket adds no separate rejection-decision record and
   no override flag. A refused approval is still auditable and can never produce
   a runnable version.
-- The release artifact is the admission record; the evaluation report remains a
-  non-admission presentation. Admission of a *real* strategy and real forward
-  tracking remain blocked (#12/#18/#27); the synthetic Shadow Live mechanism
-  below is engineering evidence only.
+- The release artifact records admission. Both protected evaluations must pass
+  before the reviewer can approve a release. The delivery has exercised this
+  gate with generated inputs in both formats and has no approved real release.
 - The store's `queries.sqlite` budget boundary is unchanged: approval, fetch,
   lifecycle and status never read a sealed partition and never debit a query.
 
@@ -1258,16 +1383,15 @@ ranges (its pre-registered input scope) rather than by walking snapshot
 lineage. If lineage later proves the action never entered the evaluated
 evidence, an operator records `sustained` for that revision.
 
-### Shadow Live one-day ledger (MVP-13, synthetic only)
+### Shadow Live one-day ledger (MVP-13)
 
-`prajnatrade shadow update` accounts **one manually triggered synthetic trading
+`prajnatrade shadow update` accounts **one manually triggered paper trading
 day** for every tracked immutable release version, `prajnatrade shadow report`
 dumps one version's committed ledger for trusted audit, and `prajnatrade shadow
 compare` compares the common, consecutive committed forward interval of two or
 more versions. Shadow Live is **virtual accounting only**: it never connects to
-a broker, never sends or simulates a real order, never reads real market data
-and never uses the network. Every number below is synthetic engineering
-evidence, not a strategy result.
+a broker or sends a real order. The operator supplies a point-in-time feed.
+The examples below use generated prices and record engineering evidence.
 
 A release ID is the account boundary. Each version keeps its own cash,
 positions, orders, fees, slippage, dividends and NAV; prices may be shared,
@@ -1287,11 +1411,11 @@ prajnatrade shadow compare --ledger /trusted/shadow-ledger \
   [--output comparison.json]
 ```
 
-#### 1. The synthetic feed (`--data`)
+#### 1. The point-in-time feed (`--data`)
 
-The feed is versioned synthetic JSON. Every row carries a timezone-aware
-`available_at` and a non-empty `availability_evidence`; a missing price is an
-explicit `null`, never a fabricated value.
+The feed is versioned JSON. Every row carries a timezone-aware
+`available_at` and non-empty `availability_evidence`. Use an explicit
+`null` for missing prices. The example uses the synthetic v1 format.
 
 ```json
 {"schema_version": 1, "data_kind": "synthetic",
@@ -1323,14 +1447,20 @@ Validation is strict and a malformed feed is rejected with exit 2,
 and a stable `error.phase:"feed"`; nothing is frozen and no ledger day is
 written. The rules:
 
-- `schema_version` is 1, `data_kind` is `synthetic`, and `symbols` is exactly
-  the five ETFs.
+- The feed declares schema version 1 with `data_kind: synthetic`, or
+  version 2 with `data_kind: real` and `raw_price_basis: unadjusted`.
+  Its scope must match the release scope. `symbols` is exactly the five ETFs.
 - `calendar`, `raw_bars` and `derived` are non-empty; calendar dates are unique
   and strictly increasing; every row date is in the calendar.
 - `raw_bars` OHLC prices are finite and positive (or `null`), `volume` is
   finite and nonnegative (or `null`), `trading_status` is
   `trading|suspended|unknown`, and `high >= max(open, close)`,
   `low <= min(open, close)`.
+- Schema v2 also accepts `partial_halt` with a halt window. Raw bars carry
+  `open_available_at` and `close_available_at`. Missing opening-price
+  evidence blocks an eligible version before freezing the day. A confirmed
+  halt expires the corresponding opening order and a confirmed close can
+  still be used for valuation.
 - `derived.value` is finite and positive (or `null`).
 - A corporate action is `cash_dividend` (`cash_per_share` + `pay_date`) or
   `share_adjustment` (`ratio`); numeric terms are finite and positive when
@@ -1519,7 +1649,7 @@ committed history.
   version, report exits 2) instead of being silently accepted.
 
 `shadow report` writes a trusted audit document
-(`kind: shadow_live_ledger_report`, `scope: synthetic`) containing the
+(`kind: shadow_live_ledger_report`, scope from the committed version) containing the
 progress row, an integrity block, a summary (days, first/last committed date,
 ending NAV, total return, fees, slippage, dividends, fills, unfilled orders,
 anomalies, ending cash, every applied correction, the separate
@@ -1619,7 +1749,7 @@ real market data, broker or network. It demonstrates the accounting and
 idempotency rules of #16/#33; it is not evidence of real forward performance and
 does not complete the real-chain acceptance of #35.
 
-#### 7. Multi-version forward comparison (#34, synthetic only)
+#### 7. Multi-version forward comparison (#34)
 
 `prajnatrade shadow compare` is a **read-only** comparison of the forward
 history in one ledger. It never runs a strategy, never fills an order, never
@@ -1764,9 +1894,13 @@ prajnatrade acceptance report \
   --output docs/acceptance/issue-17-report.md   # or report.json
 ```
 
-The version-1 manifest has exactly `delivery`, the six required scenarios and
-`real_chain`; unknown fields are rejected so sealed diagnostics or credentials
-cannot be smuggled into the public checklist. Each scenario records status
+The manifest contains `delivery`, the six required scenarios and `real_chain`.
+Version 2 records each release's policy, direction ID, Holdout range,
+authorization ID, independence confirmation and an evidence reference. Its
+forward rows carry the corresponding release ID, signal date, next session,
+terminal order state and ledger hash. The real-chain gate checks the
+consecutive common sessions for a qualifying pair of releases. Version 1
+remains readable for historical evidence. Each scenario records status
 (`verified`, `blocked`, `failed`, `not_run`), scope (synthetic/real, Mock/real
 Agent, historical/forward), expected/observed, evidence references and
 missing/unblock blockers. A `verified` scenario needs evidence and non-empty
@@ -1786,10 +1920,11 @@ that the six-scenario rule was not met. The command is operator-only:
 `prajnatrade-agent` has no `acceptance` command.
 
 **The overall #17 verdict remains blocked.** The tests and CLI scenario and
-the real five-ETF historical Discovery baseline and bounded Mock campaign are
-verified (3 of 6).
+the historical real five-ETF baseline, bounded Mock campaign and controlled
+model iteration are verified (4 of 6).
 @ZombieIce accepted the two cost scenarios and both halt-related NAV gaps.
-Scenarios 4–6 remain blocked and the real candidate-to-release chain is empty.
+The real protected evaluation and real forward scenarios remain blocked. The
+real candidate-to-release chain is empty.
 See the [acceptance report](docs/acceptance/issue-17-report.md) and the
 [signed Discovery review](docs/research/issue-24-researcher-handoff.md).
 

@@ -59,7 +59,8 @@ def _runtime_components(
     }
 
 
-def _runtime_identity(strategy_executor: dict[str, Any] | None = None) -> str:
+def runtime_identity(strategy_executor: dict[str, Any] | None = None) -> str:
+    """Fingerprint the accounting dependencies and optional strategy executor."""
     return _fingerprint(_runtime_components(strategy_executor))
 
 
@@ -336,6 +337,27 @@ def _campaign(connection: sqlite3.Connection, campaign_id: str) -> sqlite3.Row:
     return row
 
 
+def campaign_discovery(project: Path, campaign_id: str) -> dict[str, Any]:
+    """Return the frozen Discovery bindings available to a research round."""
+    project_id = project_status(project)["project_id"]
+    with _connection(project) as connection:
+        campaign = _campaign(connection, campaign_id)
+        evaluation = json.loads(campaign["evaluation_json"])
+        if _fingerprint(evaluation) != campaign["evaluation_hash"]:
+            raise ValueError("Campaign evaluation fingerprint mismatch.")
+        return {
+            "project_id": project_id,
+            "campaign_id": campaign_id,
+            "snapshot_id": evaluation["snapshot_id"],
+            "campaign_evaluation_hash": campaign["evaluation_hash"],
+            "evaluation": evaluation,
+            "discovery_budget": {
+                "attempts": campaign["attempts"],
+                "max_seconds": campaign["max_seconds"],
+            },
+        }
+
+
 class _Budget(TypedDict):
     attempts_remaining: int
     execution_seconds_remaining: float
@@ -440,9 +462,10 @@ def _normalize_request(raw: object) -> dict[str, Any]:
 
 
 @contextmanager
-def _campaign_lock(
+def campaign_execution_lock(
     project: Path, campaign_id: str, *, blocking: bool = True
 ) -> Generator[None, None, None]:
+    """Serialize a Campaign's Discovery attempts with research round transitions."""
     filename = hashlib.sha256(campaign_id.encode()).hexdigest() + ".lock"
     with (project / ".prajnatrade" / filename).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
@@ -509,8 +532,10 @@ def _find_experiment(
 def _execute_request(
     project: Path, campaign_id: str, submission_id: str, request: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    from prajnatrade.research_direction import require_discovery_work
+
     project_id = project_status(project)["project_id"]
-    with _campaign_lock(project, campaign_id), _connection(project) as connection:
+    with campaign_execution_lock(project, campaign_id), _connection(project) as connection:
         campaign = _campaign(connection, campaign_id)
         _settle_interrupted(connection, campaign)
         campaign = _campaign(connection, campaign_id)
@@ -521,6 +546,7 @@ def _execute_request(
             receipt = _receipt(project_id, connection, campaign, previous)
             if receipt.get("error", {}).get("code") != "EXECUTION_INTERRUPTED":
                 return receipt
+            require_discovery_work(project, connection, campaign_id)
             remaining = _budget(connection, campaign)["execution_seconds_remaining"]
             if remaining <= 0:
                 raise ProtocolError("BUDGET_EXHAUSTED", "resume", "stop", "Execution time exhausted.")
@@ -538,6 +564,7 @@ def _execute_request(
                 if previous["request_json"] != canonical:
                     raise ProtocolError("SUBMISSION_CONFLICT", "admission", "use_new_submission_id", "Submission ID already has different content.")
                 return _receipt(project_id, connection, campaign, previous)
+            require_discovery_work(project, connection, campaign_id)
             _require_container_executor(campaign, request)
             budget = _budget(connection, campaign)
             remaining = budget["execution_seconds_remaining"]
@@ -638,7 +665,7 @@ def _run_attempt(
         if _fingerprint(config) != campaign["evaluation_hash"]:
             raise ValueError("Evaluation fingerprint mismatch.")
         executor_config = _executor_config(config)
-        if config["runtime"] != _runtime_identity(executor_config):
+        if config["runtime"] != runtime_identity(executor_config):
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec: dict[str, Any] = {
             "family": family, "parameters": request["parameters"],
@@ -660,7 +687,7 @@ def _run_attempt(
             )
         else:
             strategy = make_strategy(spec)
-        window = _signal_window(spec)
+        window = signal_window_sessions(spec)
         discovery = run_discovery_strategy(
             data,
             config["snapshot_id"],
@@ -755,7 +782,7 @@ def _run_attempt(
 def experiment_status(project: Path, campaign_id: str, submission_id: str) -> dict[str, Any]:
     project_id = project_status(project)["project_id"]
     try:
-        with _campaign_lock(project, campaign_id, blocking=False), _connection(project) as connection:
+        with campaign_execution_lock(project, campaign_id, blocking=False), _connection(project) as connection:
             _settle_interrupted(connection, _campaign(connection, campaign_id))
     except BlockingIOError:
         pass
@@ -772,15 +799,17 @@ PYTHON_SIGNAL_WINDOW_SESSIONS = 60
 MAX_SIGNAL_WINDOW_SESSIONS = 252
 
 
-def _signal_window(spec: dict[str, Any]) -> int:
+def signal_window_sessions(spec: dict[str, Any]) -> int:
+    """Return the frozen trailing window required by the strategy."""
     family = spec["family"]
-    raw_lookback = spec["parameters"].get("lookback", 1)
+    parameters = spec["parameters"]
+    raw_lookback = parameters.get("lookback", 1)
     if family == "python":
         # Generated Python needs a real history panel, not the one-session
         # cross-section a lookback-less declarative strategy sees.  A strategy
         # may request a smaller window via ``parameters.lookback``; the window
         # is always point-in-time and capped to one trading year.
-        requested_lookback = spec["parameters"].get("lookback")
+        requested_lookback = parameters.get("lookback")
         if (
             isinstance(requested_lookback, int)
             and not isinstance(requested_lookback, bool)
@@ -794,6 +823,87 @@ def _signal_window(spec: dict[str, Any]) -> int:
     return lookback + 1 if family in {"momentum", "inverse_volatility"} else lookback
 
 
+_signal_window = signal_window_sessions
+
+
+def _candidate_body(
+    connection: sqlite3.Connection, project_id: object, campaign_id: str, submission_id: str,
+) -> tuple[dict[str, Any], sqlite3.Row]:
+    campaign = _campaign(connection, campaign_id)
+    experiment = _find_experiment(connection, campaign_id, submission_id)
+    if experiment is None:
+        raise ValueError("Unknown experiment submission.")
+    if experiment["status"] != "succeeded" or not experiment["result_json"]:
+        raise ValueError("Only a successful experiment can be frozen as a candidate or evaluated.")
+    request = json.loads(experiment["request_json"])
+    result = json.loads(experiment["result_json"])
+    config = json.loads(campaign["evaluation_json"])
+    return {
+        "schema_version": 1,
+        "project_id": project_id,
+        "campaign_id": campaign_id,
+        "experiment_id": experiment["experiment_id"],
+        "submission_id": submission_id,
+        "hypothesis": request["hypothesis"],
+        "strategy": request["strategy"],
+        "parameters": request["parameters"],
+        "fingerprints": result["fingerprints"],
+        "snapshot_id": config["snapshot_id"],
+        "evaluation": config,
+        "runtime_dependencies": result["runtime_dependencies"],
+        "execution_rules": config["execution_rules"],
+    }, experiment
+
+
+def _evaluation_subject(body: dict[str, Any], experiment: sqlite3.Row) -> dict[str, Any]:
+    subject = {
+        **body,
+        "candidate_id": body["experiment_id"],
+        "name": body["submission_id"],
+        "conclusion": body["hypothesis"],
+        "frozen_at": datetime.fromtimestamp(experiment["started_at"], UTC).isoformat(),
+    }
+    return {**subject, "candidate_hash": _fingerprint(subject)}
+
+
+def evaluation_subject(project: Path, campaign_id: str, submission_id: str) -> dict[str, Any]:
+    """Derive a stable evaluation subject from successful Discovery without freezing it."""
+    project_id = project_status(project)["project_id"]
+    with _connection(project) as connection:
+        body, experiment = _candidate_body(connection, project_id, campaign_id, submission_id)
+    return _evaluation_subject(body, experiment)
+
+
+def campaign_experiment_history(project: Path, campaign_id: str) -> list[dict[str, Any]]:
+    """Return the existing Discovery experiment receipts in attempt order."""
+    project_id = project_status(project)["project_id"]
+    with _connection(project) as connection:
+        connection.execute("BEGIN")
+        campaign = _campaign(connection, campaign_id)
+        attempts = connection.execute(
+            "SELECT * FROM experiments WHERE campaign_id = ? ORDER BY rowid", (campaign_id,),
+        )
+        return [_receipt(project_id, connection, campaign, attempt) for attempt in attempts]
+
+
+def _store_candidate(connection: sqlite3.Connection, body: dict[str, Any]) -> dict[str, Any]:
+    frozen = {**body, "candidate_hash": _fingerprint(body)}
+    canonical = json.dumps(frozen, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    connection.execute(
+        """INSERT INTO frozen_candidates
+        (candidate_id, campaign_id, experiment_id, candidate_hash, candidate_json)
+        VALUES (?, ?, ?, ?, ?)""",
+        (
+            frozen["candidate_id"],
+            frozen["campaign_id"],
+            frozen["experiment_id"],
+            frozen["candidate_hash"],
+            canonical,
+        ),
+    )
+    return frozen
+
+
 def freeze_experiment_candidate(
     project: Path,
     campaign_id: str,
@@ -805,68 +915,70 @@ def freeze_experiment_candidate(
         raise ValueError("Candidate name and conclusion must not be empty.")
     project_id = project_status(project)["project_id"]
     with _connection(project) as connection:
-        campaign = _campaign(connection, campaign_id)
-        experiment = _find_experiment(connection, campaign_id, submission_id)
-        if experiment is None:
-            raise ValueError("Unknown experiment submission.")
-        if experiment["status"] != "succeeded" or not experiment["result_json"]:
-            raise ValueError("Only a successful experiment can be frozen as a candidate.")
-        request = json.loads(experiment["request_json"])
-        result = json.loads(experiment["result_json"])
-        config = json.loads(campaign["evaluation_json"])
-        candidate_id = str(uuid.uuid4())
-        frozen = {
-            "schema_version": 1,
-            "candidate_id": candidate_id,
-            "project_id": project_id,
-            "campaign_id": campaign_id,
-            "experiment_id": experiment["experiment_id"],
-            "submission_id": submission_id,
+        body, _ = _candidate_body(connection, project_id, campaign_id, submission_id)
+        return _store_candidate(connection, {
+            **body,
+            "candidate_id": str(uuid.uuid4()),
             "name": name.strip(),
-            "hypothesis": request["hypothesis"],
             "conclusion": conclusion.strip(),
-            "strategy": request["strategy"],
-            "parameters": request["parameters"],
-            "fingerprints": result["fingerprints"],
-            "snapshot_id": config["snapshot_id"],
-            "evaluation": config,
-            "runtime_dependencies": result["runtime_dependencies"],
-            "execution_rules": config["execution_rules"],
             "frozen_at": datetime.now(UTC).isoformat(),
-        }
-        frozen["candidate_hash"] = _fingerprint(frozen)
-        canonical = json.dumps(frozen, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        connection.execute(
-            """INSERT INTO frozen_candidates
-            (candidate_id, campaign_id, experiment_id, candidate_hash, candidate_json)
-            VALUES (?, ?, ?, ?, ?)""",
-            (
-                candidate_id,
-                campaign_id,
-                experiment["experiment_id"],
-                frozen["candidate_hash"],
-                canonical,
-            ),
-        )
-        return frozen
+        })
+
+
+def _research_candidate_id(round_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"prajnatrade:research-candidate:{round_id}"))
+
+
+def freeze_research_candidate(
+    project: Path, campaign_id: str, submission_id: str, name: str, selection: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze the selected Discovery subject with its exact Validation binding."""
+    project_id = project_status(project)["project_id"]
+    with _connection(project) as connection:
+        body, experiment = _candidate_body(connection, project_id, campaign_id, submission_id)
+        subject = _evaluation_subject(body, experiment)
+        if (
+            selection["experiment_id"] != subject["experiment_id"]
+            or selection["experiment_hash"] != subject["candidate_hash"]
+        ):
+            raise ValueError("The selected Validation does not match this experiment.")
+        return _store_candidate(connection, {
+            **body,
+            "candidate_id": _research_candidate_id(selection["round_id"]),
+            "name": name,
+            "conclusion": selection["summary"]["selection_reason"],
+            "frozen_at": datetime.now(UTC).isoformat(),
+            "research_selection": selection,
+        })
+
+
+def _load_candidate(connection: sqlite3.Connection, candidate_id: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT candidate_hash, candidate_json FROM frozen_candidates WHERE candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    candidate = json.loads(row["candidate_json"])
+    expected_hash = _fingerprint({
+        key: value for key, value in candidate.items() if key != "candidate_hash"
+    })
+    if expected_hash != candidate["candidate_hash"] or row["candidate_hash"] != expected_hash:
+        raise ValueError("Frozen candidate fingerprint mismatch.")
+    return candidate
 
 
 def candidate_status(project: Path, candidate_id: str) -> dict[str, Any]:
-    project_status(project)
     with _connection(project) as connection:
-        row = connection.execute(
-            "SELECT candidate_hash, candidate_json FROM frozen_candidates WHERE candidate_id = ?",
-            (candidate_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError("Unknown frozen candidate.")
-        candidate = json.loads(row["candidate_json"])
-        expected_hash = _fingerprint({
-            key: value for key, value in candidate.items() if key != "candidate_hash"
-        })
-        if expected_hash != candidate["candidate_hash"] or row["candidate_hash"] != expected_hash:
-            raise ValueError("Frozen candidate fingerprint mismatch.")
-        return candidate
+        candidate = _load_candidate(connection, candidate_id)
+    if candidate is None:
+        raise ValueError("Unknown frozen candidate.")
+    return candidate
+
+
+def research_candidate_status(project: Path, round_id: str) -> dict[str, Any] | None:
+    with _connection(project) as connection:
+        return _load_candidate(connection, _research_candidate_id(round_id))
 
 
 def error_context(project: Path, campaign_id: object, submission_id: object) -> dict[str, Any]:

@@ -78,6 +78,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     evaluation_commands = evaluation.add_subparsers(
         dest="evaluation_command", required=True
     )
+    _add_direction_workflow(commands, agent_only=agent_only)
     if agent_only:
         evaluation_lookup = evaluation_commands.add_parser("status")
         evaluation_lookup.add_argument("--project", required=True, type=Path)
@@ -192,7 +193,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         "--ledger", type=Path, help="Shadow Live ledger used to derive the pause point"
     )
     release_disposition.add_argument(
-        "--data", type=Path, help="synthetic Shadow Live feed used to derive the pause point"
+        "--data", type=Path, help="Shadow Live feed used to derive the pause point"
     )
     release_disposition.add_argument(
         "--effective-signal-date",
@@ -213,7 +214,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
 
     shadow_parser = commands.add_parser(
         "shadow",
-        help="account one synthetic Shadow Live trading day and audit the ledger",
+        help="account one Shadow Live trading day and audit the paper ledger",
     )
     shadow_commands = shadow_parser.add_subparsers(
         dest="shadow_command", required=True
@@ -245,13 +246,23 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_report.add_argument("--ledger", required=True, type=Path)
     shadow_report.add_argument("--version", required=True)
     shadow_report.add_argument("--output", required=True, type=Path)
+    shadow_tick = shadow_commands.add_parser(
+        "tick", help="run the trading-day clock and report Shadow Live alerts",
+    )
+    shadow_tick.add_argument("--ledger", type=Path, required=True)
+    shadow_tick.add_argument("--store", type=Path, required=True)
+    shadow_tick.add_argument("--calendar", type=Path, required=True)
+    shadow_tick.add_argument("--data", type=Path, required=True)
+    shadow_tick.add_argument("--corrections-store", type=Path, required=True)
+    shadow_alerts = shadow_commands.add_parser("alerts", help="show recorded Shadow Live scheduler alerts")
+    shadow_alerts.add_argument("--ledger", type=Path, required=True)
     shadow_compare = shadow_commands.add_parser(
         "compare",
         help="compare the longest common committed forward interval of selected versions",
     )
     shadow_compare.add_argument("--ledger", required=True, type=Path)
     shadow_compare.add_argument(
-        "--data", required=True, type=Path, help="synthetic Shadow Live feed calendar"
+        "--data", required=True, type=Path, help="Shadow Live feed calendar"
     )
     shadow_compare.add_argument(
         "--versions",
@@ -446,6 +457,79 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     return parser
 
 
+def _add_direction_workflow(commands: argparse._SubParsersAction, *, agent_only: bool) -> None:
+    direction = commands.add_parser("direction", help="manage an authorized research direction")
+    directions = direction.add_subparsers(dest="workflow_action", required=True)
+    for action in ("status", "freeze", "retrospective"):
+        item = directions.add_parser(action)
+        item.add_argument("--project", type=Path, required=True)
+        item.add_argument("--round-id", required=action != "status")
+        if action in ("freeze", "retrospective"):
+            item.add_argument("--input", type=Path, required=True)
+        if action == "freeze":
+            item.add_argument("--evaluation-id", required=True)
+            item.add_argument("--name", required=True)
+
+    validation_parser = commands.add_parser("validation", help="compare Discovery versions on reusable Validation")
+    validations = validation_parser.add_subparsers(dest="workflow_action", required=True)
+    for action in ("propose", "details", "feedback"):
+        item = validations.add_parser(action)
+        item.add_argument("--project", type=Path, required=True)
+        item.add_argument("--round-id", required=True)
+        if action == "propose":
+            item.add_argument("--submission-id", required=True)
+            item.add_argument("--input", type=Path, required=True)
+        else:
+            item.add_argument("--evaluation-id", required=True)
+    validations.choices["details"].add_argument("--date", required=True)
+    validations.choices["details"].add_argument("--question", required=True)
+    validations.choices["feedback"].add_argument("--impact", required=True)
+    validations.choices["feedback"].add_argument("--next-experiment-id")
+    validations.choices["feedback"].add_argument("--detail-access-id")
+
+    if agent_only:
+        return
+
+    kickoff = directions.add_parser("kickoff", help="approve the direction, constraints, protocol and Validation budget")
+    kickoff.add_argument("--project", type=Path, required=True)
+    kickoff.add_argument("--store", type=Path, required=True)
+    kickoff.add_argument("--campaign-id", required=True)
+    kickoff.add_argument("--direction-key", required=True)
+    kickoff.add_argument("--name", required=True)
+    kickoff.add_argument("--authorization-id", required=True)
+    kickoff.add_argument("--input", type=Path, required=True)
+
+    for action in ("run", "service", "status"):
+        item = validations.add_parser(action)
+        item.add_argument("--store", type=Path, required=True)
+        item.add_argument("--round-id", required=True)
+        if action != "status":
+            item.add_argument("--snapshot-store", type=Path, required=True)
+            item.add_argument("--project", type=Path, required=True)
+        else:
+            item.add_argument("--evaluation-id")
+        if action == "run":
+            item.add_argument("--submission-id", required=True)
+            item.add_argument("--proposal-id", required=True)
+
+    holdout_parser = commands.add_parser("holdout", help="authorize and run a frozen direction's Final Holdout")
+    holdouts = holdout_parser.add_subparsers(dest="workflow_action", required=True)
+    for action in ("authorize", "run"):
+        item = holdouts.add_parser(action)
+        item.add_argument("--store", type=Path, required=True)
+        item.add_argument("--snapshot-store", type=Path, required=True)
+        item.add_argument("--project", type=Path, required=True)
+    holdouts.choices["run"].add_argument("--plan-id", required=True)
+    approval = holdouts.choices["authorize"]
+    approval.add_argument("--round-id", required=True)
+    approval.add_argument("--validation-evaluation-id", required=True)
+    approval.add_argument("--reviewer", required=True)
+    approval.add_argument("--reason", required=True)
+    approval.add_argument("--selection-independent", choices=["yes", "no"], required=True)
+    approval.add_argument("--independence-reason", required=True)
+    approval.add_argument("--calendar", type=Path, required=True)
+
+
 def _add_data_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--price-basis", required=True, choices=["total_return"])
@@ -482,6 +566,8 @@ def agent_main(argv: Sequence[str] | None = None) -> int:
 def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
     parser = build_parser(agent_only=agent_only)
     args = parser.parse_args(argv)
+    if args.command in {"direction", "validation", "holdout"}:
+        return _direction_workflow_command(args)
     if args.command == "evaluation":
         return _evaluation_command(args, agent_only=agent_only)
     if args.command == "release":
@@ -740,6 +826,106 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
         return 2
 
 
+def _direction_workflow_command(args: argparse.Namespace) -> int:
+    from prajnatrade import research_direction
+
+    try:
+        if args.command == "direction":
+            result = _direction_action(args, research_direction)
+        elif args.command == "validation":
+            result = _validation_action(args, research_direction)
+        else:
+            result = _holdout_action(args)
+    except (EvaluationRejection, release.ReleaseRejection, ProtocolError) as error:
+        result = {
+            "schema_version": 2, "status": "rejected", "error": error.details,
+            **getattr(error, "context", {}),
+        }
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 2 if result.get("status") in {"rejected", "blocked", "failed", "aborted", "interrupted"} else 0
+
+
+def _direction_action(args: argparse.Namespace, direction) -> dict:
+    action = args.workflow_action
+    if action == "kickoff":
+        prepared = direction.prepare_kickoff(
+            args.project, args.campaign_id, args.direction_key, args.name, args.authorization_id,
+            json.loads(args.input.read_text(encoding="utf-8")),
+        )
+        return direction.kickoff(args.project, args.store, prepared)
+    if action == "status":
+        if args.round_id is None:
+            return {"status": "ok", "directions": direction.list_directions(args.project)}
+        return direction.direction_status(args.project, args.round_id)
+    source = json.loads(args.input.read_text(encoding="utf-8"))
+    if action == "freeze":
+        return direction.freeze(args.project, args.round_id, args.evaluation_id, args.name, source)
+    return direction.retrospective(args.project, args.round_id, source)
+
+
+def _validation_action(args: argparse.Namespace, direction) -> dict:
+    from prajnatrade import protected_eval
+
+    action = args.workflow_action
+    if action == "propose":
+        return direction.proposal_submit(
+            args.project, args.round_id, args.submission_id,
+            json.loads(args.input.read_text(encoding="utf-8")),
+        )
+    if action == "details":
+        return direction.validation_details(
+            args.project, args.round_id, args.evaluation_id, args.date, args.question,
+        )
+    if action == "feedback":
+        return direction.record_feedback(
+            args.project, args.round_id, args.evaluation_id, args.impact,
+            next_experiment_id=args.next_experiment_id, detail_access_id=args.detail_access_id,
+        )
+    if action == "status":
+        return protected_eval.research_validation_status(args.store, args.round_id, args.evaluation_id)
+    if action == "run":
+        return protected_eval.run_research_validation(
+            args.store, args.snapshot_store, args.project, round_id=args.round_id,
+            submission_id=args.submission_id, proposal_id=args.proposal_id,
+        )
+    return _service_validation(args, direction, protected_eval)
+
+
+def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
+    queued = direction.pending_validation_work(args.project, args.round_id)
+    results = []
+    for proposal in queued["proposals"]:
+        try:
+            result = evaluator.run_research_validation(
+                args.store, args.snapshot_store, args.project, round_id=args.round_id,
+                submission_id=proposal["submission_id"], proposal_id=proposal["proposal_id"],
+            )
+        except (EvaluationRejection, ProtocolError) as error:
+            result = {"status": "rejected", "proposal_id": proposal["proposal_id"], "error": error.details}
+        results.append(result)
+    for request in queued["details"]:
+        receipt, details = evaluator.research_validation_details(args.store, args.round_id, request)
+        results.append(direction.publish_validation_details(
+            args.project, args.round_id, request["detail_access_id"], receipt, details,
+        ))
+    return {"schema_version": 2, "status": "completed", "round_id": args.round_id, "results": results}
+
+
+def _holdout_action(args: argparse.Namespace) -> dict:
+    from prajnatrade import research_holdout, shadow_calendar
+
+    if args.workflow_action == "run":
+        return research_holdout.run(args.store, args.snapshot_store, args.project, args.plan_id)
+    return research_holdout.authorize(
+        args.store, args.snapshot_store, args.project, args.round_id, args.validation_evaluation_id,
+        reviewer=args.reviewer, reason=args.reason, selection_independent=args.selection_independent == "yes",
+        independence_reason=args.independence_reason, calendar=shadow_calendar.load_calendar(args.calendar),
+    )
+
+
 def _evaluation_command(args: argparse.Namespace, *, agent_only: bool) -> int:
     try:
         if args.evaluation_command == "status":
@@ -840,6 +1026,19 @@ def _release_command(args: argparse.Namespace) -> int:
 
 def _shadow_command(args: argparse.Namespace) -> int:
     try:
+        if args.shadow_command in {"tick", "alerts"}:
+            from prajnatrade import shadow_schedule
+
+            if args.shadow_command == "alerts":
+                result = {"status": "ok", "notifications": shadow_schedule.notifications(args.ledger)}
+                print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+                return 0
+            result, blocked = shadow_schedule.tick(
+                args.ledger, args.store, args.calendar, args.data,
+                corrections_store=args.corrections_store,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+            return 2 if blocked else 0
         if args.shadow_command == "update":
             result, blocked = shadow.update(
                 args.ledger,

@@ -19,8 +19,27 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from cli_helpers import cli, cli_env
+from cli_helpers import cli, cli_env, ok, write_json
 from test_experiment_cli import sealed_snapshot_input
+from test_holdout_report_cli import HOLDOUT_RECEIPT, authorize_holdout
+from test_protected_eval_cli import (
+    authorize,
+    create_campaign,
+    create_plan,
+    freeze_candidate,
+    plan_input,
+    run_evaluation,
+    seal_snapshot,
+)
+from test_real_snapshot import schema_v2_fixture
+from test_shadow_cli import (
+    FUTURE,
+    ledger_rows,
+    lifecycle,
+    schema_v2_shadow_feed,
+    shadow_report,
+    shadow_update,
+)
 
 IMAGE = os.environ.get("PRAJNA_ISSUE27_IMAGE", "prajnatrade-issue27-runner:local")
 
@@ -69,6 +88,115 @@ EQUAL_WEIGHT_SOURCE = (
     "def strategy(history, state):\n"
     "    return {symbol: 1.0 / len(ETF_SYMBOLS) for symbol in ETF_SYMBOLS}\n"
 )
+
+
+def test_schema_v2_protected_and_shadow_stages_run_frozen_python_in_the_container(
+    tmp_path: Path,
+) -> None:
+    # Model-generated strategy shape and schema-v2 fields, all with synthetic inputs.
+    sealed = seal_snapshot(tmp_path, schema_v2_fixture())
+    project = tmp_path / "strategy"
+    ok(cli("project", "init", "--project", str(project)))
+    campaign = create_campaign(
+        project, sealed["store"], sealed["snapshot_id"],
+        "--strategy-executor", "container", "--strategy-image", IMAGE,
+    )
+    request = write_json(tmp_path / "python.json", {
+        "schema_version": 1,
+        "campaign_id": campaign["campaign_id"],
+        "submission_id": "python",
+        "hypothesis": "The container strategy can target a fixed ETF weight.",
+        "strategy": {
+            "family": "python",
+            "source": "def strategy(history, state): return {ETF_SYMBOLS[0]: 1.0}",
+            "parameter_schema": {
+                "parameters": {
+                    "lookback": {"type": "integer", "default": 2, "min": 2, "max": 3, "step": 1},
+                },
+                "constraints": [],
+            },
+        },
+        "parameters": {"lookback": 2},
+    })
+    ok(cli("experiment", "submit", "--project", str(project), "--input", str(request)))
+    candidate = freeze_candidate(
+        project, campaign["campaign_id"], "python", "candidate", "Evaluate the fixed ETF target.",
+    )
+    base = {
+        "root": tmp_path, "project": project, "snapshot_store": sealed["store"],
+    }
+    store = tmp_path / "evaluations"
+    plan = create_plan(base, store, candidate, plan_input(), name="plan")
+    assert plan["signal_window_sessions"] == 2
+    ok(authorize(store, plan["plan_id"]))
+    validation = ok(run_evaluation(base, store, plan["plan_id"]))
+    grant = ok(authorize_holdout(store, plan["plan_id"]))["authorization"]
+    assert grant["validation"]["evaluation_id"] == validation["evaluation_id"]
+    holdout = ok(run_evaluation(base, store, plan["plan_id"], stage="final_holdout"))
+    assert holdout["receipt"] == HOLDOUT_RECEIPT
+    for result in (validation, holdout):
+        assert result["outcome"] == "passed"
+        record = result["record"]
+        assert record["data_kind"] == "real"
+        isolation = record["isolation"]
+        assert isolation["verified"] and isolation["memory_limit_enforced"]
+        assert isolation["invocations"]
+        for evidence in [isolation["probe"], *isolation["invocations"]]:
+            assert evidence["image_digest"] == campaign["strategy_executor"]["digest"]
+            assert all(evidence["isolation_checks"].values())
+        assert record["candidate_run"]["base"]["fills"][0]["symbol"] == "511260"
+        assert record["neighbourhood"]["counts"]["variants"] == 1
+        assert record["neighbourhood"]["variants"][0]["parameters"] == {"lookback": 3}
+
+    release = ok(cli(
+        "release", "approve", "--store", str(store), "--plan-id", plan["plan_id"],
+        "--reviewer", "fixture reviewer", "--reason", "Verify schema v2 paper tracking.",
+    ))
+    release_id = release["release_id"]
+    sessions = FUTURE[:3]
+    ledger = tmp_path / "paper-ledger"
+    payload = schema_v2_shadow_feed(sessions)
+    feed = write_json(tmp_path / "generated-forward-v2.json", payload)
+    ok(lifecycle("enable", store, release_id, sessions[0]))
+    ok(shadow_update(ledger, store, feed, sessions[0], at_close=True))
+
+    sizing_bar = next(
+        row for row in payload["raw_bars"] if row["symbol"] == "511260" and row["date"] == sessions[1]
+    )
+    sizing_bar.update(close=None, close_available_at=None)
+    write_json(feed, payload)
+    interrupted = shadow_update(
+        ledger, store, feed, sessions[1], at_close=True,
+        env={**cli_env(), "PRAJNATRADE_TEST_FAILPOINT": "shadow_after_fills"},
+    )
+    assert interrupted.returncode != 0
+    assert len(ledger_rows(ledger, "days")) == 1
+    assert len(ledger_rows(ledger, "input_snapshots")) == 2
+    incomplete = shadow_update(ledger, store, feed, sessions[1], at_close=True)
+    assert incomplete.returncode != 0
+    assert json.loads(incomplete.stdout)["versions"][0]["reason_code"] == "missing_close"
+    assert len(ledger_rows(ledger, "input_snapshots")) == 1
+
+    sizing_bar.update(close=10, close_available_at=f"{sessions[1]}T15:00:00+08:00")
+    write_json(feed, payload)
+    signalled = ok(shadow_update(ledger, store, feed, sessions[1], at_close=True))
+    assert signalled["versions"][0]["committed_date"] == sessions[1]
+    settled = ok(shadow_update(ledger, store, feed, sessions[2], at_close=True))["versions"][0]
+    assert settled["committed_date"] == sessions[2]
+    output = tmp_path / "paper-report.json"
+    ok(shadow_report(ledger, release_id, output))
+    _, signal_day, settlement_day = json.loads(output.read_text())["days"]
+    signal = signal_day["result"]["signal"]
+    assert signal["target_weights"]["511260"] == 1.0
+    invocation, = signal_day["result"]["strategy_execution_evidence"]
+    assert invocation["image_digest"] == campaign["strategy_executor"]["digest"]
+    assert all(invocation["isolation_checks"].values())
+    [order] = settlement_day["result"]["orders"]
+    assert order["status"] == "filled" and order["persisted_before_deadline"]
+    assert order["order_id"] == signal_day["result"]["next_orders"][0]["order_id"]
+    replayed = ok(shadow_update(ledger, store, feed, sessions[2], at_close=True))["versions"][0]
+    assert replayed["status"] == "already_committed"
+    assert replayed["result_hash"] == settlement_day["result_hash"]
 
 
 def _campaign(tmp_path: Path, *, attempts: int = 2) -> tuple[Path, dict]:

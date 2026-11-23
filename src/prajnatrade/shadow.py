@@ -1,7 +1,7 @@
-"""Shadow Live: one atomically committed, safely rerunnable synthetic trading day (#32).
+"""Shadow Live: one atomically committed, safely rerunnable trading day (#32).
 
 Shadow Live is **virtual accounting only**.  It never connects to a broker,
-never sends a real order and never reads real market data.  A *version* is an
+never sends a real order. Trading data comes from a scope-matched feed.  A *version* is an
 immutable approved release ID from :mod:`prajnatrade.release`; every version has
 its own cash, positions, orders, fees, dividends and NAV.  Prices may be shared,
 money never is.
@@ -73,23 +73,26 @@ fees, dividends, unfilled orders, correction impact and cash deficits next to a
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from prajnatrade import dividend, release, snapshot
+from prajnatrade import dividend, release, shadow_calendar, snapshot
 from prajnatrade.backtest import _validate_weights
+from prajnatrade.container_executor import executor_from_config
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.experiment import runtime_identity
+from prajnatrade.isolation import IsolationError
 from prajnatrade.snapshot_baseline import (
-    CN_TZ,
     _is_executable_open,
     _valid_price,
     available_by,
@@ -119,8 +122,6 @@ ORDER_STATUSES = (
 )
 FAILPOINTS = ("shadow_after_fills", "shadow_after_commit_before_report")
 
-_OPEN = time(9, 30)
-_CLOSE = time(15, 0)
 _EPSILON = 1e-9
 _RELEASE_ID = re.compile(r"[0-9a-f]{64}")
 
@@ -180,20 +181,16 @@ def _failpoint(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Synthetic feed (strict validation, point-in-time evidence)
+# Feed validation and point-in-time evidence
 # ---------------------------------------------------------------------------
 
 
 def _session_open(session: str) -> datetime:
-    return datetime.combine(
-        datetime.fromisoformat(session).date(), _OPEN, tzinfo=CN_TZ
-    )
+    return shadow_calendar.session_open(session)
 
 
 def _session_close(session: str) -> datetime:
-    return datetime.combine(
-        datetime.fromisoformat(session).date(), _CLOSE, tzinfo=CN_TZ
-    )
+    return shadow_calendar.session_close(session)
 
 
 def _signal_point(session: str) -> str:
@@ -201,7 +198,7 @@ def _signal_point(session: str) -> str:
 
 
 def _evidence(row: dict[str, Any], label: str) -> None:
-    snapshot._instant(row.get("available_at"), f"{label}.available_at")
+    shadow_calendar.parse_timestamp(row.get("available_at"), f"{label}.available_at")
     evidence = row.get("availability_evidence")
     if not isinstance(evidence, str) or not evidence.strip():
         raise ValueError(f"{label} requires nonempty availability_evidence.")
@@ -220,15 +217,19 @@ def _optional_number(value: object, label: str, *, positive: bool) -> None:
 
 
 class Feed:
-    """A validated synthetic Shadow Live feed."""
+    """A validated, scope-labelled Shadow Live feed."""
 
     def __init__(self, payload: object) -> None:
         if not isinstance(payload, dict):
             raise ValueError("The Shadow Live feed must be a JSON object.")
-        if payload.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError("The Shadow Live feed must declare schema_version 1.")
-        if payload.get("data_kind") != DATA_KIND:
-            raise ValueError("The Shadow Live feed must declare data_kind 'synthetic'.")
+        kind_version = (payload.get("data_kind"), payload.get("schema_version"))
+        if kind_version not in ((DATA_KIND, SCHEMA_VERSION), ("real", 2)):
+            raise ValueError("The Shadow Live feed must declare synthetic v1 or real v2.")
+        self.data_kind = kind_version[0]
+        is_real = self.data_kind == "real"
+        if is_real and payload.get("raw_price_basis") != "unadjusted":
+            raise ValueError("A real Shadow Live feed requires unadjusted raw prices.")
+        trading_statuses = snapshot.REAL_STATUSES if is_real else TRADING_STATUSES
         symbols = payload.get("symbols")
         if (
             not isinstance(symbols, list)
@@ -272,7 +273,7 @@ class Feed:
             session = _row_date(row, session_set, "raw_bars")
             symbol = _row_symbol(row, "raw_bars")
             _evidence(row, f"raw_bars {session} {symbol}")
-            if row.get("trading_status") not in TRADING_STATUSES:
+            if row.get("trading_status") not in trading_statuses:
                 raise ValueError(
                     f"Invalid trading_status in raw_bars for {session} {symbol}."
                 )
@@ -295,6 +296,8 @@ class Feed:
                 or (high is not None and low is not None and high < low)
             ):
                 raise ValueError(f"Invalid OHLC values in raw_bars for {session} {symbol}.")
+            if is_real:
+                _real_raw_timestamps(row)
             key = (session, symbol)
             if key in self.raw:
                 raise ValueError(f"Duplicate raw_bars row for {session} {symbol}.")
@@ -410,7 +413,7 @@ def load_feed(path: str | Path) -> Feed:
             "INVALID_FEED",
             "feed",
             "correct",
-            f"The synthetic Shadow Live feed is unreadable: {error}",
+            f"The Shadow Live feed is unreadable: {error}",
         ) from error
     try:
         return Feed(payload)
@@ -418,13 +421,35 @@ def load_feed(path: str | Path) -> Feed:
         raise _reject("INVALID_FEED", "feed", "correct", str(error)) from error
 
 
-def _valid_close(row: dict | None, cutoff: datetime) -> bool:
-    return (
-        row is not None
-        and row.get("trading_status") == "trading"
-        and _valid_price(row.get("close"))
-        and available_by(row, cutoff)
-    )
+def _real_raw_timestamps(row: dict[str, Any]) -> None:
+    for field in ("open", "close"):
+        timestamp = f"{field}_available_at"
+        if timestamp not in row:
+            raise ValueError(f"A real raw bar requires {timestamp}.")
+        if row[field] is not None or row[timestamp] is not None:
+            shadow_calendar.parse_timestamp(row[timestamp], timestamp)
+
+
+def _before(value: str | None, cutoff: datetime) -> bool:
+    if not value:
+        return False
+    try:
+        instant = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    return instant.utcoffset() is not None and instant < cutoff
+
+
+def _valid_close(
+    row: dict | None, cutoff: datetime, *, data_kind: str = DATA_KIND
+) -> bool:
+    if row is None or not _valid_price(row.get("close")):
+        return False
+    if data_kind == "real":
+        return row.get("trading_status") in ("trading", "partial_halt") and available_by(
+            {**row, "available_at": row["close_available_at"]}, cutoff
+        )
+    return row.get("trading_status") == "trading" and available_by(row, cutoff)
 
 
 def _terms_valid(action: dict) -> bool:
@@ -471,6 +496,16 @@ CREATE TABLE IF NOT EXISTS progress (
   last_committed_date TEXT,
   state TEXT
 );
+CREATE TABLE IF NOT EXISTS schedule_notifications (
+  scope TEXT NOT NULL,
+  release_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  next_action TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY (scope, release_id, date, code)
+);
 """
 
 
@@ -493,6 +528,29 @@ class Ledger:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA busy_timeout = 30000")
         self.connection.executescript(_SCHEMA)
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def schedule_notifications(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM schedule_notifications ORDER BY observed_at, date, release_id, code"
+        )
+        return [dict(row) for row in rows]
+
+    def notify_schedule(self, notice: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO schedule_notifications "
+            "(scope, release_id, date, code, message, next_action, observed_at) "
+            "VALUES (:scope, :release_id, :date, :code, :message, :next_action, :observed_at)",
+            notice,
+        )
+        row = self.connection.execute(
+            "SELECT * FROM schedule_notifications "
+            "WHERE scope = :scope AND release_id = :release_id AND date = :date AND code = :code",
+            notice,
+        ).fetchone()
+        return dict(row), inserted.rowcount == 1
 
     # -- reads ---------------------------------------------------------
 
@@ -614,13 +672,17 @@ class Ledger:
             self._rollback()
             raise
 
-    def delete_input(self, version_id: str, session: str) -> None:
+    def delete_input(
+        self, version_id: str, session: str, input_hash: str | None = None
+    ) -> None:
         """Remove a never-committed input snapshot after a compute-time block."""
         self._begin()
         try:
             self.connection.execute(
-                "DELETE FROM input_snapshots WHERE version_id = ? AND date = ?",
-                (version_id, session),
+                "DELETE FROM input_snapshots WHERE version_id = ? AND date = ? "
+                "AND (? IS NULL OR input_hash = ?) AND NOT EXISTS "
+                "(SELECT 1 FROM days WHERE version_id = ? AND date = ?)",
+                (version_id, session, input_hash, input_hash, version_id, session),
             )
             self.connection.execute("COMMIT")
         except BaseException:
@@ -633,13 +695,12 @@ class Ledger:
         release_id: str,
         session: str,
         result: dict[str, Any],
-        result_hash: str,
         expected_previous: str | None,
         start_date: str,
         state: str,
         committed_at: str | None = None,
-    ) -> None:
-        """Commit one whole day and its progress atomically."""
+    ) -> tuple[dict[str, Any], str]:
+        """Return the committed day with its persistence timestamp and deadline evidence."""
         self._begin()
         try:
             existing = self.connection.execute(
@@ -662,19 +723,6 @@ class Ledger:
                     f"Progress for the version is {current!r}, not the expected "
                     f"{expected_previous!r}; refusing to skip or rewrite a session.",
                 )
-            self.connection.execute(
-                "INSERT INTO days "
-                "(version_id, date, result_json, result_hash, committed_at, status) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    version_id,
-                    session,
-                    _canonical(result),
-                    result_hash,
-                    committed_at if committed_at is not None else _now(),
-                    result["status"],
-                ),
-            )
             if progress is None:
                 self.connection.execute(
                     "INSERT INTO progress "
@@ -688,7 +736,27 @@ class Ledger:
                     "WHERE version_id = ?",
                     (session, state, version_id),
                 )
+            persisted_at = committed_at if committed_at is not None else _now()
+            committed = {
+                **result,
+                "next_orders": [
+                    {
+                        **order,
+                        "persisted_before_deadline": _before(
+                            persisted_at, datetime.fromisoformat(order["deadline"]),
+                        ),
+                    }
+                    for order in result["next_orders"]
+                ],
+            }
+            self.connection.execute(
+                "INSERT INTO days "
+                "(version_id, date, result_json, result_hash, committed_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (version_id, session, _canonical(committed), _hash(committed), persisted_at, committed["status"]),
+            )
             self.connection.execute("COMMIT")
+            return committed, persisted_at
         except BaseException:
             self._rollback()
             raise
@@ -780,7 +848,7 @@ def first_uncommitted_signal_date(
         reference = datetime.now(UTC)
         if after is not None:
             try:
-                filed = snapshot._instant(after, "filed_at")
+                filed = shadow_calendar.parse_timestamp(after, "filed_at")
             except ValueError as error:
                 raise _reject(
                     "INVALID_DATE", "disposition", "correct", str(error)
@@ -814,6 +882,8 @@ def update(
     release_ids: list[str] | tuple[str, ...] | None = None,
     *,
     corrections_store: str | Path | None = None,
+    expected_sessions: tuple[str, ...] | None = None,
+    expected_data_kind: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Process every tracked version up to ``target_date``; return (report, blocked).
 
@@ -828,6 +898,22 @@ def update(
     deliberately run without the journal; such a run applies no correction.
     """
     feed = load_feed(data)
+    if expected_data_kind is not None and expected_data_kind != feed.data_kind:
+        raise _reject(
+            "FEED_SCOPE_MISMATCH", "schedule", "correct",
+            f"The trading calendar requires a {expected_data_kind} Shadow Live feed.",
+        )
+    if expected_sessions:
+        expected_start, expected_end = expected_sessions[0], expected_sessions[-1]
+        feed_sessions = tuple(
+            session for session in feed.sessions if expected_start <= session <= expected_end
+        )
+        if feed_sessions != expected_sessions:
+            raise _reject(
+                "FEED_CALENDAR_MISMATCH", "schedule", "correct",
+                "The feed must include every scheduled session through the next open "
+                "in the operator's trading calendar.",
+            )
     try:
         target = snapshot._date(target_date)
     except ValueError as error:
@@ -839,6 +925,11 @@ def update(
             "correct",
             f"{target} is not a session in the synthetic Shadow Live feed; a "
             "non-session is never invented as a trading day.",
+        )
+    if feed.data_kind == "real" and datetime.now(UTC) < _session_close(target):
+        raise _reject(
+            "SESSION_NOT_CLOSED", "select", "wait",
+            "The real trading session must close before Shadow Live accounts for it.",
         )
     store_path = Path(store)
     if not store_path.is_dir():
@@ -875,7 +966,7 @@ def update(
     blocked = any(version["status"] == "blocked" for version in versions)
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "scope": SCOPE,
+        "scope": feed.data_kind,
         "target_date": target,
         "completed_at": _now(),
         "versions": versions,
@@ -973,10 +1064,11 @@ def write_report(
         for day in days
     ]
     summary = _report_summary(entries, progress)
+    scope = days[0]["result"]["scope"] if days else REPORT_SCOPE
     report = {
         "schema_version": SCHEMA_VERSION,
         "kind": REPORT_KIND,
-        "scope": REPORT_SCOPE,
+        "scope": scope,
         "version_id": version_id,
         "generated_at": _now(),
         "integrity": {
@@ -998,7 +1090,7 @@ def write_report(
         "schema_version": SCHEMA_VERSION,
         "status": "written",
         "kind": REPORT_KIND,
-        "scope": REPORT_SCOPE,
+        "scope": scope,
         "version_id": version_id,
         "output": str(destination),
         "days": summary["days"],
@@ -1275,6 +1367,11 @@ def compare(
                 f"The ledger has no committed history or progress for version "
                 f"{version_id}; comparison never invents a version.",
             )
+        if any(day["result"]["scope"] != feed.data_kind for day in days.values()):
+            raise _reject(
+                "FEED_SCOPE_MISMATCH", "compare", "correct",
+                f"Committed days for {version_id} require a feed of the same data scope.",
+            )
         outside = sorted(session for session in days if session not in feed.index)
         if outside:
             raise _reject(
@@ -1334,7 +1431,7 @@ def compare(
     document: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "kind": COMPARISON_KIND,
-        "scope": SCOPE,
+        "scope": feed.data_kind,
         "versions": requested,
         "comparable": comparable,
         "reason": reason,
@@ -1501,12 +1598,8 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
         )
     strategy = execution["strategy"]
     family = strategy.get("family") if isinstance(strategy, dict) else None
-    if family not in STRATEGY_FAMILIES:
-        raise _Blocked(
-            "UNSUPPORTED_STRATEGY",
-            "Shadow Live does not execute generated Python strategies locally; "
-            f"the release declares family {family!r}.",
-        )
+    if family not in (*STRATEGY_FAMILIES, "python"):
+        raise _Blocked("UNSUPPORTED_STRATEGY", f"The release declares family {family!r}.")
     parameters = execution["parameters"]
     if not isinstance(parameters, dict):
         raise _Blocked(
@@ -1536,15 +1629,35 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
         raise _Blocked(
             "RELEASE_INVALID", "The release artifact's signal window must be a positive integer."
         )
+    identity = {"family": family, "parameters": dict(parameters)}
+    runtime: dict[str, Any] = {}
     try:
-        normalize_strategy_spec({"family": family, "parameters": dict(parameters)})
-    except ValueError as error:
+        if family == "python":
+            evaluation = artifact["candidate"]["evaluation"]
+            config = evaluation["strategy_executor"]
+            if (
+                (artifact.get("workflow") != release.RESEARCH_HOLDOUT and artifact["scope"] != "real")
+                or runtime_identity(config) != evaluation["runtime"]
+            ):
+                raise ValueError("The frozen Python execution runtime is unavailable.")
+            version = normalize_strategy_spec({**strategy, "parameters": parameters})
+            if hashlib.sha256(version["source"].encode()).hexdigest() != strategy.get("source_sha256"):
+                raise ValueError("The frozen Python source fingerprint differs.")
+            identity["source_sha256"] = strategy["source_sha256"]
+            runtime = {
+                "strategy_spec": version,
+                "container_executor": executor_from_config(config),
+            }
+        else:
+            normalize_strategy_spec(identity)
+    except (KeyError, TypeError, ValueError) as error:
         raise _Blocked(
             "RELEASE_INVALID",
             f"The release artifact's frozen strategy parameters are invalid: {error}",
         ) from error
     return {
-        "strategy": {"family": family, "parameters": dict(parameters)},
+        "strategy": identity,
+        **runtime,
         "parameters": dict(parameters),
         "initial_cash": float(execution["initial_cash"]),
         "transaction_cost_bps": float(execution["transaction_cost_bps"]),
@@ -1552,6 +1665,33 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
         "signal_window_sessions": window,
         "execution_rules": execution["execution_rules"],
     }
+
+
+def _check_authorized_sessions(
+    artifact: dict[str, Any],
+    feed: Feed,
+    target: str,
+    target_state: str,
+    progress: dict[str, Any] | None,
+) -> None:
+    terms = artifact["admission"]
+    first = terms["effective_signal_date"]
+    authorized = terms["calendar"]["sessions"]
+    if first > target:
+        return
+    # Verify the prospective dates bound before the first read, including the
+    # deadline date used to size and persist the next orders.
+    if not shadow_calendar.authorized_sessions_match(feed.sessions, authorized, first):
+        raise _Blocked(
+            "AUTHORIZED_CALENDAR_MISMATCH",
+            "The feed calendar differs from the trading dates bound to this release.",
+        )
+    committed = progress is not None and progress["last_committed_date"] >= target
+    if target_state == "enabled" and not committed and feed.next_session(target) is None:
+        raise _Blocked(
+            "CALENDAR_HORIZON_EXHAUSTED",
+            f"The feed needs the next scheduled session after {target} to register orders.",
+        )
 
 
 def _run_version(
@@ -1567,6 +1707,11 @@ def _run_version(
     except release.ReleaseRejection as error:
         raise _Blocked(error.details["code"], error.details["message"]) from error
     artifact = fetched["artifact"]
+    if artifact["scope"] != feed.data_kind:
+        raise _Blocked(
+            "FEED_SCOPE_MISMATCH",
+            f"This release requires a {artifact['scope']} Shadow Live feed.",
+        )
     execution = _execution_settings(artifact)
     try:
         states = {
@@ -1578,6 +1723,8 @@ def _run_version(
     target_index = feed.index[target]
     target_state = states[target]
     progress = database.get_progress(release_id)
+    if artifact.get("workflow") == release.RESEARCH_HOLDOUT:
+        _check_authorized_sessions(artifact, feed, target, target_state, progress)
     if progress is None:
         start_index = next(
             (
@@ -1833,31 +1980,28 @@ def _process_session(
             raise _Blocked(code, reason, detail={"blockers": [b[0] for b in blockers]})
         body = built
         frozen_now = database.freeze_input(release_id, session, body, input_hash)
+        if not frozen_now:
+            concurrent = database.verified_input(release_id, session)
+            if concurrent is None or concurrent["input_hash"] != input_hash:
+                raise _Blocked(
+                    "FROZEN_INPUT_CHANGED",
+                    f"The concurrent input snapshot differs for {session}; retry the update.",
+                )
 
-    now = datetime.now(UTC)
     try:
-        result = _compute_day(body, execution, now)
-    except _Blocked:
-        if frozen_now:
-            # The completeness pre-check missed a required input; remove the
-            # just-written snapshot so a fixed feed can retry instead of being
-            # stuck on an incomplete frozen input.  A block is never a day row.
-            database.delete_input(release_id, session)
+        result = _compute_day(body, execution)
+    except _Blocked as error:
+        if frozen_now or error.code == "missing_close":
+            database.delete_input(release_id, session, input_hash)
         raise
-    # The order set becomes durable in the transaction below, so this is the
-    # persistence instant carried into the next session's frozen input.  It is
-    # captured after computation and immediately before the commit.
-    committed_at = _now()
-    database.commit_day(
+    result, committed_at = database.commit_day(
         version_id=release_id,
         release_id=release_id,
         session=session,
         result=result,
-        result_hash=_hash(result),
         expected_previous=prior["last_committed_date"],
         start_date=result["progress"]["start_date"],
         state=state,
-        committed_at=committed_at,
     )
     if session == target:
         _failpoint("shadow_after_commit_before_report")
@@ -1903,6 +2047,25 @@ def _build_input(
     }
     blockers: list[tuple[str, str]] = []
     anomalies: list[dict[str, Any]] = []
+    if feed.data_kind == "real":
+        buy_symbols = set()
+        if _before(prior.get("committed_at"), open_cutoff):
+            for order in pending:
+                if not _before(order.get("submitted_at"), open_cutoff):
+                    continue
+                symbol = order["symbol"]
+                row = raw.get(symbol)
+                if row is None or row["trading_status"] == "unknown" or (
+                    row["trading_status"] == "trading" and row["open"] is None
+                ):
+                    blockers.append((
+                        "open_evidence_missing",
+                        f"{symbol} has no evidence for the {session} opening auction.",
+                    ))
+                elif order["side"] == "buy" and _is_executable_open(
+                    row, open_cutoff, data_kind=feed.data_kind
+                ):
+                    buy_symbols.add(symbol)
 
     # #33: fix the applicable correction set *before* computing, deciding only
     # from the verified revisions and the already-committed ledger.  A frozen
@@ -1916,7 +2079,7 @@ def _build_input(
         blockers.extend(correction_blockers)
 
     for symbol in sorted(set(held) | buy_symbols):
-        if not _valid_close(raw.get(symbol), close_cutoff):
+        if not _valid_close(raw.get(symbol), close_cutoff, data_kind=feed.data_kind):
             blockers.append(
                 (
                     "missing_close",
@@ -1958,6 +2121,12 @@ def _build_input(
     signal_due = state == "enabled" and next_session is not None
     if signal_due:
         if len(window_sessions) < window_size:
+            if artifact.get("workflow") == release.RESEARCH_HOLDOUT:
+                blockers.append((
+                    "signal_window_incomplete",
+                    f"The {session} signal requires {window_size} sessions of history. "
+                    f"The feed supplies {len(window_sessions)}.",
+                ))
             anomalies.append(
                 {
                     "code": "signal_window_incomplete",
@@ -1995,7 +2164,7 @@ def _build_input(
                     execution, history_rows, prior, pending
                 )
                 for symbol in sorted(sizing_symbols - set(held) - buy_symbols):
-                    if not _valid_close(raw.get(symbol), close_cutoff):
+                    if not _valid_close(raw.get(symbol), close_cutoff, data_kind=feed.data_kind):
                         blockers.append(
                             (
                                 "missing_close",
@@ -2007,6 +2176,7 @@ def _build_input(
     body = {
         "schema_version": SCHEMA_VERSION,
         "kind": INPUT_KIND,
+        **({"data_kind": feed.data_kind} if feed.data_kind != DATA_KIND else {}),
         "version_id": release_id,
         "date": session,
         "release": {
@@ -2076,7 +2246,7 @@ def _correction_decisions(
         if ex_date > session:
             continue
         try:
-            filed = snapshot._instant(record["filed_at"], "filed_at")
+            filed = shadow_calendar.parse_timestamp(record["filed_at"], "filed_at")
         except ValueError:  # pragma: no cover - the loader already validated it
             continue
         if filed > close_cutoff:
@@ -2202,6 +2372,10 @@ def _possible_target_symbols(
     whether a position is open, so this is exact for them and conservative for
     an unknown (never generated) strategy.
     """
+    if "container_executor" in execution:
+        # Generated code is called once, against the actual settled account.
+        # Price checks for its targets happen when building the orders.
+        return set()
     try:
         strategy = make_strategy(
             {
@@ -2254,9 +2428,8 @@ def _cash_tolerance(cash: float) -> float:
     return 1e-9 * max(1.0, abs(cash))
 
 
-def _compute_day(
-    body: dict[str, Any], execution: dict[str, Any], now: datetime
-) -> dict[str, Any]:
+def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
+    data_kind = body.get("data_kind", DATA_KIND)
     session = body["date"]
     prior = body["previous"]
     state = body["release_state_at_signal_point"]
@@ -2501,7 +2674,7 @@ def _compute_day(
             orders.append(record)
             continue
         row = raw.get(symbol)
-        if not _is_executable_open(row, open_cutoff):
+        if not _is_executable_open(row, open_cutoff, data_kind=data_kind):
             record["status"] = "missing_open"
             record["reason"] = (
                 "no confirmed unadjusted open is available for this symbol; this "
@@ -2640,13 +2813,13 @@ def _compute_day(
         quantity = shares[symbol]
         row = raw.get(symbol)
         close: float | None = None
-        if quantity > _EPSILON and not _valid_close(row, close_cutoff):
+        if quantity > _EPSILON and not _valid_close(row, close_cutoff, data_kind=data_kind):
             raise _Blocked(
                 "missing_close",
                 f"{symbol} is held but has no confirmed unadjusted close "
                 f"available by {close_cutoff.isoformat()}.",
             )
-        if _valid_close(row, close_cutoff):
+        if _valid_close(row, close_cutoff, data_kind=data_kind):
             close = float(row["close"])
         value = quantity * close if quantity > _EPSILON and close is not None else 0.0
         if quantity > _EPSILON and close is None:  # pragma: no cover - guarded above
@@ -2664,6 +2837,7 @@ def _compute_day(
     # this session's after-close signal point.
     signal: dict[str, Any] | None = None
     next_orders: list[dict[str, Any]] = []
+    invocations: list[dict[str, Any]] = []
     if state == "enabled" and next_session is not None:
         window = body["session"]["derived_window"]
         if len(window["sessions"]) >= execution["signal_window_sessions"]:
@@ -2692,17 +2866,20 @@ def _compute_day(
                 )
                 if entry["session"] == session:
                     latest_values[entry["symbol"]] = float(value)
-            strategy = make_strategy(
-                {
-                    "family": execution["strategy"]["family"],
-                    "parameters": dict(execution["parameters"]),
-                }
-            )
             try:
+                strategy = make_strategy(
+                    execution.get("strategy_spec", execution["strategy"]),
+                    container_executor=execution.get("container_executor"),
+                    evidence_callback=invocations.append,
+                )
                 weights = strategy(
                     pd.DataFrame(history_rows),
                     {"cash": cash, "shares": dict(shares), "equity": nav},
                 )
+            except IsolationError as error:
+                raise _Blocked(
+                    "strategy_isolation_failed", f"The frozen container strategy failed: {error}",
+                ) from error
             except (ValueError, TypeError) as error:
                 raise _Blocked(
                     "strategy_error",
@@ -2731,7 +2908,6 @@ def _compute_day(
                     cash + market_value,
                     fee_rate,
                     slippage_rate,
-                    now,
                 )
 
     status = "committed"
@@ -2740,7 +2916,7 @@ def _compute_day(
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": DAY_KIND,
-        "scope": SCOPE,
+        "scope": data_kind,
         "status": status,
         "version_id": body["version_id"],
         "date": session,
@@ -2779,6 +2955,7 @@ def _compute_day(
         "slippage": {"day": day_slippage, "total": slippage_total},
         "signal": signal,
         "next_orders": next_orders,
+        **({"strategy_execution_evidence": invocations} if invocations else {}),
         "anomalies": anomalies,
         "corrections": corrections_applied,
         "correction_impact": correction_impact,
@@ -2798,7 +2975,6 @@ def _next_orders(
     close_equity: float,
     fee_rate: float,
     slippage_rate: float,
-    now: datetime,
 ) -> list[dict[str, Any]]:
     """Size the next session's orders at the signal close and persist them.
 
@@ -2824,7 +3000,7 @@ def _next_orders(
         if weight <= _EPSILON and quantity_held <= _EPSILON:
             continue
         row = raw.get(symbol)
-        if not _valid_close(row, close_cutoff):
+        if not _valid_close(row, close_cutoff, data_kind=body.get("data_kind", DATA_KIND)):
             raise _Blocked(
                 "missing_close",
                 f"{symbol} has no confirmed unadjusted close for order sizing.",
@@ -2877,7 +3053,6 @@ def _next_orders(
                 "execution_date": next_session,
                 "submitted_at": submitted_at,
                 "deadline": deadline.isoformat(),
-                "persisted_before_deadline": now < deadline,
             }
         )
     return orders
