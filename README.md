@@ -672,7 +672,116 @@ The Mock provider can emit deterministic Python when opted in, but a Mock
 campaign is never evidence of model novelty or investable performance. Results
 are research evidence, not investment advice or a guarantee of future returns.
 
-### Protected Validation and Final Holdout (MVP-10/MVP-11, synthetic only)
+### Direction-bound research (#37)
+
+The research lead creates a Campaign on a sealed snapshot, then approves its
+direction, objective, constraints, Validation protocol, and maximum number of
+new Validation evaluations. Use one stable direction key for the same design
+across display-name changes, Campaigns, and parameter revisions. The kickoff
+declares whether prior Holdout feedback influenced the design.
+
+```sh
+prajnatrade direction kickoff --project "$PROJECT" --store "$EVAL_STORE" \
+  --campaign-id "$CAMPAIGN" --direction-key "cross-sectional-relative-strength" \
+  --name "ETF relative strength" --authorization-id "$KICKOFF_APPROVAL" \
+  --input kickoff.json
+```
+
+The kickoff JSON contains `objective`, `constraints` (a list of strings),
+`validation_budget` (a positive integer), `validation_settings` (the evaluation
+plan input below), `independence` (an `independent` boolean and a `reason`),
+`reviewer`, and `approval_reason`. The Campaign fixes the snapshot, transaction
+cost, slippage, initial cash, and Discovery execution budget. The Validation
+protocol fixes the comparator and scoring rules for the round.
+
+After a successful Discovery experiment, the research agent submits a
+Validation proposal. Its JSON records `change`, `question`, `expected_change`,
+and `related_experiment_ids`. Once a version meets the thresholds, any new
+evaluation needs `selection_impact` explaining how the answer could change the
+selection.
+
+```sh
+prajnatrade-agent validation propose --project "$PROJECT" --round-id "$ROUND" \
+  --submission-id "$SUBMISSION" --input proposal.json
+prajnatrade validation service --project "$PROJECT" --store "$EVAL_STORE" \
+  --snapshot-store "$SNAPSHOTS" --round-id "$ROUND"
+prajnatrade-agent direction status --project "$PROJECT" --round-id "$ROUND"
+```
+
+The trusted operator can run `validation service` as a recurring job. It
+processes proposals and detail requests under the kickoff approval. The
+operator can also run one exact proposal with `validation run --project
+"$PROJECT" --store "$EVAL_STORE" --snapshot-store "$SNAPSHOTS" --round-id
+"$ROUND" --submission-id "$SUBMISSION" --proposal-id "$PROPOSAL"`. A new version
+debits once in the trusted ledger before the sealed read. Checking status,
+retrying the same evaluation, and querying stored details preserve the budget.
+The agent sees default summaries including net return, return relative to the
+equal-weight baseline, drawdown, turnover, and fees.
+
+```sh
+prajnatrade-agent validation details --project "$PROJECT" --round-id "$ROUND" \
+  --evaluation-id "$VALIDATION" --date "$TRADING_DATE" --question "$QUESTION"
+prajnatrade-agent validation feedback --project "$PROJECT" --round-id "$ROUND" \
+  --evaluation-id "$VALIDATION" --detail-access-id "$DETAIL" --impact "$IMPACT"
+prajnatrade-agent direction freeze --project "$PROJECT" --round-id "$ROUND" \
+  --evaluation-id "$VALIDATION" --name "ETF relative strength v2" --input selection.json
+```
+
+Repeat the detail request after the trusted service has run to retrieve its
+signals, positions, and fills. Feedback can reference `--next-experiment-id`.
+The selection JSON contains `selection_reason`, a `remaining_risks` list,
+an `eliminations` map keyed by experiment ID, and the agent's `independence`
+declaration. A passed version can be frozen before the budget is exhausted.
+If the budget runs out without one, use `direction retrospective` with a JSON
+`findings` and `next_step` for the lead to review.
+
+The lead authorizes one frozen selection and reaffirms whether selection
+remained independent. The trusted authorization verifies the exact selected
+Validation ID and records consent to automatically release and enable the
+frozen version on a trusted Holdout pass.
+
+```sh
+prajnatrade holdout authorize --project "$PROJECT" --store "$EVAL_STORE" \
+  --snapshot-store "$SNAPSHOTS" --round-id "$ROUND" \
+  --validation-evaluation-id "$VALIDATION" --reviewer "$REVIEWER" \
+  --reason "$APPROVAL_REASON" --selection-independent yes \
+  --independence-reason "$INDEPENDENCE_REASON" --calendar trading-calendar.json
+prajnatrade holdout run --project "$PROJECT" --store "$EVAL_STORE" \
+  --snapshot-store "$SNAPSHOTS" --plan-id "$HOLDOUT_PLAN"
+prajnatrade evaluation report --store "$EVAL_STORE" \
+  --plan-id "$HOLDOUT_PLAN" --output controlled-report.html
+```
+
+The calendar JSON includes `schema_version: 1`, `data_kind` matching the
+snapshot, a `source`, and an ordered list of ISO trading dates in `sessions`.
+Include the planned first eligible after-close signal date and subsequent
+trading days. An overlapping Holdout range can be used for another direction
+when both declarations and the recorded selection support independence.
+Prior use by the same direction, an overlapping legacy Holdout with unknown
+direction, or declared influence on an overlapping range records an
+eligibility blocker. A scored Holdout rejection ends the round and returns a
+controlled retrospective. Aborted or incomplete evidence leaves the release
+disabled.
+
+On a pass, the release begins with the first authorized trading session after
+the Holdout interval and completion date in Asia/Shanghai. Use the operator's
+recurring job to run the trading-day clock with the current feed. For example,
+a cron job can call this command every few minutes and route its output and
+nonzero exit to the operator's job monitor.
+
+```sh
+prajnatrade shadow tick --ledger "$LEDGER" --store "$EVAL_STORE" \
+  --calendar trading-calendar.json --data "$DAILY_FEED" \
+  --corrections-store "$SNAPSHOTS"
+```
+
+The clock records blocked inputs, failures, and missed next-open deadlines in
+the ledger. Its retry uses existing day commits and records missed fills
+according to the actual order persistence time. For a real run, keep the
+approved exchange calendar, contemporaneous feed, scheduler receipts, and
+reconciled forward ledger as separate acceptance evidence.
+
+### Legacy protected Validation and Final Holdout (MVP-10/MVP-11)
 
 `prajnatrade evaluation ...` performs one preregistered, human-authorized,
 OS-isolated evaluation of a frozen candidate against sealed synthetic
