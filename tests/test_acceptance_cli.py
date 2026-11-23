@@ -604,9 +604,17 @@ def test_checked_in_manifest_is_honest_and_the_report_is_current(
     assert real_llm["blockers"] == []
     llm_evidence = {entry["type"] for entry in real_llm["evidence"]}
     assert {"real_model_session", "model_submissions", "container_isolation", "model_notes"} <= llm_evidence
+    real_validation = scenarios["independent_validation_reports"]
+    assert real_validation["scope"] == {"data": "real", "agent": "real", "period": "historical"}
+    assert real_validation["status"] == "blocked"
+    assert "THRESHOLD_NOT_MET" in real_validation["observed"]
+    assert {entry["type"] for entry in real_validation["evidence"]} == {
+        "synthetic_mechanism", "real_validation_rejection",
+    }
     for scenario in scenarios.values():
         if scenario["id"] in {
             "real_snapshot_baseline", "real_data_mock", "controlled_real_llm",
+            "independent_validation_reports",
         }:
             continue
         assert scenario["scope"] == {

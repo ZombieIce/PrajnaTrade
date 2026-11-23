@@ -59,13 +59,9 @@ def _runtime_components(
     }
 
 
-def _runtime_identity(strategy_executor: dict[str, Any] | None = None) -> str:
-    return _fingerprint(_runtime_components(strategy_executor))
-
-
 def runtime_identity(strategy_executor: dict[str, Any] | None = None) -> str:
-    """Return the dependency and executor fingerprint used by frozen strategies."""
-    return _runtime_identity(strategy_executor)
+    """Fingerprint the accounting dependencies and optional strategy executor."""
+    return _fingerprint(_runtime_components(strategy_executor))
 
 
 def _executor_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -669,7 +665,7 @@ def _run_attempt(
         if _fingerprint(config) != campaign["evaluation_hash"]:
             raise ValueError("Evaluation fingerprint mismatch.")
         executor_config = _executor_config(config)
-        if config["runtime"] != _runtime_identity(executor_config):
+        if config["runtime"] != runtime_identity(executor_config):
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec: dict[str, Any] = {
             "family": family, "parameters": request["parameters"],
@@ -806,13 +802,14 @@ MAX_SIGNAL_WINDOW_SESSIONS = 252
 def signal_window_sessions(spec: dict[str, Any]) -> int:
     """Return the frozen trailing window required by the strategy."""
     family = spec["family"]
-    raw_lookback = spec["parameters"].get("lookback", 1)
+    parameters = spec["parameters"]
+    raw_lookback = parameters.get("lookback", 1)
     if family == "python":
         # Generated Python needs a real history panel, not the one-session
         # cross-section a lookback-less declarative strategy sees.  A strategy
         # may request a smaller window via ``parameters.lookback``; the window
         # is always point-in-time and capped to one trading year.
-        requested_lookback = spec["parameters"].get("lookback")
+        requested_lookback = parameters.get("lookback")
         if (
             isinstance(requested_lookback, int)
             and not isinstance(requested_lookback, bool)

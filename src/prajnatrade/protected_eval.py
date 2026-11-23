@@ -41,7 +41,12 @@ from prajnatrade import snapshot
 from prajnatrade.backtest import equal_weight_buy_and_hold
 from prajnatrade.container_executor import ContainerStrategyExecutor, executor_from_config
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.experiment import _runtime_identity, candidate_status, project_status
+from prajnatrade.experiment import (
+    candidate_status,
+    project_status,
+    runtime_identity,
+    signal_window_sessions,
+)
 from prajnatrade.isolation import IsolationError, probe_isolation_evidence
 from prajnatrade.snapshot_baseline import (
     CN_TZ,
@@ -74,10 +79,12 @@ THRESHOLD_METRICS = (
     "unfilled_orders",
 )
 THRESHOLD_OPERATORS = (">=", "<=", ">", "<", "==")
+BENCHMARK_THRESHOLD_METRICS = {"total_return", "sharpe", "max_drawdown"}
 
 REASON_THRESHOLD = "THRESHOLD_NOT_MET"
 REASON_COVERAGE = "COVERAGE_INSUFFICIENT"
 REASON_EVIDENCE = "EVIDENCE_INCOMPLETE"
+EVIDENCED_OPEN_HALT_POLICY = "evidenced_open_halt_v1"
 COARSE_MESSAGES = {
     REASON_THRESHOLD: "At least one preregistered hard threshold was not met.",
     REASON_COVERAGE: "Required coverage or minimum samples were incomplete.",
@@ -97,6 +104,10 @@ PLAN_INPUT_FIELDS = frozenset({
 NOT_ADMISSION_STATEMENT = (
     "This synthetic trusted record is engineering evidence only; it does not "
     "grant admission, approve a release, or prove real-market performance."
+)
+REAL_EVALUATION_STATEMENT = (
+    "This trusted record covers one preregistered protected stage. "
+    "Admission requires the approvals and evidence bound to the frozen plan."
 )
 
 #: The research side learns exactly one thing about Final Holdout: the request
@@ -279,6 +290,8 @@ def _record_matches(record: dict[str, Any], plan: dict[str, Any], stage: str) ->
         )
     return (
         record.get("plan_id") == plan["plan_id"]
+        and record.get("scope") == plan["scope"]
+        and record.get("data_kind") == plan["data_kind"]
         and record.get("candidate_hash") == plan["candidate_hash"]
         and record.get("snapshot_id") == plan["snapshot_id"]
         and record.get("stage") == stage
@@ -503,7 +516,7 @@ def _plan_input(
 ) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise _invalid("Plan input must be a JSON object.")
-    unknown = sorted(set(raw) - PLAN_INPUT_FIELDS)
+    unknown = sorted(set(raw) - PLAN_INPUT_FIELDS - {"allow_discovery_halt_warmup"})
     if unknown:
         raise _invalid(
             "Plan input cannot restate bound fields or add unknown fields: "
@@ -518,6 +531,9 @@ def _plan_input(
     if raw["stages"] != list(STAGES):
         raise _invalid("The plan must fix exactly the validation and final_holdout stages.")
     reason = _text(raw["reason"], "reason")
+    allow_discovery_halt_warmup = raw.get("allow_discovery_halt_warmup", False)
+    if type(allow_discovery_halt_warmup) is not bool:
+        raise _invalid("allow_discovery_halt_warmup must be a boolean.")
 
     minimum = _exact_object(
         raw["minimum_samples"], {"sessions", "valued_sessions"}, "minimum_samples"
@@ -534,7 +550,10 @@ def _plan_input(
     thresholds = []
     seen: set[str] = set()
     for entry in raw["thresholds"]:
-        item = _exact_object(entry, {"id", "metric", "op", "value"}, "each threshold")
+        fields = {"id", "metric", "op", "value"}
+        if isinstance(entry, dict) and "benchmark_multiplier" in entry:
+            fields.add("benchmark_multiplier")
+        item = _exact_object(entry, fields, "each threshold")
         identifier = _text(item["id"], "threshold.id")
         if identifier in seen:
             raise _invalid(f"Duplicate threshold id: {identifier}.")
@@ -548,14 +567,11 @@ def _plan_input(
         if item["op"] not in THRESHOLD_OPERATORS:
             raise _invalid(f"Threshold operator {item['op']!r} is not supported.")
         _number(item["value"], "threshold.value")
-        thresholds.append(
-            {
-                "id": identifier,
-                "metric": item["metric"],
-                "op": item["op"],
-                "value": item["value"],
-            }
-        )
+        if "benchmark_multiplier" in item:
+            multiplier = _number(item["benchmark_multiplier"], "threshold.benchmark_multiplier")
+            if item["metric"] not in BENCHMARK_THRESHOLD_METRICS or multiplier <= 0:
+                raise _invalid("Benchmark thresholds require return, Sharpe or drawdown and a positive multiplier.")
+        thresholds.append({**item, "id": identifier})
 
     stress = _exact_object(
         raw["stress_costs"],
@@ -613,6 +629,7 @@ def _plan_input(
         },
         "stages": list(STAGES),
         "reason": reason,
+        **({"allow_discovery_halt_warmup": True} if allow_discovery_halt_warmup else {}),
     }
 
 
@@ -635,15 +652,7 @@ def _read_plan_input(source: Path) -> object:
         raise _invalid(f"Plan input could not be read: {error}") from error
 
 
-def _signal_window_for(family: str, parameters: dict[str, Any]) -> int:
-    """Trailing sessions needed to fill a signal window for these parameters."""
-    lookback = int(parameters.get("lookback", 1))
-    return lookback + 1 if family in {"momentum", "inverse_volatility"} else lookback
-
-
 def _signal_window(candidate: dict[str, Any], parameters: dict[str, Any] | None = None) -> int:
-    from prajnatrade.experiment import signal_window_sessions
-
     return signal_window_sessions({
         **candidate["strategy"],
         "parameters": candidate["parameters"] if parameters is None else parameters,
@@ -713,6 +722,7 @@ def _build_plan(
     metadata: dict[str, Any],
     payload: dict[str, Any],
     *,
+    snapshot_store: Path,
     workflow: str | None = None,
 ) -> dict[str, Any]:
     snapshot_id = candidate.get("snapshot_id")
@@ -720,17 +730,32 @@ def _build_plan(
     if not isinstance(evaluation, dict) or evaluation.get("snapshot_id") != snapshot_id:
         raise ValueError("The frozen candidate snapshot reference is inconsistent.")
     data_kind = metadata.get("data_kind")
-    if data_kind != SCOPE and (workflow is None or data_kind != "real"):
-        raise ValueError("Protected evaluation requires an explicitly supported snapshot.")
-    if evaluation.get("data_kind", SCOPE) != data_kind:
-        raise ValueError("The frozen evaluation and the sealed snapshot use different data kinds.")
-    partitions = {name: snapshot.partition_descriptor(metadata, name) for name in STAGES}
+    if (
+        data_kind not in (SCOPE, "real")
+        or snapshot.SCHEMA_VERSION.get(metadata.get("schema_version")) != data_kind
+        or evaluation.get("data_kind", SCOPE) != data_kind
+    ):
+        raise _invalid("The frozen candidate and snapshot data kind must match.")
+    partitions = {
+        name: snapshot.partition_descriptor(metadata, name) for name in STAGES
+    }
     discovery = snapshot.partition_descriptor(metadata, "discovery")
     if evaluation.get("partition_content_hash") != discovery["content_hash"]:
         raise ValueError(
             "The frozen candidate Discovery fingerprint is not this snapshot's Discovery content."
         )
-    return {
+    if data_kind == "real" and not payload["thresholds"]:
+        raise _invalid("Real Validation requires preregistered hard thresholds.")
+    family = candidate["strategy"]["family"]
+    neighbourhood = _neighbourhood(candidate)
+    executor_config = evaluation.get("strategy_executor", {"kind": "none"})
+    if evaluation.get("runtime") != runtime_identity(executor_config):
+        raise _invalid("The candidate's frozen runtime is unavailable for protected evaluation.")
+    if family == "python":
+        executor_from_config(executor_config)
+        if neighbourhood.get("status") == "missing_parameter_schema":
+            raise _invalid("Frozen Python strategy must declare its parameter neighbourhood or no tunable parameters.")
+    plan = {
         "schema_version": RESEARCH_SCHEMA_VERSION if workflow else SCHEMA_VERSION,
         **({"workflow": workflow} if workflow else {}),
         "scope": data_kind,
@@ -752,10 +777,7 @@ def _build_plan(
         "stages": list(STAGES),
         "conclusion": candidate["conclusion"],
         "runtime": candidate["fingerprints"]["runtime_dependencies"],
-        "signal_window_sessions": (
-            _signal_window(candidate) if workflow
-            else _signal_window_for(candidate["strategy"]["family"], candidate["parameters"])
-        ),
+        "signal_window_sessions": _signal_window(candidate),
         "initial_cash": float(evaluation["initial_cash"]),
         "base_costs": _base_costs(evaluation),
         "stress_costs": payload["stress_costs"],
@@ -771,9 +793,20 @@ def _build_plan(
         "thresholds": payload["thresholds"],
         "minimum_samples": payload["minimum_samples"],
         "regimes": payload["regimes"],
-        "neighborhood": _neighbourhood(candidate),
+        "neighborhood": neighbourhood,
         "reason": payload["reason"],
     }
+    if data_kind == "real":
+        plan["coverage_policy"] = EVIDENCED_OPEN_HALT_POLICY
+    if workflow == RESEARCH_HOLDOUT:
+        plan["prior_history"] = payload["prior_history"]
+    elif payload.get("allow_discovery_halt_warmup"):
+        if data_kind != "real":
+            raise _invalid("Discovery halt warm-up requires a schema-v2 snapshot.")
+        warmup = _freeze_halt_warmup(snapshot_store, plan)
+        if warmup:
+            plan["prior_history"][VALIDATION_STAGE]["halt_warmup"] = warmup
+    return plan
 
 
 def _freeze_plan(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
@@ -810,19 +843,19 @@ def create_plan(
     if not isinstance(evaluation, dict):
         raise ValueError("The frozen candidate is missing its evaluation settings.")
     metadata = snapshot.manifest(Path(snapshot_store), snapshot_id)
-    if metadata.get("data_kind") != SCOPE:
-        raise ValueError("Protected evaluation requires an explicitly synthetic snapshot.")
+    data_kind = metadata["data_kind"]
     base_costs = _base_costs(evaluation)
     payload = _plan_input(_read_plan_input(Path(source)), base_costs)
-    stored = _freeze_plan(eval_store, _build_plan(project_id, candidate, metadata, payload))
+    plan = _build_plan(project_id, candidate, metadata, payload, snapshot_store=Path(snapshot_store))
+    stored = _freeze_plan(eval_store, plan)
     _register_plan(project, stored)
     plan_id = stored["plan_id"]
     partitions = stored["partitions"]
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "planned",
-        "scope": SCOPE,
-        "data_kind": SCOPE,
+        "scope": data_kind,
+        "data_kind": data_kind,
         "plan_id": plan_id,
         "plan_hash": plan_id,
         "candidate_id": candidate_id,
@@ -992,6 +1025,7 @@ def authorize(
         )
     directory = eval_store / "authorizations" / plan_id
     context = {
+        "scope": plan["scope"],
         "plan_id": plan_id,
         "stage": stage,
         "candidate_id": plan.get("candidate_id"),
@@ -1065,7 +1099,7 @@ def authorize(
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     body = {
         "schema_version": SCHEMA_VERSION,
-        "scope": SCOPE,
+        "scope": plan["scope"],
         "plan_id": plan_id,
         "plan_hash": plan_id,
         "candidate_id": plan["candidate_id"],
@@ -1115,7 +1149,7 @@ def authorize(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "authorized",
-        "scope": SCOPE,
+        "scope": plan["scope"],
         "plan_id": plan_id,
         "stage": stage,
         "authorization": stored,
@@ -1126,13 +1160,19 @@ def authorization_matches(
     record: dict[str, Any], plan: dict[str, Any], stage: str
 ) -> bool:
     """Check whether a stored authorization matches the trusted plan for its stage."""
+    # Kickoff authorizations derive their scope from the verified round/plan binding.
+    scope = record.get("scope")
+    if scope is None and plan.get("workflow") == RESEARCH_VALIDATION and record.get("authorization_kind") == "research_kickoff":
+        scope = plan["scope"]
     matched = (
-        record.get("plan_id") == plan["plan_id"]
+        scope == plan["scope"]
+        and record.get("plan_id") == plan["plan_id"]
         and record.get("plan_hash") == plan["plan_id"]
         and record.get("candidate_id") == plan["candidate_id"]
         and record.get("candidate_hash") == plan["candidate_hash"]
         and record.get("snapshot_id") == plan["snapshot_id"]
         and record.get("stage") == stage
+        and record.get("partition") == stage
         and record.get("partition_content_hash")
         == plan["partitions"][stage]["content_hash"]
     )
@@ -1161,7 +1201,8 @@ def _ledger(database: Path) -> sqlite3.Connection:
 
 
 def _claim_partition(
-    store: Path, plan: dict[str, Any], stage: str, authorization: dict[str, Any]
+    store: Path, snapshot_store: Path, plan: dict[str, Any], stage: str,
+    authorization: dict[str, Any],
 ) -> dict[str, Any]:
     """Atomically reserve the sealed range before the protected read."""
     content_hash = plan["partitions"][stage]["content_hash"]
@@ -1183,6 +1224,12 @@ def _claim_partition(
                 if legacy_conflict(connection, plan, stage):
                     connection.execute("ROLLBACK")
                     return {"state": "consumed"}
+                if not any(
+                    (snapshot_store / snapshot_id / f"{stage}.json").is_file()
+                    for snapshot_id in snapshot.lineage_ids(snapshot_store, plan["snapshot_id"])
+                ):
+                    connection.execute("ROLLBACK")
+                    return {"state": "source_missing"}
                 connection.execute(
                     "INSERT INTO consumed_queries "
                     "(partition_name, partition_content_hash, plan_id, candidate_hash, "
@@ -1506,7 +1553,7 @@ def evaluation_status(store: str | Path, plan_id: str) -> dict[str, Any]:
         }
     return {
         "schema_version": SCHEMA_VERSION,
-        "scope": SCOPE,
+        "scope": plan["scope"],
         "plan_id": plan_id,
         "plan": plan,
         "authorizations": authorizations,
@@ -1589,30 +1636,109 @@ def _partition_gaps(metadata: dict[str, Any], descriptor: dict[str, Any]) -> dic
     }
 
 
+def _evidenced_open_halts(raw_bars: list[dict]) -> dict[tuple[str, str], dict]:
+    """Identify rows whose only missing field is an evidenced non-executable open."""
+    result = {}
+    for row in raw_bars:
+        if (
+            row["trading_status"] != "partial_halt"
+            or row["open"] is not None
+            or any(row[field] is None for field in ("high", "low", "close", "volume"))
+            or not row["available_at"]
+            or not row["availability_evidence"]
+        ):
+            continue
+        day = date.fromisoformat(row["date"])
+        session_open = datetime.combine(day, clock_time(9, 30), tzinfo=CN_TZ)
+        halt = row["halt"]
+        resume = datetime.fromisoformat(halt["end"])
+        open_available = datetime.fromisoformat(row["open_available_at"])
+        close_available = datetime.fromisoformat(row["close_available_at"])
+        if (
+            datetime.fromisoformat(halt["start"]) <= session_open < resume
+            and open_available == resume
+            and resume <= close_available
+            and close_available.astimezone(CN_TZ).date() == day
+        ):
+            result[(row["date"], row["symbol"])] = {
+                "date": row["date"],
+                "symbol": row["symbol"],
+                "halt": halt,
+                "availability_evidence": row["availability_evidence"],
+            }
+    return result
+
+
+def _verified_discovery(snapshot_store: Path, plan: dict[str, Any]) -> dict:
+    rule = plan["prior_history"][VALIDATION_STAGE]
+    receipt = snapshot.read_discovery(
+        snapshot_store, plan["snapshot_id"], "discovery", rule.get("as_of"),
+    )
+    content_hash = receipt.get("partition_content_hash", receipt["content_hash"])
+    if (
+        content_hash != rule["discovery_content_hash"]
+        or receipt["content_hash"] != plan["candidate"]["fingerprints"]["snapshot"]
+    ):
+        raise ValueError("The frozen Discovery prior history differs from the sealed snapshot.")
+    return receipt
+
+
+def _freeze_halt_warmup(snapshot_store: Path, plan: dict[str, Any]) -> dict | None:
+    """Bind only full-halt gaps in the already visible Discovery tail."""
+    data = _verified_discovery(snapshot_store, plan)["data"]
+    prior_needed = plan["signal_window_sessions"] - 1
+    sessions = sorted({row["date"] for row in data["calendar"]})
+    if prior_needed == 0 and plan.get("workflow") == RESEARCH_VALIDATION:
+        return None
+    if not 0 < prior_needed <= len(sessions):
+        raise _invalid("The frozen signal window has no verifiable Discovery warm-up.")
+    tail = sessions[-prior_needed:]
+    cutoff = datetime.combine(
+        date.fromisoformat(plan["partitions"][VALIDATION_STAGE]["start"]),
+        clock_time(9, 30), tzinfo=CN_TZ,
+    )
+    unavailable = {
+        (row["date"], row["symbol"]) for row in data["derived"] if row["value"] is None
+    }
+    halts = []
+    for row in data["raw_bars"]:
+        day, symbol = row["date"], row["symbol"]
+        if (
+            day not in tail or (day, symbol) not in unavailable
+            or row["trading_status"] != "suspended" or not row.get("halt")
+            or not available_by(row, cutoff)
+        ):
+            continue
+        session = date.fromisoformat(day)
+        halt = row["halt"]
+        if (
+            datetime.fromisoformat(halt["start"]) <= datetime.combine(session, clock_time(9, 30), CN_TZ)
+            and datetime.fromisoformat(halt["end"]) >= datetime.combine(session, clock_time(15), CN_TZ)
+        ):
+            halts.append({"date": day, "symbol": symbol})
+    if not halts:
+        if plan.get("workflow") == RESEARCH_VALIDATION:
+            return None
+        raise _invalid("The frozen Discovery tail has no evidenced full-halt signal gaps.")
+    skipped = tail.index(max(halt["date"] for halt in halts)) + 1
+    if skipped >= plan["partitions"][VALIDATION_STAGE]["sessions"] - 1:
+        raise _invalid("The Discovery halt warm-up leaves no possible Validation signal.")
+    return {"halted_inputs": halts, "initial_signal_sessions": skipped}
+
+
 def _prior_discovery(
     snapshot_store: Path,
     plan: dict[str, Any],
     reject,
 ) -> tuple[list[str], list[dict], str]:
-    rule = plan["prior_history"][VALIDATION_STAGE]
     try:
-        receipt = snapshot.read_discovery(
-            snapshot_store,
-            plan["snapshot_id"],
-            "discovery",
-            rule.get("as_of"),
-        )
+        receipt = _verified_discovery(snapshot_store, plan)
     except ValueError as error:
         reject(
             "FINGERPRINT_MISMATCH",
             f"The frozen Discovery prior history could not be verified: {error}",
         )
     content_hash = receipt.get("partition_content_hash", receipt["content_hash"])
-    if content_hash != rule["discovery_content_hash"]:
-        reject(
-            "FINGERPRINT_MISMATCH",
-            "The frozen Discovery prior history differs from the sealed snapshot.",
-        )
     sessions = sorted({row["date"] for row in receipt["data"]["calendar"]})
     return sessions, receipt["data"]["derived"], content_hash
 
@@ -1628,18 +1754,16 @@ def _validation_export(
     """
     data = protected["data"]
     sessions = sorted({row["date"] for row in data["calendar"]})
+    family = plan["candidate"]["strategy"]["family"]
+    variant_windows = [
+        signal_window_sessions({"family": family, "parameters": entry["parameters"]})
+        for entry in plan["neighborhood"].get("variants", [])
+        if entry.get("reason") is None
+    ]
     needed = max(
-        int(plan["signal_window_sessions"]), int(plan["regimes"]["lookback"]) + 1, 1
+        plan["signal_window_sessions"], plan["regimes"]["lookback"] + 1,
+        *variant_windows,
     )
-    if plan.get("workflow"):
-        needed = max([
-            needed,
-            *(
-                _signal_window(plan["candidate"], variant["parameters"])
-                for variant in plan["neighborhood"].get("variants", [])
-                if variant.get("reason") is None
-            ),
-        ])
     export_sessions = sessions[-needed:]
     keep = set(export_sessions)
     body = {
@@ -1677,13 +1801,12 @@ def _prior_holdout(
             "VALIDATION_EVIDENCE_INVALID",
             "The Validation prior export overlaps the sealed Holdout range.",
         )
-    use_discovery = not plan.get("workflow") or (
-        len(previous) == plan["partitions"][VALIDATION_STAGE]["sessions"]
-    )
-    sessions = [*discovery_sessions, *previous] if use_discovery else previous
-    rows = [*discovery_rows, *export["derived"]] if use_discovery else export["derived"]
+    # Discovery is contiguous with the export only when it covers all of Validation.
+    complete_validation = len(previous) == plan["partitions"][VALIDATION_STAGE]["sessions"]
+    sessions = [*discovery_sessions, *previous] if complete_validation else previous
+    rows = [*discovery_rows, *export["derived"]] if complete_validation else export["derived"]
     prior_evidence = {
-        "partitions": ["discovery", VALIDATION_STAGE] if use_discovery else [VALIDATION_STAGE],
+        "partitions": ["discovery", VALIDATION_STAGE] if complete_validation else [VALIDATION_STAGE],
         "discovery_content_hash": discovery_hash,
         "validation": {
             "evaluation_id": evidence["evaluation_id"],
@@ -1745,7 +1868,6 @@ def _candidate_run(
     invocations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     candidate = plan["candidate"]
-    family = candidate["strategy"]["family"]
     variant_parameters = (
         candidate["parameters"] if parameters is None else parameters
     )
@@ -1755,10 +1877,7 @@ def _candidate_run(
     window = (
         plan["signal_window_sessions"]
         if parameters is None
-        else (
-            _signal_window(candidate, parameters) if plan.get("workflow")
-            else _signal_window_for(family, parameters)
-        )
+        else signal_window_sessions(spec)
     )
     strategy = make_strategy(
         spec,
@@ -1884,10 +2003,20 @@ def _evaluate_thresholds(
     results = []
     for entry in plan["thresholds"]:
         actual = values.get(entry["metric"])
-        if actual is None:
+        expected = entry["value"]
+        comparison = {}
+        if "benchmark_multiplier" in entry:
+            benchmark = base["baseline"]["metrics"].get(entry["metric"])
+            expected = (
+                None if benchmark is None else entry["benchmark_multiplier"] * benchmark + expected
+            )
+            if expected is not None and not math.isfinite(expected):
+                expected = None
+            comparison = {"benchmark_value": benchmark, "expected": expected}
+        if actual is None or expected is None:
             status = "unavailable"
-            message = f"{entry['metric']} is unavailable for this partition."
-        elif _compare(float(actual), entry["op"], float(entry["value"])):
+            message = f"Evidence for the {entry['metric']} threshold is unavailable."
+        elif _compare(float(actual), entry["op"], float(expected)):
             status = "passed"
             message = f"{entry['metric']} met the frozen threshold."
         else:
@@ -1895,16 +2024,37 @@ def _evaluate_thresholds(
             message = f"{entry['metric']} did not meet the frozen threshold."
         results.append(
             {
-                "id": entry["id"],
-                "metric": entry["metric"],
-                "op": entry["op"],
-                "value": entry["value"],
+                **entry,
+                **comparison,
                 "actual": actual,
                 "status": status,
                 "message": message,
             }
         )
     return results
+
+
+def _observed_warmup_sessions(runs: list[dict], policy: dict, initial_cash: float) -> list[str]:
+    """Verify the preregistered cash-only prefix of every supplied run."""
+    size = policy["initial_signal_sessions"]
+    allowed = {(row["date"], row["symbol"]) for row in policy["halted_inputs"]}
+    first_dates = []
+    for run in runs:
+        prefix = run["equity_curve"][:size]
+        gaps = run["signal_gaps"][:size]
+        days = [row["date"] for row in prefix]
+        if (
+            len(days) != size or days != [gap["date"] for gap in gaps]
+            or any(row["nav"] != initial_cash for row in prefix)
+            or any(
+                (missing["date"], symbol) not in allowed
+                for gap in gaps for missing in gap["missing_sessions"]
+                for symbol in missing["missing_symbols"]
+            )
+        ):
+            return []
+        first_dates = days
+    return first_dates
 
 
 def _neighbourhood_result(
@@ -1959,10 +2109,8 @@ def _neighbourhood_result(
             variant.update(status="invalid_config", reason=entry["reason"])
             variants.append(variant)
             continue
-        candidate = plan["candidate"]
-        variant["signal_window_sessions"] = (
-            _signal_window(candidate, entry["parameters"]) if plan.get("workflow")
-            else _signal_window_for(candidate["strategy"]["family"], entry["parameters"])
+        variant["signal_window_sessions"] = signal_window_sessions(
+            {"family": plan["candidate"]["strategy"]["family"], "parameters": entry["parameters"]}
         )
         try:
             run = _candidate_run(
@@ -2213,17 +2361,39 @@ def _evaluation_record(
     )
     valuation_complete = base_metrics["valued_sessions"] == base_metrics["sessions"]
     partition_gaps = _partition_gaps(metadata, descriptor)
+    evidenced_halts = (
+        _evidenced_open_halts(data["raw_bars"])
+        if plan.get("coverage_policy") == EVIDENCED_OPEN_HALT_POLICY else {}
+    )
+    blocking_snapshot_gap = any(
+        kind != "raw_bars" or (gap.get("date"), gap.get("symbol")) not in evidenced_halts
+        for kind, gaps in partition_gaps.items()
+        for gap in gaps
+    )
     runner = runs["base"]["candidate"]
     baseline_runner = runs["base"]["baseline"]
+    warmup_policy = plan["prior_history"][stage].get("halt_warmup")
+    warmup_sessions = []
+    signal_coverage_complete = not runner["signal_gaps"]
+    if warmup_policy:
+        # A research round has a fixed one-session baseline regardless of candidate lookback.
+        shared_window = plan["baseline"]["same_signal_window"]
+        participants = [run for scenario in runs.values() for name, run in scenario.items()
+                        if name == "candidate" or shared_window]
+        warmup_sessions = _observed_warmup_sessions(participants, warmup_policy, plan["initial_cash"])
+        signal_coverage_complete = bool(warmup_sessions) and all(
+            len(run["signal_gaps"]) == len(warmup_sessions) for run in participants
+        )
+        if not shared_window:
+            signal_coverage_complete &= all(not scenario["baseline"]["signal_gaps"] for scenario in runs.values())
     coverage_complete = (
         samples_sufficient
         and valuation_complete
         and bool(runner["signals"])
         and bool(baseline_runner["signals"])
-        and not runner["signal_gaps"]
+        and signal_coverage_complete
         and not runner["gaps"]["valuation"]
-        and not partition_gaps["raw_bars"]
-        and not partition_gaps["derived"]
+        and not blocking_snapshot_gap
     )
     failed = [item["id"] for item in thresholds if item["status"] == "failed"]
     unavailable = [item["id"] for item in thresholds if item["status"] == "unavailable"]
@@ -2277,8 +2447,7 @@ def _evaluation_record(
         "aborted": False,
         "not_admission": True,
         "not_admission_statement": (
-            NOT_ADMISSION_STATEMENT if plan["data_kind"] == SCOPE
-            else "This protected evaluation is evidence for the evaluated historical interval."
+            NOT_ADMISSION_STATEMENT if plan["data_kind"] == SCOPE else REAL_EVALUATION_STATEMENT
         ),
         "fingerprints": {
             "plan": plan["plan_id"],
@@ -2395,6 +2564,11 @@ def _evaluation_record(
             "candidate_signals": len(runner["signals"]),
             "baseline_signals": len(baseline_runner["signals"]),
             "snapshot_gaps": partition_gaps,
+            **({"discovery_warmup_sessions": warmup_sessions} if warmup_policy else {}),
+            **(
+                {"evidenced_open_halts": list(evidenced_halts.values())}
+                if plan.get("coverage_policy") == EVIDENCED_OPEN_HALT_POLICY else {}
+            ),
             "runner_gaps": {
                 "raw_bars": runner["gaps"]["raw_bars"],
                 "derived": runner["gaps"]["derived"],
@@ -2455,8 +2629,7 @@ def _aborted_record(
         "aborted": True,
         "not_admission": True,
         "not_admission_statement": (
-            NOT_ADMISSION_STATEMENT if plan["data_kind"] == SCOPE
-            else "This protected evaluation is evidence for the evaluated historical interval."
+            NOT_ADMISSION_STATEMENT if plan["data_kind"] == SCOPE else REAL_EVALUATION_STATEMENT
         ),
         "fingerprints": {
             "plan": plan["plan_id"],
@@ -2542,6 +2715,25 @@ def _isolation_evidence_summary(isolation: dict[str, Any]) -> dict[str, Any]:
         "verified": isolation.get("verified") is True,
         "memory_limit_enforced": isolation.get("memory_limit_enforced"),
         "failure_reason": isolation.get("failure_reason"),
+    }
+
+
+def _probe_container(executor: ContainerStrategyExecutor) -> dict[str, Any]:
+    """Verify the frozen runner with empty input before claiming the query."""
+    try:
+        probe = executor.run("def strategy(history, state): return None", {}, pd.DataFrame(), {})
+    except IsolationError as error:
+        return {
+            "verified": False,
+            "failure_reason": str(error),
+            "probe": error.evidence,
+        }
+    return {
+        "verified": True,
+        "memory_limit_enforced": probe.evidence["isolation_checks"]["memory_limited"],
+        "failure_reason": None,
+        "probe": probe.evidence,
+        "invocations": [],
     }
 
 
@@ -2666,6 +2858,7 @@ def run_evaluation(
     plan = _load_plan(eval_store, plan_id)
     label = "Validation" if stage == VALIDATION_STAGE else "Final Holdout"
     context = {
+        "scope": plan.get("scope"),
         "plan_id": plan.get("plan_id"),
         "stage": stage,
         "candidate_id": plan.get("candidate_id"),
@@ -2709,8 +2902,9 @@ def run_evaluation(
             "RESEARCH_WORKFLOW_REQUIRED", "Use the research workflow to execute this plan.",
             next_action="correct",
         )
-    if plan.get("scope") != SCOPE or plan.get("data_kind") != SCOPE:
-        reject("FINGERPRINT_MISMATCH", "The plan is not bound to synthetic data.")
+    data_kind = plan.get("data_kind")
+    if data_kind not in (SCOPE, "real") or plan.get("scope") != data_kind:
+        reject("FINGERPRINT_MISMATCH", "The frozen plan has an invalid data kind.")
     if plan.get("stages") != list(STAGES):
         reject("FINGERPRINT_MISMATCH", "The frozen plan does not fix both protected stages.")
     if plan.get("project_id") != project_id:
@@ -2732,7 +2926,10 @@ def run_evaluation(
             "FINGERPRINT_MISMATCH",
             "The frozen candidate differs from the plan's frozen candidate.",
         )
-    if plan.get("runtime") != _runtime_identity():
+    evaluation = candidate["evaluation"]
+    executor_config = evaluation.get("strategy_executor", {"kind": "none"})
+    runtime = runtime_identity(executor_config)
+    if plan.get("runtime") != runtime or evaluation.get("runtime") != runtime:
         reject(
             "FINGERPRINT_MISMATCH",
             "The trusted accounting engine differs from the plan's frozen runtime.",
@@ -2747,8 +2944,12 @@ def run_evaluation(
             "FINGERPRINT_MISMATCH",
             f"The frozen snapshot manifest could not be verified: {error}",
         )
-    if metadata.get("data_kind") != SCOPE:
-        reject("FINGERPRINT_MISMATCH", "The sealed snapshot is not synthetic.")
+    if (
+        metadata.get("data_kind") != data_kind
+        or snapshot.SCHEMA_VERSION.get(metadata.get("schema_version")) != data_kind
+        or evaluation.get("data_kind", SCOPE) != data_kind
+    ):
+        reject("FINGERPRINT_MISMATCH", "The frozen candidate and snapshot data kind must match.")
     for name in STAGES:
         if descriptors[name] != plan["partitions"][name]:
             reject(
@@ -2756,7 +2957,10 @@ def run_evaluation(
                 f"The sealed {name} descriptor differs from the frozen plan.",
             )
 
-    authorizations = _authorizations(eval_store, plan_id, stage)
+    try:
+        authorizations = _authorizations(eval_store, plan_id, stage)
+    except EvaluationRejection as error:
+        reject("AUTHORIZATION_REQUIRED", str(error), next_action="authorize")
     if len(authorizations) != 1 or not authorization_matches(
         authorizations[0], plan, stage
     ):
@@ -2790,6 +2994,7 @@ def run_evaluation(
             not isinstance(binding, dict)
             or binding.get("evaluation_id") != validation_evidence["evaluation_id"]
             or binding.get("record_hash") != validation_evidence["record_hash"]
+            or binding.get("export_hash") != validation_evidence["export_hash"]
         ):
             reject(
                 "AUTHORIZATION_REQUIRED",
@@ -2798,7 +3003,13 @@ def run_evaluation(
                 next_action="authorize",
             )
 
-    isolation = probe_isolation_evidence()
+    executor = None
+    if candidate["strategy"]["family"] == "python":
+        try:
+            executor = executor_from_config(executor_config)
+        except ValueError as error:
+            reject("ISOLATION_UNAVAILABLE", str(error), next_action="stop")
+    isolation = _probe_container(executor) if executor else probe_isolation_evidence()
     if isolation.get("verified") is not True:
         reject(
             "ISOLATION_UNAVAILABLE",
@@ -2827,7 +3038,9 @@ def run_evaluation(
             reject,
         )
 
-    claim = _claim_partition(eval_store, plan, stage, authorization)
+    claim = _claim_partition(eval_store, snapshot_store, plan, stage, authorization)
+    if claim["state"] == "source_missing":
+        reject("PROTECTED_SOURCE_MISSING", f"The sealed {label} payload is unavailable.")
     if claim["state"] == "consumed":
         reject(
             "QUERY_ALREADY_CONSUMED",
@@ -2870,7 +3083,7 @@ def run_evaluation(
 
     record, record_path, ledger_status = _score_claim(
         eval_store, snapshot_store, plan, stage, authorization, claim,
-        metadata, prior, prior_evidence, isolation,
+        metadata, prior, prior_evidence, isolation, executor,
     )
     evaluation_id = claim["evaluation_id"]
     receipt = _publish_receipt(project, plan, record["research_receipt"])
@@ -3048,23 +3261,14 @@ def _probe_research_isolation(
         return probe_isolation_evidence(), None
 
     executor = executor_from_config(candidate["evaluation"]["strategy_executor"])
-    probe = executor.run(
-        "def strategy(history, state): return None", {}, pd.DataFrame(), {},
-    )
-    return {
-        "verified": True,
-        "memory_limit_enforced": probe.evidence["isolation_checks"]["memory_limited"],
-        "failure_reason": None,
-        "probe": probe.evidence,
-        "invocations": [],
-    }, executor
+    return _probe_container(executor), executor
 
 
 def _research_run_context(
     snapshot_store: Path, plan: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any], ContainerStrategyExecutor | None]:
     evaluation = plan["candidate"]["evaluation"]
-    runtime = _runtime_identity(evaluation.get("strategy_executor"))
+    runtime = runtime_identity(evaluation.get("strategy_executor"))
     if runtime != plan["runtime"] or runtime != evaluation["runtime"]:
         raise _reject(
             "FINGERPRINT_MISMATCH", "run", "inspect",
@@ -3273,7 +3477,7 @@ def run_research_validation(
         metadata = snapshot.manifest(snapshot_store, subject["snapshot_id"])
         body = _build_plan(
             kickoff["project_id"], subject, metadata, kickoff["validation_settings"],
-            workflow=RESEARCH_VALIDATION,
+            snapshot_store=snapshot_store, workflow=RESEARCH_VALIDATION,
         )
         plan = _freeze_plan(eval_store, {
             **body,
@@ -3416,7 +3620,8 @@ def create_research_holdout_plan(
     evidence = selected_validation_evidence(eval_store, round_id, validation_evaluation_id, candidate)
     metadata = snapshot.manifest(Path(snapshot_store), candidate["snapshot_id"])
     body = _build_plan(
-        candidate["project_id"], candidate, metadata, evidence["plan"], workflow=RESEARCH_HOLDOUT,
+        candidate["project_id"], candidate, metadata, evidence["plan"],
+        snapshot_store=Path(snapshot_store), workflow=RESEARCH_HOLDOUT,
     )
     if body["partitions"] != evidence["plan"]["partitions"]:
         raise _reject(

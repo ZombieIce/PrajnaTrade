@@ -8,12 +8,12 @@ import pytest
 from cli_helpers import cli, ok, write_json
 from test_issue37_holdout_cli import _authorize, _calendar, _run, _selected_round
 from test_protected_eval_cli import seal_snapshot
-from test_real_snapshot import _real_input
+from test_real_snapshot import schema_v2_fixture
 
 
 @pytest.mark.isolation
 def test_schema_v2_reports_historical_scope_and_separate_automatic_admission(tmp_path: Path) -> None:
-    sealed = seal_snapshot(tmp_path, _real_input())
+    sealed = seal_snapshot(tmp_path, schema_v2_fixture())
     store = tmp_path / "operator"
     calendar_path = _calendar(tmp_path)
     calendar = json.loads(calendar_path.read_text())

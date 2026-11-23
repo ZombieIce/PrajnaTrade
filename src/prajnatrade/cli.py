@@ -193,7 +193,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         "--ledger", type=Path, help="Shadow Live ledger used to derive the pause point"
     )
     release_disposition.add_argument(
-        "--data", type=Path, help="synthetic Shadow Live feed used to derive the pause point"
+        "--data", type=Path, help="Shadow Live feed used to derive the pause point"
     )
     release_disposition.add_argument(
         "--effective-signal-date",
@@ -214,7 +214,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
 
     shadow_parser = commands.add_parser(
         "shadow",
-        help="account one synthetic Shadow Live trading day and audit the ledger",
+        help="account one Shadow Live trading day and audit the paper ledger",
     )
     shadow_commands = shadow_parser.add_subparsers(
         dest="shadow_command", required=True
@@ -262,7 +262,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     )
     shadow_compare.add_argument("--ledger", required=True, type=Path)
     shadow_compare.add_argument(
-        "--data", required=True, type=Path, help="synthetic Shadow Live feed calendar"
+        "--data", required=True, type=Path, help="Shadow Live feed calendar"
     )
     shadow_compare.add_argument(
         "--versions",

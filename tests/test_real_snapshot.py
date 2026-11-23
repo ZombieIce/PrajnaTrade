@@ -12,8 +12,8 @@ from datetime import date, timedelta, timezone
 from pathlib import Path
 
 import pytest
-
 from cli_helpers import cli
+
 from prajnatrade.data import ETF_SYMBOLS
 
 SYMBOLS = ETF_SYMBOLS
@@ -69,8 +69,8 @@ def _row_evidence(day: str) -> dict:
     }
 
 
-def _real_input() -> dict:
-    days = [_day(index) for index in range(SESSIONS)]
+def schema_v2_fixture(session_count: int = SESSIONS) -> dict:
+    days = [_day(index) for index in range(session_count)]
     sources = {
         name: {
             "source": f"synthetic-real-{name}",
@@ -185,7 +185,7 @@ def _snapshot_command(
 def test_real_snapshot_seals_schema_v2_manifest_and_reads_data_kind(
     tmp_path: Path,
 ) -> None:
-    payload = _real_input()
+    payload = schema_v2_fixture()
     receipt = _snapshot_command(tmp_path, "seal", payload=payload)
     assert receipt == {
         "schema_version": 2,
@@ -273,7 +273,7 @@ def test_real_baseline_reports_data_kind_and_fills_at_per_field_open(
 ) -> None:
     # Every row's single available_at is the 15:05 close publication; the fill
     # must come from open_available_at (09:30), which is the authoritative field.
-    result = _run_baseline(tmp_path, _real_input(), "real-fill")
+    result = _run_baseline(tmp_path, schema_v2_fixture(), "real-fill")
     assert result["data_kind"] == "real"
     assert result["signals"][0]["date"] == _day(0)
     assert result["signals"][0]["execution_date"] == _day(1)
@@ -290,7 +290,7 @@ def test_real_baseline_reports_data_kind_and_fills_at_per_field_open(
     assert {fill["raw_open"] for fill in result["fills"]} == {10.0}
 
 
-def _raw_row(payload: dict, day: str, symbol: str) -> dict:
+def raw_row(payload: dict, day: str, symbol: str) -> dict:
     return next(
         row
         for row in payload["raw_bars"]
@@ -298,7 +298,7 @@ def _raw_row(payload: dict, day: str, symbol: str) -> dict:
     )
 
 
-def _make_partial_halt(row: dict, day: str) -> None:
+def make_partial_halt(row: dict, day: str) -> None:
     row.update(
         trading_status="partial_halt",
         open=None,
@@ -314,8 +314,8 @@ def _make_partial_halt(row: dict, day: str) -> None:
 def test_real_baseline_partial_halt_blocks_the_attempt_without_deferral(
     tmp_path: Path,
 ) -> None:
-    payload = _real_input()
-    _make_partial_halt(_raw_row(payload, _day(1), SYMBOLS[0]), _day(1))
+    payload = schema_v2_fixture()
+    make_partial_halt(raw_row(payload, _day(1), SYMBOLS[0]), _day(1))
 
     result = _run_baseline(tmp_path, payload, "real-partial-open")
 
@@ -337,9 +337,9 @@ def test_real_baseline_partial_halt_blocks_the_attempt_without_deferral(
 def test_real_baseline_open_after_0930_blocks_fill_despite_early_available_at(
     tmp_path: Path,
 ) -> None:
-    payload = _real_input()
+    payload = schema_v2_fixture()
     day = _day(1)
-    row = _raw_row(payload, day, SYMBOLS[1])
+    row = raw_row(payload, day, SYMBOLS[1])
     row["available_at"] = _at(day, 9, 30)
     row["open_available_at"] = _at(day, 9, 31)
 
@@ -353,7 +353,7 @@ def test_real_baseline_open_after_0930_blocks_fill_despite_early_available_at(
 def test_real_baseline_marks_partial_halt_held_day_at_its_confirmed_close(
     tmp_path: Path,
 ) -> None:
-    result = _run_baseline(tmp_path, _real_input(), "real-partial-close")
+    result = _run_baseline(tmp_path, schema_v2_fixture(), "real-partial-close")
     day = _day(HALT_INDEX)
     point = next(row for row in result["equity_curve"] if row["date"] == day)
     assert point["holdings"][SYMBOLS[-1]]["close"] == 10.4
@@ -374,7 +374,7 @@ def test_real_baseline_marks_partial_halt_held_day_at_its_confirmed_close(
 
 
 def test_real_campaign_copies_only_discovery_and_uses_field_availability(tmp_path: Path) -> None:
-    payload = _real_input()
+    payload = schema_v2_fixture()
     payload["raw_bars"][0]["availability_evidence"] = "fixture:收盘行情"
     sealed = _snapshot_command(tmp_path, "seal", payload=payload)
     snapshot_id = sealed["snapshot_id"]
@@ -420,7 +420,7 @@ def test_real_campaign_copies_only_discovery_and_uses_field_availability(tmp_pat
 def test_real_baseline_suspended_held_day_is_an_unknown_nav_gap(
     tmp_path: Path,
 ) -> None:
-    result = _run_baseline(tmp_path, _real_input(), "real-suspended")
+    result = _run_baseline(tmp_path, schema_v2_fixture(), "real-suspended")
     day = _day(SUSPENDED_INDEX)
     point = next(row for row in result["equity_curve"] if row["date"] == day)
     assert point["nav"] is None
@@ -455,9 +455,9 @@ def test_real_baseline_suspended_held_day_is_an_unknown_nav_gap(
 
 
 def test_real_baseline_close_availability_controls_nav(tmp_path: Path) -> None:
-    payload = _real_input()
+    payload = schema_v2_fixture()
     day = _day(3)
-    row = _raw_row(payload, day, SYMBOLS[0])
+    row = raw_row(payload, day, SYMBOLS[0])
     row["close_available_at"] = _at(_day(4), 0, 1)
 
     result = _run_baseline(tmp_path, payload, "real-late-close")
@@ -519,31 +519,31 @@ def _naive_evidence_available_at(payload: dict) -> None:
 
 
 def _missing_open_available_at(payload: dict) -> None:
-    del _raw_row(payload, _day(0), SYMBOLS[0])["open_available_at"]
+    del raw_row(payload, _day(0), SYMBOLS[0])["open_available_at"]
 
 
 def _missing_close_available_at(payload: dict) -> None:
-    del _raw_row(payload, _day(0), SYMBOLS[0])["close_available_at"]
+    del raw_row(payload, _day(0), SYMBOLS[0])["close_available_at"]
 
 
 def _naive_open_available_at(payload: dict) -> None:
-    _raw_row(payload, _day(0), SYMBOLS[0])["open_available_at"] = "2024-01-02T09:30:00"
+    raw_row(payload, _day(0), SYMBOLS[0])["open_available_at"] = "2024-01-02T09:30:00"
 
 
 def _trading_null_open(payload: dict) -> None:
-    _raw_row(payload, _day(0), SYMBOLS[0])["open"] = None
+    raw_row(payload, _day(0), SYMBOLS[0])["open"] = None
 
 
 def _partial_halt_with_open(payload: dict) -> None:
-    _raw_row(payload, _day(HALT_INDEX), SYMBOLS[-1])["open"] = 10.0
+    raw_row(payload, _day(HALT_INDEX), SYMBOLS[-1])["open"] = 10.0
 
 
 def _partial_halt_without_halt(payload: dict) -> None:
-    del _raw_row(payload, _day(HALT_INDEX), SYMBOLS[-1])["halt"]
+    del raw_row(payload, _day(HALT_INDEX), SYMBOLS[-1])["halt"]
 
 
 def _suspended_with_price(payload: dict) -> None:
-    _raw_row(payload, _day(SUSPENDED_INDEX), SYMBOLS[-1])["close"] = 10.0
+    raw_row(payload, _day(SUSPENDED_INDEX), SYMBOLS[-1])["close"] = 10.0
 
 
 def _action_null_terms(payload: dict) -> None:
@@ -617,7 +617,7 @@ def _derived_present_on_suspension(payload: dict) -> None:
 def test_real_snapshot_rejects_incomplete_or_inconsistent_inputs(
     tmp_path: Path, mutate, message: str
 ) -> None:
-    payload = _real_input()
+    payload = schema_v2_fixture()
     mutate(payload)
     result = _seal_result(tmp_path, payload)
     assert result.returncode != 0
@@ -628,7 +628,7 @@ def test_real_snapshot_rejects_incomplete_or_inconsistent_inputs(
 def test_real_snapshot_preserves_verified_action_terms_and_record_date(
     tmp_path: Path,
 ) -> None:
-    payload = _real_input()
+    payload = schema_v2_fixture()
     action = _real_cash_dividend()
     payload["corporate_actions"] = [action]
 
@@ -663,21 +663,21 @@ def _as_synthetic(payload: dict) -> dict:
 def test_schema_version_and_data_kind_must_pair_without_fallback(
     tmp_path: Path,
 ) -> None:
-    real_as_synthetic = _real_input()
+    real_as_synthetic = schema_v2_fixture()
     real_as_synthetic["schema_version"] = 1
     real_as_synthetic["data_kind"] = "synthetic"
     result = _seal_result(tmp_path, real_as_synthetic, store_name="real-as-synthetic")
     assert result.returncode != 0 and not result.stdout
     assert "trading_status" in result.stderr
 
-    synthetic_as_real = _as_synthetic(_real_input())
+    synthetic_as_real = _as_synthetic(schema_v2_fixture())
     synthetic_as_real["schema_version"] = 2
     synthetic_as_real["data_kind"] = "real"
     result = _seal_result(tmp_path, synthetic_as_real, store_name="synthetic-as-real")
     assert result.returncode != 0 and not result.stdout
     assert "evidence" in result.stderr
 
-    mismatch = _real_input()
+    mismatch = schema_v2_fixture()
     mismatch["schema_version"] = 1
     result = _seal_result(tmp_path, mismatch, store_name="mismatched-version")
     assert result.returncode != 0 and not result.stdout
@@ -685,7 +685,7 @@ def test_schema_version_and_data_kind_must_pair_without_fallback(
 
 
 def test_tampered_real_discovery_payload_is_rejected(tmp_path: Path) -> None:
-    payload = _real_input()
+    payload = schema_v2_fixture()
     receipt = _snapshot_command(tmp_path, "seal", payload=payload)
     directory = tmp_path / "store" / receipt["snapshot_id"]
     directory.chmod(0o755)
@@ -711,9 +711,9 @@ def test_tampered_real_discovery_payload_is_rejected(tmp_path: Path) -> None:
 
 
 def test_real_unknown_status_is_a_gap_and_never_fills(tmp_path: Path) -> None:
-    payload = _real_input()
+    payload = schema_v2_fixture()
     day = _day(1)
-    row = _raw_row(payload, day, SYMBOLS[2])
+    row = raw_row(payload, day, SYMBOLS[2])
     row.update(
         trading_status="unknown",
         open=None,
@@ -767,7 +767,7 @@ def test_real_unknown_status_is_a_gap_and_never_fills(tmp_path: Path) -> None:
 def test_synthetic_v1_manifest_stays_synthetic_and_unversioned(
     tmp_path: Path,
 ) -> None:
-    payload = _as_synthetic(_real_input())
+    payload = _as_synthetic(schema_v2_fixture())
     receipt = _snapshot_command(
         tmp_path, "seal", payload=payload, store_name="synthetic-store"
     )
@@ -805,10 +805,10 @@ def test_real_partial_halt_final_session_stays_in_range_and_marks_nav(
     # 2026-11-20 ends the real window with 513300 and 159612 partial halts; a
     # confirmed close must keep the session in the common range without making
     # its missing 09:30 open executable.
-    payload = _real_input()
+    payload = schema_v2_fixture()
     last = _day(SESSIONS - 1)
     for symbol in (SYMBOLS[-1], SYMBOLS[3]):
-        _make_partial_halt(_raw_row(payload, last, symbol), last)
+        make_partial_halt(raw_row(payload, last, symbol), last)
 
     result = _run_baseline(tmp_path, payload, "real-final-halt")
     manifest = _snapshot_command(

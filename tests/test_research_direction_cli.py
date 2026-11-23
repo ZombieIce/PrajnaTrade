@@ -102,11 +102,11 @@ def test_proposal_recovers_discovery_inputs_without_freezing_a_candidate(tmp_pat
     ).returncode != 0
 
 
-def create_round(tmp_path: Path, policy: dict) -> tuple[Path, Path, dict, dict, dict]:
+def create_round(tmp_path: Path, policy: dict, *, snapshot_input: dict | None = None) -> tuple[Path, Path, dict, dict, dict]:
     project = tmp_path / "project"
     trusted = tmp_path / "trusted"
     ok(cli("project", "init", "--project", str(project)))
-    snapshot = seal_snapshot(tmp_path, synthetic_snapshot())
+    snapshot = seal_snapshot(tmp_path, synthetic_snapshot() if snapshot_input is None else snapshot_input)
     campaign = create_campaign(project, snapshot["store"], snapshot["snapshot_id"])
     kickoff = approve_round(project, trusted, campaign, write_json(tmp_path / "kickoff.json", policy))
     return project, trusted, snapshot, campaign, kickoff

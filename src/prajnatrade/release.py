@@ -91,6 +91,11 @@ ADMISSION_STATEMENT = (
     "tracking. Enablement is a separate operator lifecycle event registered at "
     "a pre-registered after-close signal date."
 )
+REAL_ADMISSION_STATEMENT = (
+    "This artifact records the human admission decision for this frozen candidate "
+    "and both verified protected stages. Enablement is a separate operator "
+    "lifecycle event at a pre-registered after-close signal date."
+)
 
 CONDITIONAL_ADMISSION_STATEMENT = (
     "The reviewer authorized this frozen candidate and its scheduled Shadow Live "
@@ -256,6 +261,11 @@ def _load_verified_artifact(path: Path, release_id: str) -> dict[str, Any]:
             "inspect",
             "The release artifact uses an unsupported release version.",
         )
+    if artifact.get("scope") not in shadow_calendar.DATA_KINDS:
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED", "fetch", "inspect",
+            "The release artifact has an unsupported data scope.",
+        )
     if (
         _release_id(artifact.get("candidate_hash"), artifact.get("plan_id"))
         != release_id
@@ -268,13 +278,6 @@ def _load_verified_artifact(path: Path, release_id: str) -> dict[str, Any]:
             "and plan.",
         )
     scope = artifact.get("scope")
-    if scope not in shadow_calendar.DATA_KINDS or (
-        scope != SCOPE and artifact.get("workflow") != RESEARCH_HOLDOUT
-    ):
-        raise _reject(
-            "RELEASE_INTEGRITY_FAILED", "fetch", "inspect",
-            "The stored release uses a data scope unsupported by its admission rules.",
-        )
     if artifact.get("workflow") == RESEARCH_HOLDOUT:
         terms = artifact.get("admission")
         try:
@@ -421,7 +424,7 @@ def _rejection_response(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "rejection_recorded",
-        "scope": SCOPE,
+        "scope": record["scope"],
         "release_id": record["release_id"],
         "release_version": record["release_version"],
         "candidate_id": record.get("candidate_id"),
@@ -499,6 +502,7 @@ def reject(
             command="release reject",
         )
     context = {
+        "scope": plan["scope"],
         "plan_id": plan["plan_id"],
         "release_id": release_id,
         "candidate_id": plan.get("candidate_id"),
@@ -530,7 +534,7 @@ def reject(
     body = {
         "schema_version": SCHEMA_VERSION,
         "kind": REJECTION_KIND,
-        "scope": SCOPE,
+        "scope": plan["scope"],
         "release_version": RELEASE_VERSION,
         "release_id": release_id,
         "decision": "rejected",
@@ -874,9 +878,8 @@ def _stage_evidence(
 def _approval_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
     """Verify the complete trusted evidence a human approval must rest on."""
     research = plan.get("workflow") == RESEARCH_HOLDOUT
-    scope = plan.get("scope")
-    allowed_scopes = shadow_calendar.DATA_KINDS if research else (SCOPE,)
-    if scope not in allowed_scopes or plan.get("data_kind") != scope:
+    data_kind = plan.get("data_kind")
+    if data_kind not in shadow_calendar.DATA_KINDS or plan.get("scope") != data_kind:
         raise _reject(
             "EVIDENCE_INVALID",
             "approval",
@@ -911,6 +914,7 @@ def _approval_evidence(store: Path, plan: dict[str, Any]) -> dict[str, Any]:
         candidate.get("snapshot_id") != plan.get("snapshot_id")
         or not isinstance(evaluation, dict)
         or evaluation.get("snapshot_id") != plan.get("snapshot_id")
+        or evaluation.get("data_kind", SCOPE) != data_kind
     ):
         raise _reject(
             "EVIDENCE_INVALID",
@@ -1122,7 +1126,7 @@ def _artifact(
         "approval": approval,
         "admission": {
             "decision": "approved",
-            "statement": ADMISSION_STATEMENT,
+            "statement": ADMISSION_STATEMENT if plan["scope"] == SCOPE else REAL_ADMISSION_STATEMENT,
             "automatic_enable": False,
             "enablement": (
                 "a separate operator lifecycle event registered at a "
@@ -1292,6 +1296,7 @@ def approve(
             "The frozen plan does not carry a usable candidate fingerprint.",
         )
     context = {
+        "scope": plan["scope"],
         "plan_id": plan["plan_id"],
         "release_id": release_id,
         "candidate_id": plan.get("candidate_id"),
@@ -1865,6 +1870,7 @@ def _bound_plan(store: Path, artifact: dict[str, Any]) -> dict[str, Any]:
         plan.get("candidate_hash") != artifact.get("candidate_hash")
         or plan.get("snapshot_id") != artifact.get("snapshot_id")
         or plan.get("partitions") != artifact.get("partition_fingerprints")
+        or plan.get("scope") != artifact.get("scope")
     ):
         raise _reject(
             "RELEASE_INTEGRITY_FAILED",
@@ -2145,6 +2151,7 @@ def disposition(
         ) from error
     context = {
         **context,
+        "scope": artifact["scope"],
         "candidate_id": artifact.get("candidate_id"),
         "candidate_hash": artifact.get("candidate_hash"),
         "plan_id": artifact.get("plan_id"),
@@ -2569,6 +2576,7 @@ def _append_event(
         state_before: str | None = state,
     ) -> None:
         context = {
+            "scope": artifact["scope"],
             "release_id": release_id,
             "action": action,
             "effective_signal_date": effective_signal_date,
@@ -2754,7 +2762,7 @@ def _rejection_status(
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
         "kind": REJECTION_STATUS_KIND,
-        "scope": SCOPE,
+        "scope": rejection["scope"],
         "release_id": rejection["release_id"],
         "release_version": rejection.get("release_version"),
         "artifact_hash": None,

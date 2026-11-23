@@ -17,10 +17,11 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-
 from cli_helpers import cli, cli_env, ok, write_json
 from test_protected_eval_cli import (
     SYMBOLS,
@@ -32,6 +33,7 @@ from test_protected_eval_cli import (
     submit_experiment,
     synthetic_snapshot,
 )
+from test_real_snapshot import schema_v2_fixture
 
 pytestmark = pytest.mark.isolation
 
@@ -230,6 +232,7 @@ def shadow_update(
     release_ids: tuple[str, ...] = (),
     env: dict[str, str] | None = None,
     corrections_store: Path | None = None,
+    at_close: bool = False,
 ):
     arguments = [
         "shadow", "update",
@@ -243,6 +246,21 @@ def shadow_update(
     ]
     for release_id in release_ids:
         arguments += ["--release-id", release_id]
+    if at_close:
+        # Set the process clock after the fixture close and before its next open.
+        command = """from datetime import datetime
+from unittest.mock import patch
+import sys
+from prajnatrade.cli import main
+instant = datetime.fromisoformat(sys.argv.pop(1) + 'T16:00:00+08:00')
+with patch('prajnatrade.shadow.datetime', wraps=datetime) as clock:
+    clock.now.side_effect = lambda tz=None: instant.astimezone(tz)
+    raise SystemExit(main())
+"""
+        return subprocess.run(
+            [sys.executable, "-c", command, date, *arguments], capture_output=True,
+            text=True, env=env or cli_env(), timeout=60, check=False,
+        )
     return cli(*arguments, env=env)
 
 
@@ -383,6 +401,95 @@ def shadow_feed(
         "derived": derived_rows,
         "corporate_actions": action_rows,
     }
+
+
+def schema_v2_shadow_feed(sessions: list[str]) -> dict:
+    """Generated prices and evidence in the schema-v2 forward-feed format."""
+    feed = shadow_feed(sessions)
+    feed.update(schema_version=2, data_kind="real", raw_price_basis="unadjusted")
+    for row in feed["raw_bars"]:
+        session = row["date"]
+        row.update(
+            available_at=f"{session}T15:00:00+08:00",
+            open_available_at=f"{session}T09:30:00+08:00",
+            close_available_at=f"{session}T15:00:00+08:00",
+        )
+    return feed
+
+
+def test_schema_v2_paper_orders_wait_for_open_evidence_and_compare_two_releases(
+    tmp_path: Path,
+) -> None:
+    first = build_release(
+        tmp_path / "first", schema_v2_fixture(), "equal", "equal_weight", {},
+    )
+    second = build_release(
+        tmp_path / "second", schema_v2_fixture(session_count=25), "momentum",
+        "momentum", {"lookback": 2},
+    )
+    first_id, second_id = first["release_id"], second["release_id"]
+    store = isolated_store(tmp_path, first, second)
+    ledger = tmp_path / "ledger"
+    sessions = FUTURE[:2]
+    for release_id in (first_id, second_id):
+        ok(lifecycle("enable", store, release_id, sessions[0]))
+    legacy_feed = write_feed(tmp_path / "legacy.json", shadow_feed(sessions))
+    wrong_scope = shadow_update(ledger, store, legacy_feed, sessions[0])
+    assert wrong_scope.returncode != 0
+    assert {entry["reason_code"] for entry in json.loads(wrong_scope.stdout)["versions"]} == {
+        "FEED_SCOPE_MISMATCH"
+    }
+    assert ledger_rows(ledger, "days") == []
+
+    payload = schema_v2_shadow_feed(sessions)
+    path = write_feed(tmp_path / "generated-v2.json", payload)
+    ok(shadow_update(ledger, store, path, sessions[0], at_close=True))
+    pending_open = next(
+        row for row in payload["raw_bars"]
+        if row["date"] == sessions[1] and row["symbol"] == DIVIDEND_SYMBOL
+    )
+    pending_open.update(open=None, open_available_at=None)
+    write_feed(path, payload)
+    blocked = shadow_update(ledger, store, path, sessions[1], at_close=True)
+    assert blocked.returncode != 0
+    versions = {entry["release_id"]: entry for entry in json.loads(blocked.stdout)["versions"]}
+    assert versions[first_id]["reason_code"] == "open_evidence_missing"
+    assert versions[second_id]["committed_date"] == sessions[1]
+    assert len(ledger_rows(ledger, "days")) == len(ledger_rows(ledger, "input_snapshots")) == 3
+
+    pending_open.update(
+        trading_status="partial_halt",
+        open_available_at=f"{sessions[1]}T09:30:00+08:00",
+        halt={
+            "start": f"{sessions[1]}T09:30:00+08:00",
+            "end": f"{sessions[1]}T10:30:00+08:00",
+        },
+    )
+    write_feed(path, payload)
+    retried = ok(shadow_update(ledger, store, path, sessions[1], at_close=True))
+    versions = {entry["release_id"]: entry for entry in retried["versions"]}
+    assert versions[first_id]["status"] == "committed_with_anomalies"
+    assert versions[second_id]["status"] == "already_committed"
+    assert versions[first_id]["unfilled_orders"][0]["symbol"] == DIVIDEND_SYMBOL
+    assert versions[first_id]["unfilled_orders"][0]["status"] == "missing_open"
+    report_path = tmp_path / "ledger-report.json"
+    assert ok(shadow_report(ledger, first_id, report_path))["scope"] == "real"
+    day = json.loads(report_path.read_text())["days"][1]["result"]
+    assert len(day["fills"]) == len(SYMBOLS) - 1
+    assert {order["status"] for order in day["orders"]} == {"filled", "missing_open"}
+    assert len({order["order_id"] for order in day["orders"]}) == len(SYMBOLS)
+    assert all(order["persisted_before_deadline"] for order in day["orders"])
+    assert day["positions"][DIVIDEND_SYMBOL]["close"] == 10
+
+    compare_args = ("--ledger", str(ledger), "--versions", f"{first_id},{second_id}")
+    comparison = ok(cli("shadow", "compare", *compare_args, "--data", str(path)))
+    assert comparison["comparable"]
+    assert comparison["common_interval"] == {
+        "start": sessions[0], "end": sessions[1], "sessions": 2,
+    }
+    rejected = cli("shadow", "compare", *compare_args, "--data", str(legacy_feed))
+    assert rejected.returncode != 0
+    assert json.loads(rejected.stdout)["error"]["code"] == "FEED_SCOPE_MISMATCH"
 
 
 def execution(entry: dict) -> dict:

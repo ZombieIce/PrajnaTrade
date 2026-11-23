@@ -7,12 +7,18 @@ import pytest
 from cli_helpers import agent_cli, ok, rejected, write_json
 from test_issue37_holdout_cli import _authorize, _calendar
 from test_protected_eval_cli import submit_experiment
+from test_real_snapshot import schema_v2_fixture
 from test_research_direction_cli import create_round, kickoff_input, propose, run_validation
 
 
 @pytest.mark.isolation
-def test_holdout_rejects_a_when_the_research_round_selected_b(tmp_path: Path) -> None:
-    project, store, sealed, campaign, approved = create_round(tmp_path, kickoff_input())
+@pytest.mark.parametrize("data_kind", ["synthetic", "real"])
+def test_holdout_rejects_a_when_the_research_round_selected_b(tmp_path: Path, data_kind: str) -> None:
+    payload = schema_v2_fixture(18) if data_kind == "real" else None
+    policy = kickoff_input()
+    if data_kind == "real":
+        policy["validation_settings"]["allow_discovery_halt_warmup"] = True
+    project, store, sealed, campaign, approved = create_round(tmp_path, policy, snapshot_input=payload)
     round_id = approved["round_id"]
     first = submit_experiment(
         project, campaign["campaign_id"], tmp_path / "a.json", "a",
@@ -30,6 +36,9 @@ def test_holdout_rejects_a_when_the_research_round_selected_b(tmp_path: Path) ->
         "related_experiment_ids": [],
     }), first)
     checked_a = run_validation(project, store, sealed, a)
+    replay = run_validation(project, store, sealed, a)
+    assert replay["evaluation_id"] == checked_a["evaluation_id"]
+    assert replay["budget"]["used"] == 1
     b = propose(project, round_id, write_json(tmp_path / "proposal-b.json", {
         "change": "Concentrate on the strongest recent symbol.",
         "question": "Can concentration improve return enough to justify the simpler allocation?",
@@ -52,7 +61,7 @@ def test_holdout_rejects_a_when_the_research_round_selected_b(tmp_path: Path) ->
     ))
     assert frozen["research_selection"]["summary"]["versions_attempted"] == 2
     selection = {"project": project, "round_id": round_id, "evaluation_id": checked_b["evaluation_id"]}
-    calendar = _calendar(tmp_path)
+    calendar = _calendar(tmp_path, data_kind)
     refused = rejected(_authorize(
         store, sealed, selection, calendar, evaluation_id=checked_a["evaluation_id"],
     ), "VALIDATION_SELECTION_MISMATCH")

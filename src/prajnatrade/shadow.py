@@ -1636,7 +1636,7 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
             evaluation = artifact["candidate"]["evaluation"]
             config = evaluation["strategy_executor"]
             if (
-                artifact.get("workflow") != release.RESEARCH_HOLDOUT
+                (artifact.get("workflow") != release.RESEARCH_HOLDOUT and artifact["scope"] != "real")
                 or runtime_identity(config) != evaluation["runtime"]
             ):
                 raise ValueError("The frozen Python execution runtime is unavailable.")

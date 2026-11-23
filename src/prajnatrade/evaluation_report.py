@@ -142,10 +142,11 @@ def _threshold_rows(
         else:
             rows.append(
                 {
-                    "id": entry["id"],
-                    "metric": entry["metric"],
-                    "op": entry["op"],
-                    "value": entry["value"],
+                    **entry,
+                    **(
+                        {"benchmark_value": item.get("benchmark_value"), "expected": item.get("expected")}
+                        if "benchmark_multiplier" in entry else {}
+                    ),
                     "actual": item.get("actual"),
                     "status": item.get("status"),
                     "message": item.get("message"),
@@ -595,9 +596,17 @@ def _coverage_section(stage: str, section: dict[str, Any]) -> str:
                 ("Minimum samples", coverage.get("minimum_samples")),
                 ("Samples sufficient", coverage.get("samples_sufficient")),
                 ("Coverage complete", coverage.get("complete")),
+                *(
+                    [("Cash-only Discovery warm-up dates", coverage["discovery_warmup_sessions"])]
+                    if "discovery_warmup_sessions" in coverage else []
+                ),
                 ("Candidate signals", coverage.get("candidate_signals")),
                 ("Baseline signals", coverage.get("baseline_signals")),
                 ("Snapshot raw-bar gaps", snapshot_gaps.get("raw_bars")),
+                *(
+                    [("Documented halts at the open", coverage["evidenced_open_halts"])]
+                    if "evidenced_open_halts" in coverage else []
+                ),
                 ("Snapshot derived gaps", snapshot_gaps.get("derived")),
                 ("Snapshot corporate-action gaps", snapshot_gaps.get("corporate_actions")),
                 ("Snapshot availability gaps", snapshot_gaps.get("availability")),
@@ -612,18 +621,23 @@ def _coverage_section(stage: str, section: dict[str, Any]) -> str:
 
 
 def _threshold_section(stage: str, section: dict[str, Any]) -> str:
-    rows = [
-        [
+    rows = []
+    for item in section.get("thresholds") or []:
+        threshold = item.get("value")
+        if "benchmark_multiplier" in item:
+            threshold = (
+                f"{item['benchmark_multiplier']} × baseline ({_format(item.get('benchmark_value'))})"
+                f" + {threshold} = {_format(item.get('expected'))}"
+            )
+        rows.append([
             item.get("id"),
             item.get("metric"),
             item.get("op"),
-            item.get("value"),
+            threshold,
             item.get("actual"),
             item.get("status"),
             item.get("message"),
-        ]
-        for item in section.get("thresholds") or []
-    ]
+        ])
     heading = f"<h3>Thresholds — {_esc(STAGE_LABELS[stage])}</h3>"
     if not rows:
         return heading + '<p class="muted">No preregistered threshold verdicts are stored.</p>'

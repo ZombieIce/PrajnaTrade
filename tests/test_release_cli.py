@@ -18,9 +18,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-
 from cli_helpers import cli, cli_env, ok, rejected, write_json
-from prajnatrade import release
 from test_protected_eval_cli import (
     SYMBOLS,
     authorize,
@@ -33,6 +31,9 @@ from test_protected_eval_cli import (
     submit_experiment,
     synthetic_snapshot,
 )
+from test_real_snapshot import schema_v2_fixture
+
+from prajnatrade import release
 
 pytestmark = pytest.mark.isolation
 
@@ -586,6 +587,42 @@ def test_explicit_rejection_is_immutable_auditable_and_blocks_approval(
 # ---------------------------------------------------------------------------
 # 2. A fully passed candidate produces one immutable, idempotent release.
 # ---------------------------------------------------------------------------
+
+
+def test_schema_v2_release_requires_two_passed_records_and_explicit_enable(tmp_path: Path) -> None:
+    # A real-format fixture with generated prices and evidence.
+    base = build_scenario(tmp_path, schema_v2_fixture(), "v2-release")
+    store = eval_store(base, "v2-release")
+    plan_id = create_plan(base, store, base["candidate"], plan_input(), name="v2-release")["plan_id"]
+    rejected(approve(store, plan_id), "EVIDENCE_MISSING")
+    ok(authorize(store, plan_id))
+    validation = ok(run_evaluation(base, store, plan_id))
+    assert validation["outcome"] == "passed"
+    rejected(approve(store, plan_id), "EVIDENCE_MISSING")
+    ok(authorize_holdout(store, plan_id))
+    holdout = ok(run_evaluation(base, store, plan_id, stage="final_holdout"))
+    assert holdout["outcome"] == "passed"
+    granted = ok(approve(store, plan_id))
+    release_id = granted["release_id"]
+    artifact = granted["artifact"]
+    assert granted["scope"] == artifact["scope"] == "real"
+    assert artifact["evaluations"]["validation"]["record_hash"] == validation["record"]["record_hash"]
+    assert artifact["evaluations"]["final_holdout"]["record_hash"] == holdout["record"]["record_hash"]
+    repeated = ok(approve(store, plan_id, reviewer="second-reviewer"))
+    assert repeated["release_id"] == release_id and repeated["reused"] is True
+    assert repeated["artifact"] == artifact
+    assert ok(fetch(store, release_id))["scope"] == "real"
+
+    before = ok(cli("release", "status", "--store", str(store), "--release-id", release_id))
+    assert before["scope"] == "real" and before["state"] == "published"
+    assert before["timeline"] == []
+    enabled = ok(cli(
+        "release", "enable", "--store", str(store), "--release-id", release_id,
+        "--effective-signal-date", "2030-01-02", "--reason", "Schema-v2 replay test.",
+    ))
+    assert enabled["event"]["scope"] == "real"
+    active = ok(cli("release", "status", "--store", str(store), "--release-id", release_id))
+    assert active["state"] == "enabled" and active["artifact_hash"] == artifact["artifact_hash"]
 
 
 def test_approval_creates_one_immutable_artifact_and_replays_idempotently(

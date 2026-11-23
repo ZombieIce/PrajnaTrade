@@ -15,14 +15,15 @@ import json
 import re
 import sqlite3
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
-
 from cli_helpers import cli, cli_env, ok, rejected, write_json
+from test_real_snapshot import make_partial_halt, raw_row, schema_v2_fixture
 
 pytestmark = pytest.mark.isolation
 
@@ -169,7 +170,9 @@ def seal_snapshot(root: Path, payload: dict, name: str = "snapshots") -> dict:
     }
 
 
-def create_campaign(project: Path, snapshot_store: Path, snapshot_id: str) -> dict:
+def create_campaign(
+    project: Path, snapshot_store: Path, snapshot_id: str, *executor_args: str,
+) -> dict:
     return ok(
         cli(
             "campaign",
@@ -190,6 +193,7 @@ def create_campaign(project: Path, snapshot_store: Path, snapshot_id: str) -> di
             "5",
             "--slippage-bps",
             "0",
+            *executor_args,
         )
     )
 
@@ -1042,8 +1046,11 @@ def test_repackaged_snapshot_with_the_same_protected_content_cannot_buy_another_
     assert len(list((store / "records").glob("*/record.json"))) == 1
 
 
-def build_scenario(root: Path, payload: dict, name: str) -> dict:
-    """Seal an alternative synthetic snapshot and freeze an equal-weight candidate."""
+def build_scenario(
+    root: Path, payload: dict, name: str, *,
+    family: str = "equal_weight", parameters: dict | None = None,
+) -> dict:
+    """Seal an alternative synthetic snapshot and freeze a candidate."""
     root.mkdir(parents=True, exist_ok=True)
     sealed = seal_snapshot(root, payload, f"snapshots-{name}")
     project = root / f"project-{name}"
@@ -1055,9 +1062,9 @@ def build_scenario(root: Path, payload: dict, name: str) -> dict:
         campaign["campaign_id"],
         source,
         "first",
-        "Equal weights preserve value across a cash dividend.",
-        "equal_weight",
-        {},
+        "Exercise the frozen strategy against a protected-evidence scenario.",
+        family,
+        parameters or {},
     )
     candidate = freeze_candidate(
         project,
@@ -1201,6 +1208,198 @@ def test_abort_after_protected_read_keeps_the_debit_and_never_retries(base: dict
     assert second["outcome"] == "insufficient_evidence"
     assert len(consumed_rows(store)) == 1
     assert len(evaluation_rows(store)) == 1
+
+
+def test_schema_v2_validation_checks_authorization_and_commits_before_first_read(
+    tmp_path: Path,
+) -> None:
+    # Generated prices and evidence in the schema-v2 format. No market data.
+    base = build_scenario(tmp_path, schema_v2_fixture(), "schema-v2")
+    store = eval_store(base, "schema-v2")
+    plan = create_plan(base, store, base["candidate"], plan_input(), name="schema-v2-plan")
+    different_plan = create_plan(
+        base, store, base["candidate"], plan_input(reason="different plan"),
+        name="schema-v2-other-plan",
+    )
+    assert plan["data_kind"] == plan["scope"] == "real"
+    assert plan["stages"] == ["validation", "final_holdout"]
+    grant = ok(authorize(store, different_plan["plan_id"]))["authorization"]
+    wrong_dir = store / "authorizations" / plan["plan_id"]
+    wrong_dir.mkdir()
+    wrong_grant = write_json(wrong_dir / f"validation-{grant['auth_id']}.json", grant)
+    denial = rejected(run_evaluation(base, store, plan["plan_id"]), "AUTHORIZATION_REQUIRED")
+    assert denial["opened_protected_source"] is denial["query_debited"] is False
+    assert consumed_rows(store) == evaluation_rows(store) == []
+    wrong_grant.unlink()
+    grant = ok(authorize(store, plan["plan_id"]))["authorization"]
+
+    sealed = base["snapshot_store"] / base["snapshot_id"]
+    protected = sealed / "validation.json"
+    hidden = sealed / "temporarily-unavailable.json"
+    sealed.chmod(0o755)
+    protected.rename(hidden)
+    denial = rejected(run_evaluation(base, store, plan["plan_id"]), "PROTECTED_SOURCE_MISSING")
+    assert denial["opened_protected_source"] is denial["query_debited"] is False
+    assert consumed_rows(store) == evaluation_rows(store) == []
+    hidden.rename(protected)
+    sealed.chmod(0o555)
+
+    # Observe the commit from a separate connection at the CLI's first read boundary.
+    reader = """
+import sqlite3
+import sys
+from prajnatrade import snapshot
+from prajnatrade.cli import main
+database, plan_id, authorization_id = sys.argv[1:4]
+read = snapshot.read_protected
+
+def observe(*args):
+    with sqlite3.connect(database) as conn:
+        assert conn.execute(
+            'SELECT plan_id, authorization_id, status FROM consumed_queries'
+        ).fetchall() == [(plan_id, authorization_id, 'reading')]
+        assert conn.execute('SELECT plan_id FROM evaluations').fetchall() == [(plan_id,)]
+    return read(*args)
+
+snapshot.read_protected = observe
+sys.argv[1:4] = []
+raise SystemExit(main())
+"""
+    args = [
+        "evaluation", "run", "--store", str(store), "--snapshot-store",
+        str(base["snapshot_store"]), "--plan-id", plan["plan_id"],
+        "--project", str(base["project"]), "--stage", "validation",
+    ]
+    result = ok(subprocess.run(
+        [sys.executable, "-c", reader, str(store / "queries.sqlite"),
+         plan["plan_id"], grant["auth_id"], *args],
+        capture_output=True, text=True, env=cli_env(), timeout=60, check=False,
+    ))
+    assert result["scope"] == result["record"]["data_kind"] == "real"
+    assert result["outcome"] == "passed"
+    for run in ("candidate_run", "baseline_run"):
+        assert result["record"][run]["base"]["metrics"]["fills"] == len(SYMBOLS)
+    assert result["record"]["authorization"]["auth_id"] == grant["auth_id"]
+    assert len(consumed_rows(store)) == len(evaluation_rows(store)) == 1
+    status = ok(cli("evaluation", "status", "--store", str(store), "--plan-id", plan["plan_id"]))
+    assert status["stages"]["validation"]["evaluation"]["record_integrity"] == "valid"
+    assert not status["stages"]["final_holdout"]["query_debited"]
+    assert rejected(
+        run_evaluation(base, store, plan["plan_id"], stage="final_holdout"),
+        "AUTHORIZATION_REQUIRED",
+    )["opened_protected_source"] is False
+
+
+@pytest.mark.parametrize("scenario", ["confirmed_open_halt", "missing_close", "halt_after_open"])
+def test_schema_v2_validation_distinguishes_an_evidenced_open_halt_from_a_gap(
+    tmp_path: Path, scenario: str,
+) -> None:
+    payload = schema_v2_fixture()
+    day = payload["calendar"][11]["date"]  # Last Validation session, after first fills.
+    symbol = SYMBOLS[-1]
+    bar = raw_row(payload, day, symbol)
+    make_partial_halt(bar, day)
+    if scenario == "missing_close":
+        bar.update(close=None, close_available_at=None)
+    if scenario == "halt_after_open":
+        bar["halt"]["start"] = f"{day}T09:31:00+08:00"
+    base = build_scenario(
+        tmp_path, payload, scenario, family="trend_filter", parameters={"lookback": 2},
+    )
+    store = eval_store(base, scenario)
+    plan = create_plan(base, store, base["candidate"], plan_input(), name="halt-coverage")
+    ok(authorize(store, plan["plan_id"]))
+    result = ok(run_evaluation(base, store, plan["plan_id"]))
+    record = result["record"]
+    assert record["coverage"]["snapshot_gaps"]["raw_bars"] == [{"date": day, "symbol": symbol}]
+    assert record["candidate_run"]["base"]["metrics"]["orders_unfilled"] == 1
+    if scenario == "confirmed_open_halt":
+        assert result["outcome"] == "passed"
+        assert record["coverage"]["evidenced_open_halts"][0]["halt"] == bar["halt"]
+        assert record["coverage"]["valued_sessions"] == record["coverage"]["sessions"]
+        output = tmp_path / "controlled-report.html"
+        ok(cli("evaluation", "report", "--store", str(store), "--plan-id", plan["plan_id"],
+               "--output", str(output)))
+        report = output.read_text()
+        assert "Documented halts at the open" in report
+        assert bar["availability_evidence"] in report
+    else:
+        assert result["outcome"] == "insufficient_evidence"
+        assert record["coverage"]["evidenced_open_halts"] == []
+
+
+@pytest.mark.parametrize("scenario", ["complete", "missing_validation_input", "sharpe_rejected"])
+def test_schema_v2_validation_counts_warmup_cash_and_compares_to_same_period_benchmark(
+    tmp_path: Path, scenario: str,
+) -> None:
+    payload = schema_v2_fixture()
+    days = [row["date"] for row in payload["calendar"]]
+    first, second, last = days[9:12]
+    for symbol in SYMBOLS:
+        raw_row(payload, last, symbol).update(high=11.0, close=11.0)
+    if scenario == "missing_validation_input":
+        payload["derived"] = [
+            row for row in payload["derived"]
+            if (row["date"], row["symbol"]) != (second, SYMBOLS[0])
+        ]
+    base = build_scenario(
+        tmp_path, payload, scenario, family="trend_filter", parameters={"lookback": 3},
+    )
+    store = eval_store(base, scenario)
+    thresholds = [
+        {"id": "relative_return", "metric": "total_return", "op": ">=",
+         "value": 0, "benchmark_multiplier": 0.8},
+        {"id": "relative_sharpe", "metric": "sharpe", "op": ">=",
+         "value": 0.1 if scenario == "sharpe_rejected" else 0, "benchmark_multiplier": 1},
+        {"id": "relative_drawdown", "metric": "max_drawdown", "op": ">=",
+         "value": 0, "benchmark_multiplier": 0.85},
+    ]
+    plan = create_plan(base, store, base["candidate"], plan_input(
+        allow_discovery_halt_warmup=True,
+        minimum_samples={"sessions": 3, "valued_sessions": 3},
+        thresholds=thresholds,
+    ), name="warmup")
+    assert plan["plan"]["prior_history"]["validation"]["halt_warmup"] == {
+        "initial_signal_sessions": 1,
+        "halted_inputs": [{"date": days[7], "symbol": SYMBOLS[-1]}],
+    }
+    assert "halt_warmup" not in plan["plan"]["prior_history"]["final_holdout"]
+    ok(authorize(store, plan["plan_id"]))
+    result = ok(run_evaluation(base, store, plan["plan_id"]))
+    record = result["record"]
+    assert record["coverage"]["discovery_warmup_sessions"] == [first]
+    assert record["curves"]["sessions"] == [first, second, last]
+    for side in ("candidate", "baseline"):
+        for cost in ("base", "stress"):
+            assert record["curves"][side][cost][0]["nav"] == plan["initial_cash"]
+    if scenario == "missing_validation_input":
+        assert result["outcome"] == "insufficient_evidence"
+        assert result["reason"] == "COVERAGE_INSUFFICIENT"
+        assert [gap["date"] for gap in record["coverage"]["runner_gaps"]["signal_gaps"]] == [first, second]
+        assert record["thresholds"][1]["status"] == "unavailable"
+        assert record["thresholds"][1]["expected"] is None
+    else:
+        for side in ("candidate_run", "baseline_run"):
+            assert record[side]["base"]["signals"][0]["date"] == second
+            assert record[side]["base"]["fills"][0]["date"] == last
+        baseline = record["cost_stress"]["base"]["baseline"]
+        for threshold in record["thresholds"]:
+            value = baseline[threshold["metric"]]
+            assert threshold["benchmark_value"] == value
+            assert threshold["expected"] == pytest.approx(
+                threshold["benchmark_multiplier"] * value + threshold["value"]
+            )
+        assert result["outcome"] == ("rejected" if scenario == "sharpe_rejected" else "passed")
+        assert record["verdict"]["failed_thresholds"] == (
+            ["relative_sharpe"] if scenario == "sharpe_rejected" else []
+        )
+        if scenario == "complete":
+            output = tmp_path / "controlled-report.json"
+            ok(cli("evaluation", "report", "--store", str(store), "--plan-id", plan["plan_id"],
+                   "--output", str(output)))
+            reported = json.loads(output.read_text())["stages"]["validation"]
+            assert reported["thresholds"] == record["thresholds"]
+            assert reported["coverage"]["discovery_warmup_sessions"] == [first]
 
 
 def test_tampered_protected_partition_is_detected_without_scoring(base: dict) -> None:

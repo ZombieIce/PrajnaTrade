@@ -4,7 +4,7 @@
 
 End-to-end MVP is NOT passed: the six-scenario rule was not met (4 of 6 required scenarios verified); 2 scenario(s) are blocked: independent_validation_reports, immutable_release_forward.
 
-Manifest SHA-256: `a2cf86345d8fc97cc96af73ed263871207633c2106244cdc4ee1f02dac2a2883`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
+Manifest SHA-256: `5a23728b39d3b75ce1ebe53a7d8a04b5b334d2e4ddef42e1f0b96f5fc450c9d1`. This report is rendered only from the acceptance manifest. It does not read a trusted store, re-run an evaluation, open a sealed partition or send an order. Verified means verified for the recorded scope; synthetic evidence never satisfies the real-chain gate.
 
 ## Delivery
 
@@ -25,7 +25,7 @@ Manifest SHA-256: `a2cf86345d8fc97cc96af73ed263871207633c2106244cdc4ee1f02dac2a2
 | 2 | `real_snapshot_baseline` — Real five-ETF snapshot and equal-weight baseline | verified | real | mock | historical |
 | 3 | `real_data_mock` — Real-data bounded Mock campaign | verified | real | mock | historical |
 | 4 | `controlled_real_llm` — Controlled real external LLM iteration | verified | real | real | historical |
-| 5 | `independent_validation_reports` — Independent protected validation and controlled reports | blocked | synthetic | mock | historical |
+| 5 | `independent_validation_reports` — Independent protected validation and controlled reports | blocked | real | real | historical |
 | 6 | `immutable_release_forward` — Immutable releases and multi-strategy Shadow Live | blocked | synthetic | mock | historical |
 
 Status counts: verified=4, blocked=2, failed=0, not_run=0.
@@ -81,12 +81,13 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
 
 ### 5. Independent protected validation and controlled reports (`independent_validation_reports`) — BLOCKED
 
-- **Scope**: data=synthetic, agent=mock, period=historical
+- **Scope**: data=real, agent=real, period=historical
 - **Expected**: A real-Agent candidate selected under a confirmed Validation budget on one snapshot, an immutable freeze linked to the exact passing Validation record, and a direction-bound human Final Holdout authorization before the single read. A controlled report documents the frozen protocol, scope, prior exposure, authorization, debit and outcome.
-- **Observed**: Legacy #17 tests cover one debit per sealed partition. Issue #37 fixture scenarios exercise reusable Validation, the selected Validation linkage and independent directions sharing a Holdout interval under separate approvals. The real-Agent #27 observations stop at historical Discovery. The #37 policy has no observed real research round, real Final Holdout approval or reviewed real controlled report.
+- **Observed**: #28 and #29 mechanism checks pass on generated data in both snapshot formats. The frozen 21-session candidate completed one human-authorized real Validation with the debit committed before the first read. The research receipt reports rejected (THRESHOLD_NOT_MET). The operator retained the controlled record and report. Real Final Holdout has no authorization or debit. Under the direction-bound policy, real Final Holdout evidence is still pending.
 - **Evidence**:
-  - `synthetic_mechanism` — `tests/test_protected_eval_cli.py, tests/test_holdout_report_cli.py`: Synthetic mechanism coverage only: frozen plans, single-use authorization, debit-before-read, rejection without debit, sealed-partition isolation and controlled report rendering. This does not verify a real protected evaluation.
+  - `synthetic_mechanism` — `tests/test_protected_eval_cli.py, tests/test_container_executor.py, tests/test_holdout_report_cli.py`: Generated data covers matching authorization, debit-before-read, no debit on proven non-read, replay, concurrency, abort, inspected Python, coarse receipts and controlled reports. Schema-v2 cases exercise both stages, including refusal after rejected Validation, an independently observed Holdout debit at first read, the stored Validation warm-up export, a constant Holdout receipt and a controlled report.
   - `synthetic_mechanism` — `tests/test_reusable_validation_cli.py; tests/test_research_direction_cli.py; tests/test_issue37_holdout_cli.py`: Issue #37 synthetic mechanism. The fixtures exercise a human-confirmed budget, linked Discovery versions, per-version debit and retries, a dated detail request, feedback, early freeze, budget exhaustion, and separate human authorization tied to the exact selected Validation and Holdout plan.
+  - `real_validation_rejection` — `Operator's trusted evaluation ledger, immutable record, and controlled report`: One real Validation debit and the matching human authorization reconcile to the immutable record. The research receipt contains the fixed hard-threshold rejection reason. Detailed evidence stays in the trusted store.
 - **Blockers**:
   - Missing: A direction-bound real research round from real-Agent Discovery through reusable Validation, frozen selection and human-authorized real Final Holdout.
     Unblock: Record the observed software version, confirmed direction, Campaign, snapshot, Validation budget and selected evaluation. Retain the frozen Candidate, pre-read Holdout authorization, precise interval, controlled report and independent review without re-opening the Holdout.
@@ -99,7 +100,7 @@ Status counts: verified=4, blocked=2, failed=0, not_run=0.
 - **Expected**: At least two real-data independently evaluated, human-approved immutable releases. Under issue #37, the pre-read Holdout authorization gives conditional approval and fixes the enablement calendar. The versions track at least two consecutive, common, committed real forward trading days with signal date, pre-open persistence evidence, next-session terminal order state, ledger day ID and result hash.
 - **Observed**: Legacy synthetic evidence covers explicit approval, lifecycle, corrections and accounting. Issue #37 fixtures cover automatic release and scheduled Shadow Live, including the failure and retry paths. There are no recorded real releases under this policy and no reconciled real forward sessions.
 - **Evidence**:
-  - `synthetic_mechanism` — `tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_compare_cli.py, tests/test_correction_delta_cli.py, tests/test_impact_cli.py`: Synthetic mechanism coverage only: immutable release identity, explicit human rejection records, lifecycle, atomic Shadow Live days, reruns, missing-price and missed-deadline boundaries, committed-time fill eligibility, corrections and common-interval comparison. Synthetic replay is not real forward evidence.
+  - `synthetic_mechanism` — `tests/test_release_cli.py, tests/test_shadow_cli.py, tests/test_container_executor.py, tests/test_compare_cli.py, tests/test_correction_delta_cli.py, tests/test_impact_cli.py`: The public CLI verifies both protected receipts, immutable release identity and separate enablement. A generated schema-v2 feed tests an unresolved open blocking only the affected version, a confirmed halt expiring only its order, replay of the previously committed version, and comparison over the two common committed sessions. The offline Python fixture verifies interruption and recovery from a missing sizing close, a signal from the frozen image digest, next-open settlement of the exact persisted order and a hash-identical committed replay. Earlier synthetic checks cover human rejection, deadline misses, interruptions around the atomic day commit, and one-time dividend corrections.
   - `synthetic_mechanism` — `tests/test_issue37_holdout_cli.py; tests/test_shadow_schedule.py`: Versioned synthetic mechanism on issue37-research-workflow. Conditional approval precedes the fixture Holdout, a trusted pass enables the exact immutable release on its approved calendar, and a scored rejection leaves no release. Scheduled retry, missing feed and missed deadlines are reconciled in the fixture ledger. Real forward coverage remains zero days.
 - **Blockers**:
   - Missing: At least two real candidates that independently passed real protected validation and received explicit human approval as immutable release versions; no real candidate has been approved.
@@ -125,7 +126,7 @@ No real forward trading days recorded.
 | At least two real, independently validated, human-approved immutable releases. (`two_real_approved_releases`) | NOT met | 0 real approved release(s); independent pair: none. |
 | At least two consecutive, common, committed real forward trading days, each with an after-close signal persisted pre-open and reconciled to the next session's order terminal state. (`real_forward_days`) | NOT met | 0 forward day(s); 0 reconciled (signal pre-open, terminal state recorded); consecutive real committed common window: none. |
 | The approved candidate has committed real forward ledger days. (`candidate_forward_ledger`) | NOT met | candidate forward days: none. |
-| The five real-required scenarios are verified with real-scope evidence (real data, controlled real Agent, real forward tracking). (`real_scope_evidence`) | NOT met | real_snapshot_baseline: real-scope verified; real_data_mock: real-scope verified; controlled_real_llm: real-scope verified; independent_validation_reports: status=blocked, data=synthetic (required real); immutable_release_forward: status=blocked, data=synthetic (required real), period=historical (required forward). |
+| The five real-required scenarios are verified with real-scope evidence (real data, controlled real Agent, real forward tracking). (`real_scope_evidence`) | NOT met | real_snapshot_baseline: real-scope verified; real_data_mock: real-scope verified; controlled_real_llm: real-scope verified; independent_validation_reports: status=blocked; immutable_release_forward: status=blocked, data=synthetic (required real), period=historical (required forward). |
 
 ### Unmet real-chain conditions
 

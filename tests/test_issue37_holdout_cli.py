@@ -28,7 +28,7 @@ def test_holdout_requires_an_existing_frozen_selection(tmp_path: Path) -> None:
     assert result["opened_protected_source"] is False
 
 
-def _calendar(root):
+def _calendar(root, data_kind="synthetic"):
     from datetime import datetime, timedelta
 
     from zoneinfo import ZoneInfo
@@ -36,7 +36,7 @@ def _calendar(root):
     today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     return write_json(root / "calendar.json", {
         "schema_version": 1,
-        "data_kind": "synthetic",
+        "data_kind": data_kind,
         "source": "fixture trading calendar",
         "sessions": [(today + timedelta(days=offset)).isoformat() for offset in range(1, 5)],
     })
