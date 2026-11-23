@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS holdout_queries (
     authorization_id TEXT NOT NULL,
     status TEXT NOT NULL,
     debited_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    prior_exposures TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS holdout_blockers (
     blocker_id TEXT PRIMARY KEY,
@@ -89,6 +90,8 @@ def _read_rows(store: Path, table: str, sql: str, params: tuple) -> list[dict]:
 
 def _decode_authorization(payload: str) -> dict[str, Any]:
     record = json.loads(payload)
+    if not isinstance(record, dict):
+        raise _rejection("AUTHORIZATION_INTEGRITY_FAILED", "The saved Holdout authorization is invalid.")
     auth_id = record.get("auth_id")
     if auth_id != _hash({key: value for key, value in record.items() if key != "auth_id"}):
         raise _rejection("AUTHORIZATION_INTEGRITY_FAILED", "The Holdout authorization hash differs.")
@@ -117,7 +120,9 @@ def load_holdout_claim(store: str | Path, plan_id: str) -> dict[str, Any] | None
     )
     if not rows:
         return None
-    return {**rows[0], "partition_name": STAGE, "stage": STAGE}
+    row = rows[0]
+    row["prior_exposures"] = json.loads(row["prior_exposures"])
+    return {**row, "partition_name": STAGE, "stage": STAGE}
 
 
 def blockers(store: str | Path, plan_id: str) -> list[dict]:
@@ -168,7 +173,12 @@ def _overlapping_exposures(
         if auth["auth_id"] != row["authorization_id"] or auth["direction_id"] != row["direction_id"]:
             raise _rejection("AUTHORIZATION_INTEGRITY_FAILED", "Prior Holdout identity differs from its debit.")
         exposures.append({
-            **dict(row), "workflow": WORKFLOW,
+            key: row[key] for key in (
+                "scope", "direction_id", "plan_id", "evaluation_id", "start_date", "end_date",
+                "partition_content_hash", "authorization_id", "debited_at",
+            )
+        } | {
+            "workflow": WORKFLOW,
             "design_independence": auth["design_independence"],
             "selection_independence": auth["selection_independence"],
         })
@@ -229,7 +239,7 @@ def authorize(
     calendar: dict,
 ) -> dict:
     """Bind approval to the selected evidence and to release on a trusted pass."""
-    from prajnatrade import research_direction
+    from prajnatrade import research_direction, shadow_calendar
     from prajnatrade.experiment import ProtocolError
 
     if not all(value.strip() for value in (reviewer, reason, independence_reason)):
@@ -261,6 +271,7 @@ def authorize(
         or selection["validation_evaluation_hash"] != evidence["record_hash"]
     ):
         raise _rejection("VALIDATION_SELECTION_MISMATCH", "The trusted Validation proof differs from the frozen selection.")
+    calendar = shadow_calendar.validate_calendar(calendar)
     if calendar["data_kind"] != plan["scope"]:
         raise _rejection("INVALID_CALENDAR", "The authorization calendar must match the evaluation data scope.")
     earliest = max(plan["partitions"][STAGE]["end"], datetime.now(CN_TZ).date().isoformat())
@@ -350,12 +361,15 @@ def claim(store: Path, plan: dict, authorization: dict) -> dict:
         partition = plan["partitions"][STAGE]
         evaluation_id, debited_at = str(uuid.uuid4()), _now()
         connection.execute(
-            "INSERT INTO holdout_queries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reading', ?, NULL)",
+            "INSERT INTO holdout_queries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reading', ?, NULL, ?)",
             (plan["plan_id"], plan["candidate_hash"], plan["scope"], authorization["direction_id"],
              partition["start"], partition["end"], partition["content_hash"],
-             evaluation_id, authorization["auth_id"], debited_at),
+             evaluation_id, authorization["auth_id"], debited_at, _json(exposures)),
         )
-        return {"state": "debited", "evaluation_id": evaluation_id, "debited_at": debited_at}
+        return {
+            "state": "debited", "evaluation_id": evaluation_id, "debited_at": debited_at,
+            "prior_exposures": exposures,
+        }
 
 
 def legacy_conflict(connection: sqlite3.Connection, plan: dict, stage: str) -> bool:

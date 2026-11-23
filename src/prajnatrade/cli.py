@@ -461,7 +461,7 @@ def _add_direction_workflow(commands: argparse._SubParsersAction, *, agent_only:
     for action in ("status", "freeze", "retrospective"):
         item = directions.add_parser(action)
         item.add_argument("--project", type=Path, required=True)
-        item.add_argument("--round-id", required=True)
+        item.add_argument("--round-id", required=action != "status")
         if action in ("freeze", "retrospective"):
             item.add_argument("--input", type=Path, required=True)
         if action == "freeze":
@@ -855,6 +855,8 @@ def _direction_action(args: argparse.Namespace, direction) -> dict:
         )
         return direction.kickoff(args.project, args.store, prepared)
     if action == "status":
+        if args.round_id is None:
+            return {"status": "ok", "directions": direction.list_directions(args.project)}
         return direction.direction_status(args.project, args.round_id)
     source = json.loads(args.input.read_text(encoding="utf-8"))
     if action == "freeze":

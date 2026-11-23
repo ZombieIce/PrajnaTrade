@@ -51,6 +51,7 @@ def test_validation_replays_one_version_and_spends_budget_on_another(tmp_path):
             "question": "Does this allocation meet the preregistered performance thresholds?",
             "expected_change": "A concentrated strategy may differ from the benchmark.",
             "related_experiment_ids": [],
+            **({"selection_impact": "Switch to momentum if it improves net return."} if submission_id == "b" else {}),
         })
         proposals[submission_id] = ok(agent_cli(
             "validation", "propose", "--project", str(project), "--round-id", round_id,

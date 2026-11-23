@@ -3453,6 +3453,7 @@ def run_research_holdout_evaluation(
         return claim["blocker"]
     if claim["state"] == "existing":
         return _recover_research_holdout(store, plan, authorization, claim)
+    prior_evidence["holdout_exposures"] = claim["prior_exposures"]
     record, _, status = _score_claim(
         store, snapshot_store, plan, HOLDOUT_STAGE, authorization, claim, metadata,
         prior, prior_evidence, isolation, executor,

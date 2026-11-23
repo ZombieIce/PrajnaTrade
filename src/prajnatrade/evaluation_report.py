@@ -364,6 +364,7 @@ def _research_report_evidence(store: Path, plan: dict) -> tuple[dict, dict, dict
         "selection_summary": selected["summary"],
         "validation_binding": plan["validation_binding"],
         "holdout_blockers": research_holdout.blockers(store, plan["plan_id"]),
+        "holdout_prior_exposures": claim["prior_exposures"] if claim else [],
     }
     return stages, authorizations, debits, context
 
@@ -945,6 +946,7 @@ def render_report_html(report: dict[str, Any]) -> str:
                 ("Selection summary", report["selection_summary"]),
                 ("Validation binding", report["validation_binding"]),
                 ("Holdout eligibility blockers", report["holdout_blockers"]),
+                ("Prior Holdout exposures at debit", report["holdout_prior_exposures"]),
             ]),
             "</section>",
         ))
