@@ -44,7 +44,11 @@ from prajnatrade.protected_eval import (
 from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
 from prajnatrade.report import write_campaign_report
 from prajnatrade.research import campaign_status, resume_campaign, start_campaign
-from prajnatrade.snapshot_baseline import run_discovery_baseline
+from prajnatrade.snapshot_baseline import (
+    EXECUTION_RULE_VERSIONS,
+    NEXT_OPEN_RULES,
+    run_discovery_baseline,
+)
 from prajnatrade.store import SQLiteStore
 from prajnatrade.validation import freeze_candidate, run_holdout, validate_candidate
 
@@ -299,6 +303,10 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     create.add_argument("--initial-cash", type=float, default=100_000.0)
     create.add_argument("--transaction-cost-bps", type=float, default=5.0)
     create.add_argument("--slippage-bps", type=float, default=0.0)
+    create.add_argument(
+        "--execution-rules", choices=EXECUTION_RULE_VERSIONS, default=NEXT_OPEN_RULES,
+        help="freeze platform matching rules for Discovery and protected evaluation",
+    )
     create.add_argument(
         "--strategy-executor", choices=["none", "container"], default="none",
         help="verify generated Python in a Docker container (default: none)",
@@ -639,6 +647,7 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 args.project, args.store, args.snapshot_id, args.attempts,
                 args.max_seconds, args.initial_cash, args.transaction_cost_bps,
                 args.slippage_bps, args.as_of,
+                execution_rules=args.execution_rules,
                 strategy_executor=args.strategy_executor,
                 strategy_image=args.strategy_image,
             )
@@ -853,7 +862,7 @@ def _direction_action(args: argparse.Namespace, direction) -> dict:
     if action == "kickoff":
         prepared = direction.prepare_kickoff(
             args.project, args.campaign_id, args.direction_key, args.name, args.authorization_id,
-            json.loads(args.input.read_text(encoding="utf-8")),
+            json.loads(args.input.read_text(encoding="utf-8")), store=args.store,
         )
         return direction.kickoff(args.project, args.store, prepared)
     if action == "status":
@@ -895,7 +904,11 @@ def _validation_action(args: argparse.Namespace, direction) -> dict:
 
 
 def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
-    queued = direction.pending_validation_work(args.project, args.round_id)
+    round_status = evaluator.research_validation_status(args.store, args.round_id)
+    benchmark_failed = round_status["status"] == "paused"
+    queued = direction.pending_validation_work(
+        args.project, args.round_id, benchmark_failed=benchmark_failed,
+    )
     results = []
     for proposal in queued["proposals"]:
         try:
@@ -911,7 +924,19 @@ def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
         results.append(direction.publish_validation_details(
             args.project, args.round_id, request["detail_access_id"], receipt, details,
         ))
-    return {"schema_version": 2, "status": "completed", "round_id": args.round_id, "results": results}
+    paused = benchmark_failed or any(
+        result["status"] == "paused"
+        or result.get("scoring_evidence", {}).get("baseline", {}).get("satisfied") is False
+        for result in results
+    )
+    return {
+        "schema_version": 2,
+        "scope": round_status["scope"],
+        "data_kind": round_status["data_kind"],
+        "status": "paused" if paused else "completed",
+        "round_id": args.round_id,
+        "results": results,
+    }
 
 
 def _holdout_action(args: argparse.Namespace) -> dict:

@@ -124,7 +124,7 @@ def _canonical_direction_key(raw: str) -> str:
 
 def prepare_kickoff(
     project: Path, campaign_id: str, direction_key: str, name: str,
-    authorization_id: str, source: object,
+    authorization_id: str, source: object, *, store: Path,
 ) -> dict[str, Any]:
     """Normalize the research lead's authorization before recording it."""
     from prajnatrade.protected_eval import normalize_validation_protocol
@@ -145,6 +145,22 @@ def prepare_kickoff(
         "project_id": campaign["project_id"],
         "campaign_id": campaign_id,
     })
+    trusted = store.resolve()
+    if trusted.is_relative_to(project.resolve()):
+        raise ValueError("Trusted evaluation store must be outside the research project.")
+    previous_path = _campaign_kickoff_path(trusted, campaign["project_id"], campaign_id)
+    replay_legacy_kickoff = False
+    if previous_path.is_file():
+        previous = json.loads(previous_path.read_text(encoding="utf-8"))
+        if not isinstance(previous, dict) or not isinstance(previous.get("round_id"), str):
+            raise ValueError("Invalid trusted research kickoff.")
+        _verify_kickoff(previous, previous["round_id"])
+        replay_legacy_kickoff = (
+            previous["round_id"] == round_id
+            and previous["project_id"] == campaign["project_id"]
+            and previous["campaign_id"] == campaign_id
+            and "scoring_prerequisites" not in previous["validation_settings"]
+        )
     approved = {
         "schema_version": 1,
         "direction_id": direction_id,
@@ -159,7 +175,7 @@ def prepare_kickoff(
         "validation_budget": budget,
         "baseline": {"method": "equal_weight_buy_and_hold", "weights": "equal"},
         "validation_settings": normalize_validation_protocol(
-            payload["validation_settings"], evaluation,
+            payload["validation_settings"], evaluation, replay_legacy_kickoff=replay_legacy_kickoff,
         ),
         "independence": _independence(payload["independence"]),
         "authorization_id": _text(authorization_id, "authorization_id"),
@@ -463,6 +479,7 @@ _RECEIPT_FIELDS = (
     "proposal_id", "submission_id", "experiment_id", "evaluation_id", "plan_id",
     "record_hash", "status", "outcome", "reason", "metrics",
 )
+_OPTIONAL_RECEIPT_FIELDS = ("execution_rules", "scoring_prerequisites", "scoring_evidence")
 
 
 def publish_validation(
@@ -486,6 +503,7 @@ def publish_validation(
         )):
             raise ValueError("Validation receipt does not bind to its original proposal.")
         safe = {field: receipt.get(field) for field in _RECEIPT_FIELDS}
+        safe.update({field: receipt[field] for field in _OPTIONAL_RECEIPT_FIELDS if field in receipt})
         safe.update({
             "direction_id": approved["direction_id"],
             "kickoff_id": approved["kickoff_id"],
@@ -709,8 +727,10 @@ def _validation_budget(approved: dict[str, Any], evaluations: list[dict[str, Any
     return {"limit": limit, "used": len(evaluations), "remaining": max(0, limit - len(evaluations))}
 
 
-def pending_validation_work(project: Path, round_id: str) -> dict[str, list[dict[str, Any]]]:
-    """Return only actionable proposals and unresolved detail questions to the operator."""
+def pending_validation_work(
+    project: Path, round_id: str, *, benchmark_failed: bool = False,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return actionable proposals and detail questions, including proposals awaiting a benchmark."""
     frozen = research_candidate_status(project, round_id)
     with _project(project) as connection:
         connection.execute("BEGIN")
@@ -728,7 +748,9 @@ def pending_validation_work(project: Path, round_id: str) -> dict[str, list[dict
             if existing is not None:
                 if by_id[existing]["status"] == "reading":
                     proposals.append(proposal)
-            elif not closed and budget["remaining"] and (not passed or proposal["selection_impact"]):
+            elif not closed and (
+                benchmark_failed or (budget["remaining"] and (not passed or proposal["selection_impact"]))
+            ):
                 proposals.append(proposal)
             elif evaluation_subject(project, approved["campaign_id"], proposal["submission_id"])[
                 "fingerprints"

@@ -115,6 +115,14 @@ def ok(result: subprocess.CompletedProcess[str]) -> dict:
     return json.loads(result.stdout)
 
 
+def validation_service(project: Path, store: Path, snapshots: Path, round_id: str) -> dict:
+    """Process pending proposals and details through the trusted Validation CLI."""
+    return ok(cli(
+        "validation", "service", "--project", str(project), "--store", str(store),
+        "--snapshot-store", str(snapshots), "--round-id", round_id,
+    ))
+
+
 def rejected(
     result: subprocess.CompletedProcess[str],
     code: str,

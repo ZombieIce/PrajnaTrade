@@ -1637,7 +1637,8 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
             config = evaluation["strategy_executor"]
             if (
                 (artifact.get("workflow") != release.RESEARCH_HOLDOUT and artifact["scope"] != "real")
-                or runtime_identity(config) != evaluation["runtime"]
+                or runtime_identity(config, execution_rules=evaluation["execution_rules"])
+                != evaluation["runtime"]
             ):
                 raise ValueError("The frozen Python execution runtime is unavailable.")
             version = normalize_strategy_spec({**strategy, "parameters": parameters})

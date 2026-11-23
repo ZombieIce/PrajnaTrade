@@ -11,6 +11,7 @@ import time
 import uuid
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
@@ -22,6 +23,9 @@ from prajnatrade.container_executor import (
 )
 from prajnatrade.snapshot import read_discovery
 from prajnatrade.snapshot_baseline import (
+    EXECUTION_RULE_VERSIONS,
+    NEXT_OPEN_RULES,
+    RETRY_INITIAL_RULES,
     run_discovery_equal_weight,
     run_discovery_strategy,
 )
@@ -59,9 +63,25 @@ def _runtime_components(
     }
 
 
-def runtime_identity(strategy_executor: dict[str, Any] | None = None) -> str:
+def runtime_identity(
+    strategy_executor: dict[str, Any] | None = None,
+    *,
+    execution_rules: Mapping[str, Any] | None = None,
+) -> str:
     """Fingerprint the accounting dependencies and optional strategy executor."""
-    return _fingerprint(_runtime_components(strategy_executor))
+    dependencies = _runtime_components(strategy_executor)
+    # This exact revision preserves the historical next-open matching path.
+    # All other dependencies must still match their original fingerprints.
+    if (
+        execution_rules is not None
+        and "version" not in execution_rules
+        and dependencies["snapshot_baseline.py"]
+        == "a7d354f0665281bbda758958ba93a7772427a5f48b8594a94590508c48494c34"
+    ):
+        dependencies["snapshot_baseline.py"] = (
+            "bdcb9c0c14c138d1ad7f4c8b35e6c9b0c056d5bb7af45e762024e3cc8a3e6e72"
+        )
+    return _fingerprint(dependencies)
 
 
 def _executor_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -69,20 +89,20 @@ def _executor_config(config: Mapping[str, Any]) -> dict[str, Any]:
     return dict(candidate) if isinstance(candidate, Mapping) else {"kind": "none"}
 
 
-_EXECUTION_RULES = {
+_NEXT_OPEN_EXECUTION = {
     "signal": {
-        "source": "sealed_discovery.derived.value",
+        "source": "sealed_partition.derived.value",
         "basis": "total_return",
         "availability": "evidence_required_before_next_open",
     },
     "execution": {
-        "source": "sealed_discovery.raw_bars.open",
+        "source": "sealed_partition.raw_bars.open",
         "basis": "unadjusted",
         "attempts": 1,
         "missing_required_open": "whole_rebalance_not_filled",
     },
     "valuation": {
-        "source": "sealed_discovery.raw_bars.close",
+        "source": "sealed_partition.raw_bars.close",
         "basis": "unadjusted",
         "includes": ["cash", "dividend_receivables"],
         "missing_required_close": "nav_unavailable",
@@ -92,6 +112,18 @@ _EXECUTION_RULES = {
         "share_adjustment": "apply_before_open_execution",
     },
 }
+
+
+def _execution_policy(version: str) -> dict[str, Any]:
+    if version not in EXECUTION_RULE_VERSIONS:
+        raise ValueError(f"Unknown execution rules version: {version!r}.")
+    rules = {"version": version, **deepcopy(_NEXT_OPEN_EXECUTION)}
+    if version == RETRY_INITIAL_RULES:
+        rules["execution"].update(
+            initial_entry_retry="next_open_until_filled_or_superseded",
+            retry_scope="before_first_position_is_established",
+        )
+    return rules
 
 
 def _campaign_evaluation(
@@ -104,6 +136,7 @@ def _campaign_evaluation(
     transaction_cost_bps: float,
     slippage_bps: float,
     strategy_executor: dict[str, Any],
+    execution_rules: dict[str, Any],
 ) -> dict[str, Any]:
     runtime_dependencies = _runtime_components(strategy_executor)
     return {
@@ -115,7 +148,7 @@ def _campaign_evaluation(
         "initial_cash": initial_cash,
         "transaction_cost_bps": transaction_cost_bps,
         "slippage_bps": slippage_bps,
-        "execution_rules": _EXECUTION_RULES,
+        "execution_rules": execution_rules,
         "strategy_executor": strategy_executor,
         "runtime_dependencies": runtime_dependencies,
         "runtime": _fingerprint(runtime_dependencies),
@@ -187,6 +220,7 @@ def campaign_create(
     project: Path, store: Path, snapshot_id: str, attempts: int, max_seconds: float,
     initial_cash: float, transaction_cost_bps: float, slippage_bps: float,
     as_of: str | None = None, *,
+    execution_rules: str = NEXT_OPEN_RULES,
     strategy_executor: str = "none",
     strategy_image: str | None = None,
     executor: ContainerStrategyExecutor | None = None,
@@ -194,6 +228,7 @@ def campaign_create(
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("Attempts and execution seconds must be positive.")
+    execution_policy = _execution_policy(execution_rules)
     executor_config = _resolve_executor_config(
         strategy_executor, strategy_image, executor,
     )
@@ -214,6 +249,7 @@ def campaign_create(
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
         strategy_executor=executor_config,
+        execution_rules=execution_policy,
     )
     baseline = run_discovery_equal_weight(
         data,
@@ -223,6 +259,7 @@ def campaign_create(
         initial_cash=initial_cash,
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
+        execution_rule_version=execution_rules,
     )
     campaign_id = str(uuid.uuid4())
     evaluation_hash = _fingerprint(evaluation)
@@ -258,6 +295,7 @@ def campaign_create(
             "evaluation": evaluation_hash,
         },
         "budget": {"attempts_remaining": attempts, "execution_seconds_remaining": max_seconds},
+        "execution_rules": execution_policy,
         "strategy_executor": executor_config,
     }
 
@@ -665,7 +703,8 @@ def _run_attempt(
         if _fingerprint(config) != campaign["evaluation_hash"]:
             raise ValueError("Evaluation fingerprint mismatch.")
         executor_config = _executor_config(config)
-        if config["runtime"] != runtime_identity(executor_config):
+        rules = config["execution_rules"]
+        if config["runtime"] != runtime_identity(executor_config, execution_rules=rules):
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec: dict[str, Any] = {
             "family": family, "parameters": request["parameters"],
@@ -698,6 +737,7 @@ def _run_attempt(
             initial_cash=config["initial_cash"],
             transaction_cost_bps=config["transaction_cost_bps"],
             slippage_bps=config["slippage_bps"],
+            execution_rule_version=rules.get("version", NEXT_OPEN_RULES),
         )
         benchmark = json.loads(campaign["baseline_json"])
         baseline_return = benchmark["metrics"]["total_return"]
