@@ -41,7 +41,7 @@ import os
 import sqlite3
 from collections.abc import Generator, Mapping
 from contextlib import closing, contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -79,6 +79,9 @@ REVALIDATION_NAME = "research-loop-revalidations"
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
 REVIEW_STATES = ("pending", "approved", "returned", "ended")
 REVIEW_ACTION_STATE = {"approve": "approved", "return": "returned", "end": "ended"}
+EVIDENCE_NAME = "research-loop-evidence"
+EVIDENCE_DECISIONS = ("continue", "pause", "retire")
+EVIDENCE_STATES = ("tracking", "review_due", "observation_extended", "paused", "ended")
 MAX_OBSERVATION_SESSIONS = 252
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -152,6 +155,11 @@ CREATE TABLE IF NOT EXISTS research_loop_revalidations (
     validation_id TEXT NOT NULL,
     prior_validation_id TEXT NOT NULL,
     revalidation_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_loop_evidence_decisions (
+    decision_id TEXT PRIMARY KEY,
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    decision_json TEXT NOT NULL
 );
 """
 
@@ -2786,6 +2794,581 @@ def round_status(project: Path, round_id: str | None = None) -> dict[str, Any]:
                 "rounds": [_round_status_body(connection, item) for item in identifiers],
             }
         return _round_status_body(connection, round_id)
+
+
+# ---------------------------------------------------------------------------
+# round evidence: opportunities, scoped pauses and review decisions (T3)
+# ---------------------------------------------------------------------------
+
+
+def _evidence_path(store: Path, decision_id: str) -> Path:
+    return store / EVIDENCE_NAME / f"{decision_id}.json"
+
+
+def _verify_evidence_decision(body: object) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise ValueError("An evidence decision record must be an object.")
+    expected = _hash({key: value for key, value in body.items() if key != "decision_id"})
+    if body.get("decision_id") != expected:
+        raise ValueError("The evidence decision record fingerprint mismatch.")
+    return body
+
+
+def _latest_evidence_decision(
+    connection: sqlite3.Connection, version_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT decision_json FROM research_loop_evidence_decisions "
+        "WHERE version_id = ? ORDER BY rowid DESC LIMIT 1",
+        (version_id,),
+    ).fetchone()
+    return _verify_evidence_decision(json.loads(row["decision_json"])) if row else None
+
+
+def _matching_evidence_decision(
+    connection: sqlite3.Connection,
+    trusted: Path,
+    version_id: str,
+    request_key: str,
+) -> dict[str, Any] | None:
+    """Find the stored decision with this exact human content (crash recovery)."""
+    for row in connection.execute(
+        "SELECT decision_json FROM research_loop_evidence_decisions "
+        "WHERE version_id = ? ORDER BY rowid",
+        (version_id,),
+    ):
+        body = _verify_evidence_decision(json.loads(row["decision_json"]))
+        if body.get("request_key") == request_key:
+            return body
+    directory = trusted / EVIDENCE_NAME
+    if not directory.is_dir():
+        return None
+    for path in sorted(directory.iterdir()):
+        if not path.is_file() or path.suffix != ".json":
+            continue
+        try:
+            body = _verify_evidence_decision(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if (
+            body.get("version_id") == version_id
+            and body.get("request_key") == request_key
+        ):
+            return body
+    return None
+
+
+def _store_evidence_decision(
+    connection: sqlite3.Connection, trusted: Path, body: Mapping[str, Any],
+) -> None:
+    from prajnatrade.protected_eval import write_trusted_record_once
+
+    path = _evidence_path(trusted, body["decision_id"])
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != body:
+            raise ValueError(
+                "An evidence decision record is immutable and cannot change."
+            )
+    else:
+        write_trusted_record_once(path, dict(body))
+    connection.execute(
+        "INSERT OR IGNORE INTO research_loop_evidence_decisions "
+        "(decision_id, version_id, decision_json) VALUES (?, ?, ?)",
+        (body["decision_id"], body["version_id"], _json(body)),
+    )
+
+
+def _confirmed_observation(
+    connection: sqlite3.Connection, version_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT observation_json FROM research_loop_observations WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()
+    return json.loads(row["observation_json"]) if row is not None else None
+
+
+def _evidence_request_key(
+    round_id: str,
+    version_id: str,
+    release_id: str,
+    decision: str,
+    scope: str,
+    reviewer: str,
+    reason: str,
+) -> str:
+    return _hash(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "round_id": round_id,
+            "version_id": version_id,
+            "release_id": release_id,
+            "decision": decision,
+            "scope": scope,
+            "reviewer": reviewer,
+            "reason": reason,
+        }
+    )
+
+
+def _evidence_tracking_release(
+    trusted: Path, release_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fetch one manual-tracking artifact and its timeline state (never a plan)."""
+    try:
+        artifact = release.fetch(trusted, release_id)["artifact"]
+        status = release.status(trusted, release_id)
+    except release.ReleaseRejection as error:
+        raise ProtocolError(
+            error.details["code"], "evidence", error.details["next_action"],
+            error.details["message"],
+        ) from error
+    if artifact.get("workflow") != release.TRACKING_WORKFLOW:
+        raise ProtocolError(
+            "REVIEW_CONFLICT", "evidence", "inspect",
+            "Only a manual simulated-tracking version can record an evidence decision.",
+        )
+    return artifact, status
+
+
+def _next_calendar_session(sessions: list[str], after: str) -> str:
+    later = [session for session in sessions if session > after]
+    if later:
+        return later[0]
+    return (date.fromisoformat(after) + timedelta(days=1)).isoformat()
+
+
+def _evidence_effective_session(
+    artifact: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    status: Mapping[str, Any],
+) -> str:
+    """The first uncommitted after-close session the decision applies to."""
+    admission = artifact["admission"]
+    sessions = list(admission["calendar"]["sessions"])
+    progress = evidence.get("progress") or {}
+    last = progress.get("last_committed_date")
+    if isinstance(last, str) and last:
+        effective = _next_calendar_session(sessions, last)
+    else:
+        enabled = admission["effective_signal_date"]
+        later = [session for session in sessions if session >= enabled]
+        effective = later[0] if later else enabled
+    timeline = status.get("timeline") or []
+    if timeline and effective < timeline[-1]["effective_signal_date"]:
+        effective = timeline[-1]["effective_signal_date"]
+    return effective
+
+
+def _evidence_review(
+    kickoff: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    confirmed: Mapping[str, Any] | None,
+    committed_sessions: int,
+) -> dict[str, Any]:
+    """Evaluate the round's invalidation policy and confirmed observation term."""
+    policy = kickoff.get("invalidation") or {}
+    term = None
+    minimum = None
+    if confirmed is not None:
+        raw_term = confirmed.get("observation_sessions")
+        raw_minimum = confirmed.get("minimum_opportunities")
+        if type(raw_term) is int:
+            term = raw_term
+        if type(raw_minimum) is int:
+            minimum = raw_minimum
+    term_reached = term is not None and committed_sessions >= term
+    enough = minimum is not None and evidence["due_opportunities"] >= minimum
+    trigger: str | None = None
+    reason: str | None = None
+    maximum_unfilled = policy.get("max_unfilled_opportunities")
+    if type(maximum_unfilled) is int and maximum_unfilled > 0:
+        consecutive = evidence["consecutive_intent_without_fill"]
+        unfilled = evidence["unfilled_opportunities"]
+        if consecutive >= maximum_unfilled:
+            trigger = "max_unfilled_opportunities"
+            reason = (
+                f"{consecutive} consecutive intent-without-fill opportunities "
+                f"reached the round limit of {maximum_unfilled}."
+            )
+        elif unfilled >= maximum_unfilled:
+            trigger = "max_unfilled_opportunities"
+            reason = (
+                f"{unfilled} unfilled opportunities reached the round limit of "
+                f"{maximum_unfilled}."
+            )
+    if trigger is None:
+        maximum_drawdown = policy.get("max_abs_drawdown")
+        if isinstance(maximum_drawdown, (int, float)) and not isinstance(
+            maximum_drawdown, bool
+        ) and maximum_drawdown >= 0:
+            observed = evidence["max_abs_drawdown"]
+            if observed > 0 and observed >= float(maximum_drawdown):
+                trigger = "max_abs_drawdown"
+                reason = (
+                    f"The full-history maximum drawdown {observed:.4f} reached the "
+                    f"round limit {float(maximum_drawdown):.4f}."
+                )
+    if trigger is None:
+        maximum_gap = policy.get("max_data_gap_sessions")
+        if type(maximum_gap) is int and maximum_gap > 0:
+            gaps = evidence["data_gap_sessions"]
+            if gaps >= maximum_gap:
+                trigger = "max_data_gap_sessions"
+                reason = (
+                    f"{gaps} distorted feed sessions reached the round limit of "
+                    f"{maximum_gap}."
+                )
+    if trigger is None and term_reached and not enough:
+        trigger = "observation_extended"
+        reason = (
+            f"The confirmed {term}-session observation term is reached with "
+            f"{evidence['due_opportunities']} due opportunities, below the "
+            f"minimum of {minimum}; tracking continues."
+        )
+    if trigger is None and term_reached and enough:
+        trigger = "observation_term"
+        reason = (
+            f"The confirmed {term}-session observation term is reached with "
+            f"{evidence['due_opportunities']} due opportunities (minimum {minimum})."
+        )
+    return {
+        "trigger": trigger,
+        "reason": reason,
+        "term": term,
+        "minimum": minimum,
+        "term_reached": term_reached,
+        "enough": enough,
+    }
+
+
+def _evidence_state(
+    review: Mapping[str, Any],
+    review_state: str,
+    release_state: str,
+    pauses: list[dict[str, Any]],
+) -> str:
+    if review_state == "ended" or release_state == "retired":
+        return "ended"
+    if release_state == "paused" or pauses:
+        return "paused"
+    if review["trigger"] == "observation_extended":
+        return "observation_extended"
+    if review["trigger"] is not None:
+        return "review_due"
+    return "tracking"
+
+
+def _pause_record(
+    release_state: str,
+    pauses: list[dict[str, Any]],
+    latest_decision: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if pauses:
+        record = sorted(
+            pauses, key=lambda item: (item["session"], item["scope"], item["code"])
+        )[0]
+        return {
+            key: record.get(key)
+            for key in ("session", "scope", "code", "message", "recorded_at")
+        }
+    if release_state == "paused":
+        if latest_decision is not None and latest_decision.get("decision") == "pause":
+            effect = latest_decision.get("effect") or {}
+            return {
+                "session": effect.get("effective_signal_date"),
+                "scope": latest_decision.get("scope", "version"),
+                "code": "MANUAL_PAUSE",
+                "message": latest_decision["reason"],
+                "recorded_at": latest_decision["decided_at"],
+                "decision_id": latest_decision["decision_id"],
+            }
+        return {
+            "session": None,
+            "scope": "version",
+            "code": "MANUAL_PAUSE",
+            "message": "The release timeline is paused.",
+            "recorded_at": None,
+            "decision_id": None,
+        }
+    return None
+
+
+def _evidence_facts(
+    evidence: Mapping[str, Any], confirmed: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "committed_sessions": evidence["committed_sessions"],
+        "first_committed_date": evidence["first_committed_date"],
+        "last_committed_date": evidence["last_committed_date"],
+        "first_signal_date": evidence["first_signal_date"],
+        "first_fill_date": evidence["first_fill_date"],
+        "due_opportunities": evidence["due_opportunities"],
+        "filled_opportunities": evidence["filled_opportunities"],
+        "unfilled_opportunities": evidence["unfilled_opportunities"],
+        "intent_without_fill": evidence["intent_without_fill"],
+        "consecutive_intent_without_fill": evidence["consecutive_intent_without_fill"],
+        "metrics_not_ready": evidence["metrics_not_ready"]["count"],
+        "data_gap_sessions": evidence["data_gap_sessions"],
+        "max_abs_drawdown": evidence["max_abs_drawdown"],
+        "observation": (
+            None
+            if confirmed is None
+            else {
+                "confirmed_sessions": confirmed.get("observation_sessions"),
+                "minimum_opportunities": confirmed.get("minimum_opportunities"),
+            }
+        ),
+    }
+
+
+def _evidence_decision_output(
+    body: Mapping[str, Any], *, reused: bool,
+) -> dict[str, Any]:
+    effect = body["effect"]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "round_id": body["round_id"],
+        "version_id": body["version_id"],
+        "release_id": body["release_id"],
+        "decision": body["decision"],
+        "decision_id": body["decision_id"],
+        "reviewer": body["reviewer"],
+        "reason": body["reason"],
+        "decided_at": body["decided_at"],
+        "scope": body.get("scope", "version"),
+        "facts": body["facts"],
+        "effect": effect,
+        "state": (
+            "ended"
+            if effect["state_after"] == "retired"
+            else ("paused" if effect["state_after"] == "paused" else "tracking")
+        ),
+        "release_state": effect["state_after"],
+        "reused": reused,
+    }
+
+
+def _shadow_evidence(ledger: Path, release_id: str) -> dict[str, Any]:
+    from prajnatrade import shadow
+
+    try:
+        return shadow.evidence(ledger, release_id)
+    except shadow.ShadowRejection as error:
+        raise ProtocolError(
+            error.details["code"], "evidence", error.details["next_action"],
+            error.details["message"],
+        ) from error
+
+
+def evidence_status(
+    project: Path,
+    store: Path,
+    ledger: Path,
+    round_id: str,
+    version_id: str | None = None,
+) -> dict[str, Any]:
+    """Per approved version: ledger facts, review trigger, pause and state (T3)."""
+    from prajnatrade.protected_eval import evaluation_store
+
+    trusted = evaluation_store(store)
+    if trusted.is_relative_to(project.resolve()):
+        raise ValueError("Trusted evaluation store must be outside the research project.")
+    with _project(project) as connection:
+        record = _project_round(connection, round_id)
+        if version_id is not None:
+            _require_hex(version_id, "version")
+        submissions = [
+            json.loads(row["submission_json"])
+            for row in connection.execute(
+                "SELECT submission_json FROM research_loop_submissions "
+                "WHERE round_id = ? ORDER BY rowid",
+                (round_id,),
+            )
+        ]
+        if version_id is not None and not any(
+            item["version_id"] == version_id for item in submissions
+        ):
+            raise ValueError("Unknown version for this research round.")
+        versions: list[dict[str, Any]] = []
+        for submission in submissions:
+            item_version = submission["version_id"]
+            if version_id is not None and item_version != version_id:
+                continue
+            tracking = _latest_tracking(connection, item_version)
+            if tracking is None:
+                continue
+            release_id = tracking["release_id"]
+            review_state = _review_state(connection, item_version)
+            latest_decision = _latest_evidence_decision(connection, item_version)
+            confirmed = _confirmed_observation(connection, item_version)
+            evidence = _shadow_evidence(ledger, release_id)
+            _, release_status = _evidence_tracking_release(trusted, release_id)
+            release_state = release_status["current_state"]
+            enabled = tracking["enabled_signal_date"]
+            committed_dates = evidence["committed_dates"]
+            committed_sessions = sum(
+                1 for session in committed_dates if session >= enabled
+            )
+            review = _evidence_review(
+                record["kickoff"], evidence, confirmed, committed_sessions
+            )
+            pauses = list(evidence.get("active_pauses") or [])
+            state = _evidence_state(review, review_state, release_state, pauses)
+            term = review["term"]
+            versions.append(
+                {
+                    "version_id": item_version,
+                    "review_state": review_state,
+                    "tracking": {
+                        "release_id": release_id,
+                        "enabled_signal_date": enabled,
+                        "committed_sessions": evidence["committed_sessions"],
+                        "first_committed_date": evidence["first_committed_date"],
+                        "last_committed_date": evidence["last_committed_date"],
+                        "first_signal_date": evidence["first_signal_date"],
+                        "first_fill_date": evidence["first_fill_date"],
+                        "due_opportunities": evidence["due_opportunities"],
+                        "filled_opportunities": evidence["filled_opportunities"],
+                        "unfilled_opportunities": evidence["unfilled_opportunities"],
+                        "intent_without_fill": evidence["intent_without_fill"],
+                        "consecutive_intent_without_fill": evidence[
+                            "consecutive_intent_without_fill"
+                        ],
+                        "metrics_not_ready": evidence["metrics_not_ready"],
+                        "data_gap_sessions": evidence["data_gap_sessions"],
+                        "max_abs_drawdown": evidence["max_abs_drawdown"],
+                        "observation": {
+                            "confirmed_sessions": term,
+                            "minimum_opportunities": review["minimum"],
+                            "remaining_sessions": (
+                                None
+                                if term is None
+                                else max(0, term - committed_sessions)
+                            ),
+                            "status": state,
+                        },
+                        "opportunities": evidence["opportunities"],
+                    },
+                    "review": {
+                        "trigger": review["trigger"],
+                        "reason": review["reason"],
+                        "required": review["trigger"]
+                        not in (None, "observation_extended"),
+                    },
+                    "pause": _pause_record(release_state, pauses, latest_decision),
+                    "state": state,
+                }
+            )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+        "round_id": round_id,
+        "direction_id": record["direction_id"],
+        "project_id": record["project_id"],
+        "scope": record["scope"],
+        "data_kind": record["data_kind"],
+        "versions": versions,
+    }
+
+
+def evidence_decide(
+    project: Path,
+    store: Path,
+    ledger: Path,
+    round_id: str,
+    version_id: str,
+    decision: str,
+    reviewer: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record one immutable human continue/pause/retire decision (T3)."""
+    from prajnatrade import shadow
+    from prajnatrade.protected_eval import evaluation_store
+
+    if decision not in EVIDENCE_DECISIONS:
+        raise ValueError("decision must be continue, pause or retire.")
+    reviewer = _text(reviewer, "reviewer")
+    reason = _text(reason, "reason")
+    trusted = evaluation_store(store)
+    if trusted.is_relative_to(project.resolve()):
+        raise ValueError("Trusted evaluation store must be outside the research project.")
+    with _round_lock(project, round_id), _project(project) as connection:
+        _project_round(connection, round_id)
+        _submission(connection, round_id, version_id, phase="evidence")
+        tracking = _latest_tracking(connection, version_id)
+        if tracking is None:
+            raise ProtocolError(
+                "REVIEW_CONFLICT", "evidence", "review",
+                "Only an approved simulated-tracking version can record an evidence decision.",
+            )
+        release_id = tracking["release_id"]
+        artifact, release_status = _evidence_tracking_release(trusted, release_id)
+        state_before = release_status["current_state"]
+        evidence = _shadow_evidence(ledger, release_id)
+        confirmed = _confirmed_observation(connection, version_id)
+        scope = "version"
+        request_key = _evidence_request_key(
+            round_id, version_id, release_id, decision, scope, reviewer, reason
+        )
+        existing = _matching_evidence_decision(
+            connection, trusted, version_id, request_key
+        )
+        if existing is not None:
+            return _evidence_decision_output(existing, reused=True)
+        if state_before == "retired" or _review_state(connection, version_id) == "ended":
+            raise ProtocolError(
+                "VERSION_ENDED", "evidence", "inspect",
+                "An ended version is terminal; the round may continue with a new version.",
+            )
+        if decision == "pause" and state_before != "enabled":
+            raise ProtocolError(
+                "REVIEW_CONFLICT", "evidence", "inspect",
+                "Pause requires an enabled tracking version; it is already paused.",
+            )
+        effective = _evidence_effective_session(artifact, evidence, release_status)
+        action = "none"
+        state_after = state_before
+        if decision == "pause":
+            release.pause(trusted, release_id, effective, reason)
+            action = "pause"
+            state_after = "paused"
+        elif decision == "continue":
+            if state_before == "paused":
+                release.resume(trusted, release_id, effective, reason)
+                action = "resume"
+                state_after = "enabled"
+        else:
+            release.retire(trusted, release_id, effective, reason)
+            action = "retire"
+            state_after = "retired"
+            shadow.mark_version_ended(ledger, release_id, release_id)
+        body: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "round_id": round_id,
+            "version_id": version_id,
+            "release_id": release_id,
+            "decision": decision,
+            "scope": scope,
+            "reviewer": reviewer,
+            "reason": reason,
+            "decided_at": _now(),
+            "request_key": request_key,
+            "facts": _evidence_facts(evidence, confirmed),
+            "effect": {
+                "action": action,
+                "effective_signal_date": effective,
+                "state_before": state_before,
+                "state_after": state_after,
+            },
+        }
+        body["decision_id"] = _hash(body)
+        _store_evidence_decision(connection, trusted, body)
+    return _evidence_decision_output(body, reused=False)
 
 
 # ---------------------------------------------------------------------------

@@ -545,6 +545,37 @@ def _add_research_loop_workflow(
     close.add_argument("--reason", required=True)
     close.add_argument("--input", required=True, type=Path)
 
+    evidence = rounds.add_parser(
+        "evidence",
+        help="inspect the Evidence Loop ledger state and record the human decision",
+    )
+    evidence_actions = evidence.add_subparsers(
+        dest="evidence_action", required=True
+    )
+    evidence_status = evidence_actions.add_parser(
+        "status",
+        help="report per-version tracking facts, review trigger, pause and state",
+    )
+    evidence_status.add_argument("--project", required=True, type=Path)
+    evidence_status.add_argument("--store", required=True, type=Path)
+    evidence_status.add_argument("--ledger", required=True, type=Path)
+    evidence_status.add_argument("--round-id", required=True)
+    evidence_status.add_argument("--version-id")
+    evidence_decide = evidence_actions.add_parser(
+        "decide",
+        help="record the immutable continue, pause or retire decision for one version",
+    )
+    evidence_decide.add_argument("--project", required=True, type=Path)
+    evidence_decide.add_argument("--store", required=True, type=Path)
+    evidence_decide.add_argument("--ledger", required=True, type=Path)
+    evidence_decide.add_argument("--round-id", required=True)
+    evidence_decide.add_argument("--version-id", required=True)
+    evidence_decide.add_argument(
+        "--decision", required=True, choices=["continue", "pause", "retire"]
+    )
+    evidence_decide.add_argument("--reviewer", required=True)
+    evidence_decide.add_argument("--reason", required=True)
+
 
 def _add_direction_workflow(commands: argparse._SubParsersAction, *, agent_only: bool) -> None:
     direction = commands.add_parser("direction", help="manage an authorized research direction")
@@ -999,6 +1030,26 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 source,
                 calendar=args.calendar,
             )
+        elif args.round_action == "evidence":
+            if args.evidence_action == "status":
+                result = research_loop.evidence_status(
+                    args.project,
+                    args.store,
+                    args.ledger,
+                    args.round_id,
+                    args.version_id,
+                )
+            else:
+                result = research_loop.evidence_decide(
+                    args.project,
+                    args.store,
+                    args.ledger,
+                    args.round_id,
+                    args.version_id,
+                    args.decision,
+                    args.reviewer,
+                    args.reason,
+                )
         else:
             result = research_loop.close(
                 args.project,
