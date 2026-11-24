@@ -94,8 +94,9 @@ release, shadow and acceptance are operator-only. `round open`, `validate`,
 also operator-only: the agent gets no `--store`, no ledger, no
 Lightweight Validation receipt beyond the round-status allowlist and no
 protected read. That allowlist is the agent round view — review state, return
-instructions and observation/tracking summary — without reviewer identity,
-decision reason or ledger detail. The manual simulated-tracking admission and
+instructions and observation/tracking summary. It may show the round kickoff's
+authorizing reviewer and approval reason, but never a per-version review
+decision's reviewer/reason or any ledger detail. The manual simulated-tracking admission and
 the continue/pause/retire review stay human operator decisions. New research
 surfaces require an explicit grant in the spec; sealed partitions, Holdout
 diagnostics, admission state and controlled-report internals never move to the

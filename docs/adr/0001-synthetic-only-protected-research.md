@@ -154,8 +154,11 @@ Recorded here rather than silently performed in the #17 implementation:
 - Splitting the 500+ line functions in `shadow.py`, `release.py` and
   `protected_eval.py` into smaller deep modules.
 - Refactoring the `cli.py` dispatch into a command registry.
+- Splitting `research_loop.py` (round, lightweight Validation, review,
+  revalidation and the Evidence Loop read model in one module) and bundling the
+  loose scoring-history parameters from #41 into one history-policy type.
 
-Both are behaviour-preserving refactors that need their own review; the
+These are behaviour-preserving refactors that need their own review; the
 cross-module helper seams (`snapshot_baseline.CN_TZ`/`available_by`,
 `validation.make_robustness_plan`, `protected_eval.load_plan`/`audit`,
 `snapshot.lineage_ids`) and the removal of trivial middlemen are already done.

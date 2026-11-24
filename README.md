@@ -787,10 +787,10 @@ Without `--round-id` it lists every round. Each round reports `status` (`open`
 or `closed`), the approved kickoff, the budget, and for each locked submission
 its Validation summary, current `review_state`, the return instructions
 recorded when a version was returned, the recommended and confirmed
-observation and a tracking summary, plus any closure. That agent view does not
-expose the reviewer identity or decision reason, any ledger row, ledger price
-or accounting detail, a sealed payload, a protected outcome or admission
-internals.
+observation and a tracking summary, plus any closure. The round kickoff keeps
+the authorizing reviewer and approval reason; the agent view never exposes a
+per-version review decision's reviewer or reason, any ledger row, ledger price,
+accounting detail, sealed payload, protected outcome or admission internals.
 
 #### 2. Lock a version for review
 
@@ -1031,9 +1031,11 @@ intentional cash (the inputs are ready and the strategy targets cash) and
 ordered-unfilled (an order was intended but did not fill).
 
 Each committed session records one **tracking opportunity** when the strategy's
-target changed and produced orders: its signal and execution dates, order IDs,
-and separately which orders are due, filled and unfilled. An opportunity with
-intent but no fill still counts as due. `round evidence status` reports, per
+normalized target weights changed: its signal and execution dates, order IDs,
+and separately which orders are due, filled and unfilled. Orders produced only
+by price drift under an unchanged target still settle, but they are not a
+decision opportunity. An opportunity with intent but no fill still counts as
+due. `round evidence status` reports, per
 version, the enable date, the committed range, first signal and first fill
 dates, `due_opportunities` / `filled_opportunities` / `unfilled_opportunities` /
 `intent_without_fill` (and the longest consecutive run of intent-without-fill),
@@ -1114,8 +1116,8 @@ print `error: ...` on stderr and exit 2.
 | `round submit` | agent | `submitted` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE` |
 | `round validate` | operator | `completed` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `REVALIDATION_SUPERSEDED` |
 | `round revalidate` | operator | `revalidated` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REPLAY_MISMATCH`, `EVIDENCE_SNAPSHOT_NOT_FOUND`, `EVIDENCE_NOT_SUCCESSOR`, `EVIDENCE_DATA_KIND_MISMATCH`, `EVIDENCE_INTERVAL_MISMATCH`, `EVIDENCE_PRIOR_HISTORY_MISMATCH`, `EVIDENCE_AS_OF_VIOLATION`, `EVIDENCE_INTEGRITY_VIOLATION`, `EVIDENCE_SNAPSHOT_AMBIGUOUS` |
-| `round review` | operator | `approved` / `returned` / `ended` | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `RISK_NOT_ACCEPTED`, `OBSERVATION_REQUIRED`, `REVIEW_CONFLICT`, `VERSION_ENDED`, `CALENDAR_COVERAGE_MISSING` |
-| `round close` | operator | `closed` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED` |
+| `round review` | operator | `approved` / `returned` / `ended` | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `RISK_NOT_ACCEPTED`, `OBSERVATION_REQUIRED`, `REVIEW_CONFLICT`, `VERSION_ENDED`, `CALENDAR_COVERAGE_MISSING`, `RELEASE_NOT_FOUND`, `RELEASE_INTEGRITY_FAILED`, `INVALID_TRANSITION`, `ADMISSION_INVALID` |
+| `round close` | operator | `closed` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `VERSION_ENDED` |
 | `round evidence status` | operator | `ok` (per-version `state`: `tracking` / `review_due` / `observation_extended` / `paused` / `ended`) | — | `ROUND_NOT_FOUND`, unknown version |
 | `round evidence decide` | operator | `ok` (fields `decision`, `state`, `effect`) | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `REVIEW_CONFLICT`, `VERSION_ENDED` |
 | `shadow tick`, `shadow update` | operator | `committed` / `committed_with_anomalies` / `already_committed` | — | `blocked` (exit 2 when any version blocks) |
