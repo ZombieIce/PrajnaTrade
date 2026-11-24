@@ -704,10 +704,10 @@ are research evidence, not investment advice or a guarantee of future returns.
 
 Issue #43 is the default simulated-tracking workflow. A **Research Loop** runs
 one approved round over a Campaign: approve the round contract, lock successful
-Discovery versions, replay them as lightweight Validation, then record exactly
-one human review decision per version. An **Evidence Loop** is the independent
-Shadow Live account of a version admitted to simulated tracking and the
-observation review that follows.
+Discovery versions, replay them as lightweight Validation, then record one
+current human review state per version from immutable decisions. An **Evidence
+Loop** is the independent Shadow Live account of a version admitted to
+simulated tracking and the observation review that follows.
 
 Admission here is a **manual simulated-tracking decision**. It is not the
 protected `evaluation`/Final Holdout flow and not a conditional `release`: it
@@ -784,10 +784,13 @@ prajnatrade-agent round status --project ./strategy-A [--round-id "$ROUND"]
 ```
 
 Without `--round-id` it lists every round. Each round reports `status` (`open`
-or `closed`), the approved kickoff, budget, locked submissions with their
-Validation summary, `review_state`, recommended and confirmed observation, a
-tracking summary and any closure. It never returns a sealed payload, a
-protected outcome, ledger prices or admission internals.
+or `closed`), the approved kickoff, the budget, and for each locked submission
+its Validation summary, current `review_state`, the return instructions
+recorded when a version was returned, the recommended and confirmed
+observation and a tracking summary, plus any closure. That agent view does not
+expose the reviewer identity or decision reason, any ledger row, ledger price
+or accounting detail, a sealed payload, a protected outcome or admission
+internals.
 
 #### 2. Lock a version for review
 
@@ -852,11 +855,13 @@ are `data_availability`, `scoring_start`, `coverage`, `position`, `costs`,
 | `insufficient_evidence` | `COST_EVIDENCE_INSUFFICIENT` | Replayed fees or slippage do not match Discovery. |
 | `insufficient_evidence` | `METRICS_NOT_READY` | A hard-condition metric is unavailable; the condition records `status: unavailable`. |
 
-The three position states stay distinct: no usable indicator/valuation input is
-`metrics_not_ready` (reported through the coverage checks), an explicit
-cash target is `intentional_cash` (valid position evidence), and an order that
-was intended but never filled is `ordered_unfilled`
-(`POSITION_EVIDENCE_INSUFFICIENT`, not a missing metric).
+The position-evidence states stay distinct: no usable indicator/valuation
+input is `metrics_not_ready` (reported through the coverage checks), an
+explicit cash target is `intentional_cash` (valid position evidence), and a
+candidate whose orders were intended but never filled reports
+`initial_position_not_established` (`POSITION_EVIDENCE_INSUFFICIENT`, not a
+missing metric). A candidate that established its first position reports
+`initial_position_established`.
 
 A completed receipt is published to the project with the research-visible
 allowlist and kept write-once in the trusted store. Replaying the same
@@ -871,14 +876,51 @@ the original selection reason still holds:
 ```sh
 prajnatrade round revalidate --project ./strategy-A --store /trusted/evaluations \
   --snapshot-store /trusted/snapshots --round-id "$ROUND" \
-  --version-id "$VERSION" --reason "Corrected official dividend evidence."
+  --version-id "$VERSION" --reason "Corrected official dividend evidence." \
+  --evidence-snapshot-id "$CORRECTED_SNAPSHOT"
 ```
 
-Revalidation keeps the strategy identity (the same `version_id`), recomputes
-the affected Discovery replay, records the prior receipt and hashes
-(`previous_validation_id`, `previous_receipt_hash`, `previous_outcome`) as
-history, and publishes a new validation epoch. An approved version must be ended
-before it can be revalidated.
+`--evidence-snapshot-id` names the sealed corrected successor snapshot
+explicitly and is optional. Without it, the command uses the supplied snapshot
+store's only valid successor of the locked snapshot; if no valid successor
+exists it takes the platform-fix path and reproduces the frozen partition. A
+successor must descend from the locked snapshot, keep the frozen data
+kind/schema and Discovery interval, keep the frozen prior history, and be
+readable at the recorded as-of cutoff. The command then recomputes the locked
+candidate and the equal-weight benchmark over the corrected Discovery partition
+with the same execution rules, costs, cash and scoring start.
+
+Revalidation keeps the strategy identity (the same `version_id`) and publishes
+a new validation epoch. The result keeps the prior receipt as history
+(`previous_validation_id`, `previous_receipt_hash`, `previous_outcome`) and
+records `evidence` (source snapshot, lineage, and whether the snapshot or
+runtime changed), `original_discovery` and `recomputed_discovery` (the two
+content-addressed runs with fills and ending cash) and `affected` (changed
+rows/sessions, NAV and fill changes, ending-equity delta and a summary
+reason). Replaying the same revalidation returns the stored record with
+`reused: true`.
+
+The locked strategy and every earlier receipt stay untouched. An approved
+version may be revalidated: a corrected pass keeps the review state `approved`;
+a failed or insufficient corrected receipt records the new receipt and raises a
+concrete review trigger for the operator, without silently revoking the
+approval or auto-pausing tracking. An `ended` version remains terminal and is
+refused (`VERSION_ENDED`).
+
+Corrected-evidence failures are typed rejections (exit 2, no new receipt):
+`EVIDENCE_SNAPSHOT_NOT_FOUND` (the ID is not a sealed snapshot in the store or
+its manifest is incomplete), `EVIDENCE_NOT_SUCCESSOR` (it does not descend from
+the locked snapshot), `EVIDENCE_DATA_KIND_MISMATCH` (data kind or schema
+differs from the frozen Campaign or prior snapshot),
+`EVIDENCE_INTERVAL_MISMATCH` (the frozen Discovery interval changed or the
+frozen scoring start is not a session in the corrected evidence),
+`EVIDENCE_PRIOR_HISTORY_MISMATCH` (the frozen prior history changed),
+`EVIDENCE_AS_OF_VIOLATION` (the corrected payload only became available after
+the recorded point-in-time cutoff) and `EVIDENCE_INTEGRITY_VIOLATION` (the
+sealed manifest or partition integrity check failed). If more than one valid
+successor exists, pass `--evidence-snapshot-id` (`EVIDENCE_SNAPSHOT_AMBIGUOUS`).
+A completed revalidation supersedes the locked replay, so `round validate` on
+that version is refused with `REVALIDATION_SUPERSEDED`.
 
 #### 4. Review decisions and the current state
 
@@ -1049,13 +1091,14 @@ terminal for that version only.
 ```sh
 prajnatrade shadow tick --ledger /trusted/shadow-ledger \
   --store /trusted/evaluations --calendar trading-calendar.json \
-  --data "$DAILY_FEED"
+  --data "$DAILY_FEED" --corrections-store /trusted/snapshots
 prajnatrade shadow compare --ledger /trusted/shadow-ledger \
   --data "$DAILY_FEED" --versions "$V1_RELEASE,$V2_RELEASE"
 ```
 
-`round status` and `round evidence status` summarise records only; the ledger
-remains the accounting source of truth, and the agent CLI never sees it.
+`round status` and `round evidence status` summarize stored records and
+ledger-derived counts; the ledger remains the accounting source of truth, and
+the agent CLI never sees it.
 
 #### 6. Command statuses and exit codes
 
@@ -1069,8 +1112,8 @@ print `error: ...` on stderr and exit 2.
 | `round open` | operator | `opened` | — | `ROUND_ALREADY_OPENED`, `SCORING_POLICY_NOT_FROZEN` |
 | `round status` | operator, agent | `ok` (or `open`/`closed` for one round) | — | `ROUND_NOT_FOUND` |
 | `round submit` | agent | `submitted` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE` |
-| `round validate` | operator | `completed` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT` |
-| `round revalidate` | operator | `revalidated` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT` |
+| `round validate` | operator | `completed` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `REVALIDATION_SUPERSEDED` |
+| `round revalidate` | operator | `revalidated` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REPLAY_MISMATCH`, `EVIDENCE_SNAPSHOT_NOT_FOUND`, `EVIDENCE_NOT_SUCCESSOR`, `EVIDENCE_DATA_KIND_MISMATCH`, `EVIDENCE_INTERVAL_MISMATCH`, `EVIDENCE_PRIOR_HISTORY_MISMATCH`, `EVIDENCE_AS_OF_VIOLATION`, `EVIDENCE_INTEGRITY_VIOLATION`, `EVIDENCE_SNAPSHOT_AMBIGUOUS` |
 | `round review` | operator | `approved` / `returned` / `ended` | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `RISK_NOT_ACCEPTED`, `OBSERVATION_REQUIRED`, `REVIEW_CONFLICT`, `VERSION_ENDED`, `CALENDAR_COVERAGE_MISSING` |
 | `round close` | operator | `closed` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED` |
 | `round evidence status` | operator | `ok` (per-version `state`: `tracking` / `review_due` / `observation_extended` / `paused` / `ended`) | — | `ROUND_NOT_FOUND`, unknown version |
