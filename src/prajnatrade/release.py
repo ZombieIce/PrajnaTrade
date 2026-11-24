@@ -38,6 +38,7 @@ SCHEMA_VERSION = 1
 SCOPE = "synthetic"
 RELEASE_VERSION = "release-v1"
 RESEARCH_HOLDOUT = "research_holdout"
+TRACKING_WORKFLOW = "manual_tracking"
 ARTIFACT_KIND = "immutable_release_artifact"
 STATUS_KIND = "immutable_release_status"
 REJECTION_KIND = "immutable_release_rejection"
@@ -100,6 +101,14 @@ REAL_ADMISSION_STATEMENT = (
 CONDITIONAL_ADMISSION_STATEMENT = (
     "The reviewer authorized this frozen candidate and its scheduled Shadow Live "
     "enablement before Final Holdout. The trusted passing evidence activated that decision."
+)
+
+TRACKING_ADMISSION_STATEMENT = (
+    "This artifact records a manual simulated-tracking admission for one locked "
+    "research-loop version over its lightweight passed receipt. It is not a "
+    "protected evaluation and not a conditional release: it authorizes only the "
+    "independent paper ledger that starts at the first eligible signal session, "
+    "and it does not prove real-market performance or place a real order."
 )
 
 _RELEASE_ID = re.compile(r"[0-9a-f]{64}")
@@ -177,6 +186,13 @@ def _release_id(candidate_hash: object, plan_hash: object) -> str:
     )
 
 
+def tracking_id(version_id: str, validation_id: str) -> str:
+    """The content address of one manual simulated-tracking release version."""
+    if not isinstance(version_id, str) or not isinstance(validation_id, str):
+        return ""
+    return _release_id(version_id, validation_id)
+
+
 def _check_release_id(release_id: object) -> str:
     if not isinstance(release_id, str) or not _RELEASE_ID.fullmatch(release_id):
         raise _reject(
@@ -198,6 +214,62 @@ def _artifact_location(store: Path, release_id: str) -> Path:
 
 def _artifact_bytes(artifact: dict[str, Any]) -> str:
     return _hash({key: value for key, value in artifact.items() if key != "artifact_hash"})
+
+
+def _verify_tracking_artifact(
+    artifact: dict[str, Any], effective_signal_date: object,
+) -> str:
+    """Verify one ``manual_tracking`` artifact without loading a protected plan."""
+    try:
+        if artifact.get("kind") != ARTIFACT_KIND:
+            raise ValueError("unexpected artifact kind")
+        if artifact.get("workflow") != TRACKING_WORKFLOW:
+            raise ValueError("unexpected workflow")
+        if artifact.get("simulated_tracking") is not True:
+            raise ValueError("simulated_tracking must be true")
+        version_id = artifact["candidate_hash"]
+        validation_id = artifact["plan_id"]
+        if not isinstance(version_id, str) or not isinstance(validation_id, str):
+            raise ValueError("tracking bindings must be strings")
+        if artifact.get("release_id") != tracking_id(version_id, validation_id):
+            raise ValueError("release ID is not the tracking content address")
+        if artifact.get("artifact_hash") != _artifact_bytes(artifact):
+            raise ValueError("artifact hash mismatch")
+        binding = artifact["binding"]
+        if binding.get("version_id") != version_id:
+            raise ValueError("version binding differs")
+        if binding.get("validation_id") != validation_id:
+            raise ValueError("validation binding differs")
+        admission = artifact["admission"]
+        if (
+            admission.get("decision") != "approved"
+            or admission.get("automatic_enable") is not True
+        ):
+            raise ValueError("admission is not an automatic approval")
+        if admission.get("protected_evaluation") is not False:
+            raise ValueError("tracking artifact claims a protected evaluation")
+        if admission.get("conditional_release") is not False:
+            raise ValueError("tracking artifact claims a conditional release")
+        calendar = shadow_calendar.validate_calendar(admission["calendar"])
+        if admission.get("calendar_hash") != _hash(calendar):
+            raise ValueError("calendar hash mismatch")
+        if calendar["data_kind"] != artifact.get("scope"):
+            raise ValueError("calendar scope differs from the artifact scope")
+        if (
+            not isinstance(effective_signal_date, str)
+            or effective_signal_date not in calendar["sessions"]
+        ):
+            raise ValueError("effective signal date is not a calendar session")
+        if admission.get("effective_signal_date") != effective_signal_date:
+            raise ValueError("effective signal date differs from the admission")
+    except (KeyError, TypeError, ValueError) as error:
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED",
+            "registration",
+            "inspect",
+            f"The manual simulated-tracking artifact is incomplete: {error}",
+        ) from error
+    return artifact["release_id"]
 
 
 def _verified_artifact(path: Path, release_id: str) -> dict[str, Any]:
@@ -295,6 +367,14 @@ def _load_verified_artifact(path: Path, release_id: str) -> dict[str, Any]:
                 "RELEASE_INTEGRITY_FAILED", "fetch", "inspect",
                 f"The stored conditional admission is incomplete: {error}",
             ) from error
+    elif artifact.get("workflow") == TRACKING_WORKFLOW:
+        admission = artifact.get("admission")
+        effective = (
+            admission.get("effective_signal_date")
+            if isinstance(admission, dict)
+            else None
+        )
+        _verify_tracking_artifact(artifact, effective)
     return artifact
 
 
@@ -2449,8 +2529,46 @@ def disposition(
 # ---------------------------------------------------------------------------
 
 
+def _verify_tracking_bindings(store: Path, artifact: dict[str, Any]) -> None:
+    """Re-verify a manual-tracking artifact against its trusted Validation receipt."""
+    admission = artifact.get("admission")
+    effective = (
+        admission.get("effective_signal_date") if isinstance(admission, dict) else None
+    )
+    _verify_tracking_artifact(artifact, effective)
+    validation_id = artifact["plan_id"]
+    binding = artifact.get("binding")
+    if not isinstance(binding, dict):
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED", "lifecycle", "inspect",
+            "The tracking artifact has no validated binding block.",
+        )
+    path = store / "research-loop-validations" / f"{validation_id}.json"
+    try:
+        receipt = snapshot._read_json(path)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise _reject(
+            "EVIDENCE_INVALID", "lifecycle", "inspect",
+            f"The tracking Validation receipt is unreadable: {error}",
+        ) from error
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("status") != "completed"
+        or receipt.get("validation_id") != validation_id
+        or receipt.get("version_id") != artifact.get("candidate_hash")
+        or receipt.get("receipt_hash") != binding.get("receipt_hash")
+    ):
+        raise _reject(
+            "EVIDENCE_INVALID", "lifecycle", "inspect",
+            "The tracking Validation receipt no longer matches the release artifact.",
+        )
+
+
 def _verify_bindings(store: Path, artifact: dict[str, Any]) -> None:
     """Re-verify the artifact's plan and both bound records (immutability check)."""
+    if artifact.get("workflow") == TRACKING_WORKFLOW:
+        _verify_tracking_bindings(store, artifact)
+        return
     plan_id = artifact.get("plan_id")
     try:
         plan = protected_eval.load_plan(store, plan_id)
@@ -2724,6 +2842,58 @@ def retire(
 ) -> dict[str, Any]:
     """Terminal retirement; keeps the artifact and the whole timeline for audit."""
     return _append_event("retire", store, release_id, effective_signal_date, reason)
+
+
+def register_tracking_version(
+    store: str | Path,
+    artifact: dict[str, Any],
+    effective_signal_date: str,
+    reason: str,
+) -> str:
+    """Admit one manual simulated-tracking version at its first eligible session.
+
+    The tracking artifact is written write-once and exactly one ``enable`` event
+    is appended, so replaying the same admission cannot create a second release
+    or move the enable date.  The caller binds the artifact to a research-round
+    version and its terminal passed lightweight Validation receipt.
+    """
+    eval_store = _store(store)
+    release_id = _verify_tracking_artifact(artifact, effective_signal_date)
+    reason = reason.strip() if isinstance(reason, str) else ""
+    if not reason:
+        raise _reject(
+            "INVALID_EVENT", "registration", "correct",
+            "A simulated-tracking admission requires a non-empty reason.",
+        )
+    path = _artifact_location(eval_store, release_id)
+    if path.is_file():
+        existing = _load_verified_artifact(path, release_id)
+        if existing != artifact:
+            raise _reject(
+                "RELEASE_INTEGRITY_FAILED", "registration", "inspect",
+                "A different tracking artifact already exists for this release ID.",
+            )
+    elif not _write_immutable(path, artifact):
+        existing = _load_verified_artifact(path, release_id)
+        if existing != artifact:
+            raise _reject(
+                "RELEASE_INTEGRITY_FAILED", "registration", "inspect",
+                "A concurrent tracking artifact differs from this admission.",
+            )
+    events = _timeline(eval_store, release_id)
+    if events:
+        first = events[0]
+        if (
+            first["action"] != "enable"
+            or first["effective_signal_date"] != effective_signal_date
+        ):
+            raise _reject(
+                "RELEASE_INTEGRITY_FAILED", "registration", "inspect",
+                "The tracking timeline already started with a different enable event.",
+            )
+        return release_id
+    _append_event("enable", eval_store, release_id, effective_signal_date, reason)
+    return release_id
 
 
 # ---------------------------------------------------------------------------

@@ -508,6 +508,36 @@ def _add_research_loop_workflow(
     validate.add_argument("--round-id", required=True)
     validate.add_argument("--version-id", required=True)
 
+    revalidate = rounds.add_parser(
+        "revalidate",
+        help="recompute lightweight Validation after an evidence source or platform fix",
+    )
+    revalidate.add_argument("--project", required=True, type=Path)
+    revalidate.add_argument("--store", required=True, type=Path)
+    revalidate.add_argument("--snapshot-store", required=True, type=Path)
+    revalidate.add_argument("--round-id", required=True)
+    revalidate.add_argument("--version-id", required=True)
+    revalidate.add_argument("--reason", required=True)
+
+    reviewed = rounds.add_parser(
+        "review", help="record the human approve, return or end decision for one version"
+    )
+    reviewed.add_argument("--project", required=True, type=Path)
+    reviewed.add_argument("--store", required=True, type=Path)
+    reviewed.add_argument("--round-id", required=True)
+    reviewed.add_argument("--version-id", required=True)
+    reviewed.add_argument(
+        "--decision", required=True, choices=["approve", "return", "end"]
+    )
+    reviewed.add_argument("--reviewer", required=True)
+    reviewed.add_argument("--reason", required=True)
+    reviewed.add_argument("--input", type=Path)
+    reviewed.add_argument(
+        "--calendar",
+        type=Path,
+        help="approved trading calendar required by approve",
+    )
+
     close = rounds.add_parser("close", help="record an early or exhausted round stop")
     close.add_argument("--project", required=True, type=Path)
     close.add_argument("--round-id", required=True)
@@ -943,6 +973,32 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 args.round_id,
                 args.version_id,
             )
+        elif args.round_action == "revalidate":
+            result = research_loop.revalidate(
+                args.project,
+                args.store,
+                args.snapshot_store,
+                args.round_id,
+                args.version_id,
+                args.reason,
+            )
+        elif args.round_action == "review":
+            source = (
+                json.loads(args.input.read_text(encoding="utf-8"))
+                if args.input is not None
+                else None
+            )
+            result = research_loop.review(
+                args.project,
+                args.store,
+                args.round_id,
+                args.version_id,
+                args.decision,
+                args.reviewer,
+                args.reason,
+                source,
+                calendar=args.calendar,
+            )
         else:
             result = research_loop.close(
                 args.project,
@@ -951,7 +1007,7 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 args.reason,
                 json.loads(args.input.read_text(encoding="utf-8")),
             )
-    except ProtocolError as error:
+    except (ProtocolError, release.ReleaseRejection) as error:
         result = {
             "schema_version": 1,
             "status": "rejected",
