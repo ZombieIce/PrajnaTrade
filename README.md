@@ -700,6 +700,393 @@ The Mock provider can emit deterministic Python when opted in, but a Mock
 campaign is never evidence of model novelty or investable performance. Results
 are research evidence, not investment advice or a guarantee of future returns.
 
+### Research Loop and Evidence Loop (#43)
+
+Issue #43 is the default simulated-tracking workflow. A **Research Loop** runs
+one approved round over a Campaign: approve the round contract, lock successful
+Discovery versions, replay them as lightweight Validation, then record exactly
+one human review decision per version. An **Evidence Loop** is the independent
+Shadow Live account of a version admitted to simulated tracking and the
+observation review that follows.
+
+Admission here is a **manual simulated-tracking decision**. It is not the
+protected `evaluation`/Final Holdout flow and not a conditional `release`: it
+never opens a sealed Validation/Final Holdout partition, never writes a query
+debit, never creates a protected immutable release and never enables a release
+conditionally. The protected flows and
+[`#37`](#direction-bound-research-37) keep their own recorded protocols, and
+existing plans, authorizations, debits, releases and receipts are still read
+under their original rules.
+
+#### 1. Open the round contract
+
+The research lead approves the round contract before work starts. One round is
+bound to one Campaign and one stable direction key.
+
+```sh
+prajnatrade round open --project ./strategy-A --store /trusted/evaluations \
+  --campaign-id "$CAMPAIGN" --direction-key "etf-relative-strength" \
+  --name "ETF relative strength" --authorization-id "$KICKOFF_APPROVAL" \
+  --input round.json
+```
+
+`round.json` fixes everything the agent may work within:
+
+```json
+{
+  "objective": "Prefer a version that keeps drawdown below the benchmark.",
+  "constraints": ["Long-only.", "At most one rebalance per session."],
+  "comparison": {
+    "benchmark": "equal_weight_buy_and_hold",
+    "statement": "Same Discovery interval, initial cash and costs."
+  },
+  "selection_rules": ["A lower unfilled-order count wins a tie."],
+  "hard_conditions": [
+    {"id": "drawdown", "metric": "max_drawdown", "operator": ">=", "value": -0.20}
+  ],
+  "disclosed_risks": ["Momentum may stay in cash for long stretches."],
+  "scoring_policy": {
+    "mode": "valid_observations",
+    "data_availability": "next_open",
+    "consecutive_sessions": false
+  },
+  "observation": {
+    "basis": "rebalance_frequency",
+    "minimum_opportunities": 2,
+    "review_conditions": ["two consecutive opportunities with intent but no fill"]
+  },
+  "invalidation": {
+    "max_unfilled_opportunities": 3,
+    "max_abs_drawdown": 0.25,
+    "max_data_gap_sessions": 2
+  },
+  "reviewer": "research-lead",
+  "approval_reason": "The contract and disclosed risks are approved."
+}
+```
+
+Hard-condition metrics are `net_return`, `max_drawdown`, `sharpe`, `turnover`,
+`unfilled_orders` and `valued_sessions`; operators are `>=`, `<=`, `>`, `<` and
+`==`. `scoring_policy.mode` is `valid_observations` or
+`consecutive_sessions`, `data_availability` is `next_open`, and
+`consecutive_sessions` must agree with the mode. The Campaign must already carry
+its frozen Discovery scoring policy (`campaign create
+--discovery-warmup-sessions`); otherwise the round is refused with
+`SCORING_POLICY_NOT_FROZEN`. Replaying identical content returns the stored
+round with `reused: true`; different content for the same Campaign is
+`ROUND_ALREADY_OPENED`. Changing the objective or the evaluation standard opens
+a new round; changed strategy experiments are charged to the Campaign budget.
+
+`round status` is granted to the agent and reads the project only:
+
+```sh
+prajnatrade-agent round status --project ./strategy-A [--round-id "$ROUND"]
+```
+
+Without `--round-id` it lists every round. Each round reports `status` (`open`
+or `closed`), the approved kickoff, budget, locked submissions with their
+Validation summary, `review_state`, recommended and confirmed observation, a
+tracking summary and any closure. It never returns a sealed payload, a
+protected outcome, ledger prices or admission internals.
+
+#### 2. Lock a version for review
+
+After a successful Discovery experiment the agent submits the version with its
+testable question and the condition that would change the choice.
+
+```sh
+prajnatrade-agent round submit --project ./strategy-A --round-id "$ROUND" \
+  --submission-id v1 --input submit.json
+```
+
+```json
+{
+  "experiment_id": "exp-...",
+  "change": "Replace the 20-session lookback with a 60-session one.",
+  "question": "Does the slower signal reduce drawdown without losing return?",
+  "expected_change": "Fewer rebalances and a smaller drawdown.",
+  "revisit_condition": "A lower return without the drawdown improvement.",
+  "risks": ["A slow signal can miss a regime change."],
+  "related_experiment_ids": ["exp-..."]
+}
+```
+
+`revisit_condition` is required for every submission, and the experiment must be
+a successful attempt in the round's Campaign. The receipt locks the strategy
+(with parameters and any generated source), snapshot, Discovery evaluation,
+execution rules, costs, protocol, signal window and frozen scoring policy into
+one content-addressed `version_id`; `locked` repeats those bindings. The same
+`submission_id` with the same content returns the stored version with
+`reused: true`; the same ID with different content is `SUBMISSION_CONFLICT`; the
+same content under another submission ID resolves to the same `version_id`.
+
+#### 3. Lightweight Validation (no protected allowance)
+
+```sh
+prajnatrade round validate --project ./strategy-A --store /trusted/evaluations \
+  --snapshot-store /trusted/snapshots --round-id "$ROUND" \
+  --version-id "$VERSION"
+```
+
+Lightweight Validation replays the locked candidate and the equal-weight
+benchmark over the Campaign's frozen Discovery interval, using the same sealed
+snapshot, point-in-time cutoffs, execution rules, costs, initial cash and
+scoring start as Discovery. It reuses the Discovery evidence and introduces no
+new historical scoring window keyed to the submission date. It never opens a
+protected partition and never writes a query debit; the receipt records
+`opened_protected_source: false` and `query_debited: false`.
+
+The replay must match Discovery on the scoring interval, scoreable sessions,
+fills and ending cash within the `1e-9` tolerance. The receipt's check groups
+are `data_availability`, `scoring_start`, `coverage`, `position`, `costs`,
+`replay` and `hard_conditions`. The verdict is:
+
+| `outcome` | `reason` | meaning |
+| --- | --- | --- |
+| `passed` | `null` | Every check matched and every hard condition was met. |
+| `failed` | `HARD_CONDITION_NOT_MET` | At least one round hard condition failed; the version cannot be approved. |
+| `insufficient_evidence` | `REPLAY_MISMATCH` | The replay is not byte-for-value equal to Discovery; a platform or data change needs `round revalidate`. |
+| `insufficient_evidence` | `SCORING_START_INSUFFICIENT` | The frozen scoring start is not ready for the candidate or the benchmark. |
+| `insufficient_evidence` | `COVERAGE_INSUFFICIENT` | Signal/valuation gaps or an incomplete scoring interval; `checks.data_availability` names the exact missing requirement. |
+| `insufficient_evidence` | `POSITION_EVIDENCE_INSUFFICIENT` | The account never established the preregistered position and did not explicitly target cash. |
+| `insufficient_evidence` | `COST_EVIDENCE_INSUFFICIENT` | Replayed fees or slippage do not match Discovery. |
+| `insufficient_evidence` | `METRICS_NOT_READY` | A hard-condition metric is unavailable; the condition records `status: unavailable`. |
+
+The three position states stay distinct: no usable indicator/valuation input is
+`metrics_not_ready` (reported through the coverage checks), an explicit
+cash target is `intentional_cash` (valid position evidence), and an order that
+was intended but never filled is `ordered_unfilled`
+(`POSITION_EVIDENCE_INSUFFICIENT`, not a missing metric).
+
+A completed receipt is published to the project with the research-visible
+allowlist and kept write-once in the trusted store. Replaying the same
+validation identity returns the stored receipt with `reused: true`. If the
+process is interrupted, the retry keeps the same identity, records a new
+`attempt` row and reports `attempts`/`resumed: true`; it does not spend a
+protected allowance or a new attempt.
+
+After a corrected data source or a platform fix, use `round revalidate` when
+the original selection reason still holds:
+
+```sh
+prajnatrade round revalidate --project ./strategy-A --store /trusted/evaluations \
+  --snapshot-store /trusted/snapshots --round-id "$ROUND" \
+  --version-id "$VERSION" --reason "Corrected official dividend evidence."
+```
+
+Revalidation keeps the strategy identity (the same `version_id`), recomputes
+the affected Discovery replay, records the prior receipt and hashes
+(`previous_validation_id`, `previous_receipt_hash`, `previous_outcome`) as
+history, and publishes a new validation epoch. An approved version must be ended
+before it can be revalidated.
+
+#### 4. Review decisions and the current state
+
+Every version has exactly one current review state: `pending` (no decision yet),
+`approved`, `returned` or `ended`. The reviewer records one immutable,
+content-addressed decision; both `--reviewer` and `--reason` are required. The
+platform never pre-fills the decision — a passed receipt is evidence, not an
+approval, and a failed or insufficient receipt cannot be approved.
+
+```sh
+prajnatrade round review --project ./strategy-A --store /trusted/evaluations \
+  --round-id "$ROUND" --version-id "$VERSION" --decision approve \
+  --reviewer "$REVIEWER" --reason "$APPROVAL_REASON" \
+  --input observation.json --calendar trading-calendar.json
+```
+
+`approve` requires a terminal `passed` receipt for exactly this version
+(`VALIDATION_NOT_PASSED` otherwise) and the reviewer's explicit observation
+confirmation:
+
+```json
+{
+  "observation_sessions": 20,
+  "accepted_risks": ["Momentum may stay in cash for long stretches."],
+  "observation_reason": "The recommended term plus two extra sessions."
+}
+```
+
+`observation_sessions` is a positive integer no greater than 252, and
+`accepted_risks` must list every round `disclosed_risks` entry the reviewer
+accepts; a missing one is `RISK_NOT_ACCEPTED`, and omitting the input is
+`OBSERVATION_REQUIRED`. The approved decision binds the locked version,
+submission, experiment, Validation receipt, question, revisit condition and the
+confirmed observation. It is recorded immediately even when the market is
+closed, and tracking starts at the **first eligible trading session after the
+decision's Asia/Shanghai date** from the supplied approved calendar
+(`CALENDAR_COVERAGE_MISSING` when the calendar does not cover it). The tracking
+artifact is write-once with `workflow: manual_tracking` and
+`simulated_tracking: true`, and exactly one `enable` event takes effect on that
+session; `release status` shows `published` before it and `enabled` from it.
+
+`return` sends the version back to research:
+
+```sh
+prajnatrade round review ... --decision return --input return.json
+```
+
+```json
+{
+  "change": "What V2 must change.",
+  "comparison": "How V2 is compared with V1 under the same protocol.",
+  "revisit_condition": "The result that would select this version again.",
+  "next_submission_id": "v2"
+}
+```
+
+The version's current state becomes `returned`, and its passed receipt stays
+usable. V2 is an ordinary `round submit` with a new `submission_id`; `round
+status` compares it with V1 under the same round and scoring policy. If V2 does
+not improve and V1's receipt still applies, approve V1 again with a recorded
+reason: the stored passed receipt is reused (`validation.reused: true`) instead
+of being recomputed. Re-selection is a new review decision, not a new
+Validation.
+
+`end` closes one version terminally:
+
+```sh
+prajnatrade round review ... --decision end --input end.json
+```
+
+```json
+{"detail": "Why this version is closed.", "continue_direction": true}
+```
+
+An `ended` version cannot be revalidated, re-approved or continued, but the
+round stays open and a new version may be submitted for the same direction.
+
+`round close` records an early or exhausted stop:
+
+```sh
+prajnatrade round close --project ./strategy-A --round-id "$ROUND" \
+  --reviewer "$REVIEWER" --reason "$REASON" --input close.json
+```
+
+```json
+{"stop_reason": "No remaining testable experiment could change the choice.",
+ "selected_version": "v1", "next_experiment": null}
+```
+
+A close is allowed with Campaign budget remaining. It records
+`candidate_selected` (whether `selected_version` is non-null) and the stop
+reason; a selected version must be locked and approved. A closed round refuses
+new submissions, validations, revalidations and review decisions. The same
+closure replays; a different one is `ROUND_CLOSED`.
+
+#### 5. Evidence Loop: observation, opportunities and pauses
+
+An approved version is tracked in the existing Shadow Live ledger as its own
+account; there is no second accounting engine. Tracking starts at the enable
+event's effective signal session. The first decision point may use compliant
+history before that session to initialise indicators, but nothing before
+enable — simulated fills, holdings, P&L or opportunity counts — is forward
+performance. If the required history is incomplete at the first decision point,
+the ledger records `metrics_not_ready` with the specific missing requirement
+rather than inventing an order. The ledger keeps three states distinct:
+`metrics_not_ready` (a required input or trailing window is missing),
+intentional cash (the inputs are ready and the strategy targets cash) and
+ordered-unfilled (an order was intended but did not fill).
+
+Each committed session records one **tracking opportunity** when the strategy's
+target changed and produced orders: its signal and execution dates, order IDs,
+and separately which orders are due, filled and unfilled. An opportunity with
+intent but no fill still counts as due. `round evidence status` reports, per
+version, the enable date, the committed range, first signal and first fill
+dates, `due_opportunities` / `filled_opportunities` / `unfilled_opportunities` /
+`intent_without_fill` (and the longest consecutive run of intent-without-fill),
+observation progress, `metrics_not_ready` and data-gap counts, any review
+trigger, any pause and the version state (`tracking`, `review_due`,
+`observation_extended`, `paused` or `ended`). `shadow report` and
+`shadow compare` aggregate the same opportunity counts; `shadow compare` keeps
+each requested version's `full_history` even when the common run is shorter.
+
+The platform recommends an observation term from the candidate replay's
+rebalance cadence:
+
+```text
+recommended_sessions = ceil(sessions / max(1, opportunities)) * minimum_opportunities
+```
+
+clamped to `[minimum_opportunities, 252]`, with a `basis` record. The researcher
+confirms or adjusts it in the approval input. When the confirmed term is reached
+and due opportunities meet `minimum_opportunities`, the version is reviewed. A
+term reached with too few opportunities becomes `observation_extended`: tracking
+continues and the reason is recorded. A preset invalidation condition (too many
+unfilled opportunities, an absolute drawdown limit or a data gap) also triggers
+human review; the platform never changes the verdict automatically.
+
+`round evidence status` and `round evidence decide` are operator-only:
+
+```sh
+prajnatrade round evidence status --project ./strategy-A \
+  --store /trusted/evaluations --ledger /trusted/shadow-ledger \
+  --round-id "$ROUND" [--version-id "$VERSION"]
+
+prajnatrade round evidence decide --project ./strategy-A \
+  --store /trusted/evaluations --ledger /trusted/shadow-ledger \
+  --round-id "$ROUND" --version-id "$VERSION" \
+  --decision continue|pause|retire --reviewer "$REVIEWER" --reason "$REASON"
+```
+
+`continue` records the decision and keeps tracking (it resumes a manually
+paused version); it is the human answer to a review trigger or an extended
+term. `pause` stops only that version's new signals at its first uncommitted
+after-close session, keeps pending orders and valuation, and records the pause
+scope (default `version`) and reason. A data/execution/ledger distortion pauses
+only the affected version's processing and is recorded as a scope pause on that
+version; other versions keep committing. `retire` ends that version terminally,
+keeps its artifact and full ledger history, marks its ledger progress ended and
+stops later signals; the round and any other version continue.
+
+Two versions may be approved independently and track in parallel. Each has its
+own immutable tracking artifact, ledger account, enable date and full history.
+`shadow compare` reports only the common consecutive forward interval and never
+mixes the two accounts; V2's forward evidence begins at its own enable, and an
+incomparable pair states why instead of dropping a version. Ending a version is
+terminal for that version only.
+
+```sh
+prajnatrade shadow tick --ledger /trusted/shadow-ledger \
+  --store /trusted/evaluations --calendar trading-calendar.json \
+  --data "$DAILY_FEED"
+prajnatrade shadow compare --ledger /trusted/shadow-ledger \
+  --data "$DAILY_FEED" --versions "$V1_RELEASE,$V2_RELEASE"
+```
+
+`round status` and `round evidence status` summarise records only; the ledger
+remains the accounting source of truth, and the agent CLI never sees it.
+
+#### 6. Command statuses and exit codes
+
+Every workflow command prints one versioned JSON document. Protocol rejections
+use `{"schema_version", "status": "rejected", "error": {code, phase,
+next_action, message}, ...context}` and exit 2; plain path/SQLite/value errors
+print `error: ...` on stderr and exit 2.
+
+| Command | Side | Success `status` | Evidence-bearing statuses (exit 0) | Rejection (exit 2) |
+| --- | --- | --- | --- | --- |
+| `round open` | operator | `opened` | — | `ROUND_ALREADY_OPENED`, `SCORING_POLICY_NOT_FROZEN` |
+| `round status` | operator, agent | `ok` (or `open`/`closed` for one round) | — | `ROUND_NOT_FOUND` |
+| `round submit` | agent | `submitted` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE` |
+| `round validate` | operator | `completed` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT` |
+| `round revalidate` | operator | `revalidated` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT` |
+| `round review` | operator | `approved` / `returned` / `ended` | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `RISK_NOT_ACCEPTED`, `OBSERVATION_REQUIRED`, `REVIEW_CONFLICT`, `VERSION_ENDED`, `CALENDAR_COVERAGE_MISSING` |
+| `round close` | operator | `closed` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED` |
+| `round evidence status` | operator | `ok` (per-version `state`: `tracking` / `review_due` / `observation_extended` / `paused` / `ended`) | — | `ROUND_NOT_FOUND`, unknown version |
+| `round evidence decide` | operator | `ok` (fields `decision`, `state`, `effect`) | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `REVIEW_CONFLICT`, `VERSION_ENDED` |
+| `shadow tick`, `shadow update` | operator | `committed` / `committed_with_anomalies` / `already_committed` | — | `blocked` (exit 2 when any version blocks) |
+
+A Validation `failed` or `insufficient_evidence` verdict is evidence, not a
+protocol rejection, so `round validate` and `round revalidate` exit 0 and the
+receipt records the `outcome` and `reason`; approval is refused later.
+
+**Synthetic scope.** This is a synthetic mechanism test: synthetic snapshots,
+synthetic prices, a synthetic feed and no broker, real order, credential or
+network. The public-CLI tests demonstrate the #43 round, receipt, review and
+observation rules; they are not evidence of real forward performance, do not
+satisfy the #35 real-chain gate and do not change the #17 acceptance verdict.
+
 ### Direction-bound research (#37)
 
 The research lead creates a Campaign on a sealed snapshot, then approves its
@@ -1994,6 +2381,9 @@ carry real-scope evidence. Anything short of the full gate is reported as
 `failed`, `blocked` or `not_run`, with explicit blockers and a plain statement
 that the six-scenario rule was not met. The command is operator-only:
 `prajnatrade-agent` has no `acceptance` command.
+
+Issue #43 adds synthetic Research Loop and Evidence Loop tracking only; it adds
+no acceptance scenario and does not change the #17 verdict.
 
 **The overall #17 verdict remains blocked.** The tests and CLI scenario and
 the historical real five-ETF baseline, bounded Mock campaign and controlled
