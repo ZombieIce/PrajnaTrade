@@ -83,6 +83,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         dest="evaluation_command", required=True
     )
     _add_direction_workflow(commands, agent_only=agent_only)
+    _add_research_loop_workflow(commands, agent_only=agent_only)
     if agent_only:
         evaluation_lookup = evaluation_commands.add_parser("status")
         evaluation_lookup.add_argument("--project", required=True, type=Path)
@@ -304,6 +305,10 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     create.add_argument("--transaction-cost-bps", type=float, default=5.0)
     create.add_argument("--slippage-bps", type=float, default=0.0)
     create.add_argument(
+        "--discovery-warmup-sessions", type=int,
+        help="use this many opening Discovery sessions for history before a common scoring start",
+    )
+    create.add_argument(
         "--execution-rules", choices=EXECUTION_RULE_VERSIONS, default=NEXT_OPEN_RULES,
         help="freeze platform matching rules for Discovery and protected evaluation",
     )
@@ -465,6 +470,120 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     return parser
 
 
+def _add_research_loop_workflow(
+    commands: argparse._SubParsersAction, *, agent_only: bool,
+) -> None:
+    research_round = commands.add_parser(
+        "round", help="open, submit to, validate, and close a research round"
+    )
+    rounds = research_round.add_subparsers(dest="round_action", required=True)
+    status = rounds.add_parser("status", help="report research-visible round progress")
+    status.add_argument("--project", required=True, type=Path)
+    status.add_argument("--round-id")
+    submit = rounds.add_parser("submit", help="lock a successful Discovery version")
+    submit.add_argument("--project", required=True, type=Path)
+    submit.add_argument("--round-id", required=True)
+    submit.add_argument("--submission-id", required=True)
+    submit.add_argument("--input", required=True, type=Path)
+    if agent_only:
+        return
+
+    opened = rounds.add_parser(
+        "open", help="approve the round contract and its frozen Campaign bindings"
+    )
+    opened.add_argument("--project", required=True, type=Path)
+    opened.add_argument("--store", required=True, type=Path)
+    opened.add_argument("--campaign-id", required=True)
+    opened.add_argument("--direction-key", required=True)
+    opened.add_argument("--name", required=True)
+    opened.add_argument("--authorization-id", required=True)
+    opened.add_argument("--input", required=True, type=Path)
+
+    validate = rounds.add_parser(
+        "validate", help="replay a locked version as lightweight Validation"
+    )
+    validate.add_argument("--project", required=True, type=Path)
+    validate.add_argument("--store", required=True, type=Path)
+    validate.add_argument("--snapshot-store", required=True, type=Path)
+    validate.add_argument("--round-id", required=True)
+    validate.add_argument("--version-id", required=True)
+
+    revalidate = rounds.add_parser(
+        "revalidate",
+        help=(
+            "recompute lightweight Validation after a data correction, "
+            "evidence source or platform fix"
+        ),
+    )
+    revalidate.add_argument("--project", required=True, type=Path)
+    revalidate.add_argument("--store", required=True, type=Path)
+    revalidate.add_argument("--snapshot-store", required=True, type=Path)
+    revalidate.add_argument("--round-id", required=True)
+    revalidate.add_argument("--version-id", required=True)
+    revalidate.add_argument("--reason", required=True)
+    revalidate.add_argument(
+        "--evidence-snapshot-id",
+        help="corrected successor snapshot to recompute the Discovery evidence on",
+    )
+
+    reviewed = rounds.add_parser(
+        "review", help="record the human approve, return or end decision for one version"
+    )
+    reviewed.add_argument("--project", required=True, type=Path)
+    reviewed.add_argument("--store", required=True, type=Path)
+    reviewed.add_argument("--round-id", required=True)
+    reviewed.add_argument("--version-id", required=True)
+    reviewed.add_argument(
+        "--decision", required=True, choices=["approve", "return", "end"]
+    )
+    reviewed.add_argument("--reviewer", required=True)
+    reviewed.add_argument("--reason", required=True)
+    reviewed.add_argument("--input", type=Path)
+    reviewed.add_argument(
+        "--calendar",
+        type=Path,
+        help="approved trading calendar required by approve",
+    )
+
+    close = rounds.add_parser("close", help="record an early or exhausted round stop")
+    close.add_argument("--project", required=True, type=Path)
+    close.add_argument("--round-id", required=True)
+    close.add_argument("--reviewer", required=True)
+    close.add_argument("--reason", required=True)
+    close.add_argument("--input", required=True, type=Path)
+
+    evidence = rounds.add_parser(
+        "evidence",
+        help="inspect the Evidence Loop ledger state and record the human decision",
+    )
+    evidence_actions = evidence.add_subparsers(
+        dest="evidence_action", required=True
+    )
+    evidence_status = evidence_actions.add_parser(
+        "status",
+        help="report per-version tracking facts, review trigger, pause and state",
+    )
+    evidence_status.add_argument("--project", required=True, type=Path)
+    evidence_status.add_argument("--store", required=True, type=Path)
+    evidence_status.add_argument("--ledger", required=True, type=Path)
+    evidence_status.add_argument("--round-id", required=True)
+    evidence_status.add_argument("--version-id")
+    evidence_decide = evidence_actions.add_parser(
+        "decide",
+        help="record the immutable continue, pause or retire decision for one version",
+    )
+    evidence_decide.add_argument("--project", required=True, type=Path)
+    evidence_decide.add_argument("--store", required=True, type=Path)
+    evidence_decide.add_argument("--ledger", required=True, type=Path)
+    evidence_decide.add_argument("--round-id", required=True)
+    evidence_decide.add_argument("--version-id", required=True)
+    evidence_decide.add_argument(
+        "--decision", required=True, choices=["continue", "pause", "retire"]
+    )
+    evidence_decide.add_argument("--reviewer", required=True)
+    evidence_decide.add_argument("--reason", required=True)
+
+
 def _add_direction_workflow(commands: argparse._SubParsersAction, *, agent_only: bool) -> None:
     direction = commands.add_parser("direction", help="manage an authorized research direction")
     directions = direction.add_subparsers(dest="workflow_action", required=True)
@@ -576,6 +695,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
     args = parser.parse_args(argv)
     if args.command in {"direction", "validation", "holdout"}:
         return _direction_workflow_command(args)
+    if args.command == "round":
+        return _research_loop_command(args)
     if args.command == "evaluation":
         return _evaluation_command(args, agent_only=agent_only)
     if args.command == "release":
@@ -650,6 +771,7 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 execution_rules=args.execution_rules,
                 strategy_executor=args.strategy_executor,
                 strategy_image=args.strategy_image,
+                discovery_warmup_sessions=args.discovery_warmup_sessions,
             )
             print(json.dumps(result, sort_keys=True, allow_nan=False))
             return 0
@@ -835,6 +957,16 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
         return 2
 
 
+def _rejection_result(error: Exception, *, schema_version: int) -> dict:
+    """One machine-readable rejection shape for every workflow dispatch."""
+    return {
+        "schema_version": schema_version,
+        "status": "rejected",
+        "error": error.details,
+        **getattr(error, "context", {}),
+    }
+
+
 def _direction_workflow_command(args: argparse.Namespace) -> int:
     from prajnatrade import research_direction
 
@@ -846,10 +978,105 @@ def _direction_workflow_command(args: argparse.Namespace) -> int:
         else:
             result = _holdout_action(args)
     except (EvaluationRejection, release.ReleaseRejection, ProtocolError) as error:
-        result = {
-            "schema_version": 2, "status": "rejected", "error": error.details,
-            **getattr(error, "context", {}),
-        }
+        result = _rejection_result(error, schema_version=2)
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 2 if result.get("status") in {"rejected", "blocked", "failed", "aborted", "interrupted"} else 0
+
+
+def _research_loop_command(args: argparse.Namespace) -> int:
+    from prajnatrade import research_loop
+
+    try:
+        if args.round_action == "open":
+            prepared = research_loop.prepare_round(
+                args.project,
+                args.campaign_id,
+                args.direction_key,
+                args.name,
+                args.authorization_id,
+                json.loads(args.input.read_text(encoding="utf-8")),
+                store=args.store,
+            )
+            result = research_loop.open_round(args.project, args.store, prepared)
+        elif args.round_action == "status":
+            result = research_loop.round_status(args.project, args.round_id)
+        elif args.round_action == "submit":
+            result = research_loop.submit(
+                args.project,
+                args.round_id,
+                args.submission_id,
+                json.loads(args.input.read_text(encoding="utf-8")),
+            )
+        elif args.round_action == "validate":
+            result = research_loop.validate(
+                args.project,
+                args.store,
+                args.snapshot_store,
+                args.round_id,
+                args.version_id,
+            )
+        elif args.round_action == "revalidate":
+            result = research_loop.revalidate(
+                args.project,
+                args.store,
+                args.snapshot_store,
+                args.round_id,
+                args.version_id,
+                args.reason,
+                evidence_snapshot_id=args.evidence_snapshot_id,
+            )
+        elif args.round_action == "review":
+            source = (
+                json.loads(args.input.read_text(encoding="utf-8"))
+                if args.input is not None
+                else None
+            )
+            result = research_loop.review(
+                args.project,
+                args.store,
+                args.round_id,
+                args.version_id,
+                args.decision,
+                args.reviewer,
+                args.reason,
+                source,
+                calendar=args.calendar,
+            )
+        elif args.round_action == "evidence":
+            if args.evidence_action == "status":
+                result = research_loop.evidence_status(
+                    args.project,
+                    args.store,
+                    args.ledger,
+                    args.round_id,
+                    args.version_id,
+                )
+            else:
+                result = research_loop.evidence_decide(
+                    args.project,
+                    args.store,
+                    args.ledger,
+                    args.round_id,
+                    args.version_id,
+                    args.decision,
+                    args.reviewer,
+                    args.reason,
+                )
+        else:
+            result = research_loop.close(
+                args.project,
+                args.round_id,
+                args.reviewer,
+                args.reason,
+                json.loads(args.input.read_text(encoding="utf-8")),
+            )
+    except (ProtocolError, release.ReleaseRejection) as error:
+        # Both the module's own ProtocolError and any release-layer refusal use
+        # the shared renderer, so the protocol context is never dropped.
+        result = _rejection_result(error, schema_version=1)
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

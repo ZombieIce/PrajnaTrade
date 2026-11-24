@@ -53,6 +53,42 @@ remains readable under its recorded rules.
    inputs and observed execution. The acceptance requirements for real research
    and reconciled real forward evidence continue to apply.
 
+## Manual simulated-tracking admission (issue #43)
+
+Issue #43 adds a default simulated-tracking loop beside the protected
+direction-bound policy above. Its admission is a human review decision, not
+protected evidence.
+
+1. **Three decisions, one current state.** A locked research version has exactly
+   one current review state: `pending`, `approved`, `returned` or `ended`.
+   `approve`, `return` and `end` are mutually exclusive decisions recorded as
+   immutable, content-addressed records with a named reviewer and reason; `end`
+   is terminal, `returned` may later be approved or ended, and replaying a
+   decision returns the stored one. A passed Lightweight Validation never
+   pre-fills the human decision.
+2. **No protected allowance or debit.** Lightweight Validation replays the
+   locked version and benchmark over the frozen Discovery interval using the
+   frozen scoring start, execution rules and costs. It does not open a
+   Validation or Final Holdout partition, does not spend a Validation
+   allowance, and records `opened_protected_source: false` and
+   `query_debited: false`. Revalidation keeps the strategy identity and records
+   a new evidence epoch: a corrected successor must preserve the frozen
+   interval, data kind and prior history, and the original and recomputed
+   Discovery runs stay as history. Approval creates a write-once
+   `manual_tracking` artifact and one enable event at the first eligible
+   trading session; it is not `release approve` and not a Holdout
+   authorization.
+3. **Synthetic stays labelled.** Simulated-tracking artifacts carry
+   `simulated_tracking: true`, and the Shadow Live ledger remains synthetic or
+   replay evidence with the same `scope`/`data_kind` labels. A synthetic ledger
+   is not forward evidence and never satisfies the real-chain acceptance gate.
+4. **Old records keep their protocols.** Issue #37 plans, authorizations, query
+   debits, immutable releases, rejections and receipts, and the issue #17
+   records, remain governed by the direction-bound policy above and their
+   original recorded rules. The new loop does not re-judge or migrate them, and
+   a `manual_tracking` version is a different admission source, not a protected
+   release.
+
 ## Original decision (issue #17)
 
 1. **Synthetic only.** Every sealed snapshot, evaluation, release, forward
@@ -118,8 +154,11 @@ Recorded here rather than silently performed in the #17 implementation:
 - Splitting the 500+ line functions in `shadow.py`, `release.py` and
   `protected_eval.py` into smaller deep modules.
 - Refactoring the `cli.py` dispatch into a command registry.
+- Splitting `research_loop.py` (round, lightweight Validation, review,
+  revalidation and the Evidence Loop read model in one module) and bundling the
+  loose scoring-history parameters from #41 into one history-policy type.
 
-Both are behaviour-preserving refactors that need their own review; the
+These are behaviour-preserving refactors that need their own review; the
 cross-module helper seams (`snapshot_baseline.CN_TZ`/`available_by`,
 `validation.make_robustness_plan`, `protected_eval.load_plan`/`audit`,
 `snapshot.lineage_ids`) and the removal of trivial middlemen are already done.

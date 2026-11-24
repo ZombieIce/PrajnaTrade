@@ -25,8 +25,9 @@ A single test file, without the wrapper:
 PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
-The full suite takes roughly **11 minutes** (249 tests at the time of writing).
-CI (`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
+The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
+CI run); at the time of writing this branch collects **429 tests**. CI
+(`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
 Python 3.12; `lint` runs `ruff check .`.
 
 ## Isolation tests
@@ -47,6 +48,22 @@ In a nested/agent session use `scripts/test.sh fast`; run `full` on the host or
 let CI do it. A failure that names `sandbox_init`, `sandbox_install_failed`, or
 an unavailable sandbox runtime is usually this boundary, not a product bug —
 confirm on the host before changing code.
+
+## Research Loop and Evidence Loop tests (#43)
+
+`tests/test_research_loop_cli.py` covers the round contract, locked versions and
+Lightweight Validation; `tests/test_version_review_cli.py` covers approve/return/
+end, manual simulated-tracking admission and platform-fix revalidation;
+`tests/test_corrected_evidence_cli.py` covers corrected-successor evidence
+(lineage, frozen interval/data-kind/prior history, recomputed Discovery runs
+and the affected diff); `tests/test_evidence_loop_cli.py` covers the observation
+recommendation, due/filled/unfilled opportunities, scoped pauses, review
+triggers and dual-version tracking. All four are **fast**: they drive the
+public CLI on synthetic sealed snapshots, Lightweight Validation runs
+declarative strategies in the trusted controller, and the review/evidence tests
+build `manual_tracking` artifacts and ledger fixtures directly instead of
+running a protected evaluation. They are not marked `isolation`; see
+[`tests/README.md`](../../tests/README.md) for the rule if that changes.
 
 ## Docker tests
 

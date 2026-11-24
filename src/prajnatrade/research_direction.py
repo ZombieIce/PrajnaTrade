@@ -122,6 +122,15 @@ def _canonical_direction_key(raw: str) -> str:
     return _text(key, "direction_key")
 
 
+def direction_id(direction_key: str) -> str:
+    """Return the stable identity of a research-direction key.
+
+    The research lead continues to use the design key across renamed directions
+    and new Campaigns, so formatting differences in the key do not change it.
+    """
+    return _hash({"direction_key": _canonical_direction_key(direction_key)})
+
+
 def prepare_kickoff(
     project: Path, campaign_id: str, direction_key: str, name: str,
     authorization_id: str, source: object, *, store: Path,
@@ -139,9 +148,9 @@ def prepare_kickoff(
     campaign = campaign_discovery(project, campaign_id)
     evaluation = campaign["evaluation"]
     key = _canonical_direction_key(direction_key)
-    direction_id = _hash({"direction_key": key})
+    direction = direction_id(direction_key)
     round_id = _hash({
-        "direction_id": direction_id,
+        "direction_id": direction,
         "project_id": campaign["project_id"],
         "campaign_id": campaign_id,
     })
@@ -163,7 +172,7 @@ def prepare_kickoff(
         )
     approved = {
         "schema_version": 1,
-        "direction_id": direction_id,
+        "direction_id": direction,
         "direction_key": key,
         "round_id": round_id,
         "name": _text(name, "name"),

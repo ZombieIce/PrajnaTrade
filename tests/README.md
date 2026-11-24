@@ -26,10 +26,14 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src <venv>/python -m pytest -q -p no:cachep
   to drive it with `subprocess.Popen` instead of `cli`.
 
 Scenario fixtures stay with the module that owns them:
-`synthetic_snapshot`/`build_scenario` in `test_protected_eval_cli.py` and
-`sealed_snapshot_input` in `test_experiment_cli.py`.  The existing
-`from test_protected_eval_cli import ...` cross-imports still work; import
-generic helpers from `cli_helpers` directly.
+`synthetic_snapshot`/`build_scenario` in `test_protected_eval_cli.py`,
+`sealed_snapshot_input` in `test_experiment_cli.py`, the #43 round builders
+(`round_input`, `open_round`, `submit_version`, `validate_version`) in
+`test_research_loop_cli.py`, and the corrected-successor builders in
+`test_corrected_evidence_cli.py`; the review and evidence tests cross-import
+the round builders rather than copying them.  The existing `from
+test_protected_eval_cli import ...` cross-imports still work; import generic
+helpers from `cli_helpers` directly.
 
 ## Isolation marker
 
@@ -40,9 +44,14 @@ marked `isolation`:
 - module level with `pytestmark = pytest.mark.isolation` in
   `test_isolation.py`, `test_protected_eval_cli.py`,
   `test_holdout_report_cli.py`, `test_release_cli.py`, `test_impact_cli.py`,
-  `test_shadow_cli.py`, `test_compare_cli.py`, `test_correction_delta_cli.py`;
-- individually for the generated-Python/probe tests in `test_research_cli.py`
-  and the generated-Python parameter of
+  `test_shadow_cli.py`, `test_compare_cli.py`, `test_correction_delta_cli.py`,
+  `test_shadow_schedule.py`, `test_validation_batch_cli.py` and
+  `test_validation_scoring_cli.py`;
+- individually for the generated-Python/probe tests in `test_research_cli.py`,
+  `test_research_direction_cli.py`, `test_reusable_validation_cli.py`,
+  `test_issue37_holdout_cli.py`, `test_holdout_recovery_cli.py`,
+  `test_direction_schema_v2_cli.py`, `test_execution_rules_cli.py`,
+  `test_validation_selection_cli.py`, and the generated-Python parameter of
   `test_openai_provider.py::test_campaign_records_provider_usage_without_persisting_api_credentials`.
 
 The fast suite deselects them:
@@ -51,9 +60,13 @@ The fast suite deselects them:
 ... -m "not isolation"
 ```
 
-`pyproject.toml` (owned by a separate change) registers the marker.  Until that
-lands, pytest emits `PytestUnknownMarkWarning` for `isolation`; selection with
-`-m` still works.
+`pyproject.toml` registers the `isolation` marker. The #43 Research Loop,
+version-review, corrected-evidence and Evidence Loop tests are fast:
+Lightweight Validation runs declarative strategies in the trusted controller,
+and the review/evidence tests build `manual_tracking` artifacts and ledger
+fixtures directly instead of running a protected flow. If a #43 test starts
+creating releases through the protected flow, mark it and record why in the
+module docstring.
 
 ## Order independence
 

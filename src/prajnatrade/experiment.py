@@ -26,6 +26,7 @@ from prajnatrade.snapshot_baseline import (
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
+    first_ready_open,
     run_discovery_equal_weight,
     run_discovery_strategy,
 )
@@ -43,12 +44,16 @@ def _fingerprint(value: object) -> str:
 
 def _runtime_components(
     strategy_executor: dict[str, Any] | None = None,
+    *,
+    history_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     directory = Path(__file__).parent
     files = (
         "strategies.py", "backtest.py", "data.py", "snapshot.py", "snapshot_baseline.py",
         "container_executor.py",
     )
+    if history_policy is not None:
+        files += ("experiment.py",)
     executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}
     return {
         **{
@@ -63,25 +68,65 @@ def _runtime_components(
     }
 
 
+# The declared-history engine adds a separate path. Bind exact source revisions
+# when recognizing a legacy campaign built before that path was introduced.
+_LEGACY_SNAPSHOT_SOURCE = "f79160cacc77f7e0be10d4f43b03a854370b7caa1c03ea757a78df9b1ede1e77"
+_LEGACY_ACCOUNTING_SOURCE = "a7d354f0665281bbda758958ba93a7772427a5f48b8594a94590508c48494c34"
+_UNVERSIONED_ACCOUNTING_SOURCE = "bdcb9c0c14c138d1ad7f4c8b35e6c9b0c056d5bb7af45e762024e3cc8a3e6e72"
+_COMPATIBLE_RUNTIME_SOURCES = {
+    "snapshot.py": "46bd58c44b85fd6990f4a16bc247b42e80ac5d07ca273e168ed23a78451b4554",
+    "snapshot_baseline.py": "8af82f3b897e5105927828e4b116cb1642a02b4eef688c6da3b396dd19a449a2",
+}
+
+
 def runtime_identity(
     strategy_executor: dict[str, Any] | None = None,
     *,
     execution_rules: Mapping[str, Any] | None = None,
+    history_policy: Mapping[str, Any] | None = None,
 ) -> str:
-    """Fingerprint the accounting dependencies and optional strategy executor."""
-    dependencies = _runtime_components(strategy_executor)
-    # This exact revision preserves the historical next-open matching path.
-    # All other dependencies must still match their original fingerprints.
+    """Fingerprint the accounting dependencies and optional strategy executor.
+
+    Passing the Campaign's ``history_policy`` binds the declared-history engine
+    (``experiment.py``) as well, matching the frozen Campaign runtime.  A source
+    fix therefore changes the identity and forces a fresh replay identity.
+    """
+    dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
     if (
-        execution_rules is not None
+        history_policy is None
+        and execution_rules is not None
         and "version" not in execution_rules
-        and dependencies["snapshot_baseline.py"]
-        == "a7d354f0665281bbda758958ba93a7772427a5f48b8594a94590508c48494c34"
+        and dependencies["snapshot_baseline.py"] == _LEGACY_ACCOUNTING_SOURCE
     ):
-        dependencies["snapshot_baseline.py"] = (
-            "bdcb9c0c14c138d1ad7f4c8b35e6c9b0c056d5bb7af45e762024e3cc8a3e6e72"
-        )
+        dependencies["snapshot_baseline.py"] = _UNVERSIONED_ACCOUNTING_SOURCE
     return _fingerprint(dependencies)
+
+
+def runtime_matches(
+    stored: str,
+    strategy_executor: dict[str, Any] | None = None,
+    *,
+    execution_rules: Mapping[str, Any] | None = None,
+    history_policy: Mapping[str, Any] | None = None,
+) -> bool:
+    """Check the exact current runtime or a compatible legacy dependency set."""
+    dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
+    if stored == _fingerprint(dependencies):
+        return True
+    if history_policy is not None or any(
+        dependencies[name] != digest for name, digest in _COMPATIBLE_RUNTIME_SOURCES.items()
+    ):
+        return False
+    legacy = {
+        **dependencies,
+        "snapshot.py": _LEGACY_SNAPSHOT_SOURCE,
+        "snapshot_baseline.py": (
+            _UNVERSIONED_ACCOUNTING_SOURCE
+            if execution_rules is not None and "version" not in execution_rules
+            else _LEGACY_ACCOUNTING_SOURCE
+        ),
+    }
+    return stored == _fingerprint(legacy)
 
 
 def _executor_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -137,8 +182,9 @@ def _campaign_evaluation(
     slippage_bps: float,
     strategy_executor: dict[str, Any],
     execution_rules: dict[str, Any],
+    history_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    runtime_dependencies = _runtime_components(strategy_executor)
+    runtime_dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
     return {
         "engine": "sealed-discovery-v1",
         "snapshot_id": snapshot_id,
@@ -152,6 +198,7 @@ def _campaign_evaluation(
         "strategy_executor": strategy_executor,
         "runtime_dependencies": runtime_dependencies,
         "runtime": _fingerprint(runtime_dependencies),
+        **({"history_policy": dict(history_policy)} if history_policy is not None else {}),
     }
 
 
@@ -224,6 +271,7 @@ def campaign_create(
     strategy_executor: str = "none",
     strategy_image: str | None = None,
     executor: ContainerStrategyExecutor | None = None,
+    discovery_warmup_sessions: int | None = None,
 ) -> dict[str, object]:
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
@@ -235,11 +283,16 @@ def campaign_create(
     receipt = read_discovery(store, snapshot_id, "discovery", as_of)
     data = receipt["data"]
     data_kind = receipt["data_kind"]
-    content = json.dumps(
-        data, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
-    ).encode("utf-8")
+    content = _discovery_json(data)
     snapshot_hash = receipt["content_hash"]
     partition_hash = receipt.get("partition_content_hash", snapshot_hash)
+    history_policy = None
+    prior_history = None
+    baseline_options: dict[str, Any] = {}
+    if discovery_warmup_sessions is not None:
+        history_policy = _discovery_history_policy(data, receipt, discovery_warmup_sessions)
+        prior_history = receipt.get("prior_history")
+        baseline_options = {"history_requirements": [], "scoring_start": history_policy["scoring_start"]}
     evaluation = _campaign_evaluation(
         data_kind=data_kind,
         snapshot_id=snapshot_id,
@@ -250,6 +303,7 @@ def campaign_create(
         slippage_bps=slippage_bps,
         strategy_executor=executor_config,
         execution_rules=execution_policy,
+        history_policy=history_policy,
     )
     baseline = run_discovery_equal_weight(
         data,
@@ -260,6 +314,7 @@ def campaign_create(
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rules,
+        **baseline_options,
     )
     campaign_id = str(uuid.uuid4())
     evaluation_hash = _fingerprint(evaluation)
@@ -283,6 +338,11 @@ def campaign_create(
                 json.dumps(baseline, sort_keys=True, separators=(",", ":"), allow_nan=False),
             ),
         )
+        if prior_history is not None:
+            connection.execute(
+                "INSERT INTO campaign_prior_history (campaign_id, payload) VALUES (?, ?)",
+                (campaign_id, _discovery_json(prior_history)),
+            )
     return {
         "schema_version": 1,
         "project_id": project_id,
@@ -297,6 +357,43 @@ def campaign_create(
         "budget": {"attempts_remaining": attempts, "execution_seconds_remaining": max_seconds},
         "execution_rules": execution_policy,
         "strategy_executor": executor_config,
+        **({"history_policy": history_policy} if history_policy is not None else {}),
+    }
+
+
+def _discovery_json(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+
+
+def _discovery_history_policy(
+    data: dict[str, list[dict]], receipt: Mapping[str, Any], warmup_sessions: int,
+) -> dict[str, Any]:
+    sessions = sorted({row["date"] for row in data["calendar"]})
+    if type(warmup_sessions) is not int or not 0 <= warmup_sessions < len(sessions):
+        raise ValueError("Discovery warmup must leave at least one scoring session.")
+    policy = {
+        "schema_version": 1,
+        "warmup_sessions": warmup_sessions,
+        "scoring_start": sessions[warmup_sessions],
+    }
+    if "prior_history" in receipt:
+        policy["prior_history_hash"] = receipt["prior_history_hash"]
+    return policy
+
+
+def _history_options(
+    policy: Mapping[str, Any], prior_history: dict[str, list] | None,
+    requirements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "scoring_start": policy["scoring_start"],
+        "history_requirements": requirements,
+        "prior_history": (
+            (prior_history["sessions"], prior_history["derived"])
+            if prior_history is not None else None
+        ),
     }
 
 
@@ -328,6 +425,12 @@ def _ensure_project_schema(connection: sqlite3.Connection) -> None:
     }
     if "snapshot_id" not in campaign_columns:
         connection.execute("ALTER TABLE campaigns ADD COLUMN snapshot_id TEXT")
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS campaign_prior_history (
+            campaign_id TEXT PRIMARY KEY, payload BLOB NOT NULL,
+            FOREIGN KEY(campaign_id) REFERENCES campaigns(campaign_id)
+        )"""
+    )
     connection.execute(
         """CREATE TABLE IF NOT EXISTS frozen_candidates (
             candidate_id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL,
@@ -387,6 +490,7 @@ def campaign_discovery(project: Path, campaign_id: str) -> dict[str, Any]:
             "project_id": project_id,
             "campaign_id": campaign_id,
             "snapshot_id": evaluation["snapshot_id"],
+            "snapshot_hash": campaign["snapshot_hash"],
             "campaign_evaluation_hash": campaign["evaluation_hash"],
             "evaluation": evaluation,
             "discovery_budget": {
@@ -462,16 +566,19 @@ def _normalize_request(raw: object) -> dict[str, Any]:
         raise ValueError("Strategy must be a JSON object.")
     family = strategy.get("family")
     if family in STRATEGY_FAMILIES:
-        if set(strategy) != {"family"}:
-            raise ValueError("Declarative strategies accept only the family field.")
+        if set(strategy) - {"family", "history_requirements"}:
+            raise ValueError("Declarative strategies accept only family and history_requirements.")
         spec = normalize_strategy_spec(
             {"family": family, "parameters": raw["parameters"]}
         )
         canonical_strategy: dict[str, Any] = {"family": spec["family"]}
     elif family == "python":
-        if "source" not in strategy or set(strategy) - {"family", "source", "parameter_schema"}:
+        if "source" not in strategy or set(strategy) - {
+            "family", "source", "parameter_schema", "history_requirements",
+        }:
             raise ValueError(
-                "Python strategies require family and source and accept only parameter_schema."
+                "Python strategies require family and source and accept parameter_schema "
+                "and history_requirements."
             )
         candidate: dict[str, Any] = {
             "family": "python",
@@ -491,6 +598,10 @@ def _normalize_request(raw: object) -> dict[str, Any]:
             canonical_strategy["parameter_schema"] = spec["parameter_schema"]
     else:
         raise ValueError("Unsupported strategy family.")
+    if "history_requirements" in strategy:
+        canonical_strategy["history_requirements"] = strategy_history_requirements({
+            **spec, "history_requirements": strategy["history_requirements"],
+        })
     return {
         "schema_version": 1, "campaign_id": raw["campaign_id"],
         "submission_id": raw["submission_id"], "hypothesis": raw["hypothesis"],
@@ -597,6 +708,7 @@ def _execute_request(
                 (time.time(), experiment_id),
             )
         else:
+            _freeze_history_requirements(campaign, request)
             canonical = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False)
             if previous is not None:
                 if previous["request_json"] != canonical:
@@ -626,6 +738,20 @@ def _require_container_executor(
             "INVALID_SUBMISSION", "admission", "correct",
             "Generated Python requires a campaign created with "
             "--strategy-executor container.",
+        )
+
+
+def _freeze_history_requirements(campaign: sqlite3.Row, request: dict[str, Any]) -> None:
+    policy = json.loads(campaign["evaluation_json"]).get("history_policy")
+    strategy = request["strategy"]
+    if policy is not None:
+        strategy["history_requirements"] = strategy_history_requirements({
+            **strategy, "parameters": request["parameters"],
+        })
+    elif "history_requirements" in strategy:
+        raise ProtocolError(
+            "INVALID_SUBMISSION", "admission", "correct",
+            "Strategy history requirements need a Campaign with a frozen Discovery scoring start.",
         )
 
 
@@ -662,6 +788,8 @@ def _strategy_identity(request: Mapping[str, Any]) -> dict[str, Any]:
         identity["source_sha256"] = strategy["source_sha256"]
         if "parameter_schema" in strategy:
             identity["parameter_schema"] = strategy["parameter_schema"]
+    if "history_requirements" in strategy:
+        identity["history_requirements"] = strategy["history_requirements"]
     return identity
 
 
@@ -704,11 +832,18 @@ def _run_attempt(
             raise ValueError("Evaluation fingerprint mismatch.")
         executor_config = _executor_config(config)
         rules = config["execution_rules"]
-        if config["runtime"] != runtime_identity(executor_config, execution_rules=rules):
+        policy = config.get("history_policy")
+        if not runtime_matches(
+            config["runtime"], executor_config, execution_rules=rules, history_policy=policy,
+        ):
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec: dict[str, Any] = {
             "family": family, "parameters": request["parameters"],
         }
+        history_options = (
+            _attempt_history_options(connection, campaign_id, policy, data, request["strategy"])
+            if policy is not None else {}
+        )
         strategy = None
         if family == "python":
             if executor_config.get("kind") != "container":
@@ -738,6 +873,7 @@ def _run_attempt(
             transaction_cost_bps=config["transaction_cost_bps"],
             slippage_bps=config["slippage_bps"],
             execution_rule_version=rules.get("version", NEXT_OPEN_RULES),
+            **history_options,
         )
         benchmark = json.loads(campaign["baseline_json"])
         baseline_return = benchmark["metrics"]["total_return"]
@@ -778,7 +914,7 @@ def _run_attempt(
             "discovery": discovery,
             "diagnostics": [
                 {"code": "WARMUP_REQUIRED", "required_sessions": window}
-            ] if window > 1 else [],
+            ] if policy is None and window > 1 else [],
         }
         if family == "python":
             result["strategy"] = dict(request["strategy"])
@@ -787,6 +923,8 @@ def _run_attempt(
             raise _TimeExpired()
     except _TimeExpired:
         error_details = {"code": "BUDGET_EXHAUSTED", "phase": "discovery", "next_action": "stop", "message": "Execution time exhausted."}
+    except ProtocolError as error:
+        error_details = error.details
     except Exception as error:
         error_details = {
             "code": "EXECUTION_FAILED", "phase": "discovery", "next_action": "inspect",
@@ -819,6 +957,29 @@ def _run_attempt(
     return _receipt(project_id, connection, campaign, experiment)
 
 
+def _attempt_history_options(
+    connection: sqlite3.Connection, campaign_id: str, policy: Mapping[str, Any],
+    data: dict[str, list[dict]], strategy: Mapping[str, Any],
+) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT payload FROM campaign_prior_history WHERE campaign_id = ?", (campaign_id,),
+    ).fetchone()
+    content = row["payload"] if row is not None else None
+    actual_hash = hashlib.sha256(content).hexdigest() if content is not None else None
+    if actual_hash != policy.get("prior_history_hash"):
+        raise ValueError("Discovery prior history fingerprint mismatch.")
+    options = _history_options(
+        policy, json.loads(content) if content is not None else None,
+        strategy["history_requirements"],
+    )
+    if first_ready_open(data, **options) != policy["scoring_start"]:
+        raise ProtocolError(
+            "INSUFFICIENT_HISTORY", "discovery", "inspect",
+            f"Strategy history is unavailable at the Discovery scoring start {policy['scoring_start']}.",
+        )
+    return options
+
+
 def experiment_status(project: Path, campaign_id: str, submission_id: str) -> dict[str, Any]:
     project_id = project_status(project)["project_id"]
     try:
@@ -839,7 +1000,7 @@ PYTHON_SIGNAL_WINDOW_SESSIONS = 60
 MAX_SIGNAL_WINDOW_SESSIONS = 252
 
 
-def signal_window_sessions(spec: dict[str, Any]) -> int:
+def signal_window_sessions(spec: Mapping[str, Any]) -> int:
     """Return the frozen trailing window required by the strategy."""
     family = spec["family"]
     parameters = spec["parameters"]
@@ -864,6 +1025,43 @@ def signal_window_sessions(spec: dict[str, Any]) -> int:
 
 
 _signal_window = signal_window_sessions
+
+
+def strategy_history_requirements(
+    spec: Mapping[str, Any], *, parameter_variant: bool = False,
+) -> list[dict[str, Any]]:
+    """Return the canonical declaration, with the family minimum for each variant."""
+    family = spec["family"]
+    minimum = 0 if family == "equal_weight" else signal_window_sessions(spec)
+    default = {"id": "strategy_lookback", "observations": minimum, "mode": "valid_observations"}
+    if "history_requirements" not in spec:
+        return [default] if minimum else []
+    raw = spec["history_requirements"]
+    if not isinstance(raw, list):
+        raise ValueError("history_requirements must be an array.")
+    requirements: dict[str, dict[str, Any]] = {}
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry) != {"id", "observations", "mode"}:
+            raise ValueError("History requirements need id, observations and mode.")
+        identifier, observations, mode = entry["id"], entry["observations"], entry["mode"]
+        if not isinstance(identifier, str) or not identifier or identifier != identifier.strip():
+            raise ValueError("History requirement IDs must be nonempty strings without outer whitespace.")
+        if identifier in requirements:
+            raise ValueError(f"Duplicate history requirement ID: {identifier!r}.")
+        if type(observations) is not int or observations <= 0:
+            raise ValueError("History requirement observations must be a positive integer.")
+        if mode not in ("valid_observations", "consecutive_sessions"):
+            raise ValueError("History requirement mode must be valid_observations or consecutive_sessions.")
+        requirements[identifier] = dict(entry)
+    declared = max((item["observations"] for item in requirements.values()), default=0)
+    if family != "python" and declared < minimum:
+        if not parameter_variant:
+            raise ValueError(f"{family} requires at least {minimum} observations.")
+        if "strategy_lookback" in requirements:
+            requirements["strategy_lookback"]["observations"] = minimum
+        else:
+            requirements["strategy_lookback"] = default
+    return [requirements[name] for name in sorted(requirements)]
 
 
 def _candidate_body(
