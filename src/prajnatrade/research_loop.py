@@ -19,6 +19,19 @@ Contract resolutions that the shared design contract leaves implicit:
   writes a write-once ``manual_tracking`` release artifact and appends one
   ``enable`` event at the first approved calendar session after the decision; it
   never runs Validation again, so re-selecting a version reuses its receipt.
+  The replay key is the human decision content, so replaying it on a later day
+  returns the first stored effective session instead of conflicting.
+* Ending an approved version is one terminal path whether it comes from
+  ``round review --decision end`` or ``round evidence decide retire``: the
+  immutable decision is recorded, the release timeline gets its terminal retire
+  event and the next Shadow Live tick marks the ledger progress ``ended``
+  without adding a day, signal or order.  ``round close`` only selects a
+  currently ``approved``, not-ended version.
+* ``round revalidate`` also accepts an ``approved`` version after a data/platform
+  correction.  A passing corrected receipt keeps the current state ``approved``;
+  a failing or insufficient one keeps the approval but records a concrete review
+  trigger rather than silently revoking it or pausing tracking.  ``ended`` stays
+  terminal and is refused.
 * ``replay_engine_identity`` fingerprints this module's own replay/metric code.
   ``validation_id`` does not cover it, so :func:`revalidate` binds it together
   with the current runtime and evidence source into the new identity and records
@@ -84,6 +97,8 @@ VALIDATION_NAME = "research-loop-validations"
 REVIEW_NAME = "research-loop-reviews"
 REVALIDATION_NAME = "research-loop-revalidations"
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
+VALIDATION_TERMINAL_FAILPOINT = "round_validation_after_terminal_receipt"
+EVIDENCE_DECIDE_FAILPOINT = "round_evidence_after_apply"
 REVIEW_STATES = ("pending", "approved", "returned", "ended")
 REVIEW_ACTION_STATE = {"approve": "approved", "return": "returned", "end": "ended"}
 EVIDENCE_NAME = "research-loop-evidence"
@@ -191,6 +206,13 @@ def _hash(value: object) -> str:
 
 
 def _now() -> str:
+    """The decision timestamp; ``PRAJNATRADE_TEST_NOW`` is a test-only clock."""
+    fixed = os.environ.get("PRAJNATRADE_TEST_NOW")
+    if fixed:
+        parsed = datetime.fromisoformat(fixed)
+        if parsed.tzinfo is None:
+            raise ValueError("PRAJNATRADE_TEST_NOW must include a timezone.")
+        return parsed.isoformat()
     return datetime.now(UTC).isoformat()
 
 
@@ -987,6 +1009,11 @@ def _fills_match(left: list[dict], right: list[dict]) -> bool:
     return True
 
 
+def _ending_cash(run: Mapping[str, Any]) -> float | None:
+    curve = run.get("equity_curve") or []
+    return curve[-1]["cash"] if curve else None
+
+
 def _run_summary(run: Mapping[str, Any], *, first_decision: bool = False) -> dict[str, Any]:
     metrics = run["metrics"]
     summary: dict[str, Any] = {
@@ -996,6 +1023,7 @@ def _run_summary(run: Mapping[str, Any], *, first_decision: bool = False) -> dic
         "valued_sessions": metrics["valued_sessions"],
         "fills": metrics["fills"],
         "ending_equity": metrics["ending_equity"],
+        "ending_cash": _ending_cash(run),
         "fees_paid": metrics["fees_paid"],
         "slippage_paid": metrics["slippage_paid"],
         "orders_filled": metrics["orders_filled"],
@@ -1104,6 +1132,10 @@ def _replay_comparison(
             mismatches.append(f"{label}.fills")
         if not _within(run["metrics"]["ending_equity"], original["metrics"]["ending_equity"]):
             mismatches.append(f"{label}.ending_equity")
+        # Fills and cash must match Discovery, not only ending equity (spec #43
+        # L56): two runs can agree on NAV while holding different cash.
+        if not _within(_ending_cash(run), _ending_cash(original)):
+            mismatches.append(f"{label}.ending_cash")
     return {
         "tolerance": METRIC_TOLERANCE,
         "reference": reference_name,
@@ -1272,8 +1304,6 @@ def _receipt(
     submission: Mapping[str, Any],
     *,
     validation_id: str,
-    attempts: int,
-    resumed: bool,
     replay: Mapping[str, Any],
     recomputed: Mapping[str, Any] | None = None,
     corrected: Mapping[str, Any] | None = None,
@@ -1432,8 +1462,6 @@ def _receipt(
         "checks": checks,
         "observation": observation,
         "replay": comparison,
-        "attempts": attempts,
-        "resumed": resumed,
         "opened_protected_source": False,
         "query_debited": False,
     }
@@ -1518,15 +1546,22 @@ def _write_running_marker(
 
 def _write_terminal_receipt(
     store: Path, validation_id: str, receipt: Mapping[str, Any],
-) -> None:
+) -> bool:
+    """Write the immutable receipt; a retry recovers an identical existing one.
+
+    Only the deterministic evidence content is stored, so a crash between the
+    trusted write and the project publication recomputes byte-identical content.
+    Returns True when the receipt was already there (recovered, not rewritten).
+    """
     path = _validation_path(store, validation_id)
     if path.is_file():
         existing = json.loads(path.read_text(encoding="utf-8"))
         if existing.get("status") == "completed":
             if existing != receipt:
                 raise ValueError("A terminal research-loop Validation receipt cannot change.")
-            return
+            return True
     _atomic_write(path, receipt)
+    return False
 
 
 def _load_trusted_receipt(
@@ -1639,8 +1674,8 @@ def validate(
             if state == "approved":
                 raise ProtocolError(
                     "REVIEW_CONFLICT", "validation", "inspect",
-                    "An approved version keeps its admitted receipt; use revalidate "
-                    "only after the approval is ended.",
+                    "An approved version keeps its admitted receipt; use round "
+                    "revalidate to re-check corrected evidence.",
                 )
             campaign = campaign_discovery(project, record["campaign_id"])
             _require_campaign_binding(record, campaign)
@@ -1663,7 +1698,13 @@ def validate(
             ).fetchone()
             if terminal is not None:
                 receipt = _load_trusted_receipt(trusted, validation_id, terminal["receipt_json"])
-                return {**receipt, "reused": True}
+                stored_attempts = len(_attempt_rows(connection, validation_id))
+                return {
+                    **receipt,
+                    "reused": True,
+                    "attempts": stored_attempts,
+                    "resumed": stored_attempts > 1,
+                }
             attempts = _attempt_rows(connection, validation_id)
             resumed = bool(attempts)
             attempt = len(attempts) + 1
@@ -1699,14 +1740,14 @@ def validate(
             record,
             submission,
             validation_id=validation_id,
-            attempts=attempt,
-            resumed=resumed,
             replay=replay,
         )
         # The trusted evidence is written before the research-visible copy is
         # published, so a crash between the two is recovered by re-running the
-        # same identity and finding the identical terminal receipt.
+        # same identity and finding the identical terminal receipt (the receipt
+        # content deliberately excludes mutable attempt provenance).
         _write_terminal_receipt(trusted, validation_id, receipt)
+        _failpoint(VALIDATION_TERMINAL_FAILPOINT)
         with _project(project) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
@@ -1736,7 +1777,75 @@ def validate(
                 "(validation_id, version_id, receipt_json) VALUES (?, ?, ?)",
                 (validation_id, version_id, _json(_published(receipt))),
             )
-    return {**receipt, "reused": False}
+    return {
+        **receipt,
+        # A recovered terminal receipt means this invocation still completes the
+        # attempt and publishes it, so it is resumed rather than a plain replay.
+        "reused": False,
+        "attempts": attempt,
+        "resumed": resumed,
+    }
+
+
+def load_tracking_receipt(store: str | Path, validation_id: str) -> dict[str, Any]:
+    """Public seam: load one completed lightweight Validation receipt safely.
+
+    Cross-module readers (``release``) must not reach into the trusted directory
+    layout or use a generic JSON reader: this seam verifies the content address,
+    the terminal status and the identity every time.
+    """
+    validation_id = _require_hex(validation_id, "validation")
+    path = _validation_path(Path(store), validation_id)
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(
+            "The bound lightweight Validation receipt is missing."
+        ) from error
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError(
+            f"The bound lightweight Validation receipt is unreadable: {error}"
+        ) from error
+    if not isinstance(receipt, dict) or receipt.get("status") != "completed":
+        raise ValueError("The bound lightweight Validation receipt is not terminal.")
+    expected = _hash({key: value for key, value in receipt.items() if key != "receipt_hash"})
+    if (
+        receipt.get("receipt_hash") != expected
+        or receipt.get("validation_id") != validation_id
+    ):
+        raise ValueError(
+            "The bound lightweight Validation receipt failed its content-address check."
+        )
+    return receipt
+
+
+def verify_tracking_binding(
+    store: str | Path,
+    validation_id: str,
+    version_id: str,
+    receipt_hash: str,
+) -> dict[str, Any]:
+    """Verify the receipt a manual-tracking release artifact binds.
+
+    The release contract (spec #43 L31/L34) admits only a *passed* terminal
+    lightweight Validation for exactly this version, so a tampered or non-passed
+    trusted record fails closed even when the artifact itself is intact.
+    """
+    receipt = load_tracking_receipt(store, validation_id)
+    if receipt.get("version_id") != version_id:
+        raise ValueError(
+            "The bound lightweight Validation receipt belongs to another version."
+        )
+    if receipt.get("receipt_hash") != receipt_hash:
+        raise ValueError(
+            "The bound lightweight Validation receipt differs from the release binding."
+        )
+    if receipt.get("outcome") != "passed":
+        raise ValueError(
+            "The bound lightweight Validation receipt did not pass; a manual-tracking "
+            "release requires a passed receipt."
+        )
+    return receipt
 
 
 # ---------------------------------------------------------------------------
@@ -2010,6 +2119,56 @@ def _first_signal_session(calendar: Mapping[str, Any], decided_at: str) -> str:
     )
 
 
+def _terminal_session(calendar: Mapping[str, Any], decided_at: str) -> str:
+    """The first calendar session after a terminal decision.
+
+    The review CLI does not receive the Shadow Live ledger, so it cannot know
+    the last committed session.  The first session after "now" is the earliest
+    after-close point the ledger cannot have committed yet; when the approved
+    calendar is already exhausted it falls back to its last session (the release
+    timeline only refuses a *decreasing* effective date).
+    """
+    local_date = datetime.fromisoformat(decided_at).astimezone(SHANGHAI).date()
+    sessions = calendar["sessions"]
+    for session in sessions:
+        if date.fromisoformat(session) > local_date:
+            return session
+    return sessions[-1]
+
+
+def _release_protocol(phase: str, call):
+    """Run one release seam call, rendering its rejection as a ProtocolError."""
+    try:
+        return call()
+    except release.ReleaseRejection as error:
+        converted = ProtocolError(
+            error.details["code"],
+            phase,
+            error.details["next_action"],
+            error.details["message"],
+        )
+        converted.context = dict(error.context)
+        raise converted from error
+
+
+def _retire_tracking(
+    trusted: Path, release_id: str, decided_at: str, reason: str, *, phase: str,
+) -> None:
+    """Append the terminal retire event for a manually tracked version (once)."""
+    status = _release_protocol(
+        phase, lambda: release.status(trusted, release_id)
+    )
+    if status["current_state"] == "retired":
+        return
+    artifact = _release_protocol(
+        phase, lambda: release.fetch(trusted, release_id)
+    )["artifact"]
+    effective = _terminal_session(artifact["admission"]["calendar"], decided_at)
+    _release_protocol(
+        phase, lambda: release.retire(trusted, release_id, effective, reason)
+    )
+
+
 def _tracking_artifact(
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
@@ -2052,6 +2211,12 @@ def _tracking_artifact(
         "round_id": record["round_id"],
         "direction_id": record["direction_id"],
         "campaign_id": record["campaign_id"],
+        # The release content-address contract keeps ``plan_id``/``plan_hash``
+        # equal to the lightweight Validation ID.  The explicit ``plan_kind`` and
+        # ``validation_id`` fields make that reusable evidence unambiguous: this
+        # is not a frozen protected plan and never authorizes a protected read.
+        "plan_kind": "lightweight_validation",
+        "validation_id": validation_id,
         "plan_id": validation_id,
         "plan_hash": validation_id,
         "plan_frozen_at": body["decided_at"],
@@ -2290,6 +2455,7 @@ def review(
             raise ValueError("The research round copy does not match the trusted approval.")
         submission = _submission(connection, round_id, version_id, phase="review")
         kickoff = record["kickoff"]
+        tracking = _latest_tracking(connection, version_id)
         binding = _review_binding(connection, record, submission, trusted)
         receipt: dict[str, Any] | None = None
         if binding["validation"] is not None:
@@ -2322,11 +2488,12 @@ def review(
             confirmation = _approve_confirmation(source, kickoff, receipt)
             decided_at = _now()
             calendar_data = _tracking_calendar(calendar, record)
-            effective = _first_signal_session(calendar_data, decided_at)
+            # The replay key is the human decision content, never the clock: the
+            # first computed effective session is stored on the decision and a
+            # later replay returns it unchanged (spec #43 L31).
             request_payload = {
                 "observation": confirmation,
                 "calendar_hash": _hash(calendar_data),
-                "effective_signal_date": effective,
             }
         elif decision == "return":
             decided_at = _now()
@@ -2345,13 +2512,24 @@ def review(
                 artifact = _tracking_artifact(
                     record, submission, await_receipt, existing
                 )
-                release.register_tracking_version(
-                    trusted,
-                    artifact,
-                    existing["tracking"]["enabled_signal_date"],
-                    existing["reason"],
+                _release_protocol(
+                    "review",
+                    lambda: release.register_tracking_version(
+                        trusted,
+                        artifact,
+                        existing["tracking"]["enabled_signal_date"],
+                        existing["reason"],
+                    ),
                 )
                 _store_observation(connection, existing)
+            elif existing["decision"] == "end" and tracking is not None:
+                _retire_tracking(
+                    trusted,
+                    tracking["release_id"],
+                    existing["decided_at"],
+                    existing["reason"],
+                    phase="review",
+                )
             _store_decision(connection, trusted, existing)
             return _review_result(
                 existing,
@@ -2391,7 +2569,9 @@ def review(
                 "release_id": release.tracking_id(
                     version_id, receipt["validation_id"]
                 ),
-                "enabled_signal_date": request_payload["effective_signal_date"],
+                "enabled_signal_date": _first_signal_session(
+                    calendar_data, decided_at
+                ),
                 "calendar_hash": request_payload["calendar_hash"],
             }
         elif decision == "return":
@@ -2402,15 +2582,22 @@ def review(
         if decision == "approve":
             artifact = _tracking_artifact(record, submission, receipt, body)
             _store_decision(connection, trusted, body)
-            release.register_tracking_version(
-                trusted,
-                artifact,
-                body["tracking"]["enabled_signal_date"],
-                reason,
+            _release_protocol(
+                "review",
+                lambda: release.register_tracking_version(
+                    trusted,
+                    artifact,
+                    body["tracking"]["enabled_signal_date"],
+                    reason,
+                ),
             )
             _store_observation(connection, body)
         else:
             _store_decision(connection, trusted, body)
+            if decision == "end" and tracking is not None:
+                _retire_tracking(
+                    trusted, tracking["release_id"], decided_at, reason, phase="review"
+                )
         return _review_result(
             body,
             reused=False,
@@ -2696,15 +2883,14 @@ def _successor_candidates(
         except (OSError, ValueError):
             continue
         if locked_snapshot_id not in lineage[1:]:
+            # A genuinely unrelated snapshot is not successor evidence and is
+            # skipped; a successor-shaped snapshot is never silently ignored.
             continue
-        try:
-            candidates.append(
-                _successor_evidence(
-                    snapshot_store, campaign, record, locked_snapshot_id, snapshot_id
-                )
+        candidates.append(
+            _successor_evidence(
+                snapshot_store, campaign, record, locked_snapshot_id, snapshot_id
             )
-        except ProtocolError:
-            continue
+        )
     return candidates
 
 
@@ -2789,6 +2975,18 @@ def _revalidation_body(
     for field in ("original_discovery", "recomputed_discovery", "affected"):
         if field in receipt:
             body[field] = receipt[field]
+    review_block: dict[str, Any] | None = None
+    if review_state == "approved":
+        trigger = None
+        if receipt["outcome"] == "failed":
+            trigger = "REVALIDATION_FAILED"
+        elif receipt["outcome"] == "insufficient_evidence":
+            trigger = "REVALIDATION_INSUFFICIENT_EVIDENCE"
+        review_block = {
+            "required": trigger is not None,
+            "trigger": trigger,
+            "reason": receipt["reason"],
+        }
     result = {
         "schema_version": SCHEMA_VERSION,
         "status": "revalidated",
@@ -2805,6 +3003,9 @@ def _revalidation_body(
         "reason": receipt["reason"],
         "evidence": dict(evidence),
     }
+    if review_block is not None:
+        body["review"] = review_block
+        result["review"] = review_block
     for field in ("original_discovery", "recomputed_discovery", "affected"):
         if field in receipt:
             result[field] = receipt[field]
@@ -2857,12 +3058,8 @@ def revalidate(
                     "VERSION_ENDED", "revalidation", "inspect",
                     "An ended version is terminal and cannot be revalidated.",
                 )
-            if state == "approved":
-                raise ProtocolError(
-                    "REVIEW_CONFLICT", "revalidation", "inspect",
-                    "An approved version keeps its admitted receipt; end it before "
-                    "revalidating a fresh review.",
-                )
+            # An approved version can still be re-checked after a data or
+            # platform correction (spec #43 L33); only ``ended`` is terminal.
             row = connection.execute(
                 "SELECT validation_id, receipt_json FROM research_loop_validations "
                 "WHERE version_id = ?",
@@ -2926,10 +3123,13 @@ def revalidate(
             ).fetchone()
             if stored is not None:
                 body = _verify_revalidation(json.loads(stored["revalidation_json"]))
+                stored_attempts = len(_attempt_rows(connection, validation_id))
                 return {
                     **body["result"],
                     "revalidation_id": body["revalidation_id"],
                     "reused": True,
+                    "attempts": stored_attempts,
+                    "resumed": stored_attempts > 1,
                 }
             attempts = _attempt_rows(connection, validation_id)
             resumed = bool(attempts)
@@ -2994,8 +3194,6 @@ def revalidate(
                 record,
                 submission,
                 validation_id=attempt_context[0],
-                attempts=attempt_context[1],
-                resumed=resumed,
                 replay=replay,
                 recomputed=recomputed,
                 corrected={
@@ -3032,8 +3230,6 @@ def revalidate(
                 record,
                 submission,
                 validation_id=attempt_context[0],
-                attempts=attempt_context[1],
-                resumed=resumed,
                 replay=replay,
             )
         _write_terminal_receipt(trusted, attempt_context[0], receipt)
@@ -3106,6 +3302,8 @@ def revalidate(
         **body["result"],
         "revalidation_id": body["revalidation_id"],
         "reused": False,
+        "attempts": attempt_context[1],
+        "resumed": resumed,
     }
 
 
@@ -3137,13 +3335,16 @@ def _validation_summary(
             "attempts": attempts,
         }
         revalidated = connection.execute(
-            "SELECT revalidation_id, prior_validation_id FROM "
+            "SELECT revalidation_id, prior_validation_id, revalidation_json FROM "
             "research_loop_revalidations WHERE validation_id = ?",
             (terminal["validation_id"],),
         ).fetchone()
         if revalidated is not None:
             summary["revalidation_id"] = revalidated["revalidation_id"]
             summary["revalidated_from"] = revalidated["prior_validation_id"]
+            review_block = json.loads(revalidated["revalidation_json"]).get("review")
+            if review_block is not None:
+                summary["review"] = review_block
         for field in (
             "evidence", "original_discovery", "recomputed_discovery", "affected",
         ):
@@ -3217,12 +3418,13 @@ def _review_summary(
         summary = latest["return"]
     else:
         summary = latest["end"]
+    # Round status is agent-visible: it may show the state, the decision kind,
+    # the return instructions and the confirmed observation, but never the human
+    # reviewer's identity or reasoning (F8).
     return {
         "state": latest["review_state"],
         "decision": latest["decision"],
         "decision_id": latest["decision_id"],
-        "reviewer": latest["reviewer"],
-        "reason": latest["reason"],
         "decided_at": latest["decided_at"],
         "summary": summary,
     }
@@ -3337,7 +3539,6 @@ def _round_status_body(
             ),
             "release_ids": [item["release_id"] for item in tracked],
             "versions": tracked,
-            "committed_sessions": 0,
         },
     }
     if closure is not None:
@@ -3450,6 +3651,90 @@ def _store_evidence_decision(
     )
 
 
+def _release_event(
+    status: Mapping[str, Any], action: str, reason: str,
+) -> dict[str, Any] | None:
+    """The last lifecycle event when a crashed decision already applied it."""
+    timeline = status.get("timeline") or []
+    if not timeline:
+        return None
+    event = timeline[-1]
+    if event.get("action") == action and event.get("reason") == reason:
+        return event
+    return None
+
+
+def _evidence_end_review(
+    connection: sqlite3.Connection,
+    trusted: Path,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    reviewer: str,
+    reason: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any], str, dict[str, Any]]:
+    """The terminal review content for an Evidence Loop retirement decision."""
+    binding = _review_binding(connection, record, submission, trusted)
+    payload = {
+        "detail": reason,
+        "continue_direction": True,
+        "evidence_decision": "retire",
+    }
+    request_key = _review_request_key(
+        record["round_id"],
+        submission["version_id"],
+        "end",
+        reviewer,
+        reason,
+        payload,
+        binding,
+    )
+    existing = _matching_review(
+        connection, trusted, submission["version_id"], request_key
+    )
+    return existing, payload, request_key, binding
+
+
+def _store_evidence_end_review(
+    connection: sqlite3.Connection,
+    trusted: Path,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    reviewer: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record the one terminal review state for an Evidence Loop retirement.
+
+    ``round evidence decide retire`` is the same terminal decision as
+    ``round review end``: it must leave exactly one current review state
+    (``ended``) so both status views agree and ``round close`` refuses the
+    version.  The record is content-addressed and replay-safe.
+    """
+    existing, payload, request_key, binding = _evidence_end_review(
+        connection, trusted, record, submission, reviewer, reason
+    )
+    if existing is not None:
+        # A crash can leave the immutable trusted record without its project row
+        # (the write-ahead file is not transactional); reconcile it here.
+        _store_decision(connection, trusted, existing)
+        return existing
+    body: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "round_id": record["round_id"],
+        "version_id": submission["version_id"],
+        "decision": "end",
+        "review_state": "ended",
+        "reviewer": reviewer,
+        "reason": reason,
+        "decided_at": _now(),
+        "binding": binding,
+        "request_key": request_key,
+        "end": payload,
+    }
+    body["decision_id"] = _hash(body)
+    _store_decision(connection, trusted, body)
+    return body
+
+
 def _confirmed_observation(
     connection: sqlite3.Connection, version_id: str,
 ) -> dict[str, Any] | None:
@@ -3465,7 +3750,7 @@ def _evidence_request_key(
     version_id: str,
     release_id: str,
     decision: str,
-    scope: str,
+    pause_scope: str,
     reviewer: str,
     reason: str,
 ) -> str:
@@ -3476,7 +3761,7 @@ def _evidence_request_key(
             "version_id": version_id,
             "release_id": release_id,
             "decision": decision,
-            "scope": scope,
+            "pause_scope": pause_scope,
             "reviewer": reviewer,
             "reason": reason,
         }
@@ -3530,6 +3815,32 @@ def _evidence_effective_session(
     if timeline and effective < timeline[-1]["effective_signal_date"]:
         effective = timeline[-1]["effective_signal_date"]
     return effective
+
+
+def _review_signature(trigger: str, evidence: Mapping[str, Any]) -> str | None:
+    """Stable identity of one review trigger instance (F12 acknowledgement).
+
+    A human ``continue`` acknowledges the trigger it saw, not the trigger code
+    forever: a materially new instance (deeper drawdown, another unfilled run,
+    more gap sessions) has a different signature and reopens the review.
+    """
+    if trigger == "max_unfilled_opportunities":
+        salient: dict[str, Any] = {
+            "unfilled": evidence["unfilled_opportunities"],
+            "consecutive": evidence["consecutive_intent_without_fill"],
+        }
+    elif trigger == "max_abs_drawdown":
+        salient = {"observed": round(float(evidence["max_abs_drawdown"]), 12)}
+    elif trigger == "max_data_gap_sessions":
+        salient = {"gaps": evidence["data_gap_sessions"]}
+    elif trigger in ("observation_term", "observation_extended"):
+        salient = {
+            "due": evidence["due_opportunities"],
+            "committed": evidence["committed_sessions"],
+        }
+    else:
+        salient = {}
+    return _hash({"trigger": trigger, "salient": salient})
 
 
 def _evidence_review(
@@ -3607,6 +3918,7 @@ def _evidence_review(
     return {
         "trigger": trigger,
         "reason": reason,
+        "key": None if trigger is None else _review_signature(trigger, evidence),
         "term": term,
         "minimum": minimum,
         "term_reached": term_reached,
@@ -3619,6 +3931,8 @@ def _evidence_state(
     review_state: str,
     release_state: str,
     pauses: list[dict[str, Any]],
+    *,
+    acknowledged: bool = False,
 ) -> str:
     if review_state == "ended" or release_state == "retired":
         return "ended"
@@ -3626,7 +3940,7 @@ def _evidence_state(
         return "paused"
     if review["trigger"] == "observation_extended":
         return "observation_extended"
-    if review["trigger"] is not None:
+    if review["trigger"] is not None and not acknowledged:
         return "review_due"
     return "tracking"
 
@@ -3649,7 +3963,9 @@ def _pause_record(
             effect = latest_decision.get("effect") or {}
             return {
                 "session": effect.get("effective_signal_date"),
-                "scope": latest_decision.get("scope", "version"),
+                "scope": latest_decision.get(
+                    "pause_scope", latest_decision.get("scope", "version")
+                ),
                 "code": "MANUAL_PAUSE",
                 "message": latest_decision["reason"],
                 "recorded_at": latest_decision["decided_at"],
@@ -3710,6 +4026,8 @@ def _evidence_decision_output(
         "reason": body["reason"],
         "decided_at": body["decided_at"],
         "scope": body.get("scope", "version"),
+        "data_kind": body.get("data_kind"),
+        "pause_scope": body.get("pause_scope", "version"),
         "facts": body["facts"],
         "effect": effect,
         "state": (
@@ -3786,8 +4104,24 @@ def evidence_status(
             review = _evidence_review(
                 record["kickoff"], evidence, confirmed, committed_sessions
             )
+            acknowledgement = (
+                latest_decision.get("review") or {}
+                if latest_decision is not None
+                and latest_decision.get("decision") == "continue"
+                else {}
+            )
+            acknowledged = bool(
+                review["key"] is not None
+                and acknowledgement.get("key") == review["key"]
+            )
             pauses = list(evidence.get("active_pauses") or [])
-            state = _evidence_state(review, review_state, release_state, pauses)
+            state = _evidence_state(
+                review,
+                review_state,
+                release_state,
+                pauses,
+                acknowledged=acknowledged,
+            )
             term = review["term"]
             versions.append(
                 {
@@ -3827,7 +4161,19 @@ def evidence_status(
                         "trigger": review["trigger"],
                         "reason": review["reason"],
                         "required": review["trigger"]
-                        not in (None, "observation_extended"),
+                        not in (None, "observation_extended")
+                        and not acknowledged,
+                        "acknowledged": acknowledged,
+                        "acknowledged_by": (
+                            latest_decision["decision_id"]
+                            if acknowledged and latest_decision is not None
+                            else None
+                        ),
+                        "acknowledged_trigger": (
+                            acknowledgement.get("trigger")
+                            if acknowledged
+                            else None
+                        ),
                     },
                     "pause": _pause_record(release_state, pauses, latest_decision),
                     "state": state,
@@ -3867,8 +4213,8 @@ def evidence_decide(
     if trusted.is_relative_to(project.resolve()):
         raise ValueError("Trusted evaluation store must be outside the research project.")
     with _round_lock(project, round_id), _project(project) as connection:
-        _project_round(connection, round_id)
-        _submission(connection, round_id, version_id, phase="evidence")
+        record = _project_round(connection, round_id)
+        submission = _submission(connection, round_id, version_id, phase="evidence")
         tracking = _latest_tracking(connection, version_id)
         if tracking is None:
             raise ProtocolError(
@@ -3880,42 +4226,126 @@ def evidence_decide(
         state_before = release_status["current_state"]
         evidence = _shadow_evidence(ledger, release_id)
         confirmed = _confirmed_observation(connection, version_id)
-        scope = "version"
+        # Artifact labelling: ``scope`` is the data scope and ``data_kind`` its
+        # kind; the pause range is recorded separately (CODING_STANDARDS 1).
+        scope = record["scope"]
+        data_kind = record["data_kind"]
+        pause_scope = "version"
         request_key = _evidence_request_key(
-            round_id, version_id, release_id, decision, scope, reviewer, reason
+            round_id, version_id, release_id, decision, pause_scope, reviewer, reason
         )
         existing = _matching_evidence_decision(
             connection, trusted, version_id, request_key
         )
         if existing is not None:
             return _evidence_decision_output(existing, reused=True)
-        if state_before == "retired" or _review_state(connection, version_id) == "ended":
+        review_state = _review_state(connection, version_id)
+        effective = _evidence_effective_session(artifact, evidence, release_status)
+        action = "none"
+        state_after = state_before
+        recovered = False
+        if decision != "retire" and (
+            state_before == "retired" or review_state == "ended"
+        ):
             raise ProtocolError(
                 "VERSION_ENDED", "evidence", "inspect",
                 "An ended version is terminal; the round may continue with a new version.",
             )
-        if decision == "pause" and state_before != "enabled":
-            raise ProtocolError(
-                "REVIEW_CONFLICT", "evidence", "inspect",
-                "Pause requires an enabled tracking version; it is already paused.",
-            )
-        effective = _evidence_effective_session(artifact, evidence, release_status)
-        action = "none"
-        state_after = state_before
         if decision == "pause":
-            release.pause(trusted, release_id, effective, reason)
+            if state_before == "paused":
+                event = _release_event(release_status, "pause", reason)
+                if event is None:
+                    raise ProtocolError(
+                        "REVIEW_CONFLICT", "evidence", "inspect",
+                        "Pause requires an enabled tracking version; it is already paused.",
+                    )
+                recovered = True
+                state_before = event["state_before"]
+                effective = event["effective_signal_date"]
+            elif state_before != "enabled":
+                raise ProtocolError(
+                    "REVIEW_CONFLICT", "evidence", "inspect",
+                    "Pause requires an enabled tracking version; it is already paused.",
+                )
             action = "pause"
             state_after = "paused"
         elif decision == "continue":
             if state_before == "paused":
-                release.resume(trusted, release_id, effective, reason)
                 action = "resume"
                 state_after = "enabled"
+            elif state_before == "enabled":
+                # A crashed resume already appended its event; acknowledge it
+                # instead of applying a second one.
+                event = _release_event(release_status, "resume", reason)
+                if event is not None:
+                    recovered = True
+                    state_before = event["state_before"]
+                    effective = event["effective_signal_date"]
+                    action = "resume"
+                    state_after = "enabled"
+            else:
+                raise ProtocolError(
+                    "VERSION_ENDED", "evidence", "inspect",
+                    "An ended version is terminal; the round may continue with a new version.",
+                )
         else:
-            release.retire(trusted, release_id, effective, reason)
+            own_review: dict[str, Any] | None = None
+            if review_state == "ended":
+                own_review, _, _, _ = _evidence_end_review(
+                    connection, trusted, record, submission, reviewer, reason
+                )
+                if own_review is None:
+                    raise ProtocolError(
+                        "VERSION_ENDED", "evidence", "inspect",
+                        "An ended version is terminal; the round may continue with a new version.",
+                    )
+            if state_before == "retired":
+                event = _release_event(release_status, "retire", reason)
+                if event is None:
+                    raise ProtocolError(
+                        "VERSION_ENDED", "evidence", "inspect",
+                        "An ended version is terminal; the round may continue with a new version.",
+                    )
+                recovered = True
+                state_before = event["state_before"]
+                effective = event["effective_signal_date"]
             action = "retire"
             state_after = "retired"
+        if decision == "retire":
+            _store_evidence_end_review(
+                connection, trusted, record, submission, reviewer, reason
+            )
             shadow.mark_version_ended(ledger, release_id, release_id)
+            if not recovered:
+                _release_protocol(
+                    "evidence",
+                    lambda: release.retire(trusted, release_id, effective, reason),
+                )
+        elif action == "pause" and not recovered:
+            _release_protocol(
+                "evidence",
+                lambda: release.pause(trusted, release_id, effective, reason),
+            )
+        elif action == "resume" and not recovered:
+            _release_protocol(
+                "evidence",
+                lambda: release.resume(trusted, release_id, effective, reason),
+            )
+        _failpoint(EVIDENCE_DECIDE_FAILPOINT)
+        acknowledged_review: dict[str, Any] | None = None
+        if decision == "continue":
+            enabled = tracking["enabled_signal_date"]
+            committed_sessions = sum(
+                1 for day in evidence["committed_dates"] if day >= enabled
+            )
+            current = _evidence_review(
+                record["kickoff"], evidence, confirmed, committed_sessions
+            )
+            acknowledged_review = {
+                "trigger": current["trigger"],
+                "key": current["key"],
+                "reason": current["reason"],
+            }
         body: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "round_id": round_id,
@@ -3923,6 +4353,8 @@ def evidence_decide(
             "release_id": release_id,
             "decision": decision,
             "scope": scope,
+            "data_kind": data_kind,
+            "pause_scope": pause_scope,
             "reviewer": reviewer,
             "reason": reason,
             "decided_at": _now(),
@@ -3935,6 +4367,8 @@ def evidence_decide(
                 "state_after": state_after,
             },
         }
+        if acknowledged_review is not None:
+            body["review"] = acknowledged_review
         body["decision_id"] = _hash(body)
         _store_evidence_decision(connection, trusted, body)
     return _evidence_decision_output(body, reused=False)
@@ -3946,12 +4380,8 @@ def evidence_decide(
 
 
 def _version_approved(connection: sqlite3.Connection, version_id: str) -> bool:
-    row = connection.execute(
-        "SELECT review_json FROM research_loop_reviews WHERE version_id = ? "
-        "ORDER BY rowid DESC LIMIT 1",
-        (version_id,),
-    ).fetchone()
-    return row is not None and json.loads(row["review_json"]).get("decision") == "approve"
+    """Whether the version's one current review state is ``approved``."""
+    return _review_state(connection, version_id) == "approved"
 
 
 def close(
@@ -4009,6 +4439,13 @@ def close(
                 raise ProtocolError(
                     "VALIDATION_NOT_PASSED", "close", "review",
                     "The selected version is not locked in this research round.",
+                )
+            state = _review_state(connection, selected)
+            if state == "ended":
+                raise ProtocolError(
+                    "VERSION_ENDED", "close", "inspect",
+                    "An ended or retired version is terminal and cannot be selected "
+                    "as the round's candidate; the round may cite a new version.",
                 )
             if not _version_approved(connection, selected):
                 raise ProtocolError(

@@ -375,6 +375,9 @@ def _load_verified_artifact(path: Path, release_id: str) -> dict[str, Any]:
             else None
         )
         _verify_tracking_artifact(artifact, effective)
+        # Defense in depth: every reader re-verifies the bound passed receipt,
+        # so a tampered or revoked trusted record fails closed immediately.
+        _verify_tracking_bindings(Path(path.parents[2]), artifact)
     return artifact
 
 
@@ -2536,32 +2539,42 @@ def _verify_tracking_bindings(store: Path, artifact: dict[str, Any]) -> None:
         admission.get("effective_signal_date") if isinstance(admission, dict) else None
     )
     _verify_tracking_artifact(artifact, effective)
-    validation_id = artifact["plan_id"]
+    if artifact.get("plan_kind", "lightweight_validation") != "lightweight_validation":
+        raise _reject(
+            "RELEASE_INTEGRITY_FAILED", "lifecycle", "inspect",
+            "The tracking artifact claims a different plan kind.",
+        )
+    validation_id = artifact.get("validation_id") or artifact["plan_id"]
     binding = artifact.get("binding")
     if not isinstance(binding, dict):
         raise _reject(
             "RELEASE_INTEGRITY_FAILED", "lifecycle", "inspect",
             "The tracking artifact has no validated binding block.",
         )
-    path = store / "research-loop-validations" / f"{validation_id}.json"
-    try:
-        receipt = snapshot._read_json(path)
-    except (OSError, UnicodeError, ValueError) as error:
-        raise _reject(
-            "EVIDENCE_INVALID", "lifecycle", "inspect",
-            f"The tracking Validation receipt is unreadable: {error}",
-        ) from error
     if (
-        not isinstance(receipt, dict)
-        or receipt.get("status") != "completed"
-        or receipt.get("validation_id") != validation_id
-        or receipt.get("version_id") != artifact.get("candidate_hash")
-        or receipt.get("receipt_hash") != binding.get("receipt_hash")
+        binding.get("validation_id") != validation_id
+        or artifact.get("plan_id") != validation_id
     ):
         raise _reject(
-            "EVIDENCE_INVALID", "lifecycle", "inspect",
-            "The tracking Validation receipt no longer matches the release artifact.",
+            "RELEASE_INTEGRITY_FAILED", "lifecycle", "inspect",
+            "The tracking artifact's bound Validation ID is inconsistent.",
         )
+    # Cross-module access goes through the public research-loop seam, which
+    # re-verifies the content address, the version binding and the passed
+    # outcome on every read (defense in depth; spec #43 L31).
+    from prajnatrade import research_loop
+
+    try:
+        research_loop.verify_tracking_binding(
+            store,
+            validation_id,
+            artifact.get("candidate_hash"),
+            binding.get("receipt_hash"),
+        )
+    except ValueError as error:
+        raise _reject(
+            "EVIDENCE_INVALID", "lifecycle", "inspect", str(error)
+        ) from error
 
 
 def _verify_bindings(store: Path, artifact: dict[str, Any]) -> None:
@@ -2867,14 +2880,14 @@ def register_tracking_version(
         )
     path = _artifact_location(eval_store, release_id)
     if path.is_file():
-        existing = _load_verified_artifact(path, release_id)
+        existing = _verified_artifact(path, release_id)
         if existing != artifact:
             raise _reject(
                 "RELEASE_INTEGRITY_FAILED", "registration", "inspect",
                 "A different tracking artifact already exists for this release ID.",
             )
     elif not _write_immutable(path, artifact):
-        existing = _load_verified_artifact(path, release_id)
+        existing = _verified_artifact(path, release_id)
         if existing != artifact:
             raise _reject(
                 "RELEASE_INTEGRITY_FAILED", "registration", "inspect",

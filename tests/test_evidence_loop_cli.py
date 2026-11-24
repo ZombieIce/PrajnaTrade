@@ -13,16 +13,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-from cli_helpers import agent_cli, cli, ok, rejected, write_json
+from cli_helpers import agent_cli, assert_hex, cli, cli_env, ok, rejected, write_json
 from test_experiment_cli import sealed_snapshot_input
 from test_protected_eval_cli import SYMBOLS, submit_experiment
 from test_research_loop_cli import (
+    close_round,
     opening,
     round_status,
     submit_version,
@@ -39,7 +41,9 @@ from test_shadow_cli import (
 from test_version_review_cli import (
     approve_version,
     calendar_file,
+    end_input,
     observation_input,
+    review,
 )
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -113,6 +117,21 @@ def crashed_closes(sessions: list[str], crash_offset: int) -> dict[str, list[flo
     }
 
 
+def deeper_crash_closes(
+    sessions: list[str], crash_offset: int, deeper_offset: int
+) -> dict[str, list[float | None]]:
+    """Flat closes, then a 40% drawdown, then a deeper 60% drawdown from peak."""
+    crash = session_at(sessions, crash_offset)
+    deeper = session_at(sessions, deeper_offset)
+    return {
+        symbol: [
+            10.0 if session < crash else (6.0 if session < deeper else 4.0)
+            for session in sessions
+        ]
+        for symbol in SYMBOLS
+    }
+
+
 def evidence_status(
     project: Path,
     store: Path,
@@ -149,6 +168,7 @@ def evidence_decide(
     *,
     reason: str,
     reviewer: str = "research-lead",
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return cli(
         "round",
@@ -170,12 +190,19 @@ def evidence_decide(
         reviewer,
         "--reason",
         reason,
+        env=env,
     )
 
 
 def version_entry(status: dict, version_id: str) -> dict:
     return next(
         item for item in status["versions"] if item["version_id"] == version_id
+    )
+
+
+def submission_entry(status: dict, version_id: str) -> dict:
+    return next(
+        item for item in status["submissions"] if item["version_id"] == version_id
     )
 
 
@@ -493,31 +520,42 @@ def test_metrics_not_ready_is_distinct_from_consecutive_intent_without_fill(
     round_id = tracking["round_id"]
     sessions = tracking["sessions"]
 
-    # (a) A ready signal whose orders never fill: consecutive intent-without-fill.
-    release_id = tracking["v1"]["approval"]["tracking"]["release_id"]
+    # (a) A ready strategy whose target changes every session but whose orders
+    # never fill: consecutive intent-without-fill.  The alternating synthetic
+    # derived closes make momentum switch between invested and cash every day,
+    # so every decision point is a real target change (not price-drift noise).
+    release_id = tracking["v2"]["approval"]["tracking"]["release_id"]
     ledger = tmp_path / "unfilled-ledger"
+    oscillating = {
+        symbol: [10.0 if index % 2 == 0 else 8.0 for index in range(len(sessions))]
+        for symbol in SYMBOLS
+    }
     feed = write_feed(
         tmp_path / "unfilled-feed.json",
-        feed_for(sessions, direction="rising", raw_overrides=missing_opens(sessions, 2)),
+        shadow_feed(
+            sessions,
+            derived=oscillating,
+            raw_overrides=missing_opens(sessions, 2),
+        ),
     )
     ok(
         shadow_update(
             ledger,
             tracking["store"],
             feed,
-            session_at(sessions, 4),
+            session_at(sessions, 11),
             release_ids=(release_id,),
         )
     )
     status = ok(evidence_status(tracking["project"], tracking["store"], ledger, round_id))
-    entry = version_entry(status, tracking["v1"]["version_id"])
+    entry = version_entry(status, tracking["v2"]["version_id"])
     facts = entry["tracking"]
     assert facts["metrics_not_ready"]["count"] == 0
-    assert facts["due_opportunities"] == 4
+    assert facts["due_opportunities"] == 9
     assert facts["filled_opportunities"] == 0
-    assert facts["unfilled_opportunities"] == 3
-    assert facts["intent_without_fill"] == 3
-    assert facts["consecutive_intent_without_fill"] == 3
+    assert facts["unfilled_opportunities"] == 4
+    assert facts["intent_without_fill"] == 4
+    assert facts["consecutive_intent_without_fill"] == 4
     assert facts["first_fill_date"] is None
     assert entry["state"] == "review_due"
     assert entry["review"]["trigger"] == "max_unfilled_opportunities"
@@ -584,6 +622,82 @@ def test_metrics_not_ready_is_distinct_from_consecutive_intent_without_fill(
     assert short_facts["first_signal_date"] == session_at(sessions, 6)
     assert short["state"] == "tracking"
     assert short["review"]["trigger"] is None
+
+
+# ---------------------------------------------------------------------------
+# 4b. Price drift alone is not a decision opportunity
+# ---------------------------------------------------------------------------
+
+
+def test_drift_only_orders_do_not_create_decision_opportunities(
+    tracking: dict, tmp_path: Path
+) -> None:
+    round_id = tracking["round_id"]
+    sessions = tracking["sessions"]
+    v1_id = tracking["v1"]["version_id"]
+    release_id = tracking["v1"]["approval"]["tracking"]["release_id"]
+    enabled = tracking["v1"]["approval"]["tracking"]["enabled_signal_date"]
+    assert enabled == session_at(sessions, 1)
+    # A constant equal-weight target: the first symbol's price rises while the
+    # others stay flat, so every later session needs rebalancing orders even
+    # though the strategy's target weights never change.
+    drifting = {
+        symbol: [
+            10.0 + (0.25 * index if symbol == SYMBOLS[0] else 0.0)
+            for index in range(len(sessions))
+        ]
+        for symbol in SYMBOLS
+    }
+    ledger = tmp_path / "ledger"
+    feed = write_feed(
+        tmp_path / "drift-feed.json",
+        shadow_feed(
+            sessions,
+            closes=drifting,
+            derived={symbol: [10.0] * len(sessions) for symbol in SYMBOLS},
+        ),
+    )
+    ok(
+        shadow_update(
+            ledger,
+            tracking["store"],
+            feed,
+            session_at(sessions, 6),
+            release_ids=(release_id,),
+        )
+    )
+    entry = version_entry(
+        ok(evidence_status(tracking["project"], tracking["store"], ledger, round_id)),
+        v1_id,
+    )
+    facts = entry["tracking"]
+    assert facts["committed_sessions"] == 6
+    assert facts["due_opportunities"] == 1
+    assert facts["filled_opportunities"] == 1
+    assert facts["unfilled_opportunities"] == 0
+    assert [item["signal_date"] for item in facts["opportunities"]] == [enabled]
+
+    days = report_days(ledger, release_id, tmp_path / "drift-report.json")
+    by_date = {entry["date"]: entry["result"] for entry in days}
+    drift_days = [
+        result
+        for date, result in by_date.items()
+        if date > enabled and result["next_orders"]
+    ]
+    assert drift_days, "the scenario must produce drift-only rebalancing orders"
+    for result in drift_days:
+        assert result["opportunities"] == []
+        assert result["signal"]["opportunity"] == {
+            "due": False,
+            "reason": "target_unchanged",
+        }
+        assert result["signal"]["target_weights"] == by_date[enabled]["signal"][
+            "target_weights"
+        ]
+    # Drift orders still settle normally and keep the accounting coherent.
+    assert any(order["status"] == "filled" for result in drift_days for order in result["orders"])
+    assert facts["first_signal_date"] == enabled
+    assert facts["first_fill_date"] == session_at(sessions, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +803,59 @@ def test_scoped_pause_stops_only_the_affected_version(tracking: dict, tmp_path: 
 
 
 # ---------------------------------------------------------------------------
+# 5b. A scope-pause write failure is reported, never silently swallowed
+# ---------------------------------------------------------------------------
+
+
+def test_scope_pause_persistence_failure_is_reported_not_pretended(
+    tracking: dict, tmp_path: Path
+) -> None:
+    project, store, ledger = clone_environment(tmp_path / "clone", tracking)
+    round_id = tracking["round_id"]
+    sessions = tracking["sessions"]
+    v1_id = tracking["v1"]["version_id"]
+    release_id = tracking["v1"]["approval"]["tracking"]["release_id"]
+    feed = write_feed(tmp_path / "feed.json", feed_for(sessions, direction="rising"))
+    ok(
+        shadow_update(
+            ledger, store, feed, session_at(sessions, 2), release_ids=(release_id,)
+        )
+    )
+    database = ledger / "shadow.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TRIGGER refuse_scope_pause BEFORE INSERT ON scope_pauses "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic scope pause failure'); END"
+        )
+    distorted = write_feed(
+        tmp_path / "distorted.json",
+        feed_for(
+            sessions,
+            direction="falling",
+            actions=late_dividend_action(sessions, 3, SYMBOLS[0]),
+        ),
+    )
+    blocked = shadow_update(
+        ledger, store, distorted, session_at(sessions, 4), release_ids=(release_id,)
+    )
+    assert blocked.returncode == 2, (blocked.stdout, blocked.stderr)
+    entry = json.loads(blocked.stdout)["versions"][0]
+    assert entry["status"] == "blocked"
+    assert entry["reason_code"] == "missing_action_terms"
+    assert [item["code"] for item in entry["anomalies"]] == [
+        "scope_pause_not_recorded"
+    ]
+    assert "synthetic scope pause failure" in entry["anomalies"][0]["message"]
+    assert ledger_rows(ledger, "scope_pauses") == []
+    # The platform never pretends the pause was recorded.
+    status = version_entry(
+        ok(evidence_status(project, store, ledger, round_id)), v1_id
+    )
+    assert status["pause"] is None
+    assert status["state"] != "paused"
+
+
+# ---------------------------------------------------------------------------
 # 6. Trusted performance anomaly triggers human review; continue keeps tracking
 # ---------------------------------------------------------------------------
 
@@ -734,9 +901,10 @@ def test_trusted_drawdown_requires_human_review_and_continue_keeps_tracking(
     assert decided["effect"]["action"] == "none"
     assert decided["effect"]["state_before"] == "enabled"
     assert decided["facts"]["max_abs_drawdown"] >= 0.25
-    _assert_hex(decided["decision_id"])
+    assert_hex(decided["decision_id"])
 
-    # Continue keeps the version tracking; a later session still commits.
+    # Continue acknowledges this trigger: the version keeps tracking instead of
+    # reporting review_due forever for the same acknowledged observation.
     ok(
         shadow_update(
             ledger, store, feed, session_at(sessions, 4), release_ids=(release_id,)
@@ -746,18 +914,41 @@ def test_trusted_drawdown_requires_human_review_and_continue_keeps_tracking(
         ok(evidence_status(project, store, ledger, round_id)), v1_id
     )
     assert after["tracking"]["committed_sessions"] == 4
-    assert after["state"] == "review_due"
+    assert after["state"] == "tracking"
     assert after["review"]["trigger"] == "max_abs_drawdown"
+    assert after["review"]["required"] is False
+    assert after["review"]["acknowledged"] is True
+    assert after["review"]["acknowledged_by"] == decided["decision_id"]
+    assert after["review"]["acknowledged_trigger"] == "max_abs_drawdown"
+
+    # A deeper, unacknowledged drawdown is a new trigger: review is due again.
+    deeper = write_feed(
+        tmp_path / "deeper-feed.json",
+        feed_for(
+            sessions,
+            direction="rising",
+            closes=deeper_crash_closes(sessions, 3, 5),
+        ),
+    )
+    ok(
+        shadow_update(
+            ledger, store, deeper, session_at(sessions, 5), release_ids=(release_id,)
+        )
+    )
+    reopened = version_entry(
+        ok(evidence_status(project, store, ledger, round_id)), v1_id
+    )
+    assert reopened["tracking"]["max_abs_drawdown"] >= 0.5
+    assert reopened["state"] == "review_due"
+    assert reopened["review"]["trigger"] == "max_abs_drawdown"
+    assert reopened["review"]["required"] is True
+    assert reopened["review"]["acknowledged"] is False
 
 
 # ---------------------------------------------------------------------------
 # 7. continue / pause / retire: pause stops signals, pending orders and
 #    valuation continue, continue resumes, retire is terminal and keeps history
 # ---------------------------------------------------------------------------
-
-
-def _assert_hex(value: object) -> None:
-    assert isinstance(value, str) and len(value) == 64, value
 
 
 def test_continue_pause_and_retire_outcomes_keep_the_old_facts(
@@ -810,6 +1001,21 @@ def test_continue_pause_and_retire_outcomes_keep_the_old_facts(
     assert paused["effect"]["action"] == "pause"
     assert paused["effect"]["state_after"] == "paused"
     assert paused["effect"]["effective_signal_date"] == session_at(sessions, 4)
+    # The artifact-labelling standard applies to the decision record too: scope
+    # is the data scope, and the pause range has its own field.
+    assert paused["scope"] == "synthetic"
+    assert paused["data_kind"] == "synthetic"
+    assert paused["pause_scope"] == "version"
+    stored_decision = json.loads(
+        (
+            store
+            / "research-loop-evidence"
+            / f"{paused['decision_id']}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert stored_decision["scope"] == "synthetic"
+    assert stored_decision["data_kind"] == "synthetic"
+    assert stored_decision["pause_scope"] == "version"
     paused_status = ok(evidence_status(project, store, ledger, round_id))
     paused_entry = version_entry(paused_status, v2_id)
     assert paused_entry["state"] == "paused"
@@ -880,7 +1086,7 @@ def test_continue_pause_and_retire_outcomes_keep_the_old_facts(
     assert retired["decision"] == "retire"
     assert retired["effect"]["action"] == "retire"
     assert retired["effect"]["state_after"] == "retired"
-    _assert_hex(retired["decision_id"])
+    assert_hex(retired["decision_id"])
     replay = ok(
         evidence_decide(
             project, store, ledger, round_id, v2_id, "retire",
@@ -916,9 +1122,23 @@ def test_continue_pause_and_retire_outcomes_keep_the_old_facts(
         ok(evidence_status(project, store, ledger, round_id)), v2_id
     )
     assert final["state"] == "ended"
-    assert final["review_state"] == "approved"
+    assert final["review_state"] == "ended"
     assert final["tracking"]["committed_sessions"] == 5
     assert final["tracking"]["last_committed_date"] == session_at(sessions, 7)
+    # Retiring through the Evidence Loop is the one terminal review state, not a
+    # release-only side effect: both status views agree.
+    round_final = submission_entry(ok(round_status(project, round_id)), v2_id)
+    assert round_final["review_state"] == "ended"
+    assert round_final["tracking"]["state"] == "ended"
+    close_source = write_json(
+        tmp_path / "close-retired.json",
+        {
+            "stop_reason": "No remaining testable version could change the choice.",
+            "selected_version": v2_id,
+            "next_experiment": None,
+        },
+    )
+    rejected(close_round(project, round_id, close_source), "VERSION_ENDED")
     rejected(
         evidence_decide(
             project, store, ledger, round_id, v2_id, "pause",
@@ -979,6 +1199,172 @@ def test_retire_stops_new_signals_and_keeps_committed_history(
     assert final["state"] == "ended"
     assert final["tracking"]["committed_sessions"] == 3
     assert final["tracking"]["due_opportunities"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 8b. Ending an approved version through round review retires its tracking
+# ---------------------------------------------------------------------------
+
+
+def test_review_end_retires_tracking_and_keeps_the_ledger_history(
+    tracking: dict, tmp_path: Path
+) -> None:
+    project, store, ledger = clone_environment(tmp_path / "clone", tracking)
+    round_id = tracking["round_id"]
+    sessions = tracking["sessions"]
+    v1_id = tracking["v1"]["version_id"]
+    release_id = tracking["v1"]["approval"]["tracking"]["release_id"]
+    feed = write_feed(tmp_path / "feed.json", feed_for(sessions, direction="rising"))
+    ok(
+        shadow_update(
+            ledger, store, feed, session_at(sessions, 3), release_ids=(release_id,)
+        )
+    )
+    before = [
+        (entry["date"], entry["result_hash"])
+        for entry in report_days(ledger, release_id, tmp_path / "before.json")
+    ]
+    assert len(before) == 3
+
+    ended = ok(
+        review(
+            project,
+            store,
+            round_id,
+            v1_id,
+            "end",
+            reason="The approved simulated-tracking version is ended for this round.",
+            source=write_json(tmp_path / "end.json", end_input()),
+        )
+    )
+    assert ended["review_state"] == "ended"
+    timeline = release_status(store, release_id)["timeline"]
+    assert [event["action"] for event in timeline] == ["enable", "retire"]
+    assert timeline[-1]["effective_signal_date"] == session_at(sessions, 1)
+
+    # A later tick settles nothing new: the ledger history stays byte-identical.
+    after = ok(
+        shadow_update(
+            ledger, store, feed, session_at(sessions, 6), release_ids=(release_id,)
+        )
+    )
+    assert after["versions"][0]["status"] == "ended"
+    assert after["versions"][0]["reason_code"] == "VERSION_ENDED"
+    after_days = report_days(ledger, release_id, tmp_path / "after.json")
+    assert [(entry["date"], entry["result_hash"]) for entry in after_days] == before
+    progress = ledger_rows(ledger, "progress")
+    assert len(progress) == 1 and progress[0][4] == "ended"
+
+    further = ok(
+        shadow_update(
+            ledger, store, feed, session_at(sessions, 9), release_ids=(release_id,)
+        )
+    )
+    assert further["versions"][0]["status"] == "ended"
+    assert len(report_days(ledger, release_id, tmp_path / "further.json")) == 3
+
+    status = version_entry(ok(evidence_status(project, store, ledger, round_id)), v1_id)
+    assert status["state"] == "ended"
+    assert status["review_state"] == "ended"
+    assert status["tracking"]["committed_sessions"] == 3
+    round_entry = submission_entry(ok(round_status(project, round_id)), v1_id)
+    assert round_entry["review_state"] == "ended"
+    assert round_entry["tracking"]["state"] == "ended"
+
+    close_source = write_json(
+        tmp_path / "close-ended.json",
+        {
+            "stop_reason": "No remaining testable version could change the choice.",
+            "selected_version": v1_id,
+            "next_experiment": None,
+        },
+    )
+    rejected(close_round(project, round_id, close_source), "VERSION_ENDED")
+
+
+# ---------------------------------------------------------------------------
+# 8c. A crash between applying and storing an evidence decision reconciles
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_decision_crash_window_reconciles_without_a_second_event(
+    tracking: dict, tmp_path: Path
+) -> None:
+    round_id = tracking["round_id"]
+    sessions = tracking["sessions"]
+    v2_id = tracking["v2"]["version_id"]
+    release_id = tracking["v2"]["approval"]["tracking"]["release_id"]
+    failpoint = "round_evidence_after_apply"
+
+    def prepared(root: Path) -> tuple[Path, Path, Path]:
+        project, store, ledger = clone_environment(root, tracking)
+        feed = write_feed(root / "feed.json", feed_for(sessions, direction="rising"))
+        ok(
+            shadow_update(
+                ledger, store, feed, session_at(sessions, 3), release_ids=(release_id,)
+            )
+        )
+        return project, store, ledger
+
+    # (a) Pause: the release event is applied before the immutable decision is
+    # stored.  A retry must reconcile the same decision, never refuse it.
+    project, store, ledger = prepared(tmp_path / "pause-clone")
+    reason = "Pause only V2 while the synthetic feed is reviewed."
+    crashed = evidence_decide(
+        project, store, ledger, round_id, v2_id, "pause",
+        reason=reason, env=cli_env(PRAJNATRADE_TEST_FAILPOINT=failpoint),
+    )
+    assert crashed.returncode == 2, (crashed.stdout, crashed.stderr)
+    timeline = release_status(store, release_id)["timeline"]
+    assert [event["action"] for event in timeline] == ["enable", "pause"]
+    assert not (store / "research-loop-evidence").exists()
+    recovered = ok(
+        evidence_decide(project, store, ledger, round_id, v2_id, "pause", reason=reason)
+    )
+    assert recovered["decision"] == "pause"
+    assert recovered["effect"] == {
+        "action": "pause",
+        "effective_signal_date": session_at(sessions, 4),
+        "state_before": "enabled",
+        "state_after": "paused",
+    }
+    assert [
+        event["action"] for event in release_status(store, release_id)["timeline"]
+    ] == ["enable", "pause"]
+    assert len(list((store / "research-loop-evidence").glob("*.json"))) == 1
+    assert version_entry(
+        ok(evidence_status(project, store, ledger, round_id)), v2_id
+    )["state"] == "paused"
+
+    # (b) Retire: the same window also leaves the review state and ledger ended
+    # but no evidence decision; the retry stores the one terminal decision.
+    project, store, ledger = prepared(tmp_path / "retire-clone")
+    reason = "Retire V2 after the review; keep every committed day."
+    crashed = evidence_decide(
+        project, store, ledger, round_id, v2_id, "retire",
+        reason=reason, env=cli_env(PRAJNATRADE_TEST_FAILPOINT=failpoint),
+    )
+    assert crashed.returncode == 2, (crashed.stdout, crashed.stderr)
+    assert [
+        event["action"] for event in release_status(store, release_id)["timeline"]
+    ] == ["enable", "retire"]
+    assert not (store / "research-loop-evidence").exists()
+    retired = ok(
+        evidence_decide(project, store, ledger, round_id, v2_id, "retire", reason=reason)
+    )
+    assert retired["decision"] == "retire"
+    assert retired["effect"]["state_after"] == "retired"
+    assert [
+        event["action"] for event in release_status(store, release_id)["timeline"]
+    ] == ["enable", "retire"]
+    assert len(list((store / "research-loop-evidence").glob("*.json"))) == 1
+    final = version_entry(
+        ok(evidence_status(project, store, ledger, round_id)), v2_id
+    )
+    assert final["state"] == "ended"
+    assert final["review_state"] == "ended"
+    progress = ledger_rows(ledger, "progress")
+    assert len(progress) == 1 and progress[0][4] == "ended"
 
 
 # ---------------------------------------------------------------------------

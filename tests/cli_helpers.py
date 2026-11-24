@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -33,11 +34,17 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = REPO_ROOT / "src"
 DEFAULT_TIMEOUT_SECONDS = 60.0
+HEX = re.compile(r"[0-9a-f]{64}")
 AGENT_COMMAND = (
     sys.executable,
     "-c",
     "from prajnatrade.cli import agent_main; raise SystemExit(agent_main())",
 )
+
+
+def assert_hex(value: object) -> None:
+    """Assert that ``value`` is a 64-character lowercase hexadecimal ID."""
+    assert isinstance(value, str) and HEX.fullmatch(value), value
 
 
 def repo_root() -> Path:
