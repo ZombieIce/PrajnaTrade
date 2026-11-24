@@ -83,11 +83,19 @@ def runtime_identity(
     strategy_executor: dict[str, Any] | None = None,
     *,
     execution_rules: Mapping[str, Any] | None = None,
+    history_policy: Mapping[str, Any] | None = None,
 ) -> str:
-    """Fingerprint the accounting dependencies and optional strategy executor."""
-    dependencies = _runtime_components(strategy_executor)
+    """Fingerprint the accounting dependencies and optional strategy executor.
+
+    Passing the Campaign's ``history_policy`` binds the declared-history engine
+    (``experiment.py``) as well, matching the frozen Campaign runtime.  A source
+    fix therefore changes the identity and forces a fresh replay identity.
+    """
+    dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
     if (
-        execution_rules is not None and "version" not in execution_rules
+        history_policy is None
+        and execution_rules is not None
+        and "version" not in execution_rules
         and dependencies["snapshot_baseline.py"] == _LEGACY_ACCOUNTING_SOURCE
     ):
         dependencies["snapshot_baseline.py"] = _UNVERSIONED_ACCOUNTING_SOURCE
@@ -482,6 +490,7 @@ def campaign_discovery(project: Path, campaign_id: str) -> dict[str, Any]:
             "project_id": project_id,
             "campaign_id": campaign_id,
             "snapshot_id": evaluation["snapshot_id"],
+            "snapshot_hash": campaign["snapshot_hash"],
             "campaign_evaluation_hash": campaign["evaluation_hash"],
             "evaluation": evaluation,
             "discovery_budget": {

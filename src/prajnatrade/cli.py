@@ -83,6 +83,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         dest="evaluation_command", required=True
     )
     _add_direction_workflow(commands, agent_only=agent_only)
+    _add_research_loop_workflow(commands, agent_only=agent_only)
     if agent_only:
         evaluation_lookup = evaluation_commands.add_parser("status")
         evaluation_lookup.add_argument("--project", required=True, type=Path)
@@ -469,6 +470,52 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     return parser
 
 
+def _add_research_loop_workflow(
+    commands: argparse._SubParsersAction, *, agent_only: bool,
+) -> None:
+    research_round = commands.add_parser(
+        "round", help="open, submit to, validate, and close a research round"
+    )
+    rounds = research_round.add_subparsers(dest="round_action", required=True)
+    status = rounds.add_parser("status", help="report research-visible round progress")
+    status.add_argument("--project", required=True, type=Path)
+    status.add_argument("--round-id")
+    submit = rounds.add_parser("submit", help="lock a successful Discovery version")
+    submit.add_argument("--project", required=True, type=Path)
+    submit.add_argument("--round-id", required=True)
+    submit.add_argument("--submission-id", required=True)
+    submit.add_argument("--input", required=True, type=Path)
+    if agent_only:
+        return
+
+    opened = rounds.add_parser(
+        "open", help="approve the round contract and its frozen Campaign bindings"
+    )
+    opened.add_argument("--project", required=True, type=Path)
+    opened.add_argument("--store", required=True, type=Path)
+    opened.add_argument("--campaign-id", required=True)
+    opened.add_argument("--direction-key", required=True)
+    opened.add_argument("--name", required=True)
+    opened.add_argument("--authorization-id", required=True)
+    opened.add_argument("--input", required=True, type=Path)
+
+    validate = rounds.add_parser(
+        "validate", help="replay a locked version as lightweight Validation"
+    )
+    validate.add_argument("--project", required=True, type=Path)
+    validate.add_argument("--store", required=True, type=Path)
+    validate.add_argument("--snapshot-store", required=True, type=Path)
+    validate.add_argument("--round-id", required=True)
+    validate.add_argument("--version-id", required=True)
+
+    close = rounds.add_parser("close", help="record an early or exhausted round stop")
+    close.add_argument("--project", required=True, type=Path)
+    close.add_argument("--round-id", required=True)
+    close.add_argument("--reviewer", required=True)
+    close.add_argument("--reason", required=True)
+    close.add_argument("--input", required=True, type=Path)
+
+
 def _add_direction_workflow(commands: argparse._SubParsersAction, *, agent_only: bool) -> None:
     direction = commands.add_parser("direction", help="manage an authorized research direction")
     directions = direction.add_subparsers(dest="workflow_action", required=True)
@@ -580,6 +627,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
     args = parser.parse_args(argv)
     if args.command in {"direction", "validation", "holdout"}:
         return _direction_workflow_command(args)
+    if args.command == "round":
+        return _research_loop_command(args)
     if args.command == "evaluation":
         return _evaluation_command(args, agent_only=agent_only)
     if args.command == "release":
@@ -854,6 +903,59 @@ def _direction_workflow_command(args: argparse.Namespace) -> int:
         result = {
             "schema_version": 2, "status": "rejected", "error": error.details,
             **getattr(error, "context", {}),
+        }
+    except (OSError, sqlite3.Error, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 2 if result.get("status") in {"rejected", "blocked", "failed", "aborted", "interrupted"} else 0
+
+
+def _research_loop_command(args: argparse.Namespace) -> int:
+    from prajnatrade import research_loop
+
+    try:
+        if args.round_action == "open":
+            prepared = research_loop.prepare_round(
+                args.project,
+                args.campaign_id,
+                args.direction_key,
+                args.name,
+                args.authorization_id,
+                json.loads(args.input.read_text(encoding="utf-8")),
+                store=args.store,
+            )
+            result = research_loop.open_round(args.project, args.store, prepared)
+        elif args.round_action == "status":
+            result = research_loop.round_status(args.project, args.round_id)
+        elif args.round_action == "submit":
+            result = research_loop.submit(
+                args.project,
+                args.round_id,
+                args.submission_id,
+                json.loads(args.input.read_text(encoding="utf-8")),
+            )
+        elif args.round_action == "validate":
+            result = research_loop.validate(
+                args.project,
+                args.store,
+                args.snapshot_store,
+                args.round_id,
+                args.version_id,
+            )
+        else:
+            result = research_loop.close(
+                args.project,
+                args.round_id,
+                args.reviewer,
+                args.reason,
+                json.loads(args.input.read_text(encoding="utf-8")),
+            )
+    except ProtocolError as error:
+        result = {
+            "schema_version": 1,
+            "status": "rejected",
+            "error": error.details,
         }
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
