@@ -556,6 +556,18 @@ def _add_research_loop_workflow(
     close.add_argument("--reason", required=True)
     close.add_argument("--input", required=True, type=Path)
 
+    admitted = rounds.add_parser(
+        "admit",
+        help="grant one manual trailing Validation read after the automatic limit",
+    )
+    admitted.add_argument("--project", required=True, type=Path)
+    admitted.add_argument("--store", required=True, type=Path)
+    admitted.add_argument("--round-id", required=True)
+    admitted.add_argument("--version-id", required=True)
+    admitted.add_argument("--reviewer", required=True)
+    admitted.add_argument("--reason", required=True)
+    admitted.add_argument("--input", required=True, type=Path)
+
     evidence = rounds.add_parser(
         "evidence",
         help="inspect the Evidence Loop ledger state and record the human decision",
@@ -1070,6 +1082,16 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                     args.reviewer,
                     args.reason,
                 )
+        elif args.round_action == "admit":
+            result = research_loop.admit(
+                args.project,
+                args.store,
+                args.round_id,
+                args.version_id,
+                args.reviewer,
+                args.reason,
+                json.loads(args.input.read_text(encoding="utf-8")),
+            )
         else:
             result = research_loop.close(
                 args.project,

@@ -840,10 +840,13 @@ Without `--round-id` it lists every round. Each round reports `status` (`open`
 or `closed`), the approved kickoff, the budget, and for each locked submission
 its Validation summary, current `review_state`, the return instructions
 recorded when a version was returned, the recommended and confirmed
-observation and a tracking summary, plus any closure. The round kickoff keeps
-the authorizing reviewer and approval reason; the agent view never exposes a
-per-version review decision's reviewer or reason, any ledger row, ledger price,
-accounting detail, sealed payload, protected outcome or admission internals.
+observation and a tracking summary, plus any closure. A protocol-v2 round also
+reports the frozen split, the automatic Validation limit and use counters, the
+recorded manual admissions (IDs, version, granted-at and derived use state) and
+`lifecycle`. The round kickoff keeps the authorizing reviewer and approval
+reason; the agent view never exposes a per-version review decision's reviewer
+or reason, a manual admission's reviewer or reason, any ledger row, ledger
+price, accounting detail, sealed payload or protected outcome.
 
 #### 2. Lock a version for review
 
@@ -954,8 +957,10 @@ The trusted read is counted once per locked version. `round validate`:
 2. **Atomic reservation (one use per version).** Under the round lock and one
    SQLite write transaction, and before any attempt row, trusted write or sealed
    read: an existing use for this version is reused (resume or revalidation);
-   otherwise, when `count(automatic uses) < auto_validation_limit`, the next
-   `automatic` row is inserted; otherwise the command is refused with
+   otherwise an unused [manual admission](#manual-validation-admission-protocol-v2)
+   bound to this version is consumed as a `manual` row; otherwise, when
+   `count(automatic uses) < auto_validation_limit`, the next `automatic` row is
+   inserted; otherwise the command is refused with
    `VALIDATION_ALLOWANCE_EXHAUSTED` (exit 2, `next_action: "admit"`, context
    `round_state: "awaiting_validation_admission"` and the allowance). That
    refusal writes no attempt, no trusted record and reads nothing. Two versions
@@ -1029,12 +1034,79 @@ refused with `EVIDENCE_DEVELOPMENT_MISMATCH` (the other checks keep the
 **Status.** For a v2 round, `round status` adds the per-round
 `validation_allowance` (`auto_limit`, `automatic_used`, `manual_used`,
 `total_used`, `remaining` and the `uses` rows with sequence, version, validation
-ID, kind, admission ID and consumed-at) and `lifecycle` (`research`,
+ID, kind, admission ID and consumed-at), the recorded `admissions` (admission ID,
+round, version, granted-at, the recorded comparison and selection impact, and
+the derived `used`/`consumed_validation_id`; the reviewer identity and reason
+stay out of the agent view) and `lifecycle` (`research`,
 `awaiting_validation_admission` once every automatic slot is used, or
 `converged` when the round is closed). A version's `validation` summary keeps
 its legacy fields and adds `kind`, `protocol`, `scoring`, `warmup` and `usage`
-when the stored receipt has them. The agent sees these counters and dates only;
-it never sees a sealed payload, the per-session curves or the run detail.
+when the stored receipt has them. The agent sees these counters, dates and the
+admission IDs only; it never sees a sealed payload, the per-session curves, the
+run detail or the admission's reviewer/reason.
+
+##### Manual Validation admission (protocol v2)
+
+When the automatic limit is used, the next automatic `round validate` pauses
+before the sealed read: it rejects with `VALIDATION_ALLOWANCE_EXHAUSTED` (exit
+2, `next_action: "admit"`, context `round_state:
+"awaiting_validation_admission"` and the allowance) and writes no attempt,
+trusted record or use row. Discovery does not pause: new experiments and new
+locked versions are submitted while the round lifecycle is
+`awaiting_validation_admission`.
+
+The researcher decides between an existing passing version, closing with no
+candidate, or one extra read:
+
+```sh
+prajnatrade round admit --project ./strategy-A --store /trusted/evaluations \
+  --round-id "$ROUND" --version-id "$VERSION" \
+  --reviewer "$REVIEWER" --reason "$ADMISSION_REASON" --input admit.json
+```
+
+```json
+{
+  "comparison": "Compare V2 with the passed V1 on the same trailing segment and costs.",
+  "selection_impact": "If V2 improves the trailing return without a deeper drawdown, it replaces V1; otherwise V1 stays selected."
+}
+```
+
+`round admit` is operator-only. It records one write-once, content-addressed
+`research-loop-admissions/<admission_id>.json` and a project row:
+`admission_id` addresses the immutable body (`schema_version`, round, version,
+reviewer, reason, comparison, selection_impact); `granted_at` is stored
+alongside it. The output is `{"schema_version", "status": "admitted", "reused",
+"admission": {... "granted_at", "used", "consumed_validation_id"},
+"allowance": {...}}`. `used`/`consumed_validation_id` are derived from the
+validation-use ledger, never written into the admission. **Granting is not a
+read:** it writes no use row and leaves `automatic_used`/`manual_used`/
+`total_used` unchanged.
+
+One admission is bound to one version. Identical request content replays the
+stored admission (`reused: true`, including its original `granted_at`); a
+different admission for the same version is `ADMISSION_CONFLICT`. A closed round
+is `ROUND_CLOSED`, an ended version `VERSION_ENDED`, an approved version
+`REVIEW_CONFLICT` and an unknown version `SUBMISSION_NOT_FOUND`. A version that
+already has a counted or completed trailing read needs no admission and is
+refused with `VALIDATION_ALREADY_COMPLETED`, so no grant is left stranded. A
+protocol-v1 round has no automatic limit and refuses an admission with
+`VALIDATION_POLICY_REQUIRED`. A crash after the trusted write converges on retry:
+the stored grant is published and returned.
+
+The admitted version's next `round validate` consumes the admission atomically
+inside the same round-lock/SQLite reservation, before any attempt or read: it
+inserts one `manual` use row (with `admission_id` and the next round sequence)
+instead of an automatic row. An admission is consumed even while automatic
+slots remain, so a granted manual read never silently becomes automatic. A
+different version can never consume it; a second validate of the same version
+reuses the existing use and terminal receipt; an interrupted read keeps the
+manual use. The formal receipt's `usage` block records
+`{"kind": "manual", "admission_id": ..., "sequence": ..., "use_id": ...}`, and
+`round status` shows `manual_used` and the use row's `kind`/`admission_id`
+beside the automatic counters (`remaining` is always the automatic remainder).
+With every automatic slot used, `lifecycle` stays
+`awaiting_validation_admission` even after a manual read, exactly as frozen in
+the round policy; it becomes `converged` only when the round closes.
 
 After a corrected data source or a platform fix, use `round revalidate` when
 the original selection reason still holds:
@@ -1176,11 +1248,18 @@ prajnatrade round close --project ./strategy-A --round-id "$ROUND" \
  "selected_version": "v1", "next_experiment": null}
 ```
 
-A close is allowed with Campaign budget remaining. It records
+A close is allowed with Campaign budget remaining, after the automatic limit is
+exhausted and while the lifecycle waits for a manual admission. It records
 `candidate_selected` (whether `selected_version` is non-null) and the stop
-reason; a selected version must be locked and approved. A closed round refuses
-new submissions, validations, revalidations and review decisions. The same
-closure replays; a different one is `ROUND_CLOSED`.
+reason; a selected version must be locked and approved. A v2 closure also
+freezes `validation_allowance` (the allowance counters at the stop) and, when a
+version is selected, a `selected_validation` block with its `validation_id`,
+`receipt_hash`, `validation_kind` and `protocol`, so the closure can be traced
+to the receipt it was selected on without a second read. A v1 closure keeps its
+#43 body. A closed round refuses new submissions, admissions, validations,
+revalidations and review decisions. The same closure replays by its stored
+`closure_id` (a closure recorded before #50 keeps its exact legacy body and
+identity); a different one is `ROUND_CLOSED`.
 
 #### 5. Evidence Loop: observation, opportunities and pauses
 
@@ -1278,12 +1357,13 @@ print `error: ...` on stderr and exit 2.
 | Command | Side | Success `status` | Evidence-bearing statuses (exit 0) | Rejection (exit 2) |
 | --- | --- | --- | --- | --- |
 | `round open` | operator | `opened` | — | `ROUND_ALREADY_OPENED`, `SCORING_POLICY_NOT_FROZEN`, `VALIDATION_POLICY_REQUIRED`, `DISCOVERY_SPLIT_NOT_FROZEN` |
-| `round status` | operator, agent | `ok` (or `open`/`closed` for one round); v2 adds `validation_allowance`, `validation_policy` and `lifecycle` | — | `ROUND_NOT_FOUND` |
+| `round status` | operator, agent | `ok` (or `open`/`closed` for one round); v2 adds `validation_allowance`, `validation_policy`, `admissions` and `lifecycle` | — | `ROUND_NOT_FOUND` |
 | `round submit` | agent | `submitted` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE` |
 | `round validate` | operator | `completed` (v2 adds `validation_kind`/`protocol`/`development`/`trailing`/`scoring`/`warmup`/`provenance`/`usage`/`summary`/`allowance`) | `passed`, `failed`, `insufficient_evidence` (exit 0; a v2 `failed`/`insufficient_evidence` keeps its counted use) | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `REVALIDATION_SUPERSEDED`, `VALIDATION_DATA_GAP`, `VALIDATION_ALLOWANCE_EXHAUSTED`, `VALIDATION_PARTITION_MISMATCH` |
 | `round revalidate` | operator | `revalidated` (v2 adds `validation_kind`/`evidence`/`original_validation`/`recomputed_validation`/`affected`) | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REPLAY_MISMATCH`, `EVIDENCE_SNAPSHOT_NOT_FOUND`, `EVIDENCE_NOT_SUCCESSOR`, `EVIDENCE_DATA_KIND_MISMATCH`, `EVIDENCE_INTERVAL_MISMATCH`, `EVIDENCE_DEVELOPMENT_MISMATCH`, `EVIDENCE_PRIOR_HISTORY_MISMATCH`, `EVIDENCE_AS_OF_VIOLATION`, `EVIDENCE_INTEGRITY_VIOLATION`, `EVIDENCE_SNAPSHOT_AMBIGUOUS` |
+| `round admit` | operator | `admitted` | `reused: true` replay (`admission.used` shows a consumed grant) | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `ADMISSION_CONFLICT`, `VALIDATION_ALREADY_COMPLETED`, `VALIDATION_POLICY_REQUIRED` |
 | `round review` | operator | `approved` / `returned` / `ended` | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `RISK_NOT_ACCEPTED`, `OBSERVATION_REQUIRED`, `REVIEW_CONFLICT`, `VERSION_ENDED`, `CALENDAR_COVERAGE_MISSING`, `RELEASE_NOT_FOUND`, `RELEASE_INTEGRITY_FAILED`, `INVALID_TRANSITION`, `ADMISSION_INVALID` |
-| `round close` | operator | `closed` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `VERSION_ENDED` |
+| `round close` | operator | `closed` (v2 adds `validation_allowance` and, when selected, `selected_validation`) | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `VERSION_ENDED` |
 | `round evidence status` | operator | `ok` (per-version `state`: `tracking` / `review_due` / `observation_extended` / `paused` / `ended`) | — | `ROUND_NOT_FOUND`, unknown version |
 | `round evidence decide` | operator | `ok` (fields `decision`, `state`, `effect`) | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `REVIEW_CONFLICT`, `VERSION_ENDED` |
 | `shadow tick`, `shadow update` | operator | `committed` / `committed_with_anomalies` / `already_committed` | — | `blocked` (exit 2 when any version blocks) |
