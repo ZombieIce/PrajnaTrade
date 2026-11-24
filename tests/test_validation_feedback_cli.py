@@ -884,6 +884,153 @@ def same_project_rounds(tmp_path: Path) -> dict:
     }
 
 
+def add_split_round(
+    tmp_path: Path, project: Path, source: Path, *, name: str, limit: int = 2
+) -> tuple[dict, Path, dict]:
+    """Freeze a split Campaign in an existing project and open its v2 round."""
+    campaign = add_campaign(project, source, split=True)
+    store = tmp_path / f"{name}-trusted"
+    opened = ok(
+        open_round(
+            project,
+            store,
+            campaign["campaign_id"],
+            write_json(tmp_path / f"{name}-round.json", v2_round_input(limit=limit)),
+        )
+    )
+    return campaign, store, opened
+
+
+def lock_and_read(
+    tmp_path: Path,
+    project: Path,
+    campaign: dict,
+    store: Path,
+    round_id: str,
+    *,
+    submission_id: str,
+) -> tuple[dict, dict, dict]:
+    """Lock one momentum version in a v2 round and spend its first automatic read."""
+    experiment = submit_experiment(
+        project,
+        campaign["campaign_id"],
+        tmp_path / f"{submission_id}-experiment.json",
+        submission_id,
+        "The frozen development segment determines the Discovery result.",
+        "momentum",
+        {"lookback": 2, "cash_if_negative": False},
+    )
+    version = ok(
+        submit_version(
+            project,
+            round_id,
+            submission_id,
+            write_json(
+                tmp_path / f"{submission_id}-version.json",
+                version_input(experiment["experiment_id"]),
+            ),
+        )
+    )
+    snapshots = project.parent / f"{project.name}-snapshot-store"
+    validated = ok(
+        validate_version(project, store, snapshots, round_id, version["version_id"])
+    )
+    return experiment, version, validated
+
+
+def trailing_only_successor_payload() -> dict:
+    """The trending fixture with corrected trailing Discovery rows only.
+
+    Discovery is the first 9 of the 15 sessions and the frozen split gives
+    development 6 / trailing 3.  Changing only the trailing derived values keeps
+    the development content hash (and every Campaign copy) identical while the
+    sealed snapshot identity changes.
+    """
+    payload = trending_snapshot(15)
+    trailing = _split_for_payload(payload)["trailing"]
+    trailing_dates = {
+        row["date"]
+        for row in payload["calendar"]
+        if trailing["start"] <= row["date"] <= trailing["end"]
+    }
+    for row in payload["derived"]:
+        if row["date"] in trailing_dates:
+            row["value"] = round(row["value"] * 1.01, 6)
+    return payload
+
+
+def test_v2_open_discloses_a_corrected_successor_on_the_same_development_slice(
+    tmp_path: Path,
+) -> None:
+    base = trending_snapshot(15)
+    successor = trailing_only_successor_payload()
+    first_split = _split_for_payload(base)
+    second_split = _split_for_payload(successor)
+    assert second_split["development"] == first_split["development"]
+    assert second_split["trailing"] != first_split["trailing"]
+
+    project = tmp_path / "successor-reuse"
+    ok(cli("project", "init", "--project", str(project)))
+    first_campaign, first_store, first_opened = add_split_round(
+        tmp_path, project, write_json(tmp_path / "base-snapshot.json", base),
+        name="base-round",
+    )
+    _, version, validated = lock_and_read(
+        tmp_path,
+        project,
+        first_campaign,
+        first_store,
+        first_opened["round_id"],
+        submission_id="base-version",
+    )
+    assert validated["usage"]["kind"] == "automatic"
+
+    second_campaign, _, second_opened = add_split_round(
+        tmp_path,
+        project,
+        write_json(tmp_path / "successor-snapshot.json", successor),
+        name="successor-round",
+    )
+    # The successor is a different sealed snapshot with the same development
+    # prehistory, so the disclosure matches it without a duplicate entry.
+    assert second_campaign["snapshot_id"] != first_campaign["snapshot_id"]
+    disclosure = second_opened["reuse_disclosure"]
+    assert disclosure["snapshot_id"] == second_campaign["snapshot_id"]
+    assert disclosure["previous_rounds"] == [
+        {
+            "round_id": first_opened["round_id"],
+            "campaign_id": first_campaign["campaign_id"],
+            "protocol": "trailing-70-30",
+            "match": "same_development",
+            "used": {
+                "start": first_split["trailing"]["start"],
+                "end": first_split["trailing"]["end"],
+            },
+            "overlap": {
+                "start": first_split["trailing"]["start"],
+                "end": first_split["trailing"]["end"],
+            },
+            # The prior round's counted read history is carried across.
+            "automatic_used": 1,
+            "manual_used": 0,
+            "total_used": 1,
+            "uses": [
+                {
+                    "version_id": version["version_id"],
+                    "validation_id": validated["validation_id"],
+                    "kind": "automatic",
+                    "admission_id": None,
+                    "sequence": 1,
+                }
+            ],
+        }
+    ]
+    assert disclosure["feedback"] == []
+    assert disclosure["overlapping"] is True
+    status_body = ok(round_status(project, second_opened["round_id"], agent=True))
+    assert status_body["reuse_disclosure"] == disclosure
+
+
 def test_v2_open_discloses_the_prior_rounds_used_interval_and_feedback(
     tmp_path: Path,
 ) -> None:
@@ -907,8 +1054,14 @@ def test_v2_open_discloses_the_prior_rounds_used_interval_and_feedback(
             "round_id": fixture["first_opened"]["round_id"],
             "campaign_id": fixture["first_campaign"]["campaign_id"],
             "protocol": "discovery-replay",
+            "match": "same_snapshot",
             "used": used,
             "overlap": {"start": trailing["start"], "end": trailing["end"]},
+            # A v1 round counts no Validation use, so its history is empty.
+            "automatic_used": 0,
+            "manual_used": 0,
+            "total_used": 0,
+            "uses": [],
         }
     ]
     assert disclosure["feedback"] == [

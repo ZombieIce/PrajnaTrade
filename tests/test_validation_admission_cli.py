@@ -12,14 +12,22 @@ snapshots.  Fixture builders are imported from the modules that own them.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import subprocess
-import sys
 from pathlib import Path
 
-from cli_helpers import agent_cli, assert_hex, cli, cli_env, ok, rejected, write_json
+from cli_helpers import (
+    agent_cli,
+    assert_hex,
+    cli,
+    cli_env,
+    digest,
+    ok,
+    rejected,
+    round_validate_argv,
+    write_json,
+)
 from test_formal_validation_cli import (
     VALIDATION_FAILPOINT,
     add_version,
@@ -99,16 +107,6 @@ def admit(
         "--input",
         str(source),
     )
-
-
-def canonical(value: object) -> bytes:
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-    ).encode("utf-8")
-
-
-def digest(value: object) -> str:
-    return hashlib.sha256(canonical(value)).hexdigest()
 
 
 def admission_identity(admission: dict) -> str:
@@ -426,6 +424,75 @@ def test_round_admit_records_and_replays_one_admission(tmp_path: Path) -> None:
     assert "invalid choice" in agent_result.stderr
 
 
+def test_admission_requires_the_automatic_allowance_to_be_exhausted(
+    tmp_path: Path,
+) -> None:
+    scenario = formal_scenario(tmp_path, limit=2)
+    project, store = scenario["project"], scenario["store"]
+    round_id = scenario["opened"]["round_id"]
+    first = scenario["version"]["version_id"]
+    ok(validate_version_id(scenario, first))
+    second = add_version(scenario)
+    third = add_version(
+        scenario,
+        submission_id="v3",
+        parameters={"lookback": 2, "top_k": 2, "cash_if_negative": True},
+    )
+    source = write_json(tmp_path / "admission.json", admission_input())
+
+    # One automatic slot is still open: a manual admission would bypass the
+    # limit, so the round refuses it before writing anything.
+    blocked = rejected(
+        admit(project, store, round_id, second["version"]["version_id"], source),
+        "VALIDATION_ALLOWANCE_REMAINING",
+        phase="admission",
+    )
+    assert blocked["error"]["next_action"] == "validate"
+    assert blocked["allowance"] == {
+        "auto_limit": 2,
+        "automatic_used": 1,
+        "manual_used": 0,
+        "total_used": 1,
+        "remaining": 1,
+    }
+    assert blocked["round_state"] == "research"
+    assert "automatic" in blocked["error"]["message"]
+    assert not (store / "research-loop-admissions").exists()
+    assert status(scenario)["admissions"] == []
+    assert len(round_uses(scenario)) == 1
+
+    # The researcher must let the second automatic slot be used first.
+    second_read = ok(validate_version_id(scenario, second["version"]["version_id"]))
+    assert second_read["usage"]["kind"] == "automatic"
+    assert len(round_uses(scenario)) == 2
+    assert status(scenario)["lifecycle"] == "awaiting_validation_admission"
+
+    # Now the limit is exhausted, so the identical admission request grants the
+    # extra version and its read is counted manual.
+    admitted = ok(admit(project, store, round_id, third["version"]["version_id"], source))
+    assert admitted["status"] == "admitted"
+    assert admitted["admission"]["version_id"] == third["version"]["version_id"]
+    assert admitted["admission"]["used"] is False
+    assert admitted["allowance"] == {
+        "auto_limit": 2,
+        "automatic_used": 2,
+        "manual_used": 0,
+        "total_used": 2,
+        "remaining": 0,
+    }
+    manual = ok(validate_version_id(scenario, third["version"]["version_id"]))
+    assert manual["usage"]["kind"] == "manual"
+    assert manual["usage"]["admission_id"] == admitted["admission"]["admission_id"]
+    assert admission_entry(scenario, third["version"]["version_id"])["used"] is True
+    assert counters(scenario) == {
+        "auto_limit": 2,
+        "automatic_used": 2,
+        "manual_used": 1,
+        "total_used": 3,
+        "remaining": 0,
+    }
+
+
 def test_round_admit_recovers_a_trusted_grant_without_a_project_row(
     tmp_path: Path,
 ) -> None:
@@ -650,22 +717,12 @@ def test_admitted_version_reads_once_and_a_different_version_cannot_consume_it(
 
 
 def _race_validations(scenario: dict, version_ids: tuple[str, str]) -> list[tuple]:
-    command = [
-        sys.executable,
-        "-m",
-        "prajnatrade",
-        "round",
-        "validate",
-        "--project",
-        str(scenario["project"]),
-        "--store",
-        str(scenario["store"]),
-        "--snapshot-store",
-        str(scenario["snapshots"]),
-        "--round-id",
+    command = round_validate_argv(
+        scenario["project"],
+        scenario["store"],
+        scenario["snapshots"],
         scenario["opened"]["round_id"],
-        "--version-id",
-    ]
+    )
     environment = cli_env()
     processes = [
         subprocess.Popen(
@@ -1041,3 +1098,63 @@ def test_v1_round_has_no_admission_surface_and_keeps_the_legacy_shapes(
     assert closed["candidate_selected"] is False
     assert status(scenario)["lifecycle"] == "converged"
     assert "admissions" not in status(scenario)
+
+
+def test_v1_closure_with_a_selected_version_keeps_the_legacy_body(
+    tmp_path: Path,
+) -> None:
+    scenario = legacy_scenario(tmp_path)
+    project, store = scenario["project"], scenario["store"]
+    round_id = scenario["opened"]["round_id"]
+    version_id = scenario["version"]["version_id"]
+    validated = ok(validate_version_id(scenario, version_id))
+    assert validated["status"] == "completed"
+    ok(
+        approve_version(
+            project,
+            store,
+            round_id,
+            version_id,
+            calendar_file(tmp_path, name="v1-calendar.json")[0],
+            write_json(tmp_path / "v1-observation.json", observation_input()),
+        )
+    )
+    status_body = status(scenario)
+    payload = close_input(selected=version_id)
+    closed = ok(
+        close_round(project, round_id, write_json(tmp_path / "v1-close.json", payload))
+    )
+
+    # A protocol-v1 closure keeps the exact pre-#50 body and identity: selecting
+    # an approved version adds no v2-only `selected_validation` or allowance.
+    legacy_body = {
+        "schema_version": 1,
+        "round_id": round_id,
+        "direction_id": status_body["direction_id"],
+        "project_id": status_body["project_id"],
+        "campaign_id": status_body["campaign_id"],
+        "scope": status_body["scope"],
+        "data_kind": status_body["data_kind"],
+        "reviewer": "research-lead",
+        "reason": "The round stops with a recorded reason.",
+        "stop_reason": payload["stop_reason"],
+        "candidate_selected": True,
+        "selected_version": version_id,
+        "next_experiment": None,
+        "budget": status_body["budget"],
+        "versions_attempted": len(status_body["submissions"]),
+    }
+    assert closed == {
+        **legacy_body,
+        "closure_id": digest(legacy_body),
+        "status": "closed",
+        "reused": False,
+    }
+    stored_status = status(scenario)
+    assert stored_status["closure"] == {
+        **legacy_body,
+        "closure_id": digest(legacy_body),
+    }
+    assert "validation_allowance" not in stored_status["closure"]
+    assert "selected_validation" not in stored_status["closure"]
+    assert stored_status["lifecycle"] == "converged"

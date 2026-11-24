@@ -139,9 +139,11 @@ Campaign experiment, replays by content and never consumes a use, and
 V2 re-scored on the same protocol, trailing segment, benchmark cash, costs and
 thresholds; a returned V1 is re-approved on its stored formal receipt while a
 `failed` or `insufficient_evidence` formal receipt cannot be approved; a v2
-`round open` discloses the prior round's used interval, overlap and feedback on
-the same snapshot and reuses the stored disclosure across the trusted-write
-crash window while the old receipt keeps reading under `discovery-replay`; and a
+`round open` discloses the prior round's used interval, overlap and Validation
+use history plus its feedback on the same snapshot (or on a corrected successor
+with the same frozen development content hash) and reuses the stored disclosure
+across the trusted-write crash window while the old receipt keeps reading under
+`discovery-replay`; and a
 synthetic #35 chain links snapshot, round, version, experiment, real development
 and scoring dates, warmup source, allowance usage (including a manual admission
 read), feedback, review state and tracking. The file is fast and not marked

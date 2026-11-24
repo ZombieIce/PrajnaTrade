@@ -742,16 +742,23 @@ def _receipt_used_interval(receipt: Mapping[str, Any]) -> dict[str, str] | None:
 def _reuse_disclosure(
     connection: sqlite3.Connection, prepared: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Disclose the intervals and feedback a previous round used on this snapshot.
+    """Disclose the intervals, reads and feedback a previous round used.
 
     Derived once, at v2 ``round open``, from the project's own published
-    receipts and feedback rows: no sealed payload is read and no protected
-    record is touched.  The result is outside ``kickoff_hash`` and is written
-    once with the trusted round record, so a replay returns the stored
-    disclosure instead of a value that a later prior round could change.
+    receipts, Validation-use rows and feedback rows: no sealed payload is read
+    and no protected record is touched.  A prior round is matched either on the
+    same sealed ``snapshot_id`` (``match: "same_snapshot"``) or on the same
+    frozen development content hash (``match: "same_development"``), so a
+    corrected successor snapshot that preserves the approved development
+    prehistory is still disclosed; a round is listed once with the stronger
+    snapshot match.  Each entry also carries the prior round's counted read
+    history.  The result is outside ``kickoff_hash`` and is written once with
+    the trusted round record, so a replay returns the stored disclosure instead
+    of a value that a later prior round could change.
     """
     kickoff = prepared["kickoff"]
     snapshot_id = kickoff["frozen_campaign"]["snapshot_id"]
+    development_hash = kickoff["research_partition"]["development"]["content_hash"]
     trailing = kickoff["research_partition"]["trailing"]
     previous_rounds: list[dict[str, Any]] = []
     disclosed_feedback: list[dict[str, Any]] = []
@@ -760,10 +767,21 @@ def _reuse_disclosure(
         "c.evaluation_json FROM research_loop_rounds r "
         "JOIN campaigns c ON c.campaign_id = r.campaign_id ORDER BY r.rowid"
     ):
-        used_snapshot = row["snapshot_id"]
-        if not used_snapshot:
-            used_snapshot = json.loads(row["evaluation_json"]).get("snapshot_id")
-        if used_snapshot != snapshot_id:
+        evaluation = json.loads(row["evaluation_json"])
+        used_snapshot = row["snapshot_id"] or evaluation.get("snapshot_id")
+        prior_split = evaluation.get("discovery_split")
+        prior_development = None
+        if isinstance(prior_split, Mapping):
+            prior_development = prior_split.get("development")
+            prior_development = (
+                prior_development.get("content_hash")
+                if isinstance(prior_development, Mapping) else None
+            )
+        if used_snapshot == snapshot_id:
+            match = "same_snapshot"
+        elif prior_development == development_hash:
+            match = "same_development"
+        else:
             continue
         receipt_row = connection.execute(
             "SELECT v.receipt_json FROM research_loop_validations v "
@@ -778,15 +796,30 @@ def _reuse_disclosure(
             continue
         start = max(used["start"], trailing["start"])
         end = min(used["end"], trailing["end"])
-        prior_kickoff = json.loads(row["kickoff_json"])
+        prior_kickoff = json.loads(row["kickoff_json"])["kickoff"]
         protocol = prior_kickoff.get("protocol", VALIDATION_PROTOCOL_LEGACY)
+        uses = _validation_uses(connection, row["round_id"])
         previous_rounds.append(
             {
                 "round_id": row["round_id"],
                 "campaign_id": row["campaign_id"],
                 "protocol": protocol["name"],
+                "match": match,
                 "used": used,
                 "overlap": {"start": start, "end": end} if start <= end else None,
+                "automatic_used": sum(1 for item in uses if item["kind"] == "automatic"),
+                "manual_used": sum(1 for item in uses if item["kind"] == "manual"),
+                "total_used": len(uses),
+                "uses": [
+                    {
+                        "version_id": item["version_id"],
+                        "validation_id": item["validation_id"],
+                        "kind": item["kind"],
+                        "admission_id": item["admission_id"],
+                        "sequence": item["sequence"],
+                    }
+                    for item in uses
+                ],
             }
         )
         for feedback_row in connection.execute(
@@ -2261,9 +2294,7 @@ def _formal_receipt(
         "outcome": outcome,
         "reason": reason,
         "protocol": {
-            "schema_version": 1,
-            "name": "trailing-70-30",
-            "validation_kind": VALIDATION_KIND_TRAILING,
+            **VALIDATION_PROTOCOL_TRAILING,
             "split_hash": split["split_hash"],
             "boundary": split["boundary"],
             "research_interval": {
@@ -2335,18 +2366,6 @@ def _formal_validation_record(receipt: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _trailing_content(
-    content: Mapping[str, Any], trailing: Mapping[str, Any],
-) -> dict[str, list[dict]]:
-    start, end = trailing["start"], trailing["end"]
-    return {
-        kind: [
-            row for row in content[kind] if start <= str(row.get("date")) <= end
-        ]
-        for kind in snapshot.KINDS
-    }
-
-
 def _prior_formal_runs(prior: Mapping[str, Any]) -> dict[str, Any]:
     """Rebuild the run container an affected diff needs from a formal receipt."""
     curves = prior.get("curves")
@@ -2372,11 +2391,14 @@ def _formal_affected(
     record: Mapping[str, Any],
 ) -> dict[str, Any]:
     split = _formal_split(record)
+    trailing = split["trailing"]
     return _affected(
         _prior_formal_runs(prior),
         runs,
-        _trailing_content(original_content, split["trailing"]),
-        _trailing_content(runs["data"], split["trailing"]),
+        snapshot.slice_content(
+            original_content, trailing["start"], trailing["end"]
+        ),
+        snapshot.slice_content(runs["data"], trailing["start"], trailing["end"]),
         runs["expected_sessions"],
     )
 
@@ -2616,8 +2638,11 @@ def _reserve_validation_use(
     admission yield exactly one row and exactly one read.  Branch order:
     reuse this version's row (resume / revalidation), then consume an unused
     manual admission bound to this version, then take an automatic slot, then
-    reject before the read.  An admission is consumed even while automatic slots
-    remain, so a granted manual read never silently becomes an automatic one.
+    reject before the read.  ``admit`` refuses a grant while automatic slots
+    remain, so a manual row can only be the researcher's post-limit extra read.
+    The manual branch still comes first defensively: a grant is explicit, so a
+    row recorded before this gate (or by a future caller) is honoured as manual
+    rather than silently consumed as an automatic slot.
     """
     existing = connection.execute(
         "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
@@ -3187,6 +3212,23 @@ def admit(
                 "VALIDATION_ALREADY_COMPLETED", "admission", "inspect",
                 "This version already has a counted or completed trailing "
                 "Validation read; a manual admission would be stranded.",
+            )
+        # A manual admission is the researcher's extra read *after* the
+        # automatic allowance, never a way to bypass it: the round must have
+        # used every automatic slot first.  This is what makes the paused
+        # lifecycle (`awaiting_validation_admission`) meaningful, and it means a
+        # granted manual read can never be pre-empted by an unused automatic slot.
+        allowance = _validation_allowance(connection, record)
+        if allowance is None:
+            raise ValueError("The protocol-v2 round has no frozen Validation policy.")
+        if allowance["automatic_used"] < allowance["auto_limit"]:
+            raise _rejected(
+                "VALIDATION_ALLOWANCE_REMAINING", "admission", "validate",
+                "This round still has automatic trailing Validation slots; the "
+                "researcher must let those automatic reads be used before an "
+                "operator can admit an extra version.",
+                allowance=allowance,
+                round_state="research",
             )
         trusted_existing = _trusted_admission_for_version(trusted, round_id, version_id)
         if (
@@ -6418,12 +6460,14 @@ def close(
             "versions_attempted": len(versions),
         }
         # Protocol-v2 closures also freeze the allowance at the stop, and a
-        # selected version records the receipt it was approved on.  The legacy
-        # body (no additions) keeps its exact identity so a closure stored
-        # before #50 still replays by its recorded closure_id.
-        allowance = _validation_allowance(connection, record)
-        if allowance is not None:
-            body["validation_allowance"] = allowance
+        # selected version records the receipt it was approved on.  A protocol-v1
+        # closure keeps the exact pre-#50 body -- even for a new closure -- so a
+        # v1 round's closure identity never gains v2-only fields.
+        protocol_v2 = "research_partition" in record["kickoff"]
+        if protocol_v2:
+            allowance = _validation_allowance(connection, record)
+            if allowance is not None:
+                body["validation_allowance"] = allowance
         if selected is not None:
             if selected not in versions:
                 raise ProtocolError(
@@ -6442,7 +6486,8 @@ def close(
                     "VALIDATION_NOT_PASSED", "close", "review",
                     "The selected version has no approving review decision.",
                 )
-            body["selected_validation"] = _closure_validation(connection, selected)
+            if protocol_v2:
+                body["selected_validation"] = _closure_validation(connection, selected)
         closure_id = _hash(body)
         closure = {**body, "closure_id": closure_id}
         legacy_id = _hash(

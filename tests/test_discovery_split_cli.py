@@ -22,8 +22,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
-
-from cli_helpers import assert_hex, cli, ok, rejected, write_json
+from cli_helpers import assert_hex, cli, digest, ok, rejected, write_json
 from test_experiment_cli import campaign_options, sealed_snapshot_input
 from test_protected_eval_cli import submit_experiment
 from test_research_loop_cli import (
@@ -53,18 +52,8 @@ V1_PROTOCOL = {
 
 
 # ---------------------------------------------------------------------------
-# Independent canonical hashing and sealed-payload slicing
+# Independent sealed-payload slicing
 # ---------------------------------------------------------------------------
-
-
-def canonical(value: object) -> bytes:
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-    ).encode("utf-8")
-
-
-def digest(value: object) -> str:
-    return hashlib.sha256(canonical(value)).hexdigest()
 
 
 def slice_content(content: dict, start: str, end: str) -> dict:
@@ -270,7 +259,9 @@ def test_campaign_copies_only_development_rows_and_binds_their_hash(tmp_path: Pa
     assert hashlib.sha256(blob).hexdigest() == snapshot_hash
     assert snapshot_hash == split["development"]["content_hash"]
     assert campaign["fingerprints"]["snapshot"] == split["development"]["content_hash"]
+    assert campaign["research_protocol"] == "trailing-70-30"
     assert evaluation["discovery_split"] == split
+    assert evaluation["research_protocol"] == "trailing-70-30"
     assert evaluation["partition_content_hash"] == sealed_discovery["content_hash"]
     assert campaign["history_policy"] == {
         "schema_version": 1,
@@ -562,6 +553,12 @@ def test_legacy_round_keeps_the_v1_kickoff_locked_shape_and_receipt(tmp_path: Pa
     project, snapshots, campaign = legacy_campaign(
         tmp_path, sealed_snapshot_input(15), warmup=4
     )
+    # A new Campaign always records its research protocol, including v1 for a
+    # Campaign created without the split flag.
+    assert campaign["research_protocol"] == "discovery-replay"
+    _, _, legacy_evaluation = stored_campaign(project)
+    assert legacy_evaluation["research_protocol"] == "discovery-replay"
+    assert "discovery_split" not in legacy_evaluation
     store = tmp_path / "trusted"
     source = write_json(tmp_path / "round.json", round_input())
     opened = ok(open_round(project, store, campaign["campaign_id"], source))

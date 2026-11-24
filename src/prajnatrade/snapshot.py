@@ -812,6 +812,25 @@ def _split_segment(descriptor: object, label: str) -> dict:
     }
 
 
+def slice_content(content: object, start: str, end: str) -> dict[str, list[dict]]:
+    """Copy one date range of a sealed Discovery content payload.
+
+    The payload is the ``{"calendar", "raw_bars", "corporate_actions",
+    "derived"}`` object returned by :func:`read_discovery`; rows keep their
+    sealed canonical order and the four kind arrays are always present.  This is
+    the one place the slice rows are derived, so the frozen split, the
+    development-only Campaign copy and the formal trailing run cannot drift.
+    """
+    rows = _split_content(content)
+    start, end = _date(start), _date(end)
+    if start > end:
+        raise ValueError("A partition slice starts after it ends.")
+    return {
+        kind: [row for row in rows[kind] if start <= _date(row.get("date")) <= end]
+        for kind in KINDS
+    }
+
+
 def partition_slice(content: object, start: str, end: str) -> dict:
     """Fingerprint one date range of a sealed Discovery content payload.
 
@@ -823,14 +842,7 @@ def partition_slice(content: object, start: str, end: str) -> dict:
     ``end`` are the first and last trading session actually covered, so a range
     aligned to trading sessions reproduces the requested bounds exactly.
     """
-    rows = _split_content(content)
-    start, end = _date(start), _date(end)
-    if start > end:
-        raise ValueError("A partition slice starts after it ends.")
-    sliced = {
-        kind: [row for row in rows[kind] if start <= _date(row.get("date")) <= end]
-        for kind in KINDS
-    }
+    sliced = slice_content(content, start, end)
     sessions = _split_sessions(sliced)
     return {
         "start": sessions[0],

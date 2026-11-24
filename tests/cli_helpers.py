@@ -24,6 +24,7 @@ Test-writing rules this module exists to support:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -151,3 +152,32 @@ def write_json(path: Path, payload: object) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+def canonical(value: object) -> bytes:
+    """Canonical JSON bytes, an independent oracle for the repo's content hashes."""
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def digest(value: object) -> str:
+    """SHA-256 hex of ``canonical(value)``; the test-side content address."""
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def round_validate_argv(
+    project: Path, store: Path, snapshots: Path, round_id: str,
+) -> list[str]:
+    """The argv prefix every ``round validate`` race participant shares.
+
+    Callers append the version ID under test, so two subprocesses can race the
+    same round from one command definition instead of hand-building it in each
+    test module.  The explicit interpreter and ``-m`` keep the run hermetic.
+    """
+    return [
+        sys.executable, "-m", "prajnatrade", "round", "validate",
+        "--project", str(project), "--store", str(store),
+        "--snapshot-store", str(snapshots), "--round-id", round_id,
+        "--version-id",
+    ]
