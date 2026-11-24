@@ -19,8 +19,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
-
-from cli_helpers import cli, ok, rejected, write_json
+from cli_helpers import agent_cli, cli, ok, rejected, write_json
 from test_experiment_cli import sealed_snapshot_input
 from test_protected_eval_cli import SYMBOLS, submit_experiment
 from test_research_loop_cli import (
@@ -34,7 +33,6 @@ from test_shadow_cli import (
     ledger_rows,
     report_days,
     shadow_feed,
-    shadow_report,
     shadow_update,
     write_feed,
 )
@@ -42,7 +40,6 @@ from test_version_review_cli import (
     approve_version,
     calendar_file,
     observation_input,
-    review,
 )
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -1164,6 +1161,15 @@ def test_evidence_loop_never_reads_a_protected_partition(tmp_path: Path, trackin
         "evaluations",
     ):
         assert forbidden not in rendered
+
+    # The evidence loop stays operator-only: the agent CLI gains no ledger,
+    # review or pause visibility (spec #43 agent boundary).
+    agent = agent_cli(
+        "round", "evidence", "status", "--project", str(project),
+        "--store", str(store), "--ledger", str(ledger), "--round-id", round_id,
+    )
+    assert agent.returncode != 0
+    assert "invalid choice" in agent.stderr
 
     # The tracking artifact itself states that it is not a protected evaluation.
     fetched = ok(
