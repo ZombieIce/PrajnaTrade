@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import copy
 import json
-import re
 import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from cli_helpers import agent_cli, cli, ok, rejected, write_json
+from cli_helpers import agent_cli, assert_hex, cli, cli_env, ok, rejected, write_json
+from prajnatrade import snapshot as snapshot_module
 from test_experiment_cli import sealed_snapshot_input
 from test_protected_eval_cli import submit_experiment
 from test_research_loop_cli import (
@@ -34,7 +34,6 @@ from test_research_loop_cli import (
 )
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-HEX = re.compile(r"[0-9a-f]{64}")
 CONFLICT_RETURN = {
     "change": "Lengthen the lookback so V2 differs from V1 on the same protocol.",
     "comparison": "Compare V2 with V1 on the frozen Discovery interval and identical costs.",
@@ -45,10 +44,6 @@ CONFLICT_RETURN = {
 # ---------------------------------------------------------------------------
 # Builders and assertions
 # ---------------------------------------------------------------------------
-
-
-def _hex(value: object) -> None:
-    assert isinstance(value, str) and HEX.fullmatch(value), value
 
 
 def local_today() -> date:
@@ -115,6 +110,7 @@ def review(
     reviewer: str = "research-lead",
     source: Path | None = None,
     calendar: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     args = [
         "round",
@@ -138,7 +134,7 @@ def review(
         args += ["--input", str(source)]
     if calendar is not None:
         args += ["--calendar", str(calendar)]
-    return cli(*args)
+    return cli(*args, env=env)
 
 
 def approve_version(
@@ -150,6 +146,7 @@ def approve_version(
     source: Path,
     *,
     reason: str = "The passed receipt and explicit observation confirmation admit this version.",
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return review(
         project,
@@ -160,6 +157,7 @@ def approve_version(
         reason=reason,
         source=source,
         calendar=calendar,
+        env=env,
     )
 
 
@@ -300,7 +298,7 @@ def test_returned_v1_is_reselected_with_its_reused_passed_receipt(tmp_path: Path
     assert returned["status"] == "returned"
     assert returned["review_state"] == "returned"
     assert returned["reused"] is False
-    _hex(returned["decision_id"])
+    assert_hex(returned["decision_id"])
     assert returned["return"]["change"] == "Compare a longer lookback against V1."
     assert returned["return"]["next_submission_id"] == "version-two"
     assert returned["validation"]["validation_id"] == receipt1["validation_id"]
@@ -336,8 +334,8 @@ def test_returned_v1_is_reselected_with_its_reused_passed_receipt(tmp_path: Path
     assert reselected["status"] == "approved"
     assert reselected["review_state"] == "approved"
     assert reselected["reused"] is False
-    _hex(reselected["decision_id"])
-    _hex(reselected["tracking"]["release_id"])
+    assert_hex(reselected["decision_id"])
+    assert_hex(reselected["tracking"]["release_id"])
     assert reselected["validation"]["validation_id"] == receipt1["validation_id"]
     assert reselected["validation"]["receipt_hash"] == receipt1["receipt_hash"]
     assert reselected["validation"]["reused"] is True
@@ -652,8 +650,8 @@ def test_closed_market_approval_records_one_state_and_enables_next_session(
     assert approved["review_state"] == "approved"
     assert approved["reused"] is False
     assert approved["tracking"]["enabled_signal_date"] in expected
-    _hex(approved["tracking"]["release_id"])
-    _hex(approved["tracking"]["calendar_hash"])
+    assert_hex(approved["tracking"]["release_id"])
+    assert_hex(approved["tracking"]["calendar_hash"])
     decided_local = datetime.fromisoformat(approved["decided_at"]).astimezone(SHANGHAI).date()
     assert decided_local in {before, after}
     assert (
@@ -669,6 +667,11 @@ def test_closed_market_approval_records_one_state_and_enables_next_session(
     assert fetched["scope"] == "synthetic"
     assert fetched["candidate_hash"] == version["version_id"]
     assert fetched["plan_id"] == receipt["validation_id"]
+    # The artifact names the lightweight receipt explicitly; it must not read as
+    # a protected evaluation plan.
+    assert fetched["plan_kind"] == "lightweight_validation"
+    assert fetched["validation_id"] == receipt["validation_id"]
+    assert fetched["plan_hash"] == receipt["validation_id"]
     assert "evaluations" not in fetched
     assert fetched["binding"]["version_id"] == version["version_id"]
     assert fetched["binding"]["validation_id"] == receipt["validation_id"]
@@ -703,7 +706,11 @@ def test_closed_market_approval_records_one_state_and_enables_next_session(
     status = version_status(project, round_id, version["version_id"])
     assert status["review_state"] == "approved"
     assert status["review"]["decision"] == "approve"
-    assert status["review"]["reviewer"] == "research-lead"
+    # Round status is agent-visible: it never leaks the human reviewer, the
+    # decision reason or a fabricated committed-session count.
+    assert "reviewer" not in status["review"]
+    assert "reason" not in status["review"]
+    assert "committed_sessions" not in status["tracking"]
     assert status["review"]["decided_at"] == approved["decided_at"]
     assert status["observation"]["confirmed"]["observation_sessions"] == 20
     assert status["tracking"]["release_id"] == approved["tracking"]["release_id"]
@@ -767,6 +774,223 @@ def test_closed_market_approval_records_one_state_and_enables_next_session(
 
 
 # ---------------------------------------------------------------------------
+# approval replay is date-independent: it reuses the first stored enable date
+# ---------------------------------------------------------------------------
+
+
+def test_approval_replay_uses_the_stored_effective_session_across_days(
+    tmp_path: Path,
+) -> None:
+    project, snapshots, campaign, store, opened = opening(
+        tmp_path, sealed_snapshot_input(15), warmup=4
+    )
+    round_id = opened["round_id"]
+    experiment = submit_experiment(
+        project,
+        campaign["campaign_id"],
+        tmp_path / "experiment.json",
+        "short",
+        "Short lookback.",
+        "momentum",
+        {"lookback": 2, "cash_if_negative": False},
+    )
+    version = lock(tmp_path, project, round_id, "version-one", experiment["experiment_id"])
+    receipt = ok(validate_version(project, store, snapshots, round_id, version["version_id"]))
+    assert receipt["outcome"] == "passed"
+    calendar, _ = calendar_file(tmp_path, start_offset=1, count=3)
+    source = write_json(tmp_path / "observation.json", observation_input())
+    today = local_today()
+
+    approved = ok(
+        approve_version(
+            project,
+            store,
+            round_id,
+            version["version_id"],
+            calendar,
+            source,
+            env=cli_env(PRAJNATRADE_TEST_NOW=f"{today.isoformat()}T08:00:00+08:00"),
+        )
+    )
+    assert approved["reused"] is False
+    assert approved["tracking"]["enabled_signal_date"] == (
+        today + timedelta(days=1)
+    ).isoformat()
+
+    # The same human decision is replayed on the next trading day: the key is
+    # the decision content, so the stored first-computed enable date wins.
+    replayed = ok(
+        approve_version(
+            project,
+            store,
+            round_id,
+            version["version_id"],
+            calendar,
+            source,
+            env=cli_env(
+                PRAJNATRADE_TEST_NOW=f"{(today + timedelta(days=1)).isoformat()}T08:00:00+08:00"
+            ),
+        )
+    )
+    assert replayed["reused"] is True
+    assert replayed["decision_id"] == approved["decision_id"]
+    assert replayed["decided_at"] == approved["decided_at"]
+    assert replayed["tracking"] == approved["tracking"]
+    release_id = approved["tracking"]["release_id"]
+    timeline = release_status(store, release_id)["timeline"]
+    assert [event["action"] for event in timeline] == ["enable"]
+    assert timeline[0]["effective_signal_date"] == approved["tracking"]["enabled_signal_date"]
+
+
+# ---------------------------------------------------------------------------
+# a release-layer refusal from round review renders as a review ProtocolError
+# ---------------------------------------------------------------------------
+
+
+def test_review_release_refusal_is_rendered_as_a_review_rejection(
+    tmp_path: Path,
+) -> None:
+    project, snapshots, campaign, store, opened = opening(
+        tmp_path, sealed_snapshot_input(15), warmup=4
+    )
+    round_id = opened["round_id"]
+    experiment = submit_experiment(
+        project, campaign["campaign_id"], tmp_path / "experiment.json", "short",
+        "Short lookback.", "momentum", {"lookback": 2, "cash_if_negative": False},
+    )
+    version = lock(tmp_path, project, round_id, "version-one", experiment["experiment_id"])
+    ok(validate_version(project, store, snapshots, round_id, version["version_id"]))
+    calendar, _ = calendar_file(tmp_path, start_offset=1)
+    source = write_json(tmp_path / "observation.json", observation_input())
+    approved = ok(
+        approve_version(
+            project, store, round_id, version["version_id"], calendar, source
+        )
+    )
+    release_id = approved["tracking"]["release_id"]
+    artifact_path = store / "releases" / release_id / "artifact.json"
+    original = artifact_path.read_bytes()
+
+    tampered = json.loads(original)
+    tampered["observation"]["observation_sessions"] = 1
+    artifact_path.chmod(0o600)
+    artifact_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    payload = rejected(
+        approve_version(
+            project, store, round_id, version["version_id"], calendar, source
+        ),
+        "RELEASE_INTEGRITY_FAILED",
+        phase="review",
+    )
+    # The protocol context is rendered at the top level, never dropped.
+    assert payload["release_id"] == release_id
+    assert payload["release_created"] is False
+    assert payload["opened_protected_source"] is False
+    assert payload["query_debited"] is False
+    assert "audit_id" not in payload or isinstance(payload["audit_id"], str)
+
+    artifact_path.chmod(0o600)
+    artifact_path.write_bytes(original)
+    artifact_path.chmod(0o444)
+    replay = ok(
+        approve_version(
+            project, store, round_id, version["version_id"], calendar, source
+        )
+    )
+    assert replay["reused"] is True
+    assert replay["decision_id"] == approved["decision_id"]
+
+
+# ---------------------------------------------------------------------------
+# a tracking release verifies its bound terminal passed Validation receipt
+# ---------------------------------------------------------------------------
+
+
+def _receipt_path(store: Path, validation_id: str) -> Path:
+    return store / "research-loop-validations" / f"{validation_id}.json"
+
+
+def _rewrite_receipt(path: Path, receipt: dict) -> None:
+    path.chmod(0o600)
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    path.chmod(0o400)
+
+
+def test_tracking_release_rejects_a_tampered_or_non_passed_receipt(
+    tmp_path: Path,
+) -> None:
+    project, snapshots, campaign, store, opened = opening(
+        tmp_path, sealed_snapshot_input(15), warmup=4
+    )
+    round_id = opened["round_id"]
+    experiment = submit_experiment(
+        project, campaign["campaign_id"], tmp_path / "experiment.json", "short",
+        "Short lookback.", "momentum", {"lookback": 2, "cash_if_negative": False},
+    )
+    version = lock(tmp_path, project, round_id, "version-one", experiment["experiment_id"])
+    receipt = ok(validate_version(project, store, snapshots, round_id, version["version_id"]))
+    approved = ok(
+        approve_version(
+            project,
+            store,
+            round_id,
+            version["version_id"],
+            calendar_file(tmp_path, start_offset=1)[0],
+            write_json(tmp_path / "observation.json", observation_input()),
+        )
+    )
+    release_id = approved["tracking"]["release_id"]
+    enabled = approved["tracking"]["enabled_signal_date"]
+    path = _receipt_path(store, receipt["validation_id"])
+    original = json.loads(path.read_text(encoding="utf-8"))
+    original_bytes = path.read_bytes()
+
+    def rejects_every_reader() -> None:
+        rejected(
+            cli("release", "fetch", "--store", str(store), "--release-id", release_id),
+            "EVIDENCE_INVALID",
+        )
+        rejected(
+            cli("release", "status", "--store", str(store), "--release-id", release_id),
+            "EVIDENCE_INVALID",
+        )
+        rejected(
+            cli(
+                "release", "resume", "--store", str(store), "--release-id", release_id,
+                "--effective-signal-date", enabled,
+                "--reason", "A broken receipt must never be resumed.",
+            ),
+            "EVIDENCE_INVALID",
+        )
+
+    # A field changed without recomputing the content address is tampering.
+    tampered = copy.deepcopy(original)
+    tampered["observation"]["recommended_sessions"] = 1
+    _rewrite_receipt(path, tampered)
+    rejects_every_reader()
+
+    # A hash-consistent but non-passed receipt is also refused: a manual-tracking
+    # release may only bind a passed lightweight Validation.
+    failed = copy.deepcopy(original)
+    failed["outcome"] = "failed"
+    failed["reason"] = "HARD_CONDITION_NOT_MET"
+    failed["receipt_hash"] = snapshot_module._hash(
+        {key: value for key, value in failed.items() if key != "receipt_hash"}
+    )
+    _rewrite_receipt(path, failed)
+    rejects_every_reader()
+
+    path.chmod(0o600)
+    path.write_bytes(original_bytes)
+    path.chmod(0o400)
+    fetched = ok(
+        cli("release", "fetch", "--store", str(store), "--release-id", release_id)
+    )
+    assert fetched["artifact"]["binding"]["validation_id"] == receipt["validation_id"]
+
+
+# ---------------------------------------------------------------------------
 # end is terminal for one version only; the round keeps accepting versions
 # ---------------------------------------------------------------------------
 
@@ -812,7 +1036,7 @@ def test_end_is_terminal_for_one_version_and_the_round_continues(tmp_path: Path)
     assert ended["review_state"] == "ended"
     assert ended["end"]["detail"] == end_input()["detail"]
     assert ended["end"]["continue_direction"] is True
-    _hex(ended["decision_id"])
+    assert_hex(ended["decision_id"])
 
     replayed = ok(
         review(
@@ -1168,13 +1392,13 @@ def test_revalidate_after_a_corrected_snapshot_records_prior_receipt(tmp_path: P
     assert revalidated["outcome"] == "passed"
     assert revalidated["reason"] is None
     assert revalidated["review_state"] == "returned"
-    _hex(revalidated["revalidation_id"])
+    assert_hex(revalidated["revalidation_id"])
     evidence = revalidated["evidence"]
     assert evidence["snapshot_changed"] is True
     assert evidence["snapshot_id"] == corrected["snapshot_id"]
     assert evidence["previous_snapshot_id"] == campaign["snapshot_id"]
     assert evidence["runtime_changed"] is False
-    _hex(evidence["replay_engine_identity"])
+    assert_hex(evidence["replay_engine_identity"])
 
     # The prior receipt is kept as historical evidence in the trusted store.
     prior_copy = store / "research-loop-validations" / f"{prior['validation_id']}.json"
@@ -1226,18 +1450,29 @@ def test_revalidate_after_a_corrected_snapshot_records_prior_receipt(tmp_path: P
     assert approved["validation"]["validation_id"] == revalidated["validation_id"]
     assert approved["validation"]["reused"] is True
 
-    rejected(
+    # An approved version can still be re-checked after a data/platform fix; a
+    # passing corrected receipt keeps the one current review state approved.
+    approved_revalidation = ok(
         revalidate_version(
             project,
             store,
             snapshots,
             round_id,
             version["version_id"],
-            reason="An approved version cannot be revalidated.",
-        ),
-        "REVIEW_CONFLICT",
-        phase="revalidation",
+            reason="An approved version is revalidated after the platform fix.",
+        )
     )
+    assert approved_revalidation["status"] == "revalidated"
+    assert approved_revalidation["review_state"] == "approved"
+    assert approved_revalidation["outcome"] == "passed"
+    assert approved_revalidation["validation_id"] != revalidated["validation_id"]
+    current = version_status(project, round_id, version["version_id"])
+    assert current["review_state"] == "approved"
+    assert current["validation"]["review"] == {
+        "required": False,
+        "trigger": None,
+        "reason": None,
+    }
 
     ok(
         review(

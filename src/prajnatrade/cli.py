@@ -957,6 +957,16 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
         return 2
 
 
+def _rejection_result(error: Exception, *, schema_version: int) -> dict:
+    """One machine-readable rejection shape for every workflow dispatch."""
+    return {
+        "schema_version": schema_version,
+        "status": "rejected",
+        "error": error.details,
+        **getattr(error, "context", {}),
+    }
+
+
 def _direction_workflow_command(args: argparse.Namespace) -> int:
     from prajnatrade import research_direction
 
@@ -968,10 +978,7 @@ def _direction_workflow_command(args: argparse.Namespace) -> int:
         else:
             result = _holdout_action(args)
     except (EvaluationRejection, release.ReleaseRejection, ProtocolError) as error:
-        result = {
-            "schema_version": 2, "status": "rejected", "error": error.details,
-            **getattr(error, "context", {}),
-        }
+        result = _rejection_result(error, schema_version=2)
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -1067,11 +1074,9 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 json.loads(args.input.read_text(encoding="utf-8")),
             )
     except (ProtocolError, release.ReleaseRejection) as error:
-        result = {
-            "schema_version": 1,
-            "status": "rejected",
-            "error": error.details,
-        }
+        # Both the module's own ProtocolError and any release-layer refusal use
+        # the shared renderer, so the protocol context is never dropped.
+        result = _rejection_result(error, schema_version=1)
     except (OSError, sqlite3.Error, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

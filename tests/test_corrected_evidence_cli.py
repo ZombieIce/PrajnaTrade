@@ -16,10 +16,10 @@ none is copied here.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
-from cli_helpers import cli, ok, rejected, write_json
+from cli_helpers import assert_hex, cli, ok, rejected, write_json
+from prajnatrade import snapshot as snapshot_module
 from test_experiment_cli import campaign_options, sealed_snapshot_input
 from test_protected_eval_cli import submit_experiment
 from test_research_loop_cli import (
@@ -30,14 +30,14 @@ from test_research_loop_cli import (
 from test_version_review_cli import (
     approve_version,
     calendar_file,
+    end_input,
     lock,
     observation_input,
+    release_status,
     return_input,
     review,
     version_status,
 )
-
-HEX = re.compile(r"[0-9a-f]{64}")
 EX_DATE = "2024-01-08"
 PAY_DATE = "2024-01-10"
 OLD_AMOUNT = 0.2
@@ -49,10 +49,6 @@ REASON = "The official cash dividend was corrected; recheck the affected Discove
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
-
-
-def _hex(value: object) -> None:
-    assert isinstance(value, str) and HEX.fullmatch(value), value
 
 
 def corrected_payload(day_count: int = 15) -> dict:
@@ -302,7 +298,7 @@ def test_corrected_discovery_recomputes_both_runs_and_admits_the_version(
     assert result["review_state"] == "pending"
     assert result["outcome"] == "passed"
     assert result["reason"] is None
-    _hex(result["revalidation_id"])
+    assert_hex(result["revalidation_id"])
 
     evidence = result["evidence"]
     assert evidence["verified"] is True
@@ -326,8 +322,8 @@ def test_corrected_discovery_recomputes_both_runs_and_admits_the_version(
     assert evidence["partition_content_hash"] == successor_partition
     assert successor_partition != scenario["campaign"]["fingerprints"]["partition"]
     assert evidence["snapshot_hash"] == successor_partition
-    _hex(evidence["engine_runtime_identity"])
-    _hex(evidence["replay_engine_identity"])
+    assert_hex(evidence["engine_runtime_identity"])
+    assert_hex(evidence["replay_engine_identity"])
 
     recomputed = result["recomputed_discovery"]
     assert recomputed["snapshot_id"] == successor
@@ -350,7 +346,7 @@ def test_corrected_discovery_recomputes_both_runs_and_admits_the_version(
     assert candidate["ending_cash"] == 0.0
     for field in ("total_return", "max_drawdown", "sharpe", "turnover", "valued_sessions"):
         assert field in candidate["metrics"]
-    _hex(recomputed["content_hash"])
+    assert_hex(recomputed["content_hash"])
 
     original = result["original_discovery"]
     assert original["snapshot_id"] == locked
@@ -359,7 +355,7 @@ def test_corrected_discovery_recomputes_both_runs_and_admits_the_version(
     ]
     assert original["candidate"]["fill_count"] == 5
     assert original["candidate"]["ending_equity"] > candidate["ending_equity"]
-    _hex(original["content_hash"])
+    assert_hex(original["content_hash"])
 
     affected = result["affected"]
     assert affected["changed_rows"] == {
@@ -425,6 +421,78 @@ def test_corrected_discovery_recomputes_both_runs_and_admits_the_version(
     assert approved["validation"]["validation_id"] == result["validation_id"]
     assert approved["validation"]["outcome"] == "passed"
     assert_no_protected_access(scenario)
+
+
+# ---------------------------------------------------------------------------
+# 1b. Revalidating an approved version re-checks it without revoking approval
+# ---------------------------------------------------------------------------
+
+
+def test_approved_version_revalidation_failure_raises_a_review_trigger(
+    tmp_path: Path,
+) -> None:
+    hard_conditions = [
+        {"id": "capital_preservation", "metric": "net_return", "operator": ">=", "value": -0.001},
+        {"id": "coverage", "metric": "valued_sessions", "operator": ">=", "value": 1},
+    ]
+    scenario = open_scenario(tmp_path, hard_conditions=hard_conditions)
+    round_id = scenario["opened"]["round_id"]
+    version_id = scenario["version"]["version_id"]
+    calendar, _ = calendar_file(tmp_path, start_offset=1)
+    approved = ok(
+        approve_version(
+            scenario["project"],
+            scenario["store"],
+            round_id,
+            version_id,
+            calendar,
+            write_json(tmp_path / "observation.json", observation_input()),
+            reason="The passed receipt is admitted before the data correction.",
+        )
+    )
+    release_id = approved["tracking"]["release_id"]
+    assert release_status(scenario["store"], release_id)["state"] == "enabled"
+
+    # The correction still keeps the strategy identity but breaks a hard
+    # condition: approval is neither revoked nor auto-paused, the concrete
+    # review trigger records why a human must look again.
+    successor = corrected_successor(
+        tmp_path, scenario["snapshots"], scenario["campaign"]["snapshot_id"], new_amount=0.01
+    )
+    failed = ok(revalidate(scenario, evidence_snapshot_id=successor))
+    assert failed["status"] == "revalidated"
+    assert failed["outcome"] == "failed"
+    assert failed["reason"] == "HARD_CONDITION_NOT_MET"
+    assert failed["review_state"] == "approved"
+    assert failed["review"] == {
+        "required": True,
+        "trigger": "REVALIDATION_FAILED",
+        "reason": "HARD_CONDITION_NOT_MET",
+    }
+    current = version_status(scenario["project"], round_id, version_id)
+    assert current["review_state"] == "approved"
+    assert current["validation"]["validation_id"] == failed["validation_id"]
+    assert current["validation"]["outcome"] == "failed"
+    assert current["validation"]["review"] == failed["review"]
+    assert release_status(scenario["store"], release_id)["state"] == "enabled"
+
+    # The human can still end the version; an ended version is terminal.
+    ok(
+        review(
+            scenario["project"],
+            scenario["store"],
+            round_id,
+            version_id,
+            "end",
+            reason="The corrected evidence no longer meets the frozen hard conditions.",
+            source=write_json(tmp_path / "end.json", end_input()),
+        )
+    )
+    rejected(
+        revalidate(scenario, evidence_snapshot_id=successor),
+        "VERSION_ENDED",
+        phase="revalidation",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +690,79 @@ def test_correction_without_enough_scored_history_is_insufficient_evidence(
     )
 
 
+def prior_history_scenario(root: Path) -> dict:
+    """A round whose Campaign freezes sealed prior history (warmup regression)."""
+    payload = corrected_payload()
+    payload["discovery_start"] = "2024-01-04"
+    project = root / "prior"
+    source = write_json(root / "prior-snapshot.json", payload)
+    ok(cli("project", "init", "--project", str(project)))
+    campaign = ok(
+        cli(
+            *campaign_options(project, source, attempts=6, max_seconds=180),
+            "--discovery-warmup-sessions",
+            "0",
+        )
+    )
+    assert len(campaign["history_policy"]["prior_history_hash"]) == 64
+    snapshots = project.parent / f"{project.name}-snapshot-store"
+    store = root / "prior-trusted"
+    opened = ok(
+        open_round(
+            project,
+            store,
+            campaign["campaign_id"],
+            write_json(root / "prior-round.json", round_input()),
+        )
+    )
+    experiment = submit_experiment(
+        project,
+        campaign["campaign_id"],
+        root / "prior-experiment.json",
+        "first",
+        "The sealed prior history keeps the frozen scoring start honest.",
+        "equal_weight",
+        {},
+    )
+    version = lock(
+        root, project, opened["round_id"], "version-one", experiment["experiment_id"]
+    )
+    prior = ok(
+        validate_version(
+            project, store, snapshots, opened["round_id"], version["version_id"]
+        )
+    )
+    assert prior["outcome"] == "passed", prior["checks"]
+    return {
+        "project": project,
+        "snapshots": snapshots,
+        "campaign": campaign,
+        "store": store,
+        "opened": opened,
+        "version": version,
+        "prior": prior,
+    }
+
+
+def crafted_successor(
+    store: Path, source_id: str, mutate,
+) -> str:
+    """Publish a successor-shaped manifest under its own content address.
+
+    The manifest hash, lineage and partition descriptors stay internally
+    consistent, so only the revalidation evidence checks can reject it.  This is
+    the only way to exercise the defensive typed branches of
+    ``_successor_evidence``.
+    """
+    manifest = json.loads((store / source_id / "manifest.json").read_text(encoding="utf-8"))
+    mutate(manifest)
+    crafted_id = snapshot_module._hash(manifest)
+    target = store / crafted_id
+    target.mkdir()
+    write_json(target / "manifest.json", manifest)
+    return crafted_id
+
+
 # ---------------------------------------------------------------------------
 # 5. Unrelated and non-successor evidence is a typed rejection
 # ---------------------------------------------------------------------------
@@ -712,6 +853,58 @@ def test_unrelated_and_non_successor_evidence_is_rejected(tmp_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
+# 5b. Successor-shaped but invalid evidence surfaces each typed code
+# ---------------------------------------------------------------------------
+
+
+def test_successor_shaped_invalid_evidence_is_typed(tmp_path: Path) -> None:
+    scenario = prior_history_scenario(tmp_path)
+    valid = corrected_successor(
+        tmp_path, scenario["snapshots"], scenario["campaign"]["snapshot_id"]
+    )
+
+    def replace_data_kind(manifest: dict) -> None:
+        manifest["data_kind"] = "real"
+
+    def replace_interval(manifest: dict) -> None:
+        partition = next(
+            item for item in manifest["partitions"] if item["name"] == "discovery"
+        )
+        partition["start"] = "2024-01-02"
+
+    def drop_prior_history(manifest: dict) -> None:
+        manifest.pop("discovery_prior_history", None)
+
+    def corrupt_correction(manifest: dict) -> None:
+        manifest["discovery_dividend"]["new_amount"] = 0.01
+
+    for mutate, code in (
+        (replace_data_kind, "EVIDENCE_DATA_KIND_MISMATCH"),
+        (replace_interval, "EVIDENCE_INTERVAL_MISMATCH"),
+        (drop_prior_history, "EVIDENCE_PRIOR_HISTORY_MISMATCH"),
+        (corrupt_correction, "EVIDENCE_INTEGRITY_VIOLATION"),
+    ):
+        crafted = crafted_successor(scenario["snapshots"], valid, mutate)
+        rejected(
+            revalidate(scenario, evidence_snapshot_id=crafted),
+            code,
+            phase="revalidation",
+        )
+    current = version_status(
+        scenario["project"],
+        scenario["opened"]["round_id"],
+        scenario["version"]["version_id"],
+    )
+    assert current["validation"]["validation_id"] == scenario["prior"]["validation_id"]
+    assert "history" not in current["validation"]
+
+    # The valid successor in the same store still revalidates normally.
+    accepted = ok(revalidate(scenario, evidence_snapshot_id=valid))
+    assert accepted["outcome"] == "passed"
+    assert accepted["evidence"]["snapshot_id"] == valid
+
+
+# ---------------------------------------------------------------------------
 # 6. Ambiguous successors require an explicit evidence snapshot
 # ---------------------------------------------------------------------------
 
@@ -759,6 +952,14 @@ def test_correction_published_after_the_frozen_as_of_is_rejected(
     )
     rejected(
         revalidate(scenario, evidence_snapshot_id=successor),
+        "EVIDENCE_AS_OF_VIOLATION",
+        phase="revalidation",
+    )
+    # Auto-discovery must surface the same typed rejection instead of silently
+    # falling back to the locked snapshot: only a genuinely unrelated snapshot
+    # is skipped (F5).
+    rejected(
+        revalidate(scenario),
         "EVIDENCE_AS_OF_VIOLATION",
         phase="revalidation",
     )

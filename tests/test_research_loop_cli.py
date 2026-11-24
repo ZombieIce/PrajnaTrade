@@ -9,26 +9,21 @@ imported from the modules that own them; nothing here is copied.
 from __future__ import annotations
 
 import json
-import re
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from cli_helpers import agent_cli, cli, cli_env, ok, rejected, write_json
+from cli_helpers import agent_cli, assert_hex, cli, cli_env, ok, rejected, write_json
 from test_experiment_cli import campaign_options, sealed_snapshot_input
 from test_protected_eval_cli import SYMBOLS, submit_experiment
-
-HEX = re.compile(r"[0-9a-f]{64}")
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
+VALIDATION_TERMINAL_FAILPOINT = "round_validation_after_terminal_receipt"
 
 
 # ---------------------------------------------------------------------------
 # Builders and assertions
 # ---------------------------------------------------------------------------
-
-
-def _hex(value: object) -> None:
-    assert isinstance(value, str) and HEX.fullmatch(value), value
 
 
 def round_input(**overrides: object) -> dict:
@@ -339,9 +334,9 @@ def test_round_open_freezes_the_contract_and_replays(tmp_path: Path) -> None:
     assert opened["schema_version"] == 1
     assert opened["status"] == "opened"
     assert opened["reused"] is False
-    _hex(opened["round_id"])
-    _hex(opened["direction_id"])
-    _hex(opened["kickoff_hash"])
+    assert_hex(opened["round_id"])
+    assert_hex(opened["direction_id"])
+    assert_hex(opened["kickoff_hash"])
     assert opened["project_id"] == campaign["project_id"]
     assert opened["campaign_id"] == campaign["campaign_id"]
     assert opened["scope"] == "synthetic"
@@ -475,7 +470,7 @@ def test_round_submit_locks_a_successful_discovery_version(tmp_path: Path) -> No
     assert submitted["round_id"] == round_id
     assert submitted["submission_id"] == "submission-1"
     assert submitted["experiment_id"] == experiment["experiment_id"]
-    _hex(submitted["version_id"])
+    assert_hex(submitted["version_id"])
     assert (
         submitted["strategy_fingerprint"]
         == experiment["fingerprints"]["strategy_and_parameters"]
@@ -492,7 +487,7 @@ def test_round_submit_locks_a_successful_discovery_version(tmp_path: Path) -> No
     }
     assert locked["history_policy"] == campaign["history_policy"]
     assert locked["signal_window_sessions"] == 3
-    _hex(locked["protocol_hash"])
+    assert_hex(locked["protocol_hash"])
 
     replayed = ok(submit_version(project, round_id, "submission-1", source))
     assert replayed["reused"] is True
@@ -638,8 +633,8 @@ def test_round_validate_replays_218_scoring_days_without_protected_access(
         assert receipt["reason"] is None
         assert receipt["round_id"] == round_id
         assert receipt["version_id"] == version["version_id"]
-        _hex(receipt["validation_id"])
-        _hex(receipt["receipt_hash"])
+        assert_hex(receipt["validation_id"])
+        assert_hex(receipt["receipt_hash"])
         assert receipt["opened_protected_source"] is False
         assert receipt["query_debited"] is False
         assert receipt["attempts"] == 1
@@ -669,7 +664,8 @@ def test_round_validate_replays_218_scoring_days_without_protected_access(
         )
         stored = json.loads(trusted_copy.read_text(encoding="utf-8"))
         assert stored["receipt_hash"] == receipt["receipt_hash"]
-        assert stored["attempts"] == 1
+        # Mutable attempt provenance is not part of the immutable receipt content.
+        assert "attempts" not in stored and "resumed" not in stored
 
     # Lightweight Validation never debits a protected query or writes a record.
     trusted = tmp_path / "trusted"
@@ -756,7 +752,7 @@ def test_round_validate_resumes_an_interrupted_attempt_without_a_new_identity(
     )
     assert running["validation"]["status"] == "running"
     assert running["validation"]["attempts"] == 1
-    _hex(running["validation"]["validation_id"])
+    assert_hex(running["validation"]["validation_id"])
 
     resumed = ok(validate_version(project, trusted, snapshots, round_id, second["version_id"]))
     assert resumed["status"] == "completed"
@@ -771,6 +767,86 @@ def test_round_validate_resumes_an_interrupted_attempt_without_a_new_identity(
     assert replay["validation_id"] == resumed["validation_id"]
     assert replay["receipt_hash"] == resumed["receipt_hash"]
     assert replay["attempts"] == 2
+
+
+def test_round_validate_recovers_a_terminal_receipt_without_a_second_record(
+    tmp_path: Path,
+) -> None:
+    project, snapshots, campaign = campaign_with_warmup(
+        tmp_path, sealed_snapshot_input(15), warmup=4
+    )
+    trusted = tmp_path / "trusted"
+    opened = ok(
+        open_round(
+            project,
+            trusted,
+            campaign["campaign_id"],
+            write_json(tmp_path / "round.json", round_input()),
+        )
+    )
+    round_id = opened["round_id"]
+    experiment = submit_experiment(
+        project, campaign["campaign_id"], tmp_path / "short.json", "short",
+        "Short lookback.", "momentum", {"lookback": 2, "cash_if_negative": False},
+    )
+    version = lock_version(
+        tmp_path, project, round_id, "version-first", experiment["experiment_id"]
+    )
+
+    crashed = validate_version(
+        project,
+        trusted,
+        snapshots,
+        round_id,
+        version["version_id"],
+        env=cli_env(PRAJNATRADE_TEST_FAILPOINT=VALIDATION_TERMINAL_FAILPOINT),
+    )
+    assert crashed.returncode == 2, (crashed.stdout, crashed.stderr)
+    assert "error:" in crashed.stderr
+    validations = trusted / "research-loop-validations"
+    stored_files = list(validations.glob("*.json"))
+    assert len(stored_files) == 1
+    stored = json.loads(stored_files[0].read_text(encoding="utf-8"))
+    assert stored["status"] == "completed"
+    assert "attempts" not in stored and "resumed" not in stored
+    first_validation_id = stored["validation_id"]
+    first_receipt_hash = stored["receipt_hash"]
+    running = next(
+        item
+        for item in ok(round_status(project, round_id))["submissions"]
+        if item["version_id"] == version["version_id"]
+    )
+    assert running["validation"]["status"] == "running"
+    assert running["validation"]["attempts"] == 1
+
+    recovered = ok(
+        validate_version(project, trusted, snapshots, round_id, version["version_id"])
+    )
+    assert recovered["validation_id"] == first_validation_id
+    assert recovered["receipt_hash"] == first_receipt_hash
+    assert recovered["attempts"] == 2
+    assert recovered["resumed"] is True
+    assert recovered["reused"] is False
+    assert recovered["outcome"] == stored["outcome"]
+    # The trusted record is never duplicated or rewritten by the recovery.
+    assert list(validations.glob("*.json")) == stored_files
+    assert json.loads(stored_files[0].read_text(encoding="utf-8")) == stored
+    published = next(
+        item
+        for item in ok(round_status(project, round_id))["submissions"]
+        if item["version_id"] == version["version_id"]
+    )
+    assert published["validation"]["status"] == "completed"
+    assert published["validation"]["attempts"] == 2
+    assert published["validation"]["validation_id"] == first_validation_id
+
+    replay = ok(
+        validate_version(project, trusted, snapshots, round_id, version["version_id"])
+    )
+    assert replay["reused"] is True
+    assert replay["attempts"] == 2
+    assert replay["validation_id"] == first_validation_id
+    assert replay["receipt_hash"] == first_receipt_hash
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +1044,72 @@ def test_round_validate_treats_intentional_cash_as_position_evidence(
     assert receipt["metrics"]["candidate"]["fills"] == 0
 
 
+def test_round_validate_records_ready_cash_then_a_day_ten_buy(tmp_path: Path) -> None:
+    """Spec #43 L57: ready but cash-scored for nine days, then it actively buys."""
+    payload = sealed_snapshot_input(40)
+    index = {
+        row["date"]: position for position, row in enumerate(payload["calendar"])
+    }
+    for row in payload["derived"]:
+        position = index[row["date"]]
+        row["value"] = 10.0 if position < 12 else 10.5 + 0.5 * (position - 12)
+    project, snapshots, campaign = campaign_with_warmup(tmp_path, payload, warmup=4)
+    scoring_start = campaign["history_policy"]["scoring_start"]
+    dates = [row["date"] for row in payload["calendar"]]
+    assert dates.index(scoring_start) == 4
+    experiment = submit_experiment(
+        project, campaign["campaign_id"], tmp_path / "late.json", "late",
+        "Flat synthetic prices keep momentum in cash until the tenth scored session.",
+        "momentum", {"lookback": 2, "cash_if_negative": True},
+    )
+    discovery = experiment["discovery"]
+    assert discovery["metrics"]["sessions"] == 20
+    assert discovery["metrics"]["valued_sessions"] == 20
+    assert discovery["metrics"]["fills"] == 1
+    assert discovery["position_evidence"]["state"] == "initial_position_established"
+    assert len(discovery["history_readiness"]["ready_cash_sessions"]) == 9
+
+    trusted = tmp_path / "trusted"
+    opened = ok(
+        open_round(
+            project,
+            trusted,
+            campaign["campaign_id"],
+            write_json(tmp_path / "round.json", round_input()),
+        )
+    )
+    version = lock_version(
+        tmp_path, project, opened["round_id"], "version-late", experiment["experiment_id"]
+    )
+    receipt = ok(
+        validate_version(project, trusted, snapshots, opened["round_id"], version["version_id"])
+    )
+    assert receipt["outcome"] == "passed", receipt["checks"]
+    assert receipt["reason"] is None
+    assert receipt["metrics"]["candidate"]["sessions"] == 20
+    assert receipt["metrics"]["candidate"]["valued_sessions"] == 20
+    assert receipt["metrics"]["candidate"]["fills"] == 1
+    position = receipt["checks"]["position"]["candidate"]
+    assert position["state"] == "initial_position_established"
+    cash_sessions = position["intentional_cash_sessions"]
+    assert cash_sessions == [
+        dates[4],
+        dates[5],
+        dates[6],
+        dates[7],
+        dates[8],
+        dates[9],
+        dates[10],
+        dates[11],
+        dates[12],
+    ]
+    # The tenth scored session decides at its open from the prior close history
+    # and buys in that same session; the first nine scored sessions hold cash.
+    assert position["first_position_signal_date"] == dates[13]
+    assert position["first_fill_date"] == dates[13]
+    assert receipt["replay"]["matches_discovery"] is True
+
+
 def test_round_validate_marks_ordered_unfilled_as_insufficient_evidence(
     tmp_path: Path,
 ) -> None:
@@ -1009,6 +1151,69 @@ def test_round_validate_marks_ordered_unfilled_as_insufficient_evidence(
     assert position["candidate"]["unfilled_orders"] == 1
     assert position["candidate"]["first_fill_date"] is None
     assert receipt["replay"]["matches_discovery"] is True
+
+
+# ---------------------------------------------------------------------------
+# round validate: ending cash is part of the Discovery replay comparison
+# ---------------------------------------------------------------------------
+
+
+def test_round_validate_compares_end_cash_and_rejects_a_cash_only_mismatch(
+    tmp_path: Path,
+) -> None:
+    project, snapshots, campaign = campaign_with_warmup(
+        tmp_path, sealed_snapshot_input(15), warmup=4
+    )
+    experiment = submit_experiment(
+        project, campaign["campaign_id"], tmp_path / "short.json", "short",
+        "Short lookback.", "momentum", {"lookback": 2, "cash_if_negative": False},
+    )
+    trusted = tmp_path / "trusted"
+    opened = ok(
+        open_round(
+            project,
+            trusted,
+            campaign["campaign_id"],
+            write_json(tmp_path / "round.json", round_input()),
+        )
+    )
+    version = lock_version(
+        tmp_path, project, opened["round_id"], "version-cash", experiment["experiment_id"]
+    )
+
+    # Tamper only the stored Discovery ending cash (its ending equity, fills and
+    # metrics stay identical), so a cash-blind replay would still pass.
+    database = project / ".prajnatrade" / "project.sqlite"
+    with sqlite3.connect(database) as connection:
+        raw = connection.execute(
+            "SELECT result_json FROM experiments WHERE experiment_id = ?",
+            (experiment["experiment_id"],),
+        ).fetchone()[0]
+        stored = json.loads(raw)
+        curve = stored["discovery"]["equity_curve"]
+        assert curve[-1]["cash"] is not None
+        curve[-1]["cash"] = float(curve[-1]["cash"]) + 1.0
+        connection.execute(
+            "UPDATE experiments SET result_json = ? WHERE experiment_id = ?",
+            (json.dumps(stored), experiment["experiment_id"]),
+        )
+
+    receipt = ok(
+        validate_version(
+            project, trusted, snapshots, opened["round_id"], version["version_id"]
+        )
+    )
+    assert receipt["outcome"] == "insufficient_evidence"
+    assert receipt["reason"] == "REPLAY_MISMATCH"
+    assert receipt["checks"]["replay"]["ok"] is False
+    assert receipt["replay"]["mismatches"] == ["candidate.ending_cash"]
+    for label in ("candidate", "benchmark"):
+        summary = receipt["replay"][label]
+        assert "ending_cash" in summary
+        assert summary["ending_cash"] is not None
+    assert receipt["replay"]["candidate"]["ending_cash"] != pytest.approx(
+        curve[-1]["cash"], abs=1e-9
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1188,7 +1393,7 @@ def test_round_close_records_an_early_stop_and_blocks_new_work(tmp_path: Path) -
     assert closed["status"] == "closed"
     assert closed["reused"] is False
     assert closed["round_id"] == round_id
-    _hex(closed["closure_id"])
+    assert_hex(closed["closure_id"])
     assert closed["candidate_selected"] is False
     assert closed["selected_version"] is None
     assert closed["stop_reason"] == close_input["stop_reason"]

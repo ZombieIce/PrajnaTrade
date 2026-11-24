@@ -79,7 +79,7 @@ import math
 import os
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -89,7 +89,7 @@ import pandas as pd
 from prajnatrade import dividend, release, shadow_calendar, snapshot
 from prajnatrade.backtest import _validate_weights
 from prajnatrade.container_executor import executor_from_config
-from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.data import CASH, ETF_SYMBOLS
 from prajnatrade.experiment import runtime_matches
 from prajnatrade.isolation import IsolationError
 from prajnatrade.snapshot_baseline import (
@@ -1908,15 +1908,29 @@ def _record_scope_pause(
     target: str,
     code: str,
     message: str,
-) -> None:
-    """Persist the scoped pause for a blocked version; other versions continue."""
+) -> dict[str, Any] | None:
+    """Persist the scoped pause for a blocked version; other versions continue.
+
+    A failed write is returned as a version anomaly instead of being swallowed:
+    the report must never pretend the pause was recorded, and the version entry
+    stays ``blocked`` so the operator still sees the distortion.
+    """
     session = _first_uncommitted_session(database, store, feed, release_id, target)
     try:
         database.record_scope_pause(
             release_id, session, _block_scope(code), code, message
         )
-    except sqlite3.Error:  # pragma: no cover - a corrupt ledger never blocks the update
-        pass
+    except sqlite3.Error as error:
+        return {
+            "code": "scope_pause_not_recorded",
+            "scope": _block_scope(code),
+            "session": session,
+            "message": (
+                f"The scoped pause for {code!r} at {session} could not be "
+                f"persisted: {error}"
+            ),
+        }
+    return None
 
 
 def _version_result(
@@ -1932,7 +1946,7 @@ def _version_result(
     except _Blocked as error:
         progress = _progress_or_none(database, release_id)
         last = progress["last_committed_date"] if progress else None
-        _record_scope_pause(
+        pause_failure = _record_scope_pause(
             database, store, feed, release_id, target, error.code, error.reason
         )
         return _version_entry(
@@ -1943,12 +1957,13 @@ def _version_result(
             reason_code=error.code,
             committed_date=last,
             last_committed_date=last,
+            anomalies=[pause_failure] if pause_failure is not None else None,
             detail=error.detail,
         )
     except ShadowRejection as error:
         progress = _progress_or_none(database, release_id)
         last = progress["last_committed_date"] if progress else None
-        _record_scope_pause(
+        pause_failure = _record_scope_pause(
             database,
             store,
             feed,
@@ -1965,6 +1980,7 @@ def _version_result(
             reason_code=error.details["code"],
             committed_date=last,
             last_committed_date=last,
+            anomalies=[pause_failure] if pause_failure is not None else None,
         )
 
 
@@ -2174,6 +2190,26 @@ def _run_version(
     target_index = feed.index[target]
     target_state = states[target]
     progress = database.get_progress(release_id)
+    if progress is not None and target_state == "retired":
+        # A review/evidence end appends the terminal release event at the first
+        # uncommitted after-close session.  The tick that observes it retires the
+        # ledger progress without committing another day, signal or order, so the
+        # committed history stays byte-identical (spec #43 L33).
+        last = progress.get("last_committed_date")
+        database.end_version(release_id, release_id)
+        return _version_entry(
+            release_id,
+            "ended",
+            target_date=target,
+            reason=(
+                "the manual simulated-tracking version was ended by its review "
+                "decision; its committed history is kept unchanged and no later "
+                "day, signal or order is generated"
+            ),
+            reason_code="VERSION_ENDED",
+            committed_date=last,
+            last_committed_date=last,
+        )
     if artifact.get("workflow") == release.RESEARCH_HOLDOUT:
         _check_authorized_sessions(artifact, feed, target, target_state, progress)
     if progress is None:
@@ -2330,6 +2366,7 @@ def _initial_prior(execution: dict[str, Any]) -> dict[str, Any]:
         "dividend_cash_total": 0.0,
         "nav": initial,
         "next_orders": [],
+        "signal_target": None,
         "start_date": None,
         "last_committed_date": None,
         "committed_at": None,
@@ -2371,6 +2408,10 @@ def _prior_from_result(
         "dividend_cash_total": float(result["dividends"]["cash_total"]),
         "nav": float(result["nav"]),
         "next_orders": [dict(order) for order in result["next_orders"]],
+        # The last signal target, carried across no-signal days.  Old committed
+        # rows predate this field; their same-day signal is the best fallback.
+        "signal_target": result.get("signal_target")
+        or (result.get("signal") or {}).get("target_weights"),
         "start_date": result["progress"]["start_date"],
         "last_committed_date": result["date"],
         "committed_at": committed_at,
@@ -3289,6 +3330,7 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
     signal: dict[str, Any] | None = None
     next_orders: list[dict[str, Any]] = []
     invocations: list[dict[str, Any]] = []
+    target_changed = False
     if state == "enabled" and next_session is not None:
         window = body["session"]["derived_window"]
         if len(window["sessions"]) >= execution["signal_window_sessions"]:
@@ -3360,26 +3402,39 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
                     fee_rate,
                     slippage_rate,
                 )
-                if not next_orders:
-                    # The target change required no order: record the reason in
-                    # the signal diagnostics instead of inventing an opportunity.
+                target_changed = _target_changed(prior.get("signal_target"), normalized)
+                if not next_orders and not target_changed:
+                    # The target required no order and did not change: record the
+                    # reason in the signal diagnostics, never an opportunity.
                     signal["opportunity"] = {
                         "due": False,
                         "reason": "no_target_change",
                     }
+                elif next_orders and not target_changed:
+                    # Price drift needed rebalancing orders but the strategy's
+                    # target is unchanged, so this is not a decision opportunity.
+                    signal["opportunity"] = {
+                        "due": False,
+                        "reason": "target_unchanged",
+                    }
 
-    # One due opportunity per decision point whose target change produced
-    # orders.  The outcome is joined later from the execution day's orders, so a
-    # committed day is never rewritten.  A metrics-not-ready decision point has
-    # no signal at all and therefore never creates an opportunity.
-    opportunities: list[dict[str, Any]] = [
-        {
-            "signal_date": session,
-            "execution_date": next_session,
-            "order_ids": [order["order_id"] for order in next_orders],
-            "due": True,
-        }
-    ] if next_orders else []
+    # One due opportunity per decision point whose normalized target weights
+    # changed from the version's previous signal target.  Drift-only orders are
+    # not opportunities; the outcome is joined later from the execution day's
+    # orders, so a committed day is never rewritten.  A metrics-not-ready
+    # decision point has no signal at all and creates no opportunity.
+    opportunities: list[dict[str, Any]] = (
+        [
+            {
+                "signal_date": session,
+                "execution_date": next_session,
+                "order_ids": [order["order_id"] for order in next_orders],
+                "due": True,
+            }
+        ]
+        if signal is not None and target_changed
+        else []
+    )
 
     status = "committed"
     if anomalies or any(order["status"] != "filled" for order in orders):
@@ -3426,6 +3481,9 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
         "slippage": {"day": day_slippage, "total": slippage_total},
         "signal": signal,
         "next_orders": next_orders,
+        "signal_target": (
+            normalized if signal is not None else prior.get("signal_target")
+        ),
         "opportunities": opportunities,
         **({"strategy_execution_evidence": invocations} if invocations else {}),
         "anomalies": anomalies,
@@ -3437,6 +3495,24 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
             "last_committed_date": session,
         },
     }
+
+
+def _target_changed(
+    previous: Mapping[str, float] | None, current: Mapping[str, float],
+) -> bool:
+    """Whether a signal is a real target change rather than price drift.
+
+    Drift-only rebalancing orders keep the same normalized target weights; they
+    settle normally but are not decision opportunities (spec #43 L34).  The
+    first *invested* target counts as a change, and a ``None`` -> weights signal
+    counts; an initial all-cash target is not an opportunity to trade.
+    """
+    if previous is None:
+        return any(float(current.get(symbol, 0.0)) > _EPSILON for symbol in ETF_SYMBOLS)
+    return any(
+        abs(float(current.get(asset, 0.0)) - float(previous.get(asset, 0.0))) > 1e-12
+        for asset in (*ETF_SYMBOLS, CASH)
+    )
 
 
 def _next_orders(
