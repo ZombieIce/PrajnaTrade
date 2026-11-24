@@ -2079,6 +2079,7 @@ writes no day row and does not advance; the other versions still commit.
 | `blocked` | that version wrote no day row and did not advance; `reason`/`reason_code` say why (e.g. `missing_close`, `missing_action_terms`, `missing_signal_input`, `frozen_input_changed`, `ledger_integrity_failed`, `release_integrity_failed`) |
 | `not_started` | the release is approved but not enabled at/before the target (`NOT_ENABLED`), or is first tracked after it (`ENABLED_AFTER_TARGET`) |
 | `retired` | the release is retired at the target with no ledger history to settle |
+| `ended` | a #43 manual simulated-tracking version was retired by an evidence decision; its committed history stays unchanged and no later day, signal or order is generated (`reason_code: VERSION_ENDED`) |
 
 The command exits `0` when no version is blocked, and `2` when at least one is.
 A blocked version never rolls back another version's committed days. Global

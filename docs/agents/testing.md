@@ -25,8 +25,9 @@ A single test file, without the wrapper:
 PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
-The full suite takes roughly **11 minutes** (249 tests at the time of writing).
-CI (`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
+The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
+CI run); at the time of writing this branch collects **410 tests**. CI
+(`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
 Python 3.12; `lint` runs `ruff check .`.
 
 ## Isolation tests
