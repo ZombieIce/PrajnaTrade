@@ -80,6 +80,27 @@ unchanged v1 kickoff/locked/receipt shape, and includes one direct unit test of
 `snapshot.verify_discovery_split` for tampered descriptors and payloads. The
 file is fast and not marked `isolation`.
 
+## Formal trailing Validation tests (#50-T2)
+
+`tests/test_formal_validation_cli.py` covers protocol-v2 `round validate` and
+`round revalidate`. It drives the public CLI on synthetic sealed snapshots with
+a 70/30 split Campaign (the 15-session fixture gives development 6 / trailing 3)
+and asserts: the receipt's candidate and benchmark are accounted on the trailing
+real dates only from the trailing first session with the frozen initial cash
+(the trusted receipt carries per-session curves; the published projection does
+not), a whole-interval v1 replay is distinguishable, a declared trailing gap
+blocks before the read with zero uses, the first read counts exactly once across
+a failpoint interruption, resume, terminal-receipt recovery, replay and
+failed/insufficient verdicts, an exhausted allowance refuses before the read,
+two subprocesses racing the last automatic slot yield exactly one read, a
+compliant prehistory scores every trailing session while a short one reports
+`SCORING_START_INSUFFICIENT` and keeps its use, later trailing data does not
+change the first decision, `round status` audits the allowance counters,
+lifecycle and per-version protocol/scoring/warmup/usage, and a trailing-only
+corrected successor produces a formal revalidation epoch with the prior receipt
+and affected diff while a changed development slice is refused with
+`EVIDENCE_DEVELOPMENT_MISMATCH`. The file is fast and not marked `isolation`.
+
 ## Docker tests
 
 `tests/test_container_executor.py` exercises the real Docker/Colima boundary for
