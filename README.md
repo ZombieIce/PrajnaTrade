@@ -370,6 +370,27 @@ sealed pre-Discovery observations at that opening. The Campaign receipt reports
 `history_policy.scoring_start` and the fingerprint of any sealed pre-Discovery
 history used in the Campaign.
 
+An opt-in `--discovery-split 70/30` freezes a leading-development split of the
+Campaign's sealed Discovery interval before any experiment can run:
+
+```sh
+prajnatrade campaign create --project ./strategy-A --store ./sealed-data \
+  --snapshot-id "$SNAPSHOT" --attempts 20 --max-seconds 3600 \
+  --discovery-warmup-sessions 40 --discovery-split 70/30
+```
+
+The Campaign copy then holds only the development slice
+(`floor(Discovery sessions * 70 / 100)` sessions), so every Discovery
+experiment, baseline and comparison reads approved development data by
+construction. The receipt reports `discovery_split` with the frozen rule, both
+segments' real dates, session counts and content hashes, the sealed full
+Discovery partition hash and a `split_hash`; `fingerprints.snapshot` is the
+development slice hash that the experiment integrity check verifies. Absent the
+flag, the Campaign and its stored records are unchanged (protocol v1). A split
+Campaign that will open a round also needs `--discovery-warmup-sessions`,
+because a round requires the frozen scoring policy and the warmup must leave at
+least one development scoring session.
+
 In this mode, `strategy.history_requirements` can declare each required history
 window. For example, a momentum strategy with `parameters.lookback: 20` can
 declare `{"id": "momentum", "observations": 21, "mode": "valid_observations"}`
@@ -777,6 +798,38 @@ round with `reused: true`; different content for the same Campaign is
 `ROUND_ALREADY_OPENED`. Changing the objective or the evaluation standard opens
 a new round; changed strategy experiments are charged to the Campaign budget.
 
+**Protocol v2: a frozen 70/30 split.** A Campaign created with
+`--discovery-split 70/30` (see the
+[Campaign section](#external-discovery-experiment-protocol)) freezes a v2
+round. Its split covers the Campaign's sealed **Discovery interval only** — never
+the sealed Validation or Final Holdout partitions — and is recorded before any
+experiment runs:
+
+- `development_sessions = N * 70 // 100` (floor) of the Discovery sessions; the
+  remainder goes to the trailing side. Both segments are non-empty,
+  contiguous, disjoint and exhaustive.
+- The Campaign copy holds only the development slice. `research_partition`
+  records the frozen descriptor: the sealed full Discovery partition hash and
+  session bounds, and each segment's `start`, `end`, `sessions` and
+  `content_hash`, plus the canonical `split_hash` over the descriptor body.
+- A v2 round input must also freeze this round's automatic Validation limit
+  with `"validation_policy": {"auto_validation_limit": 2}`. The limit is a
+  positive integer. A v2 campaign's round without it is refused with
+  `VALIDATION_POLICY_REQUIRED`; supplying `validation_policy` to a v1 Campaign
+  is `DISCOVERY_SPLIT_NOT_FROZEN`. The kickoff gains `protocol`
+  (`{"schema_version": 1, "name": "trailing-70-30", "validation_kind":
+  "trailing_validation"}`), the frozen `research_partition` descriptor and
+  `validation_policy`; a v1 kickoff keeps its exact old shape and hash.
+
+`round status` exposes the same split to the operator and the agent:
+top-level `protocol` (a v1 round defaults to `discovery-replay`),
+`research_partition` and `validation_policy` for v2, and per-version `protocol`
+and `research_partition` on every locked submission. That is how the operator
+verifies the development dates to research within and the trailing dates that
+will be scored without opening any payload. The formal trailing-segment
+Validation receipt protocol is part of the #50 series; a v2 round never falls
+back to the v1 full-interval replay.
+
 `round status` is granted to the agent and reads the project only:
 
 ```sh
@@ -818,8 +871,10 @@ prajnatrade-agent round submit --project ./strategy-A --round-id "$ROUND" \
 a successful attempt in the round's Campaign. The receipt locks the strategy
 (with parameters and any generated source), snapshot, Discovery evaluation,
 execution rules, costs, protocol, signal window and frozen scoring policy into
-one content-addressed `version_id`; `locked` repeats those bindings. The same
-`submission_id` with the same content returns the stored version with
+one content-addressed `version_id`; `locked` repeats those bindings (for a v2
+round it also records the round `protocol` and the frozen `research_partition`,
+so the version traces to the partition protocol it will be scored under). The
+same `submission_id` with the same content returns the stored version with
 `reused: true`; the same ID with different content is `SUBMISSION_CONFLICT`; the
 same content under another submission ID resolves to the same `version_id`.
 
@@ -830,6 +885,12 @@ prajnatrade round validate --project ./strategy-A --store /trusted/evaluations \
   --snapshot-store /trusted/snapshots --round-id "$ROUND" \
   --version-id "$VERSION"
 ```
+
+This section is the protocol v1 (`discovery-replay`) Validation path. A v2
+round records `validation_kind: trailing_validation` and is scored by the #50
+formal trailing-segment Validation entry over the frozen trailing slice, with
+the development slice as prehistory; it is not a full-interval Discovery
+replay and this build refuses to fall back to one.
 
 Lightweight Validation replays the locked candidate and the equal-weight
 benchmark over the Campaign's frozen Discovery interval, using the same sealed
@@ -1111,7 +1172,7 @@ print `error: ...` on stderr and exit 2.
 
 | Command | Side | Success `status` | Evidence-bearing statuses (exit 0) | Rejection (exit 2) |
 | --- | --- | --- | --- | --- |
-| `round open` | operator | `opened` | — | `ROUND_ALREADY_OPENED`, `SCORING_POLICY_NOT_FROZEN` |
+| `round open` | operator | `opened` | — | `ROUND_ALREADY_OPENED`, `SCORING_POLICY_NOT_FROZEN`, `VALIDATION_POLICY_REQUIRED`, `DISCOVERY_SPLIT_NOT_FROZEN` |
 | `round status` | operator, agent | `ok` (or `open`/`closed` for one round) | — | `ROUND_NOT_FOUND` |
 | `round submit` | agent | `submitted` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE` |
 | `round validate` | operator | `completed` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `REVALIDATION_SUPERSEDED` |

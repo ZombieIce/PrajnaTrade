@@ -65,6 +65,21 @@ build `manual_tracking` artifacts and ledger fixtures directly instead of
 running a protected evaluation. They are not marked `isolation`; see
 [`tests/README.md`](../../tests/README.md) for the rule if that changes.
 
+## Discovery split tests (#50-T1)
+
+`tests/test_discovery_split_cli.py` covers the opt-in 70/30 split of a
+Campaign's sealed Discovery interval. It drives `campaign create
+--discovery-split 70/30` and the v2 `round open/submit/status` protocol through
+the public CLI on synthetic snapshots, and recomputes the canonical slice
+hashes independently (the 15-session fixture seals Discovery=9 and gives
+development 6 / trailing 3, a session count not divisible by 10). It checks the
+development-only Campaign copy and its stored bytes, runs the same strategy on
+two snapshots whose development rows are identical but whose trailing rows
+differ and asserts identical signals, fills, equity and metrics, asserts the
+unchanged v1 kickoff/locked/receipt shape, and includes one direct unit test of
+`snapshot.verify_discovery_split` for tampered descriptors and payloads. The
+file is fast and not marked `isolation`.
+
 ## Docker tests
 
 `tests/test_container_executor.py` exercises the real Docker/Colima boundary for

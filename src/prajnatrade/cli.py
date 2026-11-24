@@ -309,6 +309,10 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         help="use this many opening Discovery sessions for history before a common scoring start",
     )
     create.add_argument(
+        "--discovery-split",
+        help="freeze a leading-development split of Discovery, e.g. 70/30",
+    )
+    create.add_argument(
         "--execution-rules", choices=EXECUTION_RULE_VERSIONS, default=NEXT_OPEN_RULES,
         help="freeze platform matching rules for Discovery and protected evaluation",
     )
@@ -772,6 +776,7 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 strategy_executor=args.strategy_executor,
                 strategy_image=args.strategy_image,
                 discovery_warmup_sessions=args.discovery_warmup_sessions,
+                discovery_split=args.discovery_split,
             )
             print(json.dumps(result, sort_keys=True, allow_nan=False))
             return 0
