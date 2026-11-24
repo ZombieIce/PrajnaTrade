@@ -27,11 +27,13 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src <venv>/python -m pytest -q -p no:cachep
 
 Scenario fixtures stay with the module that owns them:
 `synthetic_snapshot`/`build_scenario` in `test_protected_eval_cli.py`,
-`sealed_snapshot_input` in `test_experiment_cli.py`, and the #43 round builders
+`sealed_snapshot_input` in `test_experiment_cli.py`, the #43 round builders
 (`round_input`, `open_round`, `submit_version`, `validate_version`) in
-`test_research_loop_cli.py`; review and evidence tests cross-import them rather
-than copying them.  The existing `from test_protected_eval_cli import ...`
-cross-imports still work; import generic helpers from `cli_helpers` directly.
+`test_research_loop_cli.py`, and the corrected-successor builders in
+`test_corrected_evidence_cli.py`; the review and evidence tests cross-import
+the round builders rather than copying them.  The existing `from
+test_protected_eval_cli import ...` cross-imports still work; import generic
+helpers from `cli_helpers` directly.
 
 ## Isolation marker
 
@@ -59,11 +61,12 @@ The fast suite deselects them:
 ```
 
 `pyproject.toml` registers the `isolation` marker. The #43 Research Loop,
-version-review and Evidence Loop tests are fast: Lightweight Validation runs
-declarative strategies in the trusted controller, and the review/evidence tests
-build `manual_tracking` artifacts and ledger fixtures directly instead of
-running a protected flow. If a #43 test starts creating releases through the
-protected flow, mark it and record why in the module docstring.
+version-review, corrected-evidence and Evidence Loop tests are fast:
+Lightweight Validation runs declarative strategies in the trusted controller,
+and the review/evidence tests build `manual_tracking` artifacts and ledger
+fixtures directly instead of running a protected flow. If a #43 test starts
+creating releases through the protected flow, mark it and record why in the
+module docstring.
 
 ## Order independence
 

@@ -14,9 +14,9 @@ authorized Final Holdout) → `release approve` → `release enable` →
 `shadow update` → `acceptance report`.
 
 The #43 simulated-tracking path is parallel and separate:
-`round open` → `round submit` → `round validate` → `round review` →
-`manual_tracking` enable → `shadow update` → `round evidence status/decide`.
-It never enters the protected path above.
+`round open` → `round submit` → `round validate` (`round revalidate` after a
+correction) → `round review` → `manual_tracking` enable → `shadow update` →
+`round evidence status/decide`. It never enters the protected path above.
 
 Each arrow crosses a trust boundary and adds an immutable record; no later stage
 rewrites an earlier one.
@@ -29,11 +29,11 @@ private reuse (`snapshot._read_json` and friends) is legacy, not precedent.
 | Module | Owns | Public seam |
 | --- | --- | --- |
 | [`snapshot.py`](../../src/prajnatrade/snapshot.py) | Sealed snapshot codec: canonical JSON hashing, seal/verify, frozen partition descriptors, Discovery-only reads, successor lineage. | `seal`, `manifest`, `partition_descriptor`, `read_discovery`, `read_protected`, `lineage_ids` |
-| [`snapshot_baseline.py`](../../src/prajnatrade/snapshot_baseline.py) | Point-in-time Discovery accounting: availability by next open, equal-weight comparator, costs, dividends, per-partition strategy runs. | `run_discovery_baseline`, `run_discovery_equal_weight`, `run_discovery_strategy`, `run_partition_strategy`, `available_by`, `CN_TZ` |
-| [`experiment.py`](../../src/prajnatrade/experiment.py) | Research project and bounded Campaign protocol: locked config (including the optional container executor and its image digest), attempts, receipts, idempotent replay/resume, candidate freeze. | `project_init`, `project_status`, `campaign_create`, `experiment_submit`, `experiment_resume`, `experiment_status`, `freeze_experiment_candidate`, `candidate_status` |
+| [`snapshot_baseline.py`](../../src/prajnatrade/snapshot_baseline.py) | Point-in-time Discovery accounting: availability by next open, equal-weight comparator, costs, dividends, per-partition strategy runs. | `run_discovery_baseline`, `run_discovery_equal_weight`, `run_discovery_strategy`, `run_partition_strategy`, `available_by`, `first_ready_open`, `CN_TZ` |
+| [`experiment.py`](../../src/prajnatrade/experiment.py) | Research project and bounded Campaign protocol: locked config (including the optional container executor and its image digest), attempts, receipts, idempotent replay/resume, candidate freeze. | `project_init`, `project_status`, `campaign_create`, `experiment_submit`, `experiment_resume`, `experiment_status`, `freeze_experiment_candidate`, `candidate_status`, `runtime_identity`, `runtime_matches`, `signal_window_sessions` |
 | [`research_direction.py`](../../src/prajnatrade/research_direction.py) | Direction-bound research round (#37): approved kickoff, proposal lock, published coarse Validation receipt, dated detail request/feedback, selection freeze and retrospective; keeps the research side on the project database. | `direction_id`, `prepare_kickoff`, `kickoff`, `load_kickoff`, `proposal_submit`, `publish_validation`, `validation_details`, `publish_validation_details`, `record_feedback`, `pending_validation_work`, `selected_candidate`, `direction_status`, `list_directions`, `freeze`, `retrospective` |
 | [`research_holdout.py`](../../src/prajnatrade/research_holdout.py) | Direction-bound Final Holdout (#37): authorization, independence and overlap blockers, calendar-bound conditional release, scored-failure retrospective. | `authorize`, `run`, `load_authorization`, `load_holdout_claim`, `blockers`, `claim`, `finish` |
-| [`research_loop.py`](../../src/prajnatrade/research_loop.py) | Research Loop (#43): approved round contract on one Campaign, content-addressed locked versions, Lightweight Validation replay over the frozen Discovery interval, observation recommendation and early closure; immutable per-version approve/return/end decisions, manual simulated-tracking admission, platform-fix revalidation, and the Evidence Loop's observation/opportunity review. Never opens a protected partition or writes a query debit. | `prepare_round`, `open_round`, `load_round`, `round_status`, `submit`, `validate`, `revalidate`, `review`, `close`, `evidence_status`, `evidence_decide`, `observation_recommendation`, `replay_engine_identity` |
+| [`research_loop.py`](../../src/prajnatrade/research_loop.py) | Research Loop (#43): approved round contract on one Campaign, content-addressed locked versions, Lightweight Validation replay, returned-version reselection, corrected-successor and platform-fix revalidation (new evidence epochs with the original/recomputed Discovery runs and affected diff), immutable per-version approve/return/end decisions, manual simulated-tracking admission, observation recommendation and early closure, and the Evidence Loop's observation, opportunity, scoped-pause and terminal review. Never opens a protected partition or writes a query debit. | `prepare_round`, `open_round`, `load_round`, `round_status`, `submit`, `validate`, `revalidate`, `review`, `close`, `evidence_status`, `evidence_decide`, `observation_recommendation`, `replay_engine_identity` |
 | [`isolation.py`](../../src/prajnatrade/isolation.py) | OS worker boundary for generated Python: CPU/memory/wall/output limits and filesystem/network/process probes. | `run_isolated_strategy`, `probe_isolation_evidence`, `probe_isolation`, `IsolationLimits`, `IsolationError` |
 | [`container_executor.py`](../../src/prajnatrade/container_executor.py) | Docker/Colima boundary for generated Python: image-digest resolution, one fresh container per strategy call, actual-inspect verification, bounded JSON protocol, trusted weight validation and per-invocation evidence. | `ContainerStrategyExecutor`, `ContainerLimits`, `ExecutionResult`, `ImageIdentity`, `executor_from_config` |
 | [`dividend.py`](../../src/prajnatrade/dividend.py) | Trusted cash-dividend correction journal; builds verified successor snapshots without rewriting the predecessor. | `register`, `verify`, `load_verified_revision`, `revision_predecessor`, `successor` |
@@ -53,16 +53,20 @@ private reuse (`snapshot._read_json` and friends) is legacy, not precedent.
 
 | Store | Layout | Written by | Read by |
 | --- | --- | --- | --- |
-| Sealed snapshot store (`--snapshot-store`) | `<store>/<snapshot_id>/{manifest,discovery,validation,final_holdout}.json` (0444/0555) and `<store>/.dividend-corrections/` | `snapshot seal`, `snapshot correction register/verify/successor` (journal and successor snapshot) | `campaign create` (Discovery copy), `evaluation run` (protected payload, after debit), `shadow update`/`release disposition` (corrections journal and lineage metadata only) |
-| Trusted evaluation store (`--store`) | `plans/`, `authorizations/<plan_id>/`, `queries.sqlite`, `records/<evaluation_id>/`, `releases/<release_id>/{artifact,events,dispositions}`, `rejections/`, `audit/`, `research-loop-rounds/<round_id>.json`, `research-loop-validations/<validation_id>.json`, `research-loop-revalidations/<revalidation_id>.json`, `research-loop-reviews/<decision_id>.json`, `research-loop-evidence/<decision_id>.json` | `evaluation plan/authorize/run`, `release approve/reject/lifecycle/disposition`, `round open/validate/revalidate/review/evidence decide` (write-once round, receipt and decision copies) | `evaluation status/report`, `release status/fetch/list`, `shadow update` (release and manual-tracking artifacts), `round validate/revalidate/review` (round copy and stored receipts/decisions), `round evidence status` |
+| Sealed snapshot store (`--snapshot-store`) | `<store>/<snapshot_id>/{manifest,discovery,validation,final_holdout}.json` (0444/0555) and `<store>/.dividend-corrections/` | `snapshot seal`, `snapshot correction register/verify/successor` (journal and successor snapshot) | `campaign create` (Discovery copy), `evaluation run` (protected payload, after debit), `round validate/revalidate` (locked Discovery evidence and a verified corrected successor; no protected partition), `shadow update`/`release disposition` (corrections journal and lineage metadata only) |
+| Trusted evaluation store (`--store`) | `plans/`, `authorizations/<plan_id>/`, `queries.sqlite`, `records/<evaluation_id>/`, `releases/<release_id>/{artifact,events,dispositions}`, `rejections/`, `audit/`, `research-loop-rounds/<round_id>.json`, `research-loop-validations/<validation_id>.json`, `research-loop-revalidations/<revalidation_id>.json`, `research-loop-reviews/<decision_id>.json`, `research-loop-evidence/<decision_id>.json` | `evaluation plan/authorize/run`, `release approve/reject/lifecycle/disposition`, `round open/validate/revalidate/review/evidence decide` (write-once round, receipt, corrected-evidence revalidation and decision copies) | `evaluation status/report`, `release status/fetch/list`, `shadow update` (release and manual-tracking artifacts), `round validate/revalidate/review` (round copy and stored receipts/decisions, including the prior receipt and original/recomputed Discovery history), `round evidence status` |
 | Research project (`--project`) | `<project>/.prajnatrade/project.sqlite` plus saved request files; #43 adds `research_loop_rounds`, `_submissions`, `_validations`, `_validation_attempts`, `_reviews`, `_observations`, `_closures`, `_revalidations`, `_evidence_decisions` | `project init`, `campaign create`, `experiment submit/resume`, `candidate freeze`, `direction`/`validation` handlers, `round open/submit/validate/revalidate/review/close/evidence decide`, receipts published by the trusted side | `project status`, `experiment status`, agent `evaluation status`, `round status`, `round evidence status`, agent `round status` |
 | Shadow Live ledger (`--ledger`) | `<ledger>/shadow.sqlite`: `input_snapshots`, `days`, `progress`, `schedule_notifications`, `scope_pauses` | `shadow update/tick` (day commits and automatic scoped pauses for blocked versions), `round evidence decide` (retire marks the version's ledger progress ended) | `shadow report`, `shadow compare`, `round evidence status`, `release disposition` (pause point) |
 | Acceptance input/report | Arbitrary files under `docs/acceptance/` | `acceptance report` (output only) | nothing else — the report is rendered from the manifest alone |
 
 - **Research boundary:** the agent sees the project database (Campaign config,
   experiment receipts/results, candidates), one coarse Validation receipt and
-  the constant Final Holdout receipt. It never sees a sealed payload, protected
-  outcome/timing/diagnostic, admission or release state, or a Shadow Live row.
+  the constant Final Holdout receipt. For #43, the agent `round status` view
+  shows each version's current review state, return instructions and
+  observation/tracking summary only; it never exposes the reviewer identity or
+  decision reason, ledger rows or accounting detail. The agent never sees a
+  sealed payload, protected outcome/timing/diagnostic, admission or release
+  state, or a Shadow Live row.
 - **One read per partition:** every protected read follows a debit keyed by
   `(partition name, partition content hash)` and written before the read. A
   copied store is a new deployment with its own ledger; there is no refund.
@@ -77,7 +81,7 @@ private reuse (`snapshot._read_json` and friends) is legacy, not precedent.
 | Campaign | `project init`, `campaign create` | `project status` | project ID, locked Campaign config, Discovery copy |
 | Research | `experiment submit/resume`, `candidate freeze` | `experiment submit/status/resume` | attempts, hypotheses, receipts, candidates |
 | Protected | `evaluation plan/authorize/run`, `evaluation report` | `evaluation status` (coarse only) | plan, authorization, debit, immutable record, controlled report |
-| Research loop | `round open/validate/revalidate/review/close` | `round status`, `round submit` | approved round contract, locked versions, Lightweight Validation receipts (no protected debit), immutable review decisions, `manual_tracking` artifact and enable event, closure |
+| Research loop | `round open/validate/revalidate/review/close` | `round status`, `round submit` | approved round contract, locked versions, Lightweight Validation receipts and corrected-evidence revalidation epochs (no protected debit), immutable review decisions, `manual_tracking` artifact and enable event, closure |
 | Evidence loop | `round evidence status/decide`, `shadow tick/update/report/compare` | — | observation progress, opportunity aggregates, scoped pauses, ledger days, common-interval comparison |
 | Release | `release approve/reject`, `enable/pause/resume/retire`, `disposition` | — | artifact, rejection decisions, lifecycle events, dispositions |
 | Forward | `shadow update/report/compare` | — | per-version ledger days and comparison documents |
@@ -89,8 +93,10 @@ release, shadow and acceptance are operator-only. `round open`, `validate`,
 `revalidate`, `review`, `close`, `evidence status` and `evidence decide` are
 also operator-only: the agent gets no `--store`, no ledger, no
 Lightweight Validation receipt beyond the round-status allowlist and no
-protected read. The manual simulated-tracking admission and the
-continue/pause/retire review stay human operator decisions. New research
+protected read. That allowlist is the agent round view — review state, return
+instructions and observation/tracking summary — without reviewer identity,
+decision reason or ledger detail. The manual simulated-tracking admission and
+the continue/pause/retire review stay human operator decisions. New research
 surfaces require an explicit grant in the spec; sealed partitions, Holdout
 diagnostics, admission state and controlled-report internals never move to the
 agent CLI.
@@ -132,6 +138,7 @@ across files, never mutable state.
 | Experiment | [`test_experiment_cli.py`](../../tests/test_experiment_cli.py) | Campaign lock, submit/status, idempotent replay, resume, budget/timeout, candidate freeze, agent surface |
 | Research loop | [`test_research_loop_cli.py`](../../tests/test_research_loop_cli.py) | Round contract freeze/replay, content-addressed version lock, lightweight Validation replay (interval/scoreable days/fills/cash), warmup R1/R2, metrics-not-ready vs intentional cash vs ordered-unfilled, hard-condition and insufficient-evidence verdicts, interruption recovery, early close, agent boundary |
 | Version review | [`test_version_review_cli.py`](../../tests/test_version_review_cli.py) | Approve/return/end state machine, risk acceptance and explicit observation, manual simulated-tracking artifact and next-session enable, V1 re-selection with its stored receipt, conflict/replay, platform-fix revalidation with prior-receipt history, agent boundary |
+| Corrected evidence | [`test_corrected_evidence_cli.py`](../../tests/test_corrected_evidence_cli.py) | Successor lineage, frozen interval/data-kind/prior-history/as-of verification, corrected Discovery recompute for candidate and benchmark, original vs recomputed records and affected diff, replay and review history, typed `EVIDENCE_*` rejection, `round validate` superseded |
 | Evidence loop | [`test_evidence_loop_cli.py`](../../tests/test_evidence_loop_cli.py) | Observation recommendation and researcher confirmation, due/filled/unfilled opportunities, intent-without-fill, `metrics_not_ready` vs intentional cash vs ordered-unfilled, scoped pause while another version continues, trusted-data review trigger, continue/pause/retire, retire terminal per version, dual-version common interval |
 | Direction | [`test_research_direction_cli.py`](../../tests/test_research_direction_cli.py), [`test_validation_selection_cli.py`](../../tests/test_validation_selection_cli.py) | Kickoff approval/replay, proposal/detail/feedback, published receipts, selection freeze and retrospective, leadership selection independence |
 | Holdout | [`test_issue37_holdout_cli.py`](../../tests/test_issue37_holdout_cli.py), [`test_holdout_recovery_cli.py`](../../tests/test_holdout_recovery_cli.py), [`test_direction_schema_v2_cli.py`](../../tests/test_direction_schema_v2_cli.py) | Separate Holdout authorization, calendar-bound conditional enable, independence/overlap blockers, interrupted/missing-record recovery, no admission on incomplete evidence, schema-v2 protected input |

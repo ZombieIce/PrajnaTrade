@@ -68,12 +68,16 @@ protected evidence.
    pre-fills the human decision.
 2. **No protected allowance or debit.** Lightweight Validation replays the
    locked version and benchmark over the frozen Discovery interval using the
-   existing snapshot, scoring start, execution rules and costs. It does not open
-   a Validation or Final Holdout partition, does not spend a Validation
+   frozen scoring start, execution rules and costs. It does not open a
+   Validation or Final Holdout partition, does not spend a Validation
    allowance, and records `opened_protected_source: false` and
-   `query_debited: false`. Approval creates a write-once `manual_tracking`
-   artifact and one enable event at the first eligible trading session; it is
-   not `release approve` and not a Holdout authorization.
+   `query_debited: false`. Revalidation keeps the strategy identity and records
+   a new evidence epoch: a corrected successor must preserve the frozen
+   interval, data kind and prior history, and the original and recomputed
+   Discovery runs stay as history. Approval creates a write-once
+   `manual_tracking` artifact and one enable event at the first eligible
+   trading session; it is not `release approve` and not a Holdout
+   authorization.
 3. **Synthetic stays labelled.** Simulated-tracking artifacts carry
    `simulated_tracking: true`, and the Shadow Live ledger remains synthetic or
    replay evidence with the same `scope`/`data_kind` labels. A synthetic ledger
