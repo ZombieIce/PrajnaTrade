@@ -2190,11 +2190,18 @@ def _run_version(
     target_index = feed.index[target]
     target_state = states[target]
     progress = database.get_progress(release_id)
-    if progress is not None and target_state == "retired":
-        # A review/evidence end appends the terminal release event at the first
-        # uncommitted after-close session.  The tick that observes it retires the
-        # ledger progress without committing another day, signal or order, so the
-        # committed history stays byte-identical (spec #43 L33).
+    if (
+        progress is not None
+        and target_state == "retired"
+        and artifact.get("workflow") == release.TRACKING_WORKFLOW
+    ):
+        # A manual simulated-tracking end appends the terminal release event at
+        # the first uncommitted after-close session.  The tick that observes it
+        # retires the ledger progress without committing another day, signal or
+        # order, so the committed history stays byte-identical (spec #43 L33).
+        # A legacy protected release keeps the #32 behavior: it may still commit
+        # NAV-only days after retirement, because its ledger is not part of the
+        # Research/Evidence Loop.
         last = progress.get("last_committed_date")
         database.end_version(release_id, release_id)
         return _version_entry(
