@@ -139,6 +139,29 @@ Discovery after research has stopped changing it.
      recomputed and a new formal epoch records the prior receipt, the
      original/recomputed validation records and the trailing affected diff. A
      changed development slice is `EVIDENCE_DEVELOPMENT_MISMATCH`.
+   - **The automatic limit pauses; a human admits one version.** Once every
+     automatic slot is used, the next automatic trailing read is refused before
+     any read, attempt or trusted write (`VALIDATION_ALLOWANCE_EXHAUSTED`); the
+     round lifecycle becomes `awaiting_validation_admission` while the ordinary
+     `status` stays `open`, and Discovery continues — new experiments and
+     locked versions are still accepted. The researcher may instead select an
+     already approved passing version or close with no candidate; closing stays
+     allowed at the limit or early with Campaign budget remaining, and a new v2
+     closure records the allowance and, when a version is selected, its receipt
+     (`validation_id`/`receipt_hash`/`validation_kind`/`protocol`).
+   - **A manual admission is one version, one read, and granting is not a
+     read.** `round admit` records one write-once, content-addressed manual
+     Validation admission (reviewer, reason, comparison, selection impact)
+     bound to one locked version, in the trusted store plus a project
+     projection; identical content replays, a different admission for that
+     version is a conflict, and a version whose read is already counted or
+     completed cannot be admitted. Granting writes no use row and changes no
+     counter. The admitted version's next v2 `validate` consumes it atomically
+     as one `manual` use row carrying the `admission_id`; a different version
+     can never consume it, and replay, resume or an interruption never consumes
+     it twice. The receipt `usage` and `round status` distinguish automatic
+     from manual reads; `lifecycle` is `converged` only when the round is
+     closed.
 4. **Old records keep their protocols.** A round without a frozen split stays
    protocol v1 (`discovery-replay`): its kickoff shape, protocol hash, locked
    version and receipt are unchanged, and it refuses a `validation_policy`.
@@ -147,7 +170,9 @@ Discovery after research has stopped changing it.
    protocol and split, so its versions trace to the partition protocol they
    were locked under. A v2 round never falls back to the v1 Discovery replay.
    Issue #43 and issue #17 records are read under their original recorded
-   protocol and are not re-judged or migrated.
+   protocol and are not re-judged or migrated. A closure stored before #50
+   keeps its exact legacy body and replays by its stored `closure_id`; only a
+   new closure records the v2 allowance/selection additions.
 5. **The formal receipt keeps its own protocol.** A v2 receipt records
    `validation_kind: "trailing_validation"`, the frozen protocol/split, the
    development/trailing/scoring/warmup/provenance records, the counted `usage`

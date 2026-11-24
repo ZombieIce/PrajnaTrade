@@ -121,6 +121,7 @@ ROUND_NAME = "research-loop-rounds"
 VALIDATION_NAME = "research-loop-validations"
 REVIEW_NAME = "research-loop-reviews"
 REVALIDATION_NAME = "research-loop-revalidations"
+ADMISSION_NAME = "research-loop-admissions"
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
 VALIDATION_TERMINAL_FAILPOINT = "round_validation_after_terminal_receipt"
 EVIDENCE_DECIDE_FAILPOINT = "round_evidence_after_apply"
@@ -234,6 +235,13 @@ CREATE TABLE IF NOT EXISTS research_loop_validation_uses (
     consumed_at TEXT NOT NULL,
     UNIQUE (round_id, version_id),
     UNIQUE (round_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS research_loop_admissions (
+    admission_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL REFERENCES research_loop_rounds(round_id),
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    admission_json TEXT NOT NULL,
+    UNIQUE (round_id, version_id)
 );
 """
 
@@ -2371,45 +2379,16 @@ def _reserved_validation_use(
     return _validation_use(row)
 
 
-def _reserve_validation_use(
+def _insert_validation_use(
     connection: sqlite3.Connection,
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
     validation_id: str,
+    *,
+    kind: str,
+    admission_id: str | None,
 ) -> dict[str, Any]:
-    """Reserve this version's one counted trailing read, atomically.
-
-    Caller holds the round lock and an open ``BEGIN IMMEDIATE`` transaction, so
-    the existence check, the allowance check and the insert are one serialized
-    step: two processes racing the last slot yield exactly one row and exactly
-    one read.  A use row for this version is reused (resume / revalidation).
-    T3's manual admission consumption belongs between those two branches: an
-    unconsumed admission for this version inserts a ``manual`` row instead of an
-    ``automatic`` one.
-    """
-    existing = connection.execute(
-        "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
-        "validation_id, consumed_at FROM research_loop_validation_uses "
-        "WHERE round_id = ? AND version_id = ?",
-        (record["round_id"], submission["version_id"]),
-    ).fetchone()
-    if existing is not None:
-        return _validation_use(existing)
-    policy = record["kickoff"]["validation_policy"]
-    limit = policy["auto_validation_limit"]
-    automatic = connection.execute(
-        "SELECT count(*) FROM research_loop_validation_uses "
-        "WHERE round_id = ? AND kind = 'automatic'",
-        (record["round_id"],),
-    ).fetchone()[0]
-    if automatic >= limit:
-        raise _rejected(
-            "VALIDATION_ALLOWANCE_EXHAUSTED", "validation", "admit",
-            "This round has used every automatic trailing Validation slot; an "
-            "operator must admit this version before it can be read.",
-            allowance=_validation_allowance(connection, record),
-            round_state="awaiting_validation_admission",
-        )
+    """Insert the next immutable use row for this version's one counted read."""
     sequence = connection.execute(
         "SELECT COALESCE(MAX(sequence), 0) + 1 FROM research_loop_validation_uses "
         "WHERE round_id = ?",
@@ -2420,8 +2399,8 @@ def _reserve_validation_use(
         "round_id": record["round_id"],
         "version_id": submission["version_id"],
         "sequence": sequence,
-        "kind": "automatic",
-        "admission_id": None,
+        "kind": kind,
+        "admission_id": admission_id,
         "validation_id": validation_id,
         "consumed_at": _now(),
     }
@@ -2438,6 +2417,77 @@ def _reserve_validation_use(
     return use
 
 
+def _reserve_validation_use(
+    connection: sqlite3.Connection,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    validation_id: str,
+) -> dict[str, Any]:
+    """Reserve this version's one counted trailing read, atomically.
+
+    Caller holds the round lock and an open ``BEGIN IMMEDIATE`` transaction, so
+    the existence check, the admission check, the allowance check and the insert
+    are one serialized step: two processes racing the last slot or one manual
+    admission yield exactly one row and exactly one read.  Branch order:
+    reuse this version's row (resume / revalidation), then consume an unused
+    manual admission bound to this version, then take an automatic slot, then
+    reject before the read.  An admission is consumed even while automatic slots
+    remain, so a granted manual read never silently becomes an automatic one.
+    """
+    existing = connection.execute(
+        "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
+        "validation_id, consumed_at FROM research_loop_validation_uses "
+        "WHERE round_id = ? AND version_id = ?",
+        (record["round_id"], submission["version_id"]),
+    ).fetchone()
+    if existing is not None:
+        return _validation_use(existing)
+    admission = _admission_for_version(
+        connection, record["round_id"], submission["version_id"]
+    )
+    if admission is not None:
+        consumed = _admission_use(connection, admission["admission_id"])
+        if consumed is not None:
+            # Defensive crash/retry path: an admission already reflected by a
+            # use row is reused, never consumed a second time.
+            if consumed["version_id"] != submission["version_id"]:
+                raise ValueError(
+                    "The Validation admission was consumed by another version."
+                )
+            return consumed
+        return _insert_validation_use(
+            connection,
+            record,
+            submission,
+            validation_id,
+            kind="manual",
+            admission_id=admission["admission_id"],
+        )
+    policy = record["kickoff"]["validation_policy"]
+    limit = policy["auto_validation_limit"]
+    automatic = connection.execute(
+        "SELECT count(*) FROM research_loop_validation_uses "
+        "WHERE round_id = ? AND kind = 'automatic'",
+        (record["round_id"],),
+    ).fetchone()[0]
+    if automatic >= limit:
+        raise _rejected(
+            "VALIDATION_ALLOWANCE_EXHAUSTED", "validation", "admit",
+            "This round has used every automatic trailing Validation slot; an "
+            "operator must admit this version before it can be read.",
+            allowance=_validation_allowance(connection, record),
+            round_state="awaiting_validation_admission",
+        )
+    return _insert_validation_use(
+        connection,
+        record,
+        submission,
+        validation_id,
+        kind="automatic",
+        admission_id=None,
+    )
+
+
 def _lifecycle(
     connection: sqlite3.Connection,
     record: Mapping[str, Any],
@@ -2450,6 +2500,175 @@ def _lifecycle(
     if allowance is not None and allowance["automatic_used"] >= allowance["auto_limit"]:
         return "awaiting_validation_admission"
     return "research"
+
+
+# ---------------------------------------------------------------------------
+# Manual Validation admissions (the researcher's extra read after the limit)
+# ---------------------------------------------------------------------------
+
+_ADMISSION_IDENTITY_FIELDS = (
+    "schema_version", "round_id", "version_id", "reviewer", "reason",
+    "comparison", "selection_impact",
+)
+
+
+def _admission_path(store: Path, admission_id: str) -> Path:
+    return (
+        store
+        / ADMISSION_NAME
+        / f"{_require_hex(admission_id, 'admission')}.json"
+    )
+
+
+def _verify_admission(body: object) -> dict[str, Any]:
+    """Load and content-check one write-once admission record.
+
+    ``admission_id`` addresses the immutable decision body; ``granted_at`` is
+    stored alongside it and is deliberately outside the content address, so a
+    replay returns the originally recorded grant time.
+    """
+    if not isinstance(body, dict) or not set(_ADMISSION_IDENTITY_FIELDS) <= body.keys():
+        raise ValueError("Invalid Validation admission record.")
+    admission_id = body.get("admission_id")
+    _require_hex(admission_id, "admission")
+    if admission_id != _hash({field: body[field] for field in _ADMISSION_IDENTITY_FIELDS}):
+        raise ValueError("Validation admission fingerprint mismatch.")
+    _require_hex(body["round_id"], "research round")
+    _require_hex(body["version_id"], "version")
+    if not isinstance(body.get("granted_at"), str) or not body["granted_at"]:
+        raise ValueError("Invalid Validation admission timestamp.")
+    return body
+
+
+def _admissions(
+    connection: sqlite3.Connection, round_id: str,
+) -> list[dict[str, Any]]:
+    return [
+        _verify_admission(json.loads(row["admission_json"]))
+        for row in connection.execute(
+            "SELECT admission_json FROM research_loop_admissions "
+            "WHERE round_id = ? ORDER BY rowid",
+            (round_id,),
+        )
+    ]
+
+
+def _admission_for_version(
+    connection: sqlite3.Connection, round_id: str, version_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT admission_json FROM research_loop_admissions "
+        "WHERE round_id = ? AND version_id = ?",
+        (round_id, version_id),
+    ).fetchone()
+    return _verify_admission(json.loads(row["admission_json"])) if row is not None else None
+
+
+def _trusted_admission_for_version(
+    trusted: Path, round_id: str, version_id: str,
+) -> dict[str, Any] | None:
+    """Find a trusted admission a crashed grant wrote before its project row."""
+    directory = trusted / ADMISSION_NAME
+    if not directory.is_dir():
+        return None
+    for path in sorted(directory.glob("*.json")):
+        try:
+            body = _verify_admission(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if body["round_id"] == round_id and body["version_id"] == version_id:
+            return body
+    return None
+
+
+def _admission_use(
+    connection: sqlite3.Connection, admission_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
+        "validation_id, consumed_at FROM research_loop_validation_uses "
+        "WHERE admission_id = ?",
+        (admission_id,),
+    ).fetchone()
+    return _validation_use(row) if row is not None else None
+
+
+def _admission_view(
+    connection: sqlite3.Connection, body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The admission body plus its derived use state (never mutated in place)."""
+    use = _admission_use(connection, body["admission_id"])
+    return {
+        **{
+            field: body[field]
+            for field in (
+                "admission_id", "round_id", "version_id", "reviewer", "reason",
+                "comparison", "selection_impact", "granted_at",
+            )
+        },
+        "used": use is not None,
+        "consumed_validation_id": use["validation_id"] if use is not None else None,
+    }
+
+
+def _admission_status_view(
+    connection: sqlite3.Connection, body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The round-status projection: no human reviewer identity or reason (F8)."""
+    view = _admission_view(connection, body)
+    return {
+        field: view[field]
+        for field in (
+            "admission_id", "round_id", "version_id", "granted_at", "comparison",
+            "selection_impact", "used", "consumed_validation_id",
+        )
+    }
+
+
+def _publish_admission(
+    connection: sqlite3.Connection,
+    trusted: Path,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Write the write-once trusted record, then its project projection."""
+    from prajnatrade.protected_eval import write_trusted_record_once
+
+    path = _admission_path(trusted, body["admission_id"])
+    stored = dict(body)
+    if path.is_file():
+        existing = _verify_admission(json.loads(path.read_text(encoding="utf-8")))
+        if existing != stored:
+            raise ValueError("A Validation admission record is immutable and cannot change.")
+        stored = existing
+    else:
+        stored = write_trusted_record_once(path, stored)
+    connection.execute(
+        "INSERT OR IGNORE INTO research_loop_admissions "
+        "(admission_id, round_id, version_id, admission_json) VALUES (?, ?, ?, ?)",
+        (
+            stored["admission_id"],
+            stored["round_id"],
+            stored["version_id"],
+            _json(stored),
+        ),
+    )
+    return stored
+
+
+def _admission_result(
+    connection: sqlite3.Connection,
+    record: Mapping[str, Any],
+    body: Mapping[str, Any],
+    *,
+    reused: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "admitted",
+        "reused": reused,
+        "admission": _admission_view(connection, body),
+        "allowance": _validation_allowance(connection, record),
+    }
 
 
 def _validation_identity(
@@ -2692,6 +2911,118 @@ def validate(
     if formal:
         result["allowance"] = allowance
     return result
+
+
+def admit(
+    project: Path,
+    store: Path,
+    round_id: str,
+    version_id: str,
+    reviewer: str,
+    reason: str,
+    source: object,
+) -> dict[str, Any]:
+    """Record one write-once manual Validation admission for a v2 round.
+
+    Granting is an operator decision and is not a read: it writes no use row and
+    leaves the allowance counters unchanged.  The admission is bound to exactly
+    one locked version, replays by identical request content, and consumes only
+    when (and if) that version is validated.
+    """
+    from prajnatrade.protected_eval import evaluation_store
+
+    payload = _object(source, {"comparison", "selection_impact"})
+    reviewer = _text(reviewer, "reviewer")
+    reason = _text(reason, "reason")
+    comparison = _text(payload["comparison"], "comparison")
+    selection_impact = _text(payload["selection_impact"], "selection_impact")
+    trusted = evaluation_store(store)
+    if trusted.is_relative_to(project.resolve()):
+        raise ValueError("Trusted evaluation store must be outside the research project.")
+    with _round_lock(project, round_id), _project(project) as connection:
+        record = _project_round(connection, round_id)
+        trusted_record = _load_round_file(_round_path(trusted, round_id), round_id)
+        if trusted_record != record:
+            raise ValueError("The research round copy does not match the trusted approval.")
+        submission = _submission(connection, round_id, version_id, phase="admission")
+        body = {
+            "schema_version": SCHEMA_VERSION,
+            "round_id": record["round_id"],
+            "version_id": submission["version_id"],
+            "reviewer": reviewer,
+            "reason": reason,
+            "comparison": comparison,
+            "selection_impact": selection_impact,
+        }
+        admission_id = _hash(body)
+        existing = _admission_for_version(connection, round_id, version_id)
+        if existing is not None and existing["admission_id"] == admission_id:
+            # An identical request replays the stored grant, including its
+            # original recorded time; a completed read still reports used.
+            return _admission_result(connection, record, existing, reused=True)
+        if _closure(connection, round_id) is not None:
+            raise _rejected(
+                "ROUND_CLOSED", "admission", "inspect",
+                "A closed research round cannot admit another version.",
+            )
+        if "research_partition" not in record["kickoff"]:
+            raise _rejected(
+                "VALIDATION_POLICY_REQUIRED", "admission", "inspect",
+                "A manual Validation admission applies only to a protocol-v2 round "
+                "with a frozen automatic Validation limit.",
+            )
+        state = _review_state(connection, version_id)
+        if state == "ended":
+            raise _rejected(
+                "VERSION_ENDED", "admission", "inspect",
+                "An ended version is terminal and cannot be admitted.",
+            )
+        if state == "approved":
+            raise _rejected(
+                "REVIEW_CONFLICT", "admission", "inspect",
+                "An approved version keeps its admitted receipt; a manual "
+                "Validation admission would be a second decision for it.",
+            )
+        if existing is not None:
+            raise _rejected(
+                "ADMISSION_CONFLICT", "admission", "inspect",
+                "This version already has a different manual Validation admission.",
+            )
+        counted = connection.execute(
+            "SELECT 1 FROM research_loop_validation_uses "
+            "WHERE round_id = ? AND version_id = ?",
+            (round_id, version_id),
+        ).fetchone()
+        completed = connection.execute(
+            "SELECT 1 FROM research_loop_validations WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if counted is not None or completed is not None:
+            raise _rejected(
+                "VALIDATION_ALREADY_COMPLETED", "admission", "inspect",
+                "This version already has a counted or completed trailing "
+                "Validation read; a manual admission would be stranded.",
+            )
+        trusted_existing = _trusted_admission_for_version(trusted, round_id, version_id)
+        if (
+            trusted_existing is not None
+            and trusted_existing["admission_id"] != admission_id
+        ):
+            raise _rejected(
+                "ADMISSION_CONFLICT", "admission", "inspect",
+                "This version already has a different manual Validation admission.",
+            )
+        if trusted_existing is not None:
+            # A crash after the trusted write recovered on retry: publish the
+            # project projection only, keeping the recorded grant time.
+            stored = _publish_admission(connection, trusted, trusted_existing)
+            return _admission_result(connection, record, stored, reused=True)
+        stored = _publish_admission(
+            connection,
+            trusted,
+            {**body, "admission_id": admission_id, "granted_at": _now()},
+        )
+        return _admission_result(connection, record, stored, reused=False)
 
 
 def load_tracking_receipt(store: str | Path, validation_id: str) -> dict[str, Any]:
@@ -4605,6 +4936,10 @@ def _round_status_body(
         allowance = _validation_allowance_status(connection, record)
         if allowance is not None:
             result["validation_allowance"] = allowance
+        result["admissions"] = [
+            _admission_status_view(connection, body)
+            for body in _admissions(connection, round_id)
+        ]
     result["lifecycle"] = _lifecycle(connection, record, closure)
     if closure is not None:
         result["closure"] = closure
@@ -5449,6 +5784,31 @@ def _version_approved(connection: sqlite3.Connection, version_id: str) -> bool:
     return _review_state(connection, version_id) == "approved"
 
 
+def _closure_validation(
+    connection: sqlite3.Connection, version_id: str,
+) -> dict[str, Any]:
+    """The published receipt an approved selected version is closed on."""
+    row = connection.execute(
+        "SELECT validation_id, receipt_json FROM research_loop_validations "
+        "WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()
+    if row is None:
+        raise ProtocolError(
+            "VALIDATION_NOT_PASSED", "close", "review",
+            "The selected version has no published Validation receipt.",
+        )
+    receipt = json.loads(row["receipt_json"])
+    return {
+        "validation_id": receipt.get("validation_id", row["validation_id"]),
+        "receipt_hash": receipt["receipt_hash"],
+        "validation_kind": receipt.get(
+            "validation_kind", VALIDATION_PROTOCOL_LEGACY["validation_kind"]
+        ),
+        "protocol": dict(receipt.get("protocol", VALIDATION_PROTOCOL_LEGACY)),
+    }
+
+
 def close(
     project: Path, round_id: str, reviewer: str, reason: str, source: object,
 ) -> dict[str, Any]:
@@ -5490,15 +5850,13 @@ def close(
             "budget": dict(record["kickoff"]["budget"]),
             "versions_attempted": len(versions),
         }
-        closure_id = _hash(body)
-        closure = {**body, "closure_id": closure_id}
-        if previous is not None:
-            if previous.get("closure_id") == closure_id:
-                return {**previous, "status": "closed", "reused": True}
-            raise ProtocolError(
-                "ROUND_CLOSED", "close", "inspect",
-                "The research round already has a different closure.",
-            )
+        # Protocol-v2 closures also freeze the allowance at the stop, and a
+        # selected version records the receipt it was approved on.  The legacy
+        # body (no additions) keeps its exact identity so a closure stored
+        # before #50 still replays by its recorded closure_id.
+        allowance = _validation_allowance(connection, record)
+        if allowance is not None:
+            body["validation_allowance"] = allowance
         if selected is not None:
             if selected not in versions:
                 raise ProtocolError(
@@ -5517,6 +5875,23 @@ def close(
                     "VALIDATION_NOT_PASSED", "close", "review",
                     "The selected version has no approving review decision.",
                 )
+            body["selected_validation"] = _closure_validation(connection, selected)
+        closure_id = _hash(body)
+        closure = {**body, "closure_id": closure_id}
+        legacy_id = _hash(
+            {
+                key: value
+                for key, value in body.items()
+                if key not in {"validation_allowance", "selected_validation"}
+            }
+        )
+        if previous is not None:
+            if previous.get("closure_id") in {closure_id, legacy_id}:
+                return {**previous, "status": "closed", "reused": True}
+            raise ProtocolError(
+                "ROUND_CLOSED", "close", "inspect",
+                "The research round already has a different closure.",
+            )
         connection.execute(
             "INSERT INTO research_loop_closures (round_id, closure_json) VALUES (?, ?)",
             (round_id, _json(closure)),

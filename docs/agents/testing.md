@@ -26,7 +26,7 @@ PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
 The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
-CI run); at the time of writing this branch collects **429 tests**. CI
+CI run); at the time of writing this branch collects **470 tests**. CI
 (`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
 Python 3.12; `lint` runs `ruff check .`.
 
@@ -100,6 +100,26 @@ lifecycle and per-version protocol/scoring/warmup/usage, and a trailing-only
 corrected successor produces a formal revalidation epoch with the prior receipt
 and affected diff while a changed development slice is refused with
 `EVIDENCE_DEVELOPMENT_MISMATCH`. The file is fast and not marked `isolation`.
+
+## Manual Validation admission tests (#50-T3)
+
+`tests/test_validation_admission_cli.py` covers the protocol-v2 pause after the
+automatic Validation limit and the researcher's manual admission. It drives the
+public CLI on the same synthetic 70/30 split Campaigns as #50-T2 (the 15-session
+fixture gives development 6 / trailing 3) and asserts: the exhausted limit
+refuses before the read while `lifecycle` is `awaiting_validation_admission` and
+Discovery experiments/`round submit` keep working, `round admit` records one
+write-once content-addressed admission (reviewer, reason, comparison,
+selection impact) with no counter change, replays identical content, converges
+a trusted-only crash leftover, and refuses conflicting/closed/ended/approved/
+unknown/already-counted versions plus v1 rounds, the admitted version's next
+validate inserts exactly one `manual` use reflected in the receipt `usage`,
+another version cannot consume it, two subprocesses consuming the same
+admission or racing the last slot yield one counted read, an interrupted manual
+read keeps its use and resume converges, close-at-limit records
+`selected_validation`/`validation_allowance`, early no-candidate close with
+Campaign budget remaining still works, and a protocol-v1 round keeps its legacy
+status/closure/receipt shapes. The file is fast and not marked `isolation`.
 
 ## Docker tests
 
