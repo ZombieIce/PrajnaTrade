@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections.abc import Mapping
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -40,6 +41,9 @@ def run_discovery_strategy(
     transaction_cost_bps: float = 5.0,
     slippage_bps: float = 0.0,
     execution_rule_version: str = NEXT_OPEN_RULES,
+    history_requirements: list[dict] | None = None,
+    scoring_start: str | None = None,
+    prior_history: tuple[list[str], list[dict]] | None = None,
 ) -> dict[str, Any]:
     """Run a strategy with point-in-time signals and formal Discovery accounting."""
     return run_partition_strategy(
@@ -50,12 +54,46 @@ def run_discovery_strategy(
         partition_name="discovery",
         data_kind=data_kind,
         signal_window_sessions=signal_window_sessions,
-        prior_history=None,
+        prior_history=prior_history,
         initial_cash=initial_cash,
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rule_version,
+        history_requirements=history_requirements,
+        scoring_start=scoring_start,
     )
+
+
+def first_open_history(
+    decision_date: str,
+    prior_history: tuple[list[str], list[dict]] | None,
+    history_requirements: list[dict],
+) -> dict[str, Any]:
+    """Assess required inputs for an open without opening its partition."""
+    sessions, derived = _authorized_history([decision_date], prior_history)
+    readiness, _, _ = _history_at_open(sessions, derived, decision_date, history_requirements)
+    return readiness
+
+
+def first_ready_open(
+    data: dict[str, list[dict]],
+    *,
+    history_requirements: list[dict],
+    prior_history: tuple[list[str], list[dict]] | None = None,
+    scoring_start: str | None = None,
+) -> str | None:
+    """Find the first open whose completed history satisfies the requirements."""
+    sessions = sorted({row["date"] for row in data["calendar"]})
+    history_sessions, history_derived = _authorized_history(sessions, prior_history)
+    history_derived.update(_index_rows(data["derived"], "derived"))
+    for day in sessions:
+        if scoring_start is None or day >= scoring_start:
+            readiness, _, _ = _history_at_open(
+                history_sessions, history_derived, day, history_requirements,
+            )
+            if readiness["ready"]:
+                return day
+    return None
 
 
 def run_partition_strategy(
@@ -72,14 +110,17 @@ def run_partition_strategy(
     transaction_cost_bps: float = 5.0,
     slippage_bps: float = 0.0,
     execution_rule_version: str = NEXT_OPEN_RULES,
+    history_requirements: list[dict] | None = None,
+    scoring_start: str | None = None,
 ) -> dict[str, Any]:
     """Run a strategy over one sealed partition with formal accounting.
 
-    Accounting and NAV cover only the partition's own calendar sessions, starting
-    from ``initial_cash`` with no holdings.  ``prior_history`` (session dates and
-    derived rows from earlier partitions) may only extend the trailing signal
-    window; point-in-time availability is still enforced against the target
-    session's 09:30 cutoff.
+    With declared history requirements, signals can use completed observations
+    from authorized earlier sessions at each scoring open. Accounting starts from
+    initial cash and empty holdings on the scoring start. The strategy receives
+    the union of selected observations and per-indicator dates in
+    ``state["history_windows"]``. Legacy runs keep their partition-close signals
+    and next-open execution.
     """
     _validate_parameters(initial_cash, transaction_cost_bps, slippage_bps)
     if execution_rule_version not in EXECUTION_RULE_VERSIONS:
@@ -94,12 +135,21 @@ def run_partition_strategy(
 
     raw_bars = _index_rows(data["raw_bars"], "raw_bars")
     derived = _index_rows(data["derived"], "derived")
-    prior_sessions, prior_rows = prior_history if prior_history is not None else ([], [])
-    history_sessions = sorted({
-        *[day for day in prior_sessions if day < sessions[0]],
-        *sessions,
-    })
-    history_derived = _index_rows(list(prior_rows), "derived")
+    if history_requirements is None:
+        if scoring_start is not None:
+            raise ValueError("scoring_start requires history_requirements.")
+        prior_sessions, prior_rows = prior_history if prior_history is not None else ([], [])
+        history_sessions = sorted({
+            *(day for day in prior_sessions if day < sessions[0]),
+            *sessions,
+        })
+        history_derived = _index_rows(list(prior_rows), "derived")
+    else:
+        history_sessions, history_derived = _authorized_history(sessions, prior_history)
+        if scoring_start is not None:
+            if scoring_start not in sessions:
+                raise ValueError("scoring_start must be a trading session in the partition.")
+            sessions = sessions[sessions.index(scoring_start):]
     history_derived.update(derived)
     positions = {day: index for index, day in enumerate(history_sessions)}
 
@@ -112,6 +162,10 @@ def run_partition_strategy(
     }
     signals: list[dict[str, Any]] = []
     signal_gaps: list[dict[str, Any]] = []
+    first_scored_open = None
+    first_ready_date = None
+    history_gaps: list[dict[str, Any]] = []
+    ready_cash_sessions: list[str] = []
     fills: list[dict[str, Any]] = []
     order_attempts: list[dict[str, Any]] = []
     valuation_gaps: list[dict[str, str]] = []
@@ -123,6 +177,63 @@ def run_partition_strategy(
     pending: tuple[dict[str, Any], dict[str, float]] | None = None
 
     for day_index, day in enumerate(sessions):
+        ready = False
+        if history_requirements is not None:
+            readiness, windows, observation_values = _history_at_open(
+                history_sessions, history_derived, day, history_requirements,
+            )
+            if day_index == 0:
+                first_scored_open = readiness
+            ready = readiness["ready"]
+            if ready:
+                if first_ready_date is None:
+                    first_ready_date = day
+                state = {
+                    "cash": cash,
+                    "shares": dict(shares),
+                    "equity": equity_curve[-1]["nav"] if equity_curve else cash,
+                    "history_windows": {
+                        indicator: list(days) for indicator, days in windows.items()
+                    },
+                }
+                observation_days = sorted(observation_values)
+                history_rows = [
+                    {"date": observation_day, "symbol": symbol, "close": value}
+                    for observation_day in observation_days
+                    for symbol, value in observation_values[observation_day].items()
+                ]
+                history = pd.DataFrame(history_rows, columns=["date", "symbol", "close"])
+                weights = strategy(history, state)
+                if weights is not None:
+                    normalized = _validate_weights(weights)
+                    signal = {
+                        "date": day,
+                        "decision_date": day,
+                        "execution_date": day,
+                        "target_weights": normalized,
+                        "total_return_values": (
+                            observation_values[observation_days[-1]] if observation_days else {}
+                        ),
+                        "window": observation_days,
+                        "history_windows": windows,
+                    }
+                    signals.append(signal)
+                    pending = (signal, normalized)
+            else:
+                history_gaps.append(readiness)
+                missing = {
+                    gap["date"]: gap
+                    for requirement in readiness["requirements"]
+                    if requirement["available_observations"] < requirement["required_observations"]
+                    for gap in requirement["missing_sessions"]
+                }
+                signal_gaps.append({
+                    "date": day,
+                    "reason": "required_total_return_window_unavailable",
+                    "missing_sessions": [missing[gap_day] for gap_day in sorted(missing)],
+                    "requirements": readiness["requirements"],
+                })
+
         _apply_actions(
             day, actions.get(day, []), shares, cash, receivables, unresolved_actions
         )
@@ -131,6 +242,7 @@ def run_partition_strategy(
                 cash += item["amount"]
                 receivables.remove(item)
 
+        positive_order = pending is not None and _has_position(pending[1])
         if pending is not None:
             signal, weights = pending
             pending = None
@@ -194,14 +306,17 @@ def run_partition_strategy(
                 slippage_paid += costs["slippage"]
             order_attempts.append(attempt)
 
-        invested_sessions += any(quantity > _EPSILON for quantity in shares.values())
+        invested = _has_position(shares)
+        invested_sessions += invested
+        if ready and not invested and not positive_order:
+            ready_cash_sessions.append(day)
         nav_point, gaps = _valuation(
             day, raw_bars, shares, cash, receivables, unresolved_actions, data_kind=data_kind,
         )
         equity_curve.append(nav_point)
         valuation_gaps.extend(gaps)
 
-        if day_index + 1 >= len(sessions):
+        if history_requirements is not None or day_index + 1 >= len(sessions):
             continue
         cutoff = datetime.combine(
             datetime.fromisoformat(sessions[day_index + 1]).date(),
@@ -282,7 +397,17 @@ def run_partition_strategy(
         "order_attempts": order_attempts,
         "fills": fills,
         "equity_curve": equity_curve,
-        "position_evidence": _position_evidence(signals, fills, invested_sessions),
+        "position_evidence": _position_evidence(
+            signals, fills, invested_sessions, ready_cash=bool(ready_cash_sessions),
+        ),
+        **({
+            "history_readiness": {
+                "first_scored_open": first_scored_open,
+                "first_ready_date": first_ready_date,
+                "gaps": history_gaps,
+                "ready_cash_sessions": ready_cash_sessions,
+            },
+        } if history_requirements is not None else {}),
         "metrics": metrics,
         "gaps": {
             "raw_bars": _data_gaps(sessions, raw_bars, "raw_bars", data_kind=data_kind),
@@ -294,18 +419,106 @@ def run_partition_strategy(
     }
 
 
+def _authorized_history(
+    sessions: list[str], prior_history: tuple[list[str], list[dict]] | None,
+) -> tuple[list[str], dict[tuple[str, str], dict]]:
+    if prior_history is None or not sessions:
+        return sessions, {}
+    prior_sessions, prior_rows = prior_history
+    allowed = {day for day in prior_sessions if day < sessions[0]}
+    return sorted(allowed.union(sessions)), _index_rows(
+        [row for row in prior_rows if row["date"] in allowed], "derived",
+    )
+
+
+def _history_at_open(
+    sessions: list[str],
+    derived: dict[tuple[str, str], dict],
+    decision_date: str,
+    history_requirements: list[dict],
+) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, dict[str, float]]]:
+    """Resolve aligned ETF observations as of the open's information cutoff."""
+    valid_mode = "valid_observations"
+    consecutive_mode = "consecutive_sessions"
+    longest = {valid_mode: 0, consecutive_mode: 0}
+    for requirement in history_requirements:
+        count, mode = requirement["observations"], requirement["mode"]
+        if mode not in longest or type(count) is not int or count < 1:
+            raise ValueError("Each history requirement needs a valid mode and positive observations.")
+        longest[mode] = max(longest[mode], count)
+
+    cutoff = datetime.combine(
+        datetime.fromisoformat(decision_date).date(), time(9, 30), tzinfo=_CN_TZ,
+    )
+    panel: list[tuple[str, dict[str, float], list[str]]] = []
+    valid_indices: list[int] = []
+    for index in range(bisect_left(sessions, decision_date) - 1, -1, -1):
+        if len(panel) >= longest[consecutive_mode] and len(valid_indices) >= longest[valid_mode]:
+            break
+        day = sessions[index]
+        values = {}
+        missing = []
+        for symbol in ETF_SYMBOLS:
+            row = derived.get((day, symbol))
+            if row is None or not _valid_price(row.get("value")) or not _available_by(row, cutoff):
+                missing.append(symbol)
+            else:
+                values[symbol] = float(row["value"])
+        if not missing:
+            valid_indices.append(len(panel))
+        panel.append((day, values, sorted(missing)))
+
+    results = []
+    windows = {}
+    selected = {}
+    for requirement in history_requirements:
+        required = requirement["observations"]
+        mode = requirement["mode"]
+        if mode == consecutive_mode:
+            end = required
+        elif len(valid_indices) >= required:
+            end = valid_indices[required - 1] + 1
+        else:
+            end = len(panel)
+        valid = []
+        missing_sessions = []
+        for day, values, missing in reversed(panel[:end]):
+            if missing:
+                missing_sessions.append({"date": day, "missing_symbols": missing})
+            else:
+                valid.append(day)
+                selected[day] = values
+        windows[requirement["id"]] = valid
+        results.append({
+            "id": requirement["id"],
+            "mode": mode,
+            "required_observations": required,
+            "available_observations": len(valid),
+            "missing_sessions": missing_sessions,
+        })
+    ready = all(
+        item["available_observations"] == item["required_observations"] for item in results
+    )
+    return {"decision_date": decision_date, "ready": ready, "requirements": results}, windows, selected
+
+
+def _has_position(weights_or_shares: Mapping[str, float]) -> bool:
+    return any(weights_or_shares[symbol] > _EPSILON for symbol in ETF_SYMBOLS)
+
+
 def _position_evidence(
-    signals: list[dict[str, Any]], fills: list[dict[str, Any]], invested_sessions: int,
+    signals: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
+    invested_sessions: int,
+    *,
+    ready_cash: bool = False,
 ) -> dict[str, Any]:
-    positive = [
-        signal for signal in signals
-        if any(signal["target_weights"][symbol] > _EPSILON for symbol in ETF_SYMBOLS)
-    ]
+    positive = [signal for signal in signals if _has_position(signal["target_weights"])]
     if invested_sessions:
         state = "initial_position_established"
     elif positive:
         state = "initial_position_not_established"
-    elif signals:
+    elif signals or ready_cash:
         state = "intentional_cash"
     else:
         state = "no_position_signal"
@@ -379,6 +592,9 @@ def run_discovery_equal_weight(
     transaction_cost_bps: float,
     slippage_bps: float,
     execution_rule_version: str = NEXT_OPEN_RULES,
+    history_requirements: list[dict] | None = None,
+    scoring_start: str | None = None,
+    prior_history: tuple[list[str], list[dict]] | None = None,
 ) -> dict[str, Any]:
     """Run the fixed equal-weight buy-and-hold comparator."""
     submitted = False
@@ -402,6 +618,9 @@ def run_discovery_equal_weight(
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rule_version,
+        history_requirements=history_requirements,
+        scoring_start=scoring_start,
+        prior_history=prior_history,
     )
 
 
