@@ -121,6 +121,33 @@ ORDER_STATUSES = (
     "insufficient_shares",
 )
 FAILPOINTS = ("shadow_after_fills", "shadow_after_commit_before_report")
+SCOPE_PAUSE_SCOPES = ("feed", "execution", "ledger", "version")
+_FEED_BLOCK_CODES = frozenset(
+    {
+        "missing_close",
+        "missing_signal_input",
+        "missing_action_terms",
+        "signal_window_incomplete",
+        "open_evidence_missing",
+        "FEED_SCOPE_MISMATCH",
+        "FEED_CALENDAR_MISMATCH",
+        "CALENDAR_HORIZON_EXHAUSTED",
+        "AUTHORIZED_CALENDAR_MISMATCH",
+    }
+)
+_EXECUTION_BLOCK_CODES = frozenset(
+    {"missing_open", "strategy_error", "strategy_isolation_failed"}
+)
+_LEDGER_BLOCK_CODES = frozenset(
+    {
+        "FROZEN_INPUT_CHANGED",
+        "PROGRESS_CONFLICT",
+        "PROGRESS_MISMATCH",
+        "DAY_ALREADY_COMMITTED",
+        "LEDGER_INTEGRITY_FAILED",
+        "CORRECTION_BOOKING_MISMATCH",
+    }
+)
 
 _EPSILON = 1e-9
 _RELEASE_ID = re.compile(r"[0-9a-f]{64}")
@@ -506,6 +533,15 @@ CREATE TABLE IF NOT EXISTS schedule_notifications (
   observed_at TEXT NOT NULL,
   PRIMARY KEY (scope, release_id, date, code)
 );
+CREATE TABLE IF NOT EXISTS scope_pauses (
+  version_id TEXT NOT NULL,
+  session TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  PRIMARY KEY (version_id, session, scope, code)
+);
 """
 
 
@@ -548,6 +584,54 @@ class Ledger:
         row = self.connection.execute(
             "SELECT * FROM schedule_notifications "
             "WHERE scope = :scope AND release_id = :release_id AND date = :date AND code = :code",
+            notice,
+        ).fetchone()
+        return dict(row), inserted.rowcount == 1
+
+    def scope_pauses(self, version_id: str | None = None) -> list[dict[str, Any]]:
+        """Per-version scoped pauses written when a version blocked (T3)."""
+        if version_id is None:
+            rows = self.connection.execute(
+                "SELECT version_id, session, scope, code, message, recorded_at "
+                "FROM scope_pauses ORDER BY version_id, session, scope, code"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT version_id, session, scope, code, message, recorded_at "
+                "FROM scope_pauses WHERE version_id = ? "
+                "ORDER BY session, scope, code",
+                (version_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_scope_pause(
+        self,
+        version_id: str,
+        session: str,
+        scope: str,
+        code: str,
+        message: str,
+        recorded_at: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one scoped pause; repeated ticks with the same facts dedupe."""
+        notice = {
+            "version_id": version_id,
+            "session": session,
+            "scope": scope,
+            "code": code,
+            "message": message,
+            "recorded_at": recorded_at or _now(),
+        }
+        inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO scope_pauses "
+            "(version_id, session, scope, code, message, recorded_at) "
+            "VALUES (:version_id, :session, :scope, :code, :message, :recorded_at)",
+            notice,
+        )
+        row = self.connection.execute(
+            "SELECT version_id, session, scope, code, message, recorded_at "
+            "FROM scope_pauses WHERE version_id = :version_id AND session = :session "
+            "AND scope = :scope AND code = :code",
             notice,
         ).fetchone()
         return dict(row), inserted.rowcount == 1
@@ -755,11 +839,44 @@ class Ledger:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (version_id, session, _canonical(committed), _hash(committed), persisted_at, committed["status"]),
             )
+            # Scoped pauses stay as history; a pause is active only while its
+            # session is still uncommitted, so a later commit resolves it
+            # without rewriting the record (T3).
             self.connection.execute("COMMIT")
             return committed, persisted_at
         except BaseException:
             self._rollback()
             raise
+
+    def end_version(self, version_id: str, release_id: str) -> dict[str, Any] | None:
+        """Mark one tracking version's ledger progress ``ended`` (T3 retire).
+
+        The old committed days stay readable and unchanged.  A later tick that
+        selects the retired release sees the terminal progress row and never
+        commits another day, signal or order for it.
+        """
+        self._begin()
+        try:
+            row = self.connection.execute(
+                "SELECT 1 FROM progress WHERE version_id = ?", (version_id,)
+            ).fetchone()
+            if row is None:
+                self.connection.execute(
+                    "INSERT INTO progress "
+                    "(version_id, release_id, start_date, last_committed_date, state) "
+                    "VALUES (?, ?, NULL, NULL, 'ended')",
+                    (version_id, release_id),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE progress SET state = 'ended' WHERE version_id = ?",
+                    (version_id,),
+                )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self._rollback()
+            raise
+        return self.get_progress(version_id)
 
     # -- iteration -----------------------------------------------------
 
@@ -1108,6 +1225,191 @@ def write_report(
     }
 
 
+def _opportunity_evidence(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Join stored due opportunities to the execution day's terminal orders (T3).
+
+    An opportunity is persisted inside the signal day's atomic body.  Its
+    outcome is never written back into that committed day: the fill/unfilled
+    sets are joined here from the execution day's order rows.  ``due`` counts
+    every recorded intent, ``filled`` counts opportunities whose orders all
+    filled, ``unfilled`` counts opportunities with at least one terminal
+    non-fill, and ``intent_without_fill`` counts fully resolved opportunities
+    with no fill at all (the state that is distinct from ``metrics_not_ready``).
+    """
+    order_status: dict[str, str] = {}
+    for result in results:
+        for order in result.get("orders", ()):
+            order_status[order["order_id"]] = order["status"]
+    ordered = sorted(results, key=lambda result: result["date"])
+    records: list[dict[str, Any]] = []
+    for result in ordered:
+        for stored in result.get("opportunities", ()):
+            order_ids = list(stored.get("order_ids", ()))
+            filled = [
+                order_id
+                for order_id in order_ids
+                if order_status.get(order_id) == "filled"
+            ]
+            unfilled = [
+                order_id
+                for order_id in order_ids
+                if order_id in order_status and order_status[order_id] != "filled"
+            ]
+            unresolved = [
+                order_id for order_id in order_ids if order_id not in order_status
+            ]
+            records.append(
+                {
+                    "signal_date": stored["signal_date"],
+                    "execution_date": stored["execution_date"],
+                    "order_ids": order_ids,
+                    "due": bool(stored.get("due", True)),
+                    "filled": filled,
+                    "unfilled": unfilled,
+                    "unresolved": unresolved,
+                    "intent_without_fill": bool(
+                        order_ids and not filled and not unresolved and unfilled
+                    ),
+                }
+            )
+    due = sum(1 for record in records if record["due"])
+    filled_opportunities = sum(
+        1
+        for record in records
+        if record["due"] and record["filled"] and not record["unfilled"]
+        and not record["unresolved"]
+    )
+    unfilled_opportunities = sum(
+        1 for record in records if record["due"] and record["unfilled"]
+    )
+    intent_without_fill = sum(
+        1 for record in records if record["due"] and record["intent_without_fill"]
+    )
+    consecutive = current = 0
+    for record in records:
+        if record["intent_without_fill"]:
+            current += 1
+            consecutive = max(consecutive, current)
+        elif record["filled"] or record["unfilled"]:
+            current = 0
+    not_ready: list[dict[str, Any]] = []
+    seen_dates: set[str] = set()
+    for result in ordered:
+        for anomaly in result.get("anomalies", ()):
+            if anomaly.get("code") != "signal_window_incomplete":
+                continue
+            date = result["date"]
+            if date in seen_dates:
+                continue
+            seen_dates.add(date)
+            not_ready.append(
+                {
+                    "date": date,
+                    "required_sessions": anomaly.get("required_sessions"),
+                    "available_sessions": anomaly.get("available_sessions"),
+                }
+            )
+    first_signal = next(
+        (result["date"] for result in ordered if result.get("signal")), None
+    )
+    first_fill = next(
+        (result["date"] for result in ordered if result.get("fills")), None
+    )
+    navs = [
+        float(result["nav"])
+        for result in ordered
+        if isinstance(result.get("nav"), (int, float))
+    ]
+    return {
+        "due_opportunities": due,
+        "filled_opportunities": filled_opportunities,
+        "unfilled_opportunities": unfilled_opportunities,
+        "intent_without_fill": intent_without_fill,
+        "consecutive_intent_without_fill": consecutive,
+        "opportunities": records,
+        "metrics_not_ready": {"count": len(not_ready), "sessions": not_ready},
+        "first_signal_date": first_signal,
+        "first_fill_date": first_fill,
+        "max_abs_drawdown": abs(_max_drawdown(navs)) if len(navs) > 1 else 0.0,
+    }
+
+
+def evidence(ledger: str | Path, version_id: str) -> dict[str, Any]:
+    """Read-only Evidence Loop seam over one version's Shadow Live ledger (T3).
+
+    Returns committed-session facts, joined opportunity outcomes, the
+    metrics-not-ready sessions, the scoped pause history and its still-active
+    subset.  It never writes a day, never runs a version and never creates a
+    ledger: a version with no committed day reports zero counts instead of a
+    fabricated opportunity.
+    """
+    if not isinstance(version_id, str) or not _RELEASE_ID.fullmatch(version_id):
+        raise _reject(
+            "INVALID_RELEASE_ID",
+            "evidence",
+            "correct",
+            "Release IDs are 64-character lowercase hexadecimal content addresses.",
+        )
+    path = Path(ledger)
+    database_file = path / "shadow.sqlite"
+    if not database_file.is_file():
+        joined = _opportunity_evidence([])
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "version_id": version_id,
+            "committed_sessions": 0,
+            "committed_dates": [],
+            "first_committed_date": None,
+            "last_committed_date": None,
+            **joined,
+            "data_gap_sessions": 0,
+            "pauses": [],
+            "active_pauses": [],
+            "progress": None,
+        }
+    database = Ledger(path)
+    days = list(database.iter_days(version_id))
+    results = [day["result"] for day in days]
+    joined = _opportunity_evidence(results)
+    pauses = database.scope_pauses(version_id)
+    progress = database.get_progress(version_id)
+    last = progress.get("last_committed_date") if progress else None
+    active = [
+        pause
+        for pause in pauses
+        if not isinstance(last, str) or pause["session"] > last
+    ]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "version_id": version_id,
+        "committed_sessions": len(days),
+        "committed_dates": [day["date"] for day in days],
+        "first_committed_date": days[0]["date"] if days else None,
+        "last_committed_date": days[-1]["date"] if days else None,
+        **joined,
+        "data_gap_sessions": len(
+            {pause["session"] for pause in pauses if pause["scope"] == "feed"}
+        ),
+        "pauses": pauses,
+        "active_pauses": active,
+        "progress": progress,
+    }
+
+
+def mark_version_ended(
+    ledger: str | Path, version_id: str, release_id: str
+) -> dict[str, Any] | None:
+    """Terminal ledger marker for a retired manual-tracking version (T3)."""
+    if not isinstance(version_id, str) or not _RELEASE_ID.fullmatch(version_id):
+        raise _reject(
+            "INVALID_RELEASE_ID",
+            "evidence",
+            "correct",
+            "Release IDs are 64-character lowercase hexadecimal content addresses.",
+        )
+    return Ledger(ledger).end_version(version_id, release_id)
+
+
 def _report_summary(
     entries: list[dict[str, Any]], progress: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -1125,6 +1427,7 @@ def _report_summary(
         for entry in entries
         if entry["result"].get("cash_deficit")
     ]
+    opportunities = _opportunity_evidence([entry["result"] for entry in entries])
     return {
         "days": len(entries),
         "first_committed_date": entries[0]["date"] if entries else None,
@@ -1155,6 +1458,11 @@ def _report_summary(
             if order["status"] != "filled"
         ),
         "anomalies": sum(len(entry["result"]["anomalies"]) for entry in entries),
+        "due_opportunities": opportunities["due_opportunities"],
+        "filled_opportunities": opportunities["filled_opportunities"],
+        "unfilled_opportunities": opportunities["unfilled_opportunities"],
+        "intent_without_fill": opportunities["intent_without_fill"],
+        "metrics_not_ready": opportunities["metrics_not_ready"],
     }
 
 
@@ -1291,6 +1599,7 @@ def _comparison_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         for order in result["orders"]
         if order["status"] != "filled"
     ]
+    opportunities = _opportunity_evidence(results)
     return {
         "starting_nav": float(start_nav),
         "ending_nav": float(end_nav),
@@ -1309,6 +1618,59 @@ def _comparison_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "strategy_return": (
             (float(end_nav) - correction_impact) / float(start_nav) - 1.0
         ),
+        "due_opportunities": opportunities["due_opportunities"],
+        "filled_opportunities": opportunities["filled_opportunities"],
+        "unfilled_opportunities": opportunities["unfilled_opportunities"],
+        "intent_without_fill": opportunities["intent_without_fill"],
+    }
+
+
+def _full_history_entry(days: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Each requested version's own full committed history (T3, never the run)."""
+    dates = sorted(days)
+    results = [days[session]["result"] for session in dates]
+    opportunities = _opportunity_evidence(results)
+    navs = [
+        float(result["nav"])
+        for result in results
+        if isinstance(result.get("nav"), (int, float))
+    ]
+    first_nav = navs[0] if navs else None
+    ending_nav = navs[-1] if navs else None
+    correction_impact = math.fsum(
+        float(result.get("correction_impact", 0.0)) for result in results
+    )
+    return {
+        "sessions": len(dates),
+        "first_committed_date": dates[0] if dates else None,
+        "last_committed_date": dates[-1] if dates else None,
+        "starting_nav": first_nav,
+        "ending_nav": ending_nav,
+        "total_return": (
+            ending_nav / first_nav - 1.0
+            if ending_nav is not None and first_nav is not None and first_nav > 0
+            else None
+        ),
+        "strategy_return": (
+            (ending_nav - correction_impact) / first_nav - 1.0
+            if ending_nav is not None and first_nav is not None and first_nav > 0
+            else None
+        ),
+        "max_drawdown": _max_drawdown(navs) if len(navs) > 1 else 0.0,
+        "correction_impact": correction_impact,
+        "fees_paid": math.fsum(
+            float(result["fees"]["day"]) for result in results
+        ),
+        "unfilled_order_count": sum(
+            1
+            for result in results
+            for order in result["orders"]
+            if order["status"] != "filled"
+        ),
+        "due_opportunities": opportunities["due_opportunities"],
+        "filled_opportunities": opportunities["filled_opportunities"],
+        "unfilled_opportunities": opportunities["unfilled_opportunities"],
+        "intent_without_fill": opportunities["intent_without_fill"],
     }
 
 
@@ -1324,6 +1686,7 @@ def _coverage_entry(
             "first_committed_date": dates[0] if dates else None,
             "last_committed_date": dates[-1] if dates else None,
         },
+        "full_history": _full_history_entry(days),
     }
 
 
@@ -1499,6 +1862,63 @@ def _tracked_release_directories(
     return tracked
 
 
+def _block_scope(code: str) -> str:
+    """Classify a per-version block into a scoped pause (T3)."""
+    if code in _FEED_BLOCK_CODES:
+        return "feed"
+    if code in _EXECUTION_BLOCK_CODES:
+        return "execution"
+    if code in _LEDGER_BLOCK_CODES:
+        return "ledger"
+    return "version"
+
+
+def _first_uncommitted_session(
+    database: Ledger,
+    store: Path,
+    feed: Feed,
+    release_id: str,
+    target: str,
+) -> str:
+    """The session a scoped pause applies to: the version's first uncommitted one."""
+    progress = _progress_or_none(database, release_id)
+    last = progress.get("last_committed_date") if progress else None
+    if isinstance(last, str) and last:
+        if last in feed.index:
+            following = feed.next_session(last)
+            if following is not None and following <= target:
+                return following
+        return target
+    try:
+        for session in feed.sessions:
+            if session > target:
+                break
+            if release.state_at(store, release_id, session) == "enabled":
+                return session
+    except release.ReleaseRejection:
+        pass
+    return target
+
+
+def _record_scope_pause(
+    database: Ledger,
+    store: Path,
+    feed: Feed,
+    release_id: str,
+    target: str,
+    code: str,
+    message: str,
+) -> None:
+    """Persist the scoped pause for a blocked version; other versions continue."""
+    session = _first_uncommitted_session(database, store, feed, release_id, target)
+    try:
+        database.record_scope_pause(
+            release_id, session, _block_scope(code), code, message
+        )
+    except sqlite3.Error:  # pragma: no cover - a corrupt ledger never blocks the update
+        pass
+
+
 def _version_result(
     database: Ledger,
     store: Path,
@@ -1512,6 +1932,9 @@ def _version_result(
     except _Blocked as error:
         progress = _progress_or_none(database, release_id)
         last = progress["last_committed_date"] if progress else None
+        _record_scope_pause(
+            database, store, feed, release_id, target, error.code, error.reason
+        )
         return _version_entry(
             release_id,
             "blocked",
@@ -1525,6 +1948,15 @@ def _version_result(
     except ShadowRejection as error:
         progress = _progress_or_none(database, release_id)
         last = progress["last_committed_date"] if progress else None
+        _record_scope_pause(
+            database,
+            store,
+            feed,
+            release_id,
+            target,
+            error.details["code"],
+            error.details["message"],
+        )
         return _version_entry(
             release_id,
             "blocked",
@@ -1705,6 +2137,22 @@ def _run_version(
     release_id: str,
     corrections: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    progress = database.get_progress(release_id)
+    if progress is not None and progress.get("state") == "ended":
+        last = progress.get("last_committed_date")
+        return _version_entry(
+            release_id,
+            "ended",
+            target_date=target,
+            reason=(
+                "the manual simulated-tracking version was retired by an evidence "
+                "decision; its committed history is kept unchanged and no later "
+                "day, signal or order is generated"
+            ),
+            reason_code="VERSION_ENDED",
+            committed_date=last,
+            last_committed_date=last,
+        )
     try:
         fetched = release.fetch(store, release_id)
     except release.ReleaseRejection as error:
@@ -2912,6 +3360,26 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
                     fee_rate,
                     slippage_rate,
                 )
+                if not next_orders:
+                    # The target change required no order: record the reason in
+                    # the signal diagnostics instead of inventing an opportunity.
+                    signal["opportunity"] = {
+                        "due": False,
+                        "reason": "no_target_change",
+                    }
+
+    # One due opportunity per decision point whose target change produced
+    # orders.  The outcome is joined later from the execution day's orders, so a
+    # committed day is never rewritten.  A metrics-not-ready decision point has
+    # no signal at all and therefore never creates an opportunity.
+    opportunities: list[dict[str, Any]] = [
+        {
+            "signal_date": session,
+            "execution_date": next_session,
+            "order_ids": [order["order_id"] for order in next_orders],
+            "due": True,
+        }
+    ] if next_orders else []
 
     status = "committed"
     if anomalies or any(order["status"] != "filled" for order in orders):
@@ -2958,6 +3426,7 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
         "slippage": {"day": day_slippage, "total": slippage_total},
         "signal": signal,
         "next_orders": next_orders,
+        "opportunities": opportunities,
         **({"strategy_execution_evidence": invocations} if invocations else {}),
         "anomalies": anomalies,
         "corrections": corrections_applied,
