@@ -510,7 +510,10 @@ def _add_research_loop_workflow(
 
     revalidate = rounds.add_parser(
         "revalidate",
-        help="recompute lightweight Validation after an evidence source or platform fix",
+        help=(
+            "recompute lightweight Validation after a data correction, "
+            "evidence source or platform fix"
+        ),
     )
     revalidate.add_argument("--project", required=True, type=Path)
     revalidate.add_argument("--store", required=True, type=Path)
@@ -518,6 +521,10 @@ def _add_research_loop_workflow(
     revalidate.add_argument("--round-id", required=True)
     revalidate.add_argument("--version-id", required=True)
     revalidate.add_argument("--reason", required=True)
+    revalidate.add_argument(
+        "--evidence-snapshot-id",
+        help="corrected successor snapshot to recompute the Discovery evidence on",
+    )
 
     reviewed = rounds.add_parser(
         "review", help="record the human approve, return or end decision for one version"
@@ -1012,6 +1019,7 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 args.round_id,
                 args.version_id,
                 args.reason,
+                evidence_snapshot_id=args.evidence_snapshot_id,
             )
         elif args.round_action == "review":
             source = (

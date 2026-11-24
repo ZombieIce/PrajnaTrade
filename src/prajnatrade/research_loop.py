@@ -23,6 +23,13 @@ Contract resolutions that the shared design contract leaves implicit:
   ``validation_id`` does not cover it, so :func:`revalidate` binds it together
   with the current runtime and evidence source into the new identity and records
   the superseded receipt as historical evidence.
+* :func:`revalidate` accepts a sealed successor of the locked snapshot (explicitly
+  or as the store's only discoverable successor).  A corrected successor keeps
+  the strategy identity but changes the evidence source, so the candidate and
+  the benchmark are recomputed over the corrected Discovery partition and the
+  original Discovery result, the affected-session diff and the new receipt are
+  recorded together.  The verdict can only pass when the recomputed result still
+  meets the frozen protocol and the replay reproduces it.
 * Inputs that cannot be replayed at all (a different snapshot store, a drifted
   Campaign binding) are protocol rejections; evidence verdicts are
   ``passed`` / ``failed`` / ``insufficient_evidence`` and exit 0.
@@ -41,7 +48,7 @@ import os
 import sqlite3
 from collections.abc import Generator, Mapping
 from contextlib import closing, contextmanager
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -109,6 +116,10 @@ _RECEIPT_FIELDS = (
     "schema_version", "round_id", "version_id", "validation_id", "status", "outcome",
     "reason", "metrics", "checks", "observation", "replay", "receipt_hash",
     "opened_protected_source", "query_debited",
+)
+_OPTIONAL_RECEIPT_FIELDS = (
+    "evidence", "original_discovery", "recomputed_discovery", "affected",
+    "prior_validation_id",
 )
 
 _SCHEMA = """
@@ -837,34 +848,29 @@ def _experiment_result(
     return experiment
 
 
-def _replay(
-    project: Path,
+def _evidence_runs(
     snapshot_store: Path,
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
     campaign: Mapping[str, Any],
-    evidence: Mapping[str, Any] | None = None,
+    source: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Run the locked candidate and the benchmark over one Discovery source."""
     kickoff = record["kickoff"]
     frozen = kickoff["scoring_policy"]["frozen"]
     locked = submission["locked"]
     evaluation = campaign["evaluation"]
-    source = evidence if evidence is not None else {
-        "snapshot_id": evaluation["snapshot_id"],
-        "partition_content_hash": evaluation["partition_content_hash"],
-        "data_kind": evaluation["data_kind"],
-    }
+    cutoff = source["as_of"] if "as_of" in source else evaluation.get("as_of")
     receipt = snapshot.read_discovery(
-        Path(snapshot_store),
-        source["snapshot_id"],
-        "discovery",
-        evaluation.get("as_of"),
+        Path(snapshot_store), source["snapshot_id"], "discovery", cutoff
     )
     if receipt["data_kind"] != source["data_kind"]:
         raise ValueError("The snapshot store data kind differs from the Campaign.")
     partition_hash = receipt.get("partition_content_hash", receipt["content_hash"])
     if partition_hash != source["partition_content_hash"]:
         raise ValueError("The snapshot store Discovery content differs from the Campaign.")
+    if "snapshot_hash" in source and receipt["content_hash"] != source["snapshot_hash"]:
+        raise ValueError("The snapshot Discovery view changed at the frozen cutoff.")
     if receipt.get("prior_history_hash") != frozen.get("prior_history_hash"):
         raise ValueError("The snapshot store prior history differs from the Campaign.")
     data = receipt["data"]
@@ -909,17 +915,12 @@ def _replay(
         history_requirements=[],
         scoring_start=scoring_start,
     )
-    experiment = _experiment_result(
-        project, record["campaign_id"], submission["experiment_id"]
-    )
-    original = experiment["discovery"]
     return {
         "candidate": candidate,
         "benchmark": benchmark,
-        "original_candidate": original,
-        "original_benchmark": original["baseline_comparison"]["baseline"],
         "expected_sessions": expected,
         "scoring_start": scoring_start,
+        "data": data,
         "snapshot": {
             "verified": True,
             "snapshot_id": source["snapshot_id"],
@@ -927,7 +928,34 @@ def _replay(
             "prior_history_hash": receipt.get("prior_history_hash"),
             "scope": source["data_kind"],
             "data_kind": source["data_kind"],
+            "as_of": cutoff,
         },
+    }
+
+
+def _replay(
+    project: Path,
+    snapshot_store: Path,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    evaluation = campaign["evaluation"]
+    source = evidence if evidence is not None else {
+        "snapshot_id": evaluation["snapshot_id"],
+        "partition_content_hash": evaluation["partition_content_hash"],
+        "data_kind": evaluation["data_kind"],
+    }
+    runs = _evidence_runs(snapshot_store, record, submission, campaign, source)
+    experiment = _experiment_result(
+        project, record["campaign_id"], submission["experiment_id"]
+    )
+    original = experiment["discovery"]
+    return {
+        **runs,
+        "original_candidate": original,
+        "original_benchmark": original["baseline_comparison"]["baseline"],
     }
 
 
@@ -1053,11 +1081,16 @@ def _hard_condition(
     return {**condition, "observed": observed, "status": status}
 
 
-def _replay_comparison(replay: Mapping[str, Any]) -> dict[str, Any]:
+def _replay_comparison(
+    replay: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    *,
+    reference_name: str,
+) -> dict[str, Any]:
     mismatches: list[str] = []
     for label, run, original in (
-        ("candidate", replay["candidate"], replay["original_candidate"]),
-        ("benchmark", replay["benchmark"], replay["original_benchmark"]),
+        ("candidate", replay["candidate"], reference["candidate"]),
+        ("benchmark", replay["benchmark"], reference["benchmark"]),
     ):
         if run["start_date"] != original["start_date"]:
             mismatches.append(f"{label}.start_date")
@@ -1073,10 +1106,164 @@ def _replay_comparison(replay: Mapping[str, Any]) -> dict[str, Any]:
             mismatches.append(f"{label}.ending_equity")
     return {
         "tolerance": METRIC_TOLERANCE,
+        "reference": reference_name,
         "matches_discovery": not mismatches,
         "mismatches": mismatches,
         "candidate": _run_summary(replay["candidate"], first_decision=True),
         "benchmark": _run_summary(replay["benchmark"]),
+    }
+
+
+def _run_record(run: Mapping[str, Any]) -> dict[str, Any]:
+    """One recomputed/archival Discovery run with its metrics, fills and ending cash."""
+    metrics = _metrics(run)
+    curve = run["equity_curve"]
+    return {
+        "start_date": run["start_date"],
+        "end_date": run["end_date"],
+        "sessions": metrics["sessions"],
+        "valued_sessions": metrics["valued_sessions"],
+        "fills": list(run["fills"]),
+        "fill_count": metrics["fills"],
+        "ending_equity": metrics["ending_equity"],
+        "ending_cash": curve[-1]["cash"] if curve else None,
+        "fees_paid": metrics["fees_paid"],
+        "slippage_paid": metrics["slippage_paid"],
+        "orders_filled": metrics["orders_filled"],
+        "orders_unfilled": metrics["orders_unfilled"],
+        "signal_gaps": metrics["signal_gaps"],
+        "valuation_gaps": metrics["valuation_gaps"],
+        "metrics": metrics,
+    }
+
+
+def _discovery_record(
+    snapshot_id: str,
+    partition_content_hash: str,
+    as_of: str | None,
+    scoring_start: str,
+    runs: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Content-addressed record of one candidate+benchmark Discovery result."""
+    body = {
+        "snapshot_id": snapshot_id,
+        "partition_content_hash": partition_content_hash,
+        "as_of": as_of,
+        "scoring_start": scoring_start,
+        "candidate": _run_record(runs["candidate"]),
+        "benchmark": _run_record(runs["benchmark"]),
+    }
+    body["content_hash"] = _hash(body)
+    return body
+
+
+def _row_key(kind: str, row: Mapping[str, Any]) -> tuple[Any, ...]:
+    if kind == "calendar":
+        return (row["date"],)
+    if kind == "corporate_actions":
+        return (row["date"], row.get("symbol"), row.get("type"))
+    return (row["date"], row.get("symbol"))
+
+
+def _changed_sessions(
+    original_rows: list[dict], corrected_rows: list[dict], *,
+    kind: str,
+) -> list[str]:
+    """Sessions whose row content differs between the two Discovery payloads."""
+    original = {_row_key(kind, row): row for row in original_rows}
+    corrected = {_row_key(kind, row): row for row in corrected_rows}
+    return [
+        key[0]
+        for key in original.keys() | corrected.keys()
+        if _json(original.get(key)) != _json(corrected.get(key))
+    ]
+
+
+def _fill_sessions(fills: list[dict]) -> dict[tuple[str, str, str], list[dict]]:
+    grouped: dict[tuple[str, str, str], list[dict]] = {}
+    for fill in fills:
+        grouped.setdefault((fill["date"], fill["symbol"], fill["side"]), []).append(fill)
+    return grouped
+
+
+def _changed_fill_sessions(
+    original_fills: list[dict], corrected_fills: list[dict],
+) -> list[str]:
+    original = _fill_sessions(original_fills)
+    corrected = _fill_sessions(corrected_fills)
+    changed = set()
+    for key in original.keys() | corrected.keys():
+        if not _fills_match(original.get(key, []), corrected.get(key, [])):
+            changed.add(key[0])
+    return sorted(changed)
+
+
+def _affected(
+    original: Mapping[str, Any],
+    recomputed: Mapping[str, Any],
+    original_data: Mapping[str, Any],
+    corrected_data: Mapping[str, Any],
+    scoring_sessions: list[str],
+) -> dict[str, Any]:
+    """Summarize where the corrected Discovery evidence moves the scored result."""
+    changed_rows: dict[str, int] = {}
+    changed_sessions: set[str] = set()
+    for kind in ("calendar", "raw_bars", "corporate_actions", "derived"):
+        changed = _changed_sessions(
+            list(original_data.get(kind, [])), list(corrected_data.get(kind, [])), kind=kind
+        )
+        changed_rows[kind] = len(changed)
+        changed_sessions.update(changed)
+    original_nav = {
+        point["date"]: point["nav"] for point in original["candidate"]["equity_curve"]
+    }
+    corrected_nav = {
+        point["date"]: point["nav"] for point in recomputed["candidate"]["equity_curve"]
+    }
+    changed_nav_sessions = [
+        day for day in scoring_sessions
+        if not _within(original_nav.get(day), corrected_nav.get(day))
+    ]
+    changed_fill_sessions = _changed_fill_sessions(
+        original["candidate"]["fills"], recomputed["candidate"]["fills"]
+    )
+    original_ending = original["candidate"]["metrics"]["ending_equity"]
+    corrected_ending = recomputed["candidate"]["metrics"]["ending_equity"]
+    changed = sum(changed_rows.values())
+    summary = ", ".join(
+        f"{count} {kind}" for kind, count in changed_rows.items() if count
+    ) or "no rows"
+    fills = "unchanged" if not changed_fill_sessions else (
+        f"changed on {', '.join(changed_fill_sessions)}"
+    )
+    return {
+        "changed_rows": changed_rows,
+        "changed_sessions": sorted(changed_sessions),
+        "changed_nav_sessions": changed_nav_sessions,
+        "changed_fill_sessions": changed_fill_sessions,
+        "fills": {
+            "original": original["candidate"]["metrics"]["fills"],
+            "recomputed": recomputed["candidate"]["metrics"]["fills"],
+        },
+        "nav_sessions": {
+            "original": len(original["candidate"]["equity_curve"]),
+            "recomputed": len(recomputed["candidate"]["equity_curve"]),
+        },
+        "ending_equity": {
+            "original": original_ending,
+            "recomputed": corrected_ending,
+            "delta": (
+                corrected_ending - original_ending
+                if corrected_ending is not None and original_ending is not None
+                else None
+            ),
+        },
+        "reason": (
+            f"corrected Discovery evidence changed {changed} rows ({summary}) across "
+            f"{len(changed_sessions)} sessions; NAV changed on "
+            f"{len(changed_nav_sessions)} of {len(scoring_sessions)} scored sessions; "
+            f"fills {fills}"
+        ),
     }
 
 
@@ -1088,18 +1275,32 @@ def _receipt(
     attempts: int,
     resumed: bool,
     replay: Mapping[str, Any],
+    recomputed: Mapping[str, Any] | None = None,
+    corrected: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     kickoff = record["kickoff"]
     expected = replay["expected_sessions"]
     scoring_start = replay["scoring_start"]
     expected_end = expected[-1] if expected else None
-    candidate = replay["candidate"]
-    benchmark = replay["benchmark"]
+    evidence_run = recomputed if recomputed is not None else replay
+    candidate = evidence_run["candidate"]
+    benchmark = evidence_run["benchmark"]
     candidate_metrics = _metrics(candidate)
     benchmark_metrics = _metrics(benchmark)
-    original_candidate = replay["original_candidate"]["metrics"]
-    original_benchmark = replay["original_benchmark"]["metrics"]
-    comparison = _replay_comparison(replay)
+    if recomputed is not None:
+        reference = recomputed
+        reference_name = "recomputed_discovery"
+    else:
+        reference = {
+            "candidate": replay["original_candidate"],
+            "benchmark": replay["original_benchmark"],
+        }
+        reference_name = "original_discovery"
+    reference_candidate = reference["candidate"]["metrics"]
+    reference_benchmark = reference["benchmark"]["metrics"]
+    comparison = _replay_comparison(
+        replay, reference, reference_name=reference_name
+    )
 
     def covered(run: Mapping[str, Any]) -> bool:
         return (
@@ -1177,24 +1378,24 @@ def _receipt(
             _within(run_metrics["fees_paid"], original_metrics["fees_paid"])
             and _within(run_metrics["slippage_paid"], original_metrics["slippage_paid"])
             for run_metrics, original_metrics in (
-                (candidate_metrics, original_candidate),
-                (benchmark_metrics, original_benchmark),
+                (candidate_metrics, reference_candidate),
+                (benchmark_metrics, reference_benchmark),
             )
         ),
         "candidate": {
             "fees_paid": candidate_metrics["fees_paid"],
             "slippage_paid": candidate_metrics["slippage_paid"],
             "discovery": {
-                "fees_paid": original_candidate["fees_paid"],
-                "slippage_paid": original_candidate["slippage_paid"],
+                "fees_paid": reference_candidate["fees_paid"],
+                "slippage_paid": reference_candidate["slippage_paid"],
             },
         },
         "benchmark": {
             "fees_paid": benchmark_metrics["fees_paid"],
             "slippage_paid": benchmark_metrics["slippage_paid"],
             "discovery": {
-                "fees_paid": original_benchmark["fees_paid"],
-                "slippage_paid": original_benchmark["slippage_paid"],
+                "fees_paid": reference_benchmark["fees_paid"],
+                "slippage_paid": reference_benchmark["slippage_paid"],
             },
         },
     }
@@ -1236,6 +1437,8 @@ def _receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    if corrected is not None:
+        receipt.update(dict(corrected))
     receipt["receipt_hash"] = _hash(receipt)
     return receipt
 
@@ -1268,7 +1471,11 @@ def _validation_path(store: Path, validation_id: str) -> Path:
 
 
 def _published(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    return {field: receipt[field] for field in _RECEIPT_FIELDS}
+    published = {field: receipt[field] for field in _RECEIPT_FIELDS}
+    published.update(
+        {field: receipt[field] for field in _OPTIONAL_RECEIPT_FIELDS if field in receipt}
+    )
+    return published
 
 
 def _atomic_write(path: Path, value: object) -> None:
@@ -1437,6 +1644,18 @@ def validate(
                 )
             campaign = campaign_discovery(project, record["campaign_id"])
             _require_campaign_binding(record, campaign)
+            superseded = connection.execute(
+                "SELECT revalidation_id FROM research_loop_revalidations "
+                "WHERE version_id = ? ORDER BY rowid DESC LIMIT 1",
+                (version_id,),
+            ).fetchone()
+            if superseded is not None:
+                raise ProtocolError(
+                    "REVALIDATION_SUPERSEDED", "validation", "inspect",
+                    "This version already has revalidated evidence; re-run round "
+                    "revalidate on the current evidence source instead of replaying "
+                    "the superseded locked snapshot.",
+                )
             validation_id = _validation_identity(record, submission, campaign)
             terminal = connection.execute(
                 "SELECT receipt_json FROM research_loop_validations WHERE validation_id = ?",
@@ -2208,6 +2427,53 @@ def review(
 # ---------------------------------------------------------------------------
 
 
+def _sealed_manifests(root: Path) -> list[dict[str, Any]]:
+    """Every readable sealed manifest in a trusted snapshot store (metadata only)."""
+    manifests: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return manifests
+    for path in sorted(root.iterdir()):
+        name = path.name
+        if (
+            not path.is_dir()
+            or len(name) != 64
+            or any(char not in "0123456789abcdef" for char in name)
+        ):
+            continue
+        try:
+            manifests.append(snapshot.manifest(root, name))
+        except (OSError, ValueError):
+            continue
+    return manifests
+
+
+def _discovery_cutoff(
+    snapshot_store: Path,
+    snapshot_id: str,
+    descriptor: Mapping[str, Any],
+) -> str:
+    """The latest point-in-time cutoff that still reproduces the sealed view.
+
+    The corrected successor's own manifest records when each correction became
+    official; using the latest of those instants (and the last Discovery
+    session) applies every available revision without admitting data that was
+    not yet published.
+    """
+    cutoff = datetime.combine(
+        date.fromisoformat(descriptor["end"]),
+        time(23, 59, 59, 999999),
+        tzinfo=SHANGHAI,
+    )
+    for identifier in snapshot.lineage_ids(Path(snapshot_store), snapshot_id):
+        metadata = snapshot.manifest(Path(snapshot_store), identifier)
+        revision = metadata.get("discovery_dividend")
+        if isinstance(revision, dict) and isinstance(
+            revision.get("official_available_at"), str
+        ):
+            cutoff = max(cutoff, datetime.fromisoformat(revision["official_available_at"]))
+    return cutoff.isoformat()
+
+
 def _discovery_evidence(
     snapshot_store: Path,
     campaign: Mapping[str, Any],
@@ -2234,6 +2500,8 @@ def _discovery_evidence(
         ):
             continue
         try:
+            metadata = snapshot.manifest(root, name)
+            descriptor = snapshot.partition_descriptor(metadata, "discovery")
             receipt = snapshot.read_discovery(
                 root, name, "discovery", evaluation.get("as_of")
             )
@@ -2249,10 +2517,22 @@ def _discovery_evidence(
         if receipt.get("prior_history_hash") != frozen.get("prior_history_hash"):
             continue
         matches[name] = {
+            "verified": True,
+            "successor": False,
             "snapshot_id": name,
-            "data_kind": receipt["data_kind"],
             "snapshot_hash": receipt["content_hash"],
             "partition_content_hash": evaluation["partition_content_hash"],
+            "lineage": [name],
+            "schema_version": metadata["schema_version"],
+            "data_kind": receipt["data_kind"],
+            "prior_history_hash": receipt.get("prior_history_hash"),
+            "as_of": evaluation.get("as_of"),
+            "partition": {
+                "start": descriptor["start"],
+                "end": descriptor["end"],
+                "sessions": descriptor["sessions"],
+            },
+            "discovery_changed": False,
         }
     if not matches:
         raise ProtocolError(
@@ -2274,6 +2554,184 @@ def _discovery_evidence(
     )
 
 
+def _successor_evidence(
+    snapshot_store: Path,
+    campaign: Mapping[str, Any],
+    record: Mapping[str, Any],
+    locked_snapshot_id: str,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    """Verify one named successor snapshot and return its corrected evidence."""
+    evaluation = campaign["evaluation"]
+    frozen = record["kickoff"]["scoring_policy"]["frozen"]
+    root = Path(snapshot_store)
+    if (
+        not isinstance(snapshot_id, str)
+        or len(snapshot_id) != 64
+        or any(char not in "0123456789abcdef" for char in snapshot_id)
+    ):
+        raise ProtocolError(
+            "EVIDENCE_SNAPSHOT_NOT_FOUND", "revalidation", "check_id",
+            "The corrected evidence snapshot ID must be 64 lowercase hex characters.",
+        )
+    try:
+        metadata = snapshot.manifest(root, snapshot_id)
+        lineage = snapshot.lineage_ids(root, snapshot_id)
+    except (OSError, ValueError) as error:
+        raise ProtocolError(
+            "EVIDENCE_SNAPSHOT_NOT_FOUND", "revalidation", "check_id",
+            "The corrected evidence snapshot is not sealed in the supplied store.",
+        ) from error
+    if locked_snapshot_id not in lineage[1:]:
+        raise ProtocolError(
+            "EVIDENCE_NOT_SUCCESSOR", "revalidation", "check_id",
+            "The corrected evidence snapshot is not a successor of the locked snapshot.",
+        )
+    try:
+        previous = snapshot.manifest(root, locked_snapshot_id)
+        descriptor = snapshot.partition_descriptor(metadata, "discovery")
+        original_descriptor = snapshot.partition_descriptor(previous, "discovery")
+    except (OSError, ValueError) as error:
+        raise ProtocolError(
+            "EVIDENCE_SNAPSHOT_NOT_FOUND", "revalidation", "inspect",
+            "The corrected evidence snapshot manifest is incomplete.",
+        ) from error
+    if (
+        metadata["data_kind"] != evaluation["data_kind"]
+        or metadata["data_kind"] != previous["data_kind"]
+        or metadata["schema_version"] != previous["schema_version"]
+    ):
+        raise ProtocolError(
+            "EVIDENCE_DATA_KIND_MISMATCH", "revalidation", "inspect",
+            "The corrected evidence snapshot does not keep the frozen data kind "
+            "and schema version.",
+        )
+    interval = (descriptor["start"], descriptor["end"], descriptor["sessions"])
+    frozen_interval = (
+        original_descriptor["start"],
+        original_descriptor["end"],
+        original_descriptor["sessions"],
+    )
+    if interval != frozen_interval:
+        raise ProtocolError(
+            "EVIDENCE_INTERVAL_MISMATCH", "revalidation", "inspect",
+            "The corrected evidence snapshot changed the frozen Discovery interval.",
+        )
+    try:
+        cutoff = evaluation.get("as_of") or _discovery_cutoff(
+            root, snapshot_id, descriptor
+        )
+        receipt = snapshot.read_discovery(root, snapshot_id, "discovery", cutoff)
+    except (OSError, ValueError) as error:
+        raise ProtocolError(
+            "EVIDENCE_INTEGRITY_VIOLATION", "revalidation", "inspect",
+            "The corrected evidence snapshot failed its sealed manifest or "
+            "partition integrity check.",
+        ) from error
+    if (
+        receipt.get("partition_content_hash") != descriptor["content_hash"]
+        or receipt["content_hash"] != descriptor["content_hash"]
+    ):
+        raise ProtocolError(
+            "EVIDENCE_AS_OF_VIOLATION", "revalidation", "inspect",
+            "The corrected evidence payload only became available after the "
+            "point-in-time cutoff, so the sealed Discovery partition cannot be "
+            "recomputed honestly.",
+        )
+    if receipt["data_kind"] != evaluation["data_kind"]:
+        raise ProtocolError(
+            "EVIDENCE_DATA_KIND_MISMATCH", "revalidation", "inspect",
+            "The corrected evidence snapshot data kind differs from the Campaign.",
+        )
+    if receipt.get("prior_history_hash") != frozen.get("prior_history_hash"):
+        raise ProtocolError(
+            "EVIDENCE_PRIOR_HISTORY_MISMATCH", "revalidation", "inspect",
+            "The corrected evidence snapshot changed the frozen Discovery prior history.",
+        )
+    sessions = sorted({row["date"] for row in receipt["data"]["calendar"]})
+    if frozen["scoring_start"] not in sessions:
+        raise ProtocolError(
+            "EVIDENCE_INTERVAL_MISMATCH", "revalidation", "inspect",
+            "The frozen scoring start is not a trading session in the corrected evidence.",
+        )
+    return {
+        "verified": True,
+        "successor": True,
+        "snapshot_id": snapshot_id,
+        "snapshot_hash": receipt["content_hash"],
+        "partition_content_hash": descriptor["content_hash"],
+        "lineage": list(lineage),
+        "schema_version": metadata["schema_version"],
+        "data_kind": receipt["data_kind"],
+        "prior_history_hash": receipt.get("prior_history_hash"),
+        "as_of": cutoff,
+        "partition": {
+            "start": descriptor["start"],
+            "end": descriptor["end"],
+            "sessions": descriptor["sessions"],
+        },
+        "discovery_changed": (
+            descriptor["content_hash"] != evaluation["partition_content_hash"]
+        ),
+    }
+
+
+def _successor_candidates(
+    snapshot_store: Path,
+    campaign: Mapping[str, Any],
+    record: Mapping[str, Any],
+    locked_snapshot_id: str,
+) -> list[dict[str, Any]]:
+    """Every valid sealed successor of the locked snapshot in one store."""
+    root = Path(snapshot_store)
+    candidates: list[dict[str, Any]] = []
+    for metadata in _sealed_manifests(root):
+        snapshot_id = metadata["snapshot_id"]
+        if snapshot_id == locked_snapshot_id or not isinstance(
+            metadata.get("lineage"), dict
+        ):
+            continue
+        try:
+            lineage = snapshot.lineage_ids(root, snapshot_id)
+        except (OSError, ValueError):
+            continue
+        if locked_snapshot_id not in lineage[1:]:
+            continue
+        try:
+            candidates.append(
+                _successor_evidence(
+                    snapshot_store, campaign, record, locked_snapshot_id, snapshot_id
+                )
+            )
+        except ProtocolError:
+            continue
+    return candidates
+
+
+def _corrected_evidence(
+    snapshot_store: Path,
+    campaign: Mapping[str, Any],
+    record: Mapping[str, Any],
+    locked_snapshot_id: str,
+    evidence_snapshot_id: str | None,
+) -> dict[str, Any] | None:
+    """Resolve the corrected successor evidence; None means the platform-fix path."""
+    if evidence_snapshot_id is not None:
+        return _successor_evidence(
+            snapshot_store, campaign, record, locked_snapshot_id, evidence_snapshot_id
+        )
+    candidates = _successor_candidates(
+        snapshot_store, campaign, record, locked_snapshot_id
+    )
+    if len(candidates) > 1:
+        raise ProtocolError(
+            "EVIDENCE_SNAPSHOT_AMBIGUOUS", "revalidation", "check_id",
+            "The snapshot store holds more than one successor of the locked "
+            "snapshot; pass --evidence-snapshot-id to select the corrected evidence.",
+        )
+    return candidates[0] if candidates else None
+
+
 def _revalidation_identity(
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
@@ -2288,6 +2746,7 @@ def _revalidation_identity(
             "scoring_policy_hash": _scoring_policy_hash(record["kickoff"]),
             "evidence_snapshot_id": evidence["snapshot_id"],
             "snapshot_hash": evidence["snapshot_hash"],
+            "evidence_as_of": evidence.get("as_of"),
             "protocol_hash": submission["locked"]["protocol_hash"],
             "engine_runtime_identity": _current_runtime(campaign),
             "replay_engine_identity": replay_engine_identity(),
@@ -2327,6 +2786,9 @@ def _revalidation_body(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    for field in ("original_discovery", "recomputed_discovery", "affected"):
+        if field in receipt:
+            body[field] = receipt[field]
     result = {
         "schema_version": SCHEMA_VERSION,
         "status": "revalidated",
@@ -2343,6 +2805,9 @@ def _revalidation_body(
         "reason": receipt["reason"],
         "evidence": dict(evidence),
     }
+    for field in ("original_discovery", "recomputed_discovery", "affected"):
+        if field in receipt:
+            result[field] = receipt[field]
     body["result"] = result
     body["revalidation_id"] = _hash(body)
     return body
@@ -2355,8 +2820,15 @@ def revalidate(
     round_id: str,
     version_id: str,
     reason: str,
+    evidence_snapshot_id: str | None = None,
 ) -> dict[str, Any]:
-    """Recompute lightweight Validation after the evidence source or platform changed."""
+    """Recompute lightweight Validation after the evidence source or platform changed.
+
+    With ``evidence_snapshot_id`` (or exactly one discoverable successor) the
+    corrected Discovery values are recomputed and recorded as new evidence; the
+    locked strategy identity and every earlier receipt stay untouched.  Without
+    a successor the platform-fix path reproduces the frozen partition.
+    """
     from prajnatrade.protected_eval import evaluation_store, write_trusted_record_once
 
     reason = _text(reason, "reason")
@@ -2406,11 +2878,21 @@ def revalidate(
                 trusted, row["validation_id"], row["receipt_json"]
             )
             campaign = campaign_discovery(project, record["campaign_id"])
-            evidence = _discovery_evidence(
+            locked_snapshot_id = submission["locked"]["snapshot_id"]
+            corrected_evidence = _corrected_evidence(
                 snapshot_store,
                 campaign,
                 record,
-                submission["locked"]["snapshot_id"],
+                locked_snapshot_id,
+                evidence_snapshot_id,
+            )
+            corrected = corrected_evidence is not None
+            evidence = (
+                corrected_evidence
+                if corrected
+                else _discovery_evidence(
+                    snapshot_store, campaign, record, locked_snapshot_id
+                )
             )
             runtime = _current_runtime(campaign)
             evidence["previous_snapshot_id"] = submission["locked"]["snapshot_id"]
@@ -2475,6 +2957,8 @@ def revalidate(
                             "revalidation": True,
                             "prior_validation_id": prior["validation_id"],
                             "reason": reason,
+                            "evidence_snapshot_id": evidence["snapshot_id"],
+                            "corrected_evidence": corrected,
                             "replay_engine_identity": evidence["replay_engine_identity"],
                             "started_at": _now(),
                         }
@@ -2486,17 +2970,72 @@ def revalidate(
             trusted, attempt_context[0], record, submission, attempt_context[1]
         )
         _failpoint(VALIDATION_FAILPOINT)
-        replay = _replay(
-            project, snapshot_store, record, submission, campaign, evidence
-        )
-        receipt = _receipt(
-            record,
-            submission,
-            validation_id=attempt_context[0],
-            attempts=attempt_context[1],
-            resumed=resumed,
-            replay=replay,
-        )
+        if corrected:
+            recomputed = _evidence_runs(
+                snapshot_store, record, submission, campaign, evidence
+            )
+            replay = _evidence_runs(
+                snapshot_store, record, submission, campaign, evidence
+            )
+            original = _experiment_result(
+                project, record["campaign_id"], submission["experiment_id"]
+            )["discovery"]
+            original_runs = {
+                "candidate": original,
+                "benchmark": original["baseline_comparison"]["baseline"],
+            }
+            original_view = snapshot.read_discovery(
+                Path(snapshot_store),
+                evidence["previous_snapshot_id"],
+                "discovery",
+                campaign["evaluation"].get("as_of"),
+            )
+            receipt = _receipt(
+                record,
+                submission,
+                validation_id=attempt_context[0],
+                attempts=attempt_context[1],
+                resumed=resumed,
+                replay=replay,
+                recomputed=recomputed,
+                corrected={
+                    "evidence": dict(evidence),
+                    "prior_validation_id": prior["validation_id"],
+                    "original_discovery": _discovery_record(
+                        evidence["previous_snapshot_id"],
+                        record["kickoff"]["frozen_campaign"]["partition_content_hash"],
+                        campaign["evaluation"].get("as_of"),
+                        replay["scoring_start"],
+                        original_runs,
+                    ),
+                    "recomputed_discovery": _discovery_record(
+                        evidence["snapshot_id"],
+                        evidence["partition_content_hash"],
+                        evidence["as_of"],
+                        replay["scoring_start"],
+                        recomputed,
+                    ),
+                    "affected": _affected(
+                        original_runs,
+                        recomputed,
+                        original_view["data"],
+                        recomputed["data"],
+                        replay["expected_sessions"],
+                    ),
+                },
+            )
+        else:
+            replay = _replay(
+                project, snapshot_store, record, submission, campaign, evidence
+            )
+            receipt = _receipt(
+                record,
+                submission,
+                validation_id=attempt_context[0],
+                attempts=attempt_context[1],
+                resumed=resumed,
+                replay=replay,
+            )
         _write_terminal_receipt(trusted, attempt_context[0], receipt)
         body = _revalidation_body(
             record,
@@ -2605,6 +3144,36 @@ def _validation_summary(
         if revalidated is not None:
             summary["revalidation_id"] = revalidated["revalidation_id"]
             summary["revalidated_from"] = revalidated["prior_validation_id"]
+        for field in (
+            "evidence", "original_discovery", "recomputed_discovery", "affected",
+        ):
+            if field in receipt:
+                summary[field] = receipt[field]
+        history: list[dict[str, Any]] = []
+        for row in connection.execute(
+            "SELECT revalidation_json FROM research_loop_revalidations "
+            "WHERE version_id = ? ORDER BY rowid",
+            (version_id,),
+        ):
+            body = _verify_revalidation(json.loads(row["revalidation_json"]))
+            prior_receipt = body["prior_receipt"]
+            if not history or history[-1]["validation_id"] != prior_receipt["validation_id"]:
+                history.append(
+                    {
+                        "validation_id": prior_receipt["validation_id"],
+                        "outcome": prior_receipt["outcome"],
+                        "receipt_hash": prior_receipt["receipt_hash"],
+                    }
+                )
+        if history:
+            history.append(
+                {
+                    "validation_id": terminal["validation_id"],
+                    "outcome": receipt["outcome"],
+                    "receipt_hash": receipt["receipt_hash"],
+                }
+            )
+            summary["history"] = history
         return summary
     running: dict[str, Any] | None = None
     for row in connection.execute(
