@@ -22,12 +22,12 @@ from prajnatrade.container_executor import (
     executor_from_config,
 )
 from prajnatrade.snapshot import (
-    KINDS,
-    partition_slice,
-    read_discovery,
+    discovery_split as snapshot_discovery_split,
 )
 from prajnatrade.snapshot import (
-    discovery_split as snapshot_discovery_split,
+    partition_slice,
+    read_discovery,
+    slice_content,
 )
 from prajnatrade.snapshot_baseline import (
     EXECUTION_RULE_VERSIONS,
@@ -195,6 +195,12 @@ def _campaign_evaluation(
     runtime_dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
     return {
         "engine": "sealed-discovery-v1",
+        # The opt-in 70/30 protocol is the one new research Campaigns must use;
+        # the field is additive so readers of legacy stored Campaigns use
+        # ``.get("research_protocol", "discovery-replay")``.
+        "research_protocol": (
+            "trailing-70-30" if discovery_split is not None else "discovery-replay"
+        ),
         "snapshot_id": snapshot_id,
         "partition_content_hash": partition_content_hash,
         "as_of": as_of,
@@ -307,9 +313,7 @@ def campaign_create(
     )
     if split_descriptor is not None:
         development = split_descriptor["development"]
-        data = _development_content(
-            data, development["start"], development["end"]
-        )
+        data = slice_content(data, development["start"], development["end"])
         sliced = partition_slice(data, development["start"], development["end"])
         if sliced != development:
             raise ValueError("The development Discovery slice does not reproduce.")
@@ -382,6 +386,7 @@ def campaign_create(
         "campaign_id": campaign_id,
         "snapshot_id": snapshot_id,
         "data_kind": data_kind,
+        "research_protocol": evaluation["research_protocol"],
         "fingerprints": {
             "snapshot": snapshot_hash,
             "partition": partition_hash,
@@ -425,14 +430,6 @@ def _discovery_split_ratio(raw: object) -> tuple[int, int]:
     if development != 70:
         raise ValueError("Only the leading 70/30 Discovery split is implemented.")
     return development, validation
-
-
-def _development_content(content: dict, start: str, end: str) -> dict[str, list[dict]]:
-    """Copy only the frozen development sessions out of a Discovery payload."""
-    return {
-        kind: [row for row in content[kind] if start <= row["date"] <= end]
-        for kind in KINDS
-    }
 
 
 def _discovery_history_policy(

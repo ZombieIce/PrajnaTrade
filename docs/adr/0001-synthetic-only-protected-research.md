@@ -155,24 +155,39 @@ Discovery after research has stopped changing it.
      bound to one locked version, in the trusted store plus a project
      projection; identical content replays, a different admission for that
      version is a conflict, and a version whose read is already counted or
-     completed cannot be admitted. Granting writes no use row and changes no
-     counter. The admitted version's next v2 `validate` consumes it atomically
-     as one `manual` use row carrying the `admission_id`; a different version
+     completed cannot be admitted. An admission is allowed only once the
+     round's automatic allowance is exhausted: while `automatic_used <
+     auto_limit` the command refuses with `VALIDATION_ALLOWANCE_REMAINING`
+     so an operator cannot bypass the limit and the paused
+     `awaiting_validation_admission` lifecycle keeps its meaning; the
+     researcher must let the automatic slots be used first. Granting writes
+     no use row and changes no counter. The admitted version's next v2
+     `validate` consumes it atomically as one `manual` use row carrying the
+     `admission_id`; a different version
      can never consume it, and replay, resume or an interruption never consumes
      it twice. The receipt `usage` and `round status` distinguish automatic
      from manual reads; `lifecycle` is `converged` only when the round is
      closed.
-4. **Old records keep their protocols.** A round without a frozen split stays
+4. **Old records keep their protocols; new research uses protocol v2.** New
+   research Campaigns must be created with `--discovery-split 70/30`: the flag
+   is opt-in only so protocol-v1 Campaigns, rounds, versions, receipts and
+   closures remain readable for historical compatibility, not because v1 is
+   the current research protocol. A new Campaign's evaluation and create output
+   record `research_protocol` (`trailing-70-30` or `discovery-replay`); a
+   Campaign stored before #50 lacks the field, so readers use `.get` and
+   default to `discovery-replay`. A round without a frozen split stays
    protocol v1 (`discovery-replay`): its kickoff shape, protocol hash, locked
-   version and receipt are unchanged, and it refuses a `validation_policy`.
-   A v2 round records `trailing-70-30`/`trailing_validation`, the frozen split
-   and the round's automatic Validation limit; its protocol hash folds the
-   protocol and split, so its versions trace to the partition protocol they
-   were locked under. A v2 round never falls back to the v1 Discovery replay.
-   Issue #43 and issue #17 records are read under their original recorded
-   protocol and are not re-judged or migrated. A closure stored before #50
-   keeps its exact legacy body and replays by its stored `closure_id`; only a
-   new closure records the v2 allowance/selection additions.
+   version, receipt and closure body are unchanged, and it refuses a
+   `validation_policy`. A v2 round records
+   `trailing-70-30`/`trailing_validation`, the frozen split and the round's
+   automatic Validation limit; its protocol hash folds the protocol and split,
+   so its versions trace to the partition protocol they were locked under. A
+   v2 round never falls back to the v1 Discovery replay. Issue #43 and issue
+   #17 records are read under their original recorded protocol and are not
+   re-judged or migrated. A closure stored before #50 keeps its exact legacy
+   body and replays by its stored `closure_id`, and a new protocol-v1 closure
+   keeps that same legacy body; only a **new v2 closure** records the
+   allowance and, when a version is selected, its receipt.
 5. **The formal receipt keeps its own protocol.** A v2 receipt records
    `validation_kind: "trailing_validation"`, the frozen protocol/split, the
    development/trailing/scoring/warmup/provenance records, the counted `usage`
@@ -206,17 +221,25 @@ Discovery after research has stopped changing it.
    feedback (`feedback_ids`) as validated provenance in its body; these links
    are deliberately outside `version_id`, because a revision is the same
    experiment content whether or not its provenance is cited.
-8. **Reused evidence is disclosed across rounds.** A v2 round open on a
-   snapshot that an earlier round of the same project already used records one
-   `reuse_disclosure`: each earlier round's protocol and the interval its
+8. **Reused evidence is disclosed across rounds.** A v2 round open records one
+   `reuse_disclosure` for every earlier round in the same project whose Campaign
+   used the same sealed `snapshot_id` (`match: "same_snapshot"`) or froze the
+   same development content hash (`match: "same_development"`), so re-splitting
+   a corrected successor that preserves the approved development prehistory is
+   still disclosed; each round is listed once with the snapshot match taking
+   precedence. Each entry records the earlier round's protocol, the interval its
    published receipt actually used (a formal `trailing` segment or the legacy
    replay's scoring interval), its intersection with the new trailing segment,
-   and the feedback recorded on those versions. The disclosure is derived once
-   from the project's own published receipts and feedback rows, stored outside
-   `kickoff_hash` in the trusted round record and its project copy, and returned
-   unchanged on replay, including when the trusted record exists but its project
-   projection crashed. Protocol-v1 rounds get no disclosure; old receipts keep
-   being read under their original protocol rather than re-judged.
+   the prior round's counted Validation use history (`automatic_used`/
+   `manual_used`/`total_used` and the `uses` rows with version, validation ID,
+   kind, admission ID and sequence; empty/zero for a v1 round), and the feedback
+   recorded on those versions. The disclosure is derived once from the
+   project's own published receipts, Validation-use rows and feedback rows,
+   stored outside `kickoff_hash` in the trusted round record and its project
+   copy, and returned unchanged on replay, including when the trusted record
+   exists but its project projection crashed. Protocol-v1 rounds get no
+   disclosure; old receipts keep being read under their original protocol
+   rather than re-judged.
 9. **The selection basis is traceable from the public CLI.** A synthetic
    mechanism test follows snapshot → round → version → experiment → locked
    protocol → actual development and scoring dates → warmup source →

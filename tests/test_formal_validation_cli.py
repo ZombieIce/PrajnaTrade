@@ -16,19 +16,26 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
-import sys
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
-from cli_helpers import assert_hex, cli, cli_env, ok, rejected, write_json
+from cli_helpers import (
+    assert_hex,
+    cli,
+    cli_env,
+    ok,
+    rejected,
+    round_validate_argv,
+    write_json,
+)
+from test_corrected_evidence_cli import remove_protected_payloads
 from test_discovery_split_cli import (
     discovery_read,
     split_campaign,
     stored_campaign,
     v2_round_input,
 )
-from test_corrected_evidence_cli import remove_protected_payloads
 from test_experiment_cli import sealed_snapshot_input
 from test_protected_eval_cli import submit_experiment
 from test_research_loop_cli import (
@@ -754,22 +761,12 @@ def test_two_versions_racing_the_last_slot_yield_exactly_one_read(
 ) -> None:
     scenario = formal_scenario(tmp_path, limit=1)
     second = add_version(scenario)
-    command = [
-        sys.executable,
-        "-m",
-        "prajnatrade",
-        "round",
-        "validate",
-        "--project",
-        str(scenario["project"]),
-        "--store",
-        str(scenario["store"]),
-        "--snapshot-store",
-        str(scenario["snapshots"]),
-        "--round-id",
+    command = round_validate_argv(
+        scenario["project"],
+        scenario["store"],
+        scenario["snapshots"],
         scenario["opened"]["round_id"],
-        "--version-id",
-    ]
+    )
     environment = cli_env()
     processes = [
         subprocess.Popen(

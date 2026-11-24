@@ -370,8 +370,12 @@ sealed pre-Discovery observations at that opening. The Campaign receipt reports
 `history_policy.scoring_start` and the fingerprint of any sealed pre-Discovery
 history used in the Campaign.
 
-An opt-in `--discovery-split 70/30` freezes a leading-development split of the
-Campaign's sealed Discovery interval before any experiment can run:
+**New research Campaigns must be created with `--discovery-split 70/30`.**
+The flag is opt-in only for backward compatibility: Campaigns, rounds and
+receipts created without it are protocol v1 (`discovery-replay`) and remain
+readable for historical compatibility, but they are not the protocol new
+research uses. The flag freezes a leading-development split of the Campaign's
+sealed Discovery interval before any experiment can run:
 
 ```sh
 prajnatrade campaign create --project ./strategy-A --store ./sealed-data \
@@ -385,11 +389,15 @@ experiment, baseline and comparison reads approved development data by
 construction. The receipt reports `discovery_split` with the frozen rule, both
 segments' real dates, session counts and content hashes, the sealed full
 Discovery partition hash and a `split_hash`; `fingerprints.snapshot` is the
-development slice hash that the experiment integrity check verifies. Absent the
-flag, the Campaign and its stored records are unchanged (protocol v1). A split
-Campaign that will open a round also needs `--discovery-warmup-sessions`,
-because a round requires the frozen scoring policy and the warmup must leave at
-least one development scoring session.
+development slice hash that the experiment integrity check verifies. The
+Campaign output and its stored evaluation also record `research_protocol`
+(`"trailing-70-30"` with the flag, `"discovery-replay"` without); a Campaign
+stored before #50 lacks the field, so readers use `.get("research_protocol",
+"discovery-replay")`. Absent the flag, the Campaign and its stored records keep
+their unchanged protocol-v1 shapes. A split Campaign that will open a round
+also needs `--discovery-warmup-sessions`, because a round requires the frozen
+scoring policy and the warmup must leave at least one development scoring
+session.
 
 In this mode, `strategy.history_requirements` can declare each required history
 window. For example, a momentum strategy with `parameters.lookback: 20` can
@@ -824,13 +832,15 @@ experiment runs:
   (`{"schema_version": 1, "name": "trailing-70-30", "validation_kind":
   "trailing_validation"}`), the frozen `research_partition` descriptor and
   `validation_policy`; a v1 kickoff keeps its exact old shape and hash.
-- Opening a v2 round on a snapshot that an earlier round in the same project
-  already used computes one **reuse disclosure** (see
-  [cross-round reuse disclosure](#cross-round-reuse-disclosure)): the earlier
-  round's protocol and the interval its published receipt actually used, the
-  intersection with this round's trailing segment, and the feedback recorded
-  against that round's versions. It is stored once with the round record,
-  outside `kickoff_hash`, so a replay returns the stored disclosure.
+- Opening a v2 round computes one **reuse disclosure** (see
+  [cross-round reuse disclosure](#cross-round-reuse-disclosure)) for every
+  earlier round in the same project whose Campaign used the same sealed
+  `snapshot_id` or the same frozen development content hash (a corrected
+  successor): the earlier round's protocol and `match`, the interval its
+  published receipt actually used, the intersection with this round's trailing
+  segment, the counted Validation use history and the feedback recorded against
+  that round's versions. It is stored once with the round record, outside
+  `kickoff_hash`, so a replay returns the stored disclosure.
 
 `round status` exposes the same split to the operator and the agent:
 top-level `protocol` (a v1 round defaults to `discovery-replay`),
@@ -1113,6 +1123,14 @@ validation-use ledger, never written into the admission. **Granting is not a
 read:** it writes no use row and leaves `automatic_used`/`manual_used`/
 `total_used` unchanged.
 
+**The automatic allowance must be exhausted first.** A manual admission is the
+researcher's extra read *after* the limit, never a way to bypass it: while
+`automatic_used < auto_limit` (lifecycle `research`) `round admit` rejects with
+`VALIDATION_ALLOWANCE_REMAINING` (exit 2, `next_action: "validate"`, the
+allowance and `round_state: "research"`) and writes nothing. The researcher
+must let the automatic slots be used, after which the lifecycle is
+`awaiting_validation_admission` and the same request is accepted.
+
 One admission is bound to one version. Identical request content replays the
 stored admission (`reused: true`, including its original `granted_at`); a
 different admission for the same version is `ADMISSION_CONFLICT`. A closed round
@@ -1127,8 +1145,9 @@ the stored grant is published and returned.
 The admitted version's next `round validate` consumes the admission atomically
 inside the same round-lock/SQLite reservation, before any attempt or read: it
 inserts one `manual` use row (with `admission_id` and the next round sequence)
-instead of an automatic row. An admission is consumed even while automatic
-slots remain, so a granted manual read never silently becomes automatic. A
+instead of an automatic row. The manual branch is checked before the automatic
+one, so a granted manual read can never silently become automatic (the
+reservation remains defensive about a grant recorded before this gate). A
 different version can never consume it; a second validate of the same version
 reuses the existing use and terminal receipt; an interrupted read keeps the
 manual use. The formal receipt's `usage` block records
@@ -1216,33 +1235,50 @@ initial cash, costs and hard-condition thresholds as V1.
 
 ##### Cross-round reuse disclosure
 
-A snapshot may be re-partitioned in a new Campaign (one Campaign per round).
-When a v2 round opens on a snapshot that an earlier round of the same project
-already used, the kickoff records one top-level `reuse_disclosure` (outside
-`kickoff_hash`):
+A Discovery interval may be reused by a new Campaign (one Campaign per round),
+including a **corrected successor** whose re-sealed snapshot preserves the
+approved development prehistory but changes trailing data. When a v2 round
+opens, the kickoff records one top-level `reuse_disclosure` (outside
+`kickoff_hash`) for every earlier round in the same project whose Campaign
+either used the **same sealed `snapshot_id`** or froze the **same development
+content hash** (`evaluation_json.discovery_split.development.content_hash`):
 
 ```json
 {"snapshot_id": "…",
  "previous_rounds": [{"round_id": "…", "campaign_id": "…",
                       "protocol": "discovery-replay",
+                      "match": "same_snapshot",
                       "used": {"start": "2024-01-04", "end": "2024-01-09"},
-                      "overlap": {"start": "2024-01-07", "end": "2024-01-09"}}],
+                      "overlap": {"start": "2024-01-07", "end": "2024-01-09"},
+                      "automatic_used": 1, "manual_used": 0, "total_used": 1,
+                      "uses": [{"version_id": "…", "validation_id": "…",
+                                "kind": "automatic", "admission_id": null,
+                                "sequence": 1}]}],
  "feedback": [{"feedback_id": "…", "round_id": "…", "version_id": "…",
                "impact": "…"}],
  "overlapping": true}
 ```
 
-The previously used interval comes from the prior round's published receipt:
-a formal trailing receipt uses its `trailing` segment, and a legacy receipt
-uses the **replayed scoring interval** (`replay.candidate.start_date`/
-`end_date`, after the Campaign warmup). `overlap` is the intersection with this
-round's trailing segment (or `null`), and `feedback` lists the prior round's
-feedback rows. The value is computed once on the first open, stored in the
-trusted round record and its project copy, and returned unchanged on replay —
-even if another prior round opens meanwhile. If the trusted round file exists
-without its project row (a crash between the two writes), the stored disclosure
-is reused rather than re-derived. Protocol-v1 rounds get no disclosure, and old
-receipts keep being read under their original protocol.
+`match` is `"same_snapshot"` (the same sealed snapshot) or
+`"same_development"` (a different, typically corrected successor, snapshot
+whose frozen development slice is byte-identical). A round is listed once, with
+the snapshot match taking precedence, so the two criteria never duplicate an
+entry. The previously used interval comes from the prior round's published
+receipt: a formal trailing receipt uses its `trailing` segment, and a legacy
+receipt uses the **replayed scoring interval**
+(`replay.candidate.start_date`/`end_date`, after the Campaign warmup).
+`overlap` is the intersection with this round's trailing segment (or `null`).
+Each entry also carries the prior round's counted Validation use history —
+`automatic_used`, `manual_used`, `total_used` and the `uses` rows (version,
+validation ID, `kind`, `admission_id`, round sequence) — so a reused interval
+discloses which versions were already read; a protocol-v1 prior round has no
+use ledger, so its counters are zero and `uses` is empty. `feedback` lists the
+prior round's feedback rows. The value is computed once on the first open,
+stored in the trusted round record and its project copy, and returned unchanged
+on replay — even if another prior round opens meanwhile. If the trusted round
+file exists without its project row (a crash between the two writes), the
+stored disclosure is reused rather than re-derived. Protocol-v1 rounds get no
+disclosure, and old receipts keep being read under their original protocol.
 
 ##### Traceability of the selection basis (#35, synthetic)
 
@@ -1520,7 +1556,7 @@ print `error: ...` on stderr and exit 2.
 | `round submit` | agent | `submitted` (with the optional `revision_of`/`feedback_ids` provenance links) | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE`, `REVISION_NOT_FOUND`, `REVISION_CONFLICT`, `FEEDBACK_LINK_INVALID` |
 | `round validate` | operator | `completed` (v2 adds `validation_kind`/`protocol`/`development`/`trailing`/`scoring`/`warmup`/`provenance`/`usage`/`summary`/`allowance`) | `passed`, `failed`, `insufficient_evidence` (exit 0; a v2 `failed`/`insufficient_evidence` keeps its counted use) | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `REVALIDATION_SUPERSEDED`, `VALIDATION_DATA_GAP`, `VALIDATION_ALLOWANCE_EXHAUSTED`, `VALIDATION_PARTITION_MISMATCH` |
 | `round revalidate` | operator | `revalidated` (v2 adds `validation_kind`/`evidence`/`original_validation`/`recomputed_validation`/`affected`) | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REPLAY_MISMATCH`, `EVIDENCE_SNAPSHOT_NOT_FOUND`, `EVIDENCE_NOT_SUCCESSOR`, `EVIDENCE_DATA_KIND_MISMATCH`, `EVIDENCE_INTERVAL_MISMATCH`, `EVIDENCE_DEVELOPMENT_MISMATCH`, `EVIDENCE_PRIOR_HISTORY_MISMATCH`, `EVIDENCE_AS_OF_VIOLATION`, `EVIDENCE_INTEGRITY_VIOLATION`, `EVIDENCE_SNAPSHOT_AMBIGUOUS` |
-| `round admit` | operator | `admitted` | `reused: true` replay (`admission.used` shows a consumed grant) | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `ADMISSION_CONFLICT`, `VALIDATION_ALREADY_COMPLETED`, `VALIDATION_POLICY_REQUIRED` |
+| `round admit` | operator | `admitted` | `reused: true` replay (`admission.used` shows a consumed grant) | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `ADMISSION_CONFLICT`, `VALIDATION_ALREADY_COMPLETED`, `VALIDATION_POLICY_REQUIRED`, `VALIDATION_ALLOWANCE_REMAINING` |
 | `round detail` | operator, agent | `completed` (`reused: true` for an identical request) | — | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `DETAIL_RECORD_UNKNOWN`, `DETAIL_RECORD_UNAVAILABLE`, `VALIDATION_NOT_PASSED` |
 | `round feedback` | operator, agent | `recorded` (`reused: true` for identical content) | — | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `DETAIL_NOT_FOUND`, `FEEDBACK_LINK_INVALID` |
 | `round review` | operator | `approved` / `returned` / `ended` | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `RISK_NOT_ACCEPTED`, `OBSERVATION_REQUIRED`, `REVIEW_CONFLICT`, `VERSION_ENDED`, `CALENDAR_COVERAGE_MISSING`, `RELEASE_NOT_FOUND`, `RELEASE_INTEGRITY_FAILED`, `INVALID_TRANSITION`, `ADMISSION_INVALID` |
