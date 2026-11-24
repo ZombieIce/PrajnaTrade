@@ -1,4 +1,4 @@
-"""Research rounds, locked submissions and lightweight Validation (spec #43, T1).
+"""Research rounds, lightweight Validation, review admission and revalidation (spec #43).
 
 This module is the manual simulated-tracking admission path.  It is deliberately
 separate from the protected ``evaluation``/``holdout`` flow and from conditional
@@ -11,9 +11,18 @@ Contract resolutions that the shared design contract leaves implicit:
 
 * ``round_id`` reuses :func:`research_direction.direction_id`, so a direction
   keeps its identity across renamed keys and new Campaigns.
-* ``validation_id`` includes the *current* accounting-engine fingerprint, so a
-  platform fix yields a new identity and re-runs the replay.  The receipt records
-  both the Campaign's frozen runtime and the current one.
+* ``validation_id`` includes the *current* accounting-engine fingerprint, so an
+  accounting-platform fix yields a new identity and re-runs the replay.  The
+  running attempt records the current runtime.
+* Review decisions are immutable content-addressed epochs per version with
+  exactly one current state.  Approval binds the stored terminal passed receipt,
+  writes a write-once ``manual_tracking`` release artifact and appends one
+  ``enable`` event at the first approved calendar session after the decision; it
+  never runs Validation again, so re-selecting a version reuses its receipt.
+* ``replay_engine_identity`` fingerprints this module's own replay/metric code.
+  ``validation_id`` does not cover it, so :func:`revalidate` binds it together
+  with the current runtime and evidence source into the new identity and records
+  the superseded receipt as historical evidence.
 * Inputs that cannot be replayed at all (a different snapshot store, a drifted
   Campaign binding) are protocol rejections; evidence verdicts are
   ``passed`` / ``failed`` / ``insufficient_evidence`` and exit 0.
@@ -32,11 +41,12 @@ import os
 import sqlite3
 from collections.abc import Generator, Mapping
 from contextlib import closing, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from prajnatrade import snapshot
+from prajnatrade import release, shadow_calendar, snapshot
 from prajnatrade.container_executor import executor_from_config
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.experiment import (
@@ -64,7 +74,13 @@ DATA_AVAILABILITY = "next_open"
 BENCHMARK = "equal_weight_buy_and_hold"
 ROUND_NAME = "research-loop-rounds"
 VALIDATION_NAME = "research-loop-validations"
+REVIEW_NAME = "research-loop-reviews"
+REVALIDATION_NAME = "research-loop-revalidations"
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
+REVIEW_STATES = ("pending", "approved", "returned", "ended")
+REVIEW_ACTION_STATE = {"approve": "approved", "return": "returned", "end": "ended"}
+MAX_OBSERVATION_SESSIONS = 252
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 METRIC_REGISTRY = {
     "net_return": "total_return",
@@ -129,6 +145,13 @@ CREATE TABLE IF NOT EXISTS research_loop_observations (
 CREATE TABLE IF NOT EXISTS research_loop_closures (
     round_id TEXT PRIMARY KEY REFERENCES research_loop_rounds(round_id),
     closure_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_loop_revalidations (
+    revalidation_id TEXT PRIMARY KEY,
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    validation_id TEXT NOT NULL,
+    prior_validation_id TEXT NOT NULL,
+    revalidation_json TEXT NOT NULL
 );
 """
 
@@ -812,21 +835,27 @@ def _replay(
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
     campaign: Mapping[str, Any],
+    evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     kickoff = record["kickoff"]
     frozen = kickoff["scoring_policy"]["frozen"]
     locked = submission["locked"]
     evaluation = campaign["evaluation"]
+    source = evidence if evidence is not None else {
+        "snapshot_id": evaluation["snapshot_id"],
+        "partition_content_hash": evaluation["partition_content_hash"],
+        "data_kind": evaluation["data_kind"],
+    }
     receipt = snapshot.read_discovery(
         Path(snapshot_store),
-        evaluation["snapshot_id"],
+        source["snapshot_id"],
         "discovery",
         evaluation.get("as_of"),
     )
-    if receipt["data_kind"] != evaluation["data_kind"]:
+    if receipt["data_kind"] != source["data_kind"]:
         raise ValueError("The snapshot store data kind differs from the Campaign.")
     partition_hash = receipt.get("partition_content_hash", receipt["content_hash"])
-    if partition_hash != evaluation["partition_content_hash"]:
+    if partition_hash != source["partition_content_hash"]:
         raise ValueError("The snapshot store Discovery content differs from the Campaign.")
     if receipt.get("prior_history_hash") != frozen.get("prior_history_hash"):
         raise ValueError("The snapshot store prior history differs from the Campaign.")
@@ -841,7 +870,7 @@ def _replay(
     rules = locked["execution_rules"]
     rule_version = rules.get("version", NEXT_OPEN_RULES)
     options = {
-        "data_kind": evaluation["data_kind"],
+        "data_kind": source["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
         "prior_history": prior_history,
         "initial_cash": locked["base_costs"]["initial_cash"],
@@ -854,17 +883,17 @@ def _replay(
     strategy = _strategy_from_locked(locked["strategy"], locked["strategy_executor"])
     candidate = run_partition_strategy(
         data,
-        evaluation["snapshot_id"],
-        evaluation["partition_content_hash"],
+        source["snapshot_id"],
+        source["partition_content_hash"],
         strategy,
         partition_name="discovery",
         **options,
     )
     benchmark = run_discovery_equal_weight(
         data,
-        evaluation["snapshot_id"],
-        evaluation["partition_content_hash"],
-        data_kind=evaluation["data_kind"],
+        source["snapshot_id"],
+        source["partition_content_hash"],
+        data_kind=source["data_kind"],
         initial_cash=locked["base_costs"]["initial_cash"],
         transaction_cost_bps=locked["base_costs"]["transaction_cost_bps"],
         slippage_bps=locked["base_costs"]["slippage_bps"],
@@ -885,11 +914,11 @@ def _replay(
         "scoring_start": scoring_start,
         "snapshot": {
             "verified": True,
-            "snapshot_id": evaluation["snapshot_id"],
-            "partition_content_hash": evaluation["partition_content_hash"],
+            "snapshot_id": source["snapshot_id"],
+            "partition_content_hash": source["partition_content_hash"],
             "prior_history_hash": receipt.get("prior_history_hash"),
-            "scope": evaluation["data_kind"],
-            "data_kind": evaluation["data_kind"],
+            "scope": source["data_kind"],
+            "data_kind": source["data_kind"],
         },
     }
 
@@ -1338,7 +1367,11 @@ def _validation_identity(
 
 
 def _submission(
-    connection: sqlite3.Connection, round_id: str, version_id: str,
+    connection: sqlite3.Connection,
+    round_id: str,
+    version_id: str,
+    *,
+    phase: str = "validation",
 ) -> dict[str, Any]:
     _require_hex(version_id, "version")
     row = connection.execute(
@@ -1348,7 +1381,7 @@ def _submission(
     ).fetchone()
     if row is None:
         raise ProtocolError(
-            "SUBMISSION_NOT_FOUND", "validation", "check_id",
+            "SUBMISSION_NOT_FOUND", phase, "check_id",
             "Unknown locked version for this research round.",
         )
     body = json.loads(row["submission_json"])
@@ -1382,6 +1415,18 @@ def validate(
                     "A closed research round cannot validate another version.",
                 )
             submission = _submission(connection, round_id, version_id)
+            state = _review_state(connection, version_id)
+            if state == "ended":
+                raise ProtocolError(
+                    "VERSION_ENDED", "validation", "inspect",
+                    "An ended version cannot run another lightweight Validation.",
+                )
+            if state == "approved":
+                raise ProtocolError(
+                    "REVIEW_CONFLICT", "validation", "inspect",
+                    "An approved version keeps its admitted receipt; use revalidate "
+                    "only after the approval is ended.",
+                )
             campaign = campaign_discovery(project, record["campaign_id"])
             _require_campaign_binding(record, campaign)
             validation_id = _validation_identity(record, submission, campaign)
@@ -1468,19 +1513,1058 @@ def validate(
 
 
 # ---------------------------------------------------------------------------
-# round status
+# Review decisions: approve, return, end
 # ---------------------------------------------------------------------------
 
 
-def _review_state(connection: sqlite3.Connection, version_id: str) -> str:
+def replay_engine_identity() -> str:
+    """Fingerprint this module's own replay and metric code.
+
+    The accounting-engine fingerprint in ``validation_id`` does not cover
+    ``research_loop.py`` itself, so a fix here could otherwise silently reuse
+    an old receipt.  Revalidation identities bind this value explicitly.
+    """
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _review_path(store: Path, decision_id: str) -> Path:
+    return store / REVIEW_NAME / f"{_require_hex(decision_id, 'review decision')}.json"
+
+
+def _revalidation_path(store: Path, revalidation_id: str) -> Path:
+    return (
+        store
+        / REVALIDATION_NAME
+        / f"{_require_hex(revalidation_id, 'revalidation')}.json"
+    )
+
+
+def _verify_decision(body: object) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise ValueError("Invalid review decision record.")
+    decision_id = body.get("decision_id")
+    _require_hex(decision_id, "review decision")
+    expected = _hash({key: value for key, value in body.items() if key != "decision_id"})
+    if decision_id != expected:
+        raise ValueError("Review decision fingerprint mismatch.")
+    if body.get("review_state") != REVIEW_ACTION_STATE.get(body.get("decision")):
+        raise ValueError("Review decision state does not match its decision.")
+    return body
+
+
+def _verify_revalidation(body: object) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise ValueError("Invalid revalidation record.")
+    revalidation_id = body.get("revalidation_id")
+    _require_hex(revalidation_id, "revalidation")
+    expected = _hash(
+        {key: value for key, value in body.items() if key != "revalidation_id"}
+    )
+    if revalidation_id != expected:
+        raise ValueError("Revalidation record fingerprint mismatch.")
+    return body
+
+
+def _latest_review(
+    connection: sqlite3.Connection, version_id: str,
+) -> dict[str, Any] | None:
     row = connection.execute(
         "SELECT review_json FROM research_loop_reviews WHERE version_id = ? "
         "ORDER BY rowid DESC LIMIT 1",
         (version_id,),
     ).fetchone()
+    return _verify_decision(json.loads(row["review_json"])) if row is not None else None
+
+
+def _review_state(connection: sqlite3.Connection, version_id: str) -> str:
+    latest = _latest_review(connection, version_id)
+    return latest["review_state"] if latest is not None else "pending"
+
+
+def _latest_tracking(
+    connection: sqlite3.Connection, version_id: str,
+) -> dict[str, Any] | None:
+    for row in connection.execute(
+        "SELECT review_json FROM research_loop_reviews WHERE version_id = ? "
+        "ORDER BY rowid DESC",
+        (version_id,),
+    ):
+        body = _verify_decision(json.loads(row["review_json"]))
+        if body["decision"] == "approve":
+            return {
+                **body["tracking"],
+                "state": _review_state(connection, version_id),
+            }
+    return None
+
+
+def _validated_binding(
+    connection: sqlite3.Connection, version_id: str, trusted: Path,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    row = connection.execute(
+        "SELECT validation_id, receipt_json FROM research_loop_validations "
+        "WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()
     if row is None:
-        return "pending"
-    return json.loads(row["review_json"]).get("review_state", "pending")
+        return None, None
+    receipt = _load_trusted_receipt(trusted, row["validation_id"], row["receipt_json"])
+    return (
+        {
+            "validation_id": row["validation_id"],
+            "outcome": receipt["outcome"],
+            "receipt_hash": receipt["receipt_hash"],
+        },
+        receipt,
+    )
+
+
+def _review_binding(
+    connection: sqlite3.Connection,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    trusted: Path,
+) -> dict[str, Any]:
+    validation, _ = _validated_binding(connection, submission["version_id"], trusted)
+    return {
+        "submission_id": submission["submission_id"],
+        "experiment_id": submission["experiment_id"],
+        "strategy_fingerprint": submission["strategy_fingerprint"],
+        "experiment_hash": submission["experiment_hash"],
+        "question": submission["question"],
+        "revisit_condition": submission["revisit_condition"],
+        "risks": list(submission["risks"]),
+        "disclosed_risks": list(record["kickoff"]["disclosed_risks"]),
+        "scope": record["scope"],
+        "data_kind": record["data_kind"],
+        "validation": validation,
+    }
+
+
+def _review_request_key(
+    round_id: str,
+    version_id: str,
+    decision: str,
+    reviewer: str,
+    reason: str,
+    payload: Mapping[str, Any],
+    binding: Mapping[str, Any],
+) -> str:
+    return _hash(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "round_id": round_id,
+            "version_id": version_id,
+            "decision": decision,
+            "reviewer": reviewer,
+            "reason": reason,
+            "payload": payload,
+            "binding": binding,
+        }
+    )
+
+
+def _approve_confirmation(
+    source: object,
+    kickoff: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    if source is None:
+        raise ProtocolError(
+            "OBSERVATION_REQUIRED", "review", "correct",
+            "Approval requires the reviewer's explicit observation confirmation.",
+        )
+    try:
+        entry = _object(
+            source,
+            {"observation_sessions", "accepted_risks", "observation_reason"},
+        )
+    except ValueError as error:
+        raise ProtocolError(
+            "OBSERVATION_REQUIRED", "review", "correct",
+            "Approval requires observation_sessions, accepted_risks and "
+            "observation_reason; the platform never pre-fills a decision.",
+        ) from error
+    sessions = entry["observation_sessions"]
+    if (
+        type(sessions) is not int
+        or sessions < 1
+        or sessions > MAX_OBSERVATION_SESSIONS
+    ):
+        raise ValueError(
+            f"observation_sessions must be a positive integer no greater than "
+            f"{MAX_OBSERVATION_SESSIONS}."
+        )
+    accepted = _texts(entry["accepted_risks"], "accepted_risks")
+    observation_reason = _text(entry["observation_reason"], "observation_reason")
+    missing = [
+        risk for risk in kickoff["disclosed_risks"] if risk not in set(accepted)
+    ]
+    if missing:
+        raise ProtocolError(
+            "RISK_NOT_ACCEPTED", "review", "correct",
+            "Approval must explicitly accept every disclosed round risk; "
+            f"missing: {missing}.",
+        )
+    recommendation = receipt.get("observation") or {}
+    return {
+        "observation_sessions": sessions,
+        "accepted_risks": sorted(set(accepted)),
+        "observation_reason": observation_reason,
+        "recommended_sessions": recommendation.get("recommended_sessions"),
+        "recommendation_basis": recommendation.get("basis"),
+        "minimum_opportunities": kickoff["observation"]["minimum_opportunities"],
+        "review_conditions": list(kickoff["observation"]["review_conditions"]),
+    }
+
+
+def _return_decision(source: object) -> dict[str, Any]:
+    if source is None:
+        raise ValueError("A return decision requires --input with the change request.")
+    entry = _object(
+        source,
+        {"change", "comparison", "revisit_condition"},
+        frozenset({"next_submission_id"}),
+    )
+    payload = {
+        "change": _text(entry["change"], "change"),
+        "comparison": _text(entry["comparison"], "comparison"),
+        "revisit_condition": _text(entry["revisit_condition"], "revisit_condition"),
+    }
+    if "next_submission_id" in entry:
+        payload["next_submission_id"] = _text(
+            entry["next_submission_id"], "next_submission_id"
+        )
+    return payload
+
+
+def _end_decision(source: object) -> dict[str, Any]:
+    if source is None:
+        raise ValueError("An end decision requires --input with the closing detail.")
+    entry = _object(source, {"detail", "continue_direction"})
+    continue_direction = entry["continue_direction"]
+    if type(continue_direction) is not bool:
+        raise ValueError("continue_direction must be a boolean.")
+    return {
+        "detail": _text(entry["detail"], "detail"),
+        "continue_direction": continue_direction,
+    }
+
+
+def _tracking_calendar(path: Path | None, record: Mapping[str, Any]) -> dict[str, Any]:
+    if path is None:
+        raise ProtocolError(
+            "CALENDAR_COVERAGE_MISSING", "review", "inspect",
+            "Approval requires --calendar with the operator's approved trading calendar.",
+        )
+    try:
+        calendar = shadow_calendar.load_calendar(path)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ProtocolError(
+            "CALENDAR_COVERAGE_MISSING", "review", "inspect",
+            f"The approved trading calendar is unusable: {error}",
+        ) from error
+    if calendar["data_kind"] != record["data_kind"]:
+        raise ProtocolError(
+            "CALENDAR_COVERAGE_MISSING", "review", "inspect",
+            "The approved calendar data kind must match the research round.",
+        )
+    return calendar
+
+
+def _first_signal_session(calendar: Mapping[str, Any], decided_at: str) -> str:
+    local_date = datetime.fromisoformat(decided_at).astimezone(SHANGHAI).date()
+    for session in calendar["sessions"]:
+        if date.fromisoformat(session) > local_date:
+            return session
+    raise ProtocolError(
+        "CALENDAR_COVERAGE_MISSING", "review", "inspect",
+        "The approved trading calendar has no session after the decision date.",
+    )
+
+
+def _tracking_artifact(
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    locked = submission["locked"]
+    version_id = submission["version_id"]
+    validation_id = receipt["validation_id"]
+    strategy = locked["strategy"]
+    effective = body["tracking"]["enabled_signal_date"]
+    calendar = body["calendar"]
+    artifact_body = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": release.ARTIFACT_KIND,
+        "scope": record["scope"],
+        "data_kind": record["data_kind"],
+        "release_version": release.RELEASE_VERSION,
+        "workflow": release.TRACKING_WORKFLOW,
+        "simulated_tracking": True,
+        "release_id": release.tracking_id(version_id, validation_id),
+        "candidate_id": submission["submission_id"],
+        "candidate_hash": version_id,
+        "candidate": {
+            "version_id": version_id,
+            "submission_id": submission["submission_id"],
+            "experiment_id": submission["experiment_id"],
+            "strategy_fingerprint": submission["strategy_fingerprint"],
+            "experiment_hash": submission["experiment_hash"],
+            "strategy": strategy,
+            "parameters": strategy["parameters"],
+            "evaluation": {
+                "strategy_executor": locked["strategy_executor"],
+                "runtime": locked["runtime"],
+                "execution_rules": locked["execution_rules"],
+                "history_policy": locked["history_policy"],
+            },
+        },
+        "project_id": record["project_id"],
+        "round_id": record["round_id"],
+        "direction_id": record["direction_id"],
+        "campaign_id": record["campaign_id"],
+        "plan_id": validation_id,
+        "plan_hash": validation_id,
+        "plan_frozen_at": body["decided_at"],
+        "snapshot_id": locked["snapshot_id"],
+        "snapshot_hash": locked["snapshot_hash"],
+        "partition_fingerprints": {
+            "discovery": {
+                "content_hash": locked["snapshot_hash"],
+                "scope": record["scope"],
+                "data_kind": record["data_kind"],
+            }
+        },
+        "binding": {
+            **body["binding"],
+            "version_id": version_id,
+            "validation_id": validation_id,
+            "validation_outcome": receipt["outcome"],
+            "receipt_hash": receipt["receipt_hash"],
+            "round_id": record["round_id"],
+            "kickoff_hash": record["kickoff_hash"],
+            "snapshot_id": locked["snapshot_id"],
+            "snapshot_hash": locked["snapshot_hash"],
+            "evaluation_hash": locked["evaluation_hash"],
+            "protocol_hash": locked["protocol_hash"],
+            "scoring_policy_hash": _scoring_policy_hash(record["kickoff"]),
+            "initial_cash": locked["base_costs"]["initial_cash"],
+        },
+        "execution": {
+            "strategy": strategy,
+            "strategy_family": strategy["family"],
+            "parameters": strategy["parameters"],
+            "initial_cash": locked["base_costs"]["initial_cash"],
+            "transaction_cost_bps": locked["base_costs"]["transaction_cost_bps"],
+            "slippage_bps": locked["base_costs"]["slippage_bps"],
+            "base_costs": locked["base_costs"],
+            "signal_window_sessions": locked["signal_window_sessions"],
+            "execution_rules": locked["execution_rules"],
+            "history_policy": locked["history_policy"],
+            "strategy_executor": locked["strategy_executor"],
+            "runtime": locked["runtime"],
+        },
+        "initial_cash": locked["base_costs"]["initial_cash"],
+        "observation": body["observation"],
+        "decision": {
+            "decision_id": body["decision_id"],
+            "reviewer": body["reviewer"],
+            "reason": body["reason"],
+            "decided_at": body["decided_at"],
+        },
+        "approval": {
+            "reviewer": body["reviewer"],
+            "decision": "approved",
+            "reason": body["reason"],
+            "approved_at": body["decided_at"],
+            "decision_id": body["decision_id"],
+        },
+        "admission": {
+            "decision": "approved",
+            "automatic_enable": True,
+            "statement": release.TRACKING_ADMISSION_STATEMENT,
+            "mode": "simulated_tracking",
+            "simulated_tracking": True,
+            "protected_evaluation": False,
+            "conditional_release": False,
+            "effective_signal_date": effective,
+            "calendar_hash": _hash(calendar),
+            "calendar": calendar,
+        },
+        "tracking": {
+            "workflow": release.TRACKING_WORKFLOW,
+            "simulated_tracking": True,
+            "release_id": release.tracking_id(version_id, validation_id),
+            "enabled_signal_date": effective,
+            "calendar_hash": _hash(calendar),
+        },
+    }
+    return {**artifact_body, "artifact_hash": _hash(artifact_body)}
+
+
+def _matching_review(
+    connection: sqlite3.Connection,
+    trusted: Path,
+    version_id: str,
+    request_key: str,
+) -> dict[str, Any] | None:
+    """Find the stored decision with this exact human content (crash recovery)."""
+    for row in connection.execute(
+        "SELECT review_json FROM research_loop_reviews WHERE version_id = ? "
+        "ORDER BY rowid",
+        (version_id,),
+    ):
+        body = _verify_decision(json.loads(row["review_json"]))
+        if body.get("request_key") == request_key:
+            return body
+    directory = trusted / REVIEW_NAME
+    if not directory.is_dir():
+        return None
+    for path in sorted(directory.iterdir()):
+        if not path.is_file() or path.suffix != ".json":
+            continue
+        try:
+            body = _verify_decision(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if (
+            body.get("version_id") == version_id
+            and body.get("request_key") == request_key
+        ):
+            return body
+    return None
+
+
+def _store_decision(
+    connection: sqlite3.Connection, trusted: Path, body: Mapping[str, Any],
+) -> None:
+    from prajnatrade.protected_eval import write_trusted_record_once
+
+    path = _review_path(trusted, body["decision_id"])
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != body:
+            raise ValueError("A review decision record is immutable and cannot change.")
+    else:
+        write_trusted_record_once(path, dict(body))
+    connection.execute(
+        "INSERT OR IGNORE INTO research_loop_reviews "
+        "(decision_id, version_id, review_json) VALUES (?, ?, ?)",
+        (body["decision_id"], body["version_id"], _json(body)),
+    )
+
+
+def _store_observation(connection: sqlite3.Connection, body: Mapping[str, Any]) -> None:
+    observation = body.get("observation")
+    if observation is None:
+        return
+    connection.execute(
+        "DELETE FROM research_loop_observations WHERE version_id = ?",
+        (body["version_id"],),
+    )
+    connection.execute(
+        "INSERT INTO research_loop_observations (version_id, observation_json) "
+        "VALUES (?, ?)",
+        (body["version_id"], _json(observation)),
+    )
+
+
+def _refuse_transition(state: str, decision: str) -> None:
+    if state == "ended":
+        raise ProtocolError(
+            "VERSION_ENDED", "review", "inspect",
+            "An ended version is terminal; the round may continue with a new version.",
+        )
+    if state == REVIEW_ACTION_STATE[decision]:
+        raise ProtocolError(
+            "REVIEW_CONFLICT", "review", "review",
+            "A different decision already holds this version's current review state.",
+        )
+    if decision == "return" and state == "approved":
+        raise ProtocolError(
+            "REVIEW_CONFLICT", "review", "inspect",
+            "An approved version can only be ended, not returned to research.",
+        )
+    if decision == "approve" and state not in ("pending", "returned"):
+        raise ProtocolError(
+            "REVIEW_CONFLICT", "review", "inspect",
+            "Approval is allowed only from pending or returned.",
+        )
+
+
+def _validation_output(receipt: Mapping[str, Any], *, reused: bool) -> dict[str, Any]:
+    return {
+        "validation_id": receipt["validation_id"],
+        "outcome": receipt["outcome"],
+        "reason": receipt["reason"],
+        "receipt_hash": receipt["receipt_hash"],
+        "reused": reused,
+    }
+
+
+def _review_result(
+    body: Mapping[str, Any],
+    *,
+    reused: bool,
+    validation: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "status": body["review_state"],
+        "review_state": body["review_state"],
+        "decision_id": body["decision_id"],
+        "round_id": body["round_id"],
+        "version_id": body["version_id"],
+        "reviewer": body["reviewer"],
+        "reason": body["reason"],
+        "decided_at": body["decided_at"],
+        "reused": reused,
+    }
+    if body["decision"] == "approve":
+        result["observation"] = body["observation"]
+        result["tracking"] = body["tracking"]
+    elif body["decision"] == "return":
+        result["return"] = body["return"]
+    else:
+        result["end"] = body["end"]
+    if validation is not None:
+        result["validation"] = dict(validation)
+    return result
+
+
+def review(
+    project: Path,
+    store: Path,
+    round_id: str,
+    version_id: str,
+    decision: str,
+    reviewer: str,
+    reason: str,
+    source: object = None,
+    *,
+    calendar: Path | None = None,
+) -> dict[str, Any]:
+    """Record one immutable, content-addressed human review decision."""
+    from prajnatrade.protected_eval import evaluation_store
+
+    if decision not in REVIEW_ACTION_STATE:
+        raise ValueError("decision must be approve, return or end.")
+    reviewer = _text(reviewer, "reviewer")
+    reason = _text(reason, "reason")
+    trusted = evaluation_store(store)
+    if trusted.is_relative_to(project.resolve()):
+        raise ValueError("Trusted evaluation store must be outside the research project.")
+    with _round_lock(project, round_id), _project(project) as connection:
+        record = _project_round(connection, round_id)
+        trusted_record = _load_round_file(_round_path(trusted, round_id), round_id)
+        if trusted_record != record:
+            raise ValueError("The research round copy does not match the trusted approval.")
+        submission = _submission(connection, round_id, version_id, phase="review")
+        kickoff = record["kickoff"]
+        binding = _review_binding(connection, record, submission, trusted)
+        receipt: dict[str, Any] | None = None
+        if binding["validation"] is not None:
+            _, receipt = _validated_binding(connection, version_id, trusted)
+        if decision == "approve":
+            if receipt is None:
+                state = _review_state(connection, version_id)
+                if state == "ended":
+                    raise ProtocolError(
+                        "VERSION_ENDED", "review", "inspect",
+                        "An ended version is terminal and cannot be approved.",
+                    )
+                if state == "approved":
+                    raise ProtocolError(
+                        "REVIEW_CONFLICT", "review", "inspect",
+                        "An approved version has no lightweight Validation "
+                        "receipt that matches this decision.",
+                    )
+                raise ProtocolError(
+                    "VALIDATION_NOT_PASSED", "review", "new-version",
+                    "Approval requires a terminal lightweight Validation receipt "
+                    "for exactly this version.",
+                )
+            if receipt["outcome"] != "passed":
+                raise ProtocolError(
+                    "VALIDATION_NOT_PASSED", "review", "new-version",
+                    "Approval requires a passed receipt; hard-condition failures "
+                    "and insufficient evidence cannot be waived.",
+                )
+            confirmation = _approve_confirmation(source, kickoff, receipt)
+            decided_at = _now()
+            calendar_data = _tracking_calendar(calendar, record)
+            effective = _first_signal_session(calendar_data, decided_at)
+            request_payload = {
+                "observation": confirmation,
+                "calendar_hash": _hash(calendar_data),
+                "effective_signal_date": effective,
+            }
+        elif decision == "return":
+            decided_at = _now()
+            request_payload = _return_decision(source)
+        else:
+            decided_at = _now()
+            request_payload = _end_decision(source)
+        request_key = _review_request_key(
+            round_id, version_id, decision, reviewer, reason, request_payload, binding
+        )
+        existing = _matching_review(connection, trusted, version_id, request_key)
+        if existing is not None:
+            if existing["decision"] == "approve":
+                await_receipt = receipt
+                assert await_receipt is not None
+                artifact = _tracking_artifact(
+                    record, submission, await_receipt, existing
+                )
+                release.register_tracking_version(
+                    trusted,
+                    artifact,
+                    existing["tracking"]["enabled_signal_date"],
+                    existing["reason"],
+                )
+                _store_observation(connection, existing)
+            _store_decision(connection, trusted, existing)
+            return _review_result(
+                existing,
+                reused=True,
+                validation=(
+                    _validation_output(receipt, reused=True)
+                    if receipt is not None
+                    else None
+                ),
+            )
+        if _closure(connection, round_id) is not None:
+            raise ProtocolError(
+                "ROUND_CLOSED", "review", "inspect",
+                "A closed research round cannot record another review decision.",
+            )
+        _refuse_transition(_review_state(connection, version_id), decision)
+        body: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "round_id": round_id,
+            "version_id": version_id,
+            "decision": decision,
+            "review_state": REVIEW_ACTION_STATE[decision],
+            "reviewer": reviewer,
+            "reason": reason,
+            "decided_at": decided_at,
+            "binding": binding,
+            "request_key": request_key,
+        }
+        if decision == "approve":
+            assert receipt is not None
+            body["observation"] = {
+                **request_payload["observation"],
+                "confirmed_at": decided_at,
+            }
+            body["calendar"] = calendar_data
+            body["tracking"] = {
+                "release_id": release.tracking_id(
+                    version_id, receipt["validation_id"]
+                ),
+                "enabled_signal_date": request_payload["effective_signal_date"],
+                "calendar_hash": request_payload["calendar_hash"],
+            }
+        elif decision == "return":
+            body["return"] = request_payload
+        else:
+            body["end"] = request_payload
+        body["decision_id"] = _hash(body)
+        if decision == "approve":
+            artifact = _tracking_artifact(record, submission, receipt, body)
+            _store_decision(connection, trusted, body)
+            release.register_tracking_version(
+                trusted,
+                artifact,
+                body["tracking"]["enabled_signal_date"],
+                reason,
+            )
+            _store_observation(connection, body)
+        else:
+            _store_decision(connection, trusted, body)
+        return _review_result(
+            body,
+            reused=False,
+            validation=(
+                _validation_output(receipt, reused=True)
+                if receipt is not None
+                else None
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Platform-fix revalidation
+# ---------------------------------------------------------------------------
+
+
+def _discovery_evidence(
+    snapshot_store: Path,
+    campaign: Mapping[str, Any],
+    record: Mapping[str, Any],
+    locked_snapshot_id: str,
+) -> dict[str, Any]:
+    """Find the one sealed snapshot that reproduces the frozen Discovery partition."""
+    evaluation = campaign["evaluation"]
+    frozen = record["kickoff"]["scoring_policy"]["frozen"]
+    root = Path(snapshot_store)
+    matches: dict[str, dict[str, Any]] = {}
+    if not root.is_dir():
+        raise ProtocolError(
+            "REPLAY_MISMATCH", "revalidation", "inspect",
+            "The supplied snapshot store does not exist; the original selection "
+            "reason cannot be replayed.",
+        )
+    for path in sorted(root.iterdir()):
+        name = path.name
+        if (
+            not path.is_dir()
+            or len(name) != 64
+            or any(char not in "0123456789abcdef" for char in name)
+        ):
+            continue
+        try:
+            receipt = snapshot.read_discovery(
+                root, name, "discovery", evaluation.get("as_of")
+            )
+        except (OSError, ValueError):
+            continue
+        if receipt["data_kind"] != evaluation["data_kind"]:
+            continue
+        if (
+            receipt.get("partition_content_hash", receipt["content_hash"])
+            != evaluation["partition_content_hash"]
+        ):
+            continue
+        if receipt.get("prior_history_hash") != frozen.get("prior_history_hash"):
+            continue
+        matches[name] = {
+            "snapshot_id": name,
+            "data_kind": receipt["data_kind"],
+            "snapshot_hash": receipt["content_hash"],
+            "partition_content_hash": evaluation["partition_content_hash"],
+        }
+    if not matches:
+        raise ProtocolError(
+            "REPLAY_MISMATCH", "revalidation", "inspect",
+            "The supplied snapshot store cannot reproduce the frozen Discovery "
+            "partition; the original selection reason no longer holds.",
+        )
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if locked_snapshot_id in matches:
+        candidates = [
+            item for name, item in matches.items() if name != locked_snapshot_id
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+    raise ValueError(
+        "The snapshot store has more than one snapshot matching the frozen "
+        "Discovery partition; keep exactly the corrected snapshot."
+    )
+
+
+def _revalidation_identity(
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    prior_validation_id: str,
+    reason: str,
+) -> str:
+    return _hash(
+        {
+            "version_id": submission["version_id"],
+            "scoring_policy_hash": _scoring_policy_hash(record["kickoff"]),
+            "evidence_snapshot_id": evidence["snapshot_id"],
+            "snapshot_hash": evidence["snapshot_hash"],
+            "protocol_hash": submission["locked"]["protocol_hash"],
+            "engine_runtime_identity": _current_runtime(campaign),
+            "replay_engine_identity": replay_engine_identity(),
+            "prior_validation_id": prior_validation_id,
+            "reason": reason,
+        }
+    )
+
+
+def _revalidation_body(
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    prior: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    *,
+    reason: str,
+    review_state: str,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "round_id": record["round_id"],
+        "version_id": submission["version_id"],
+        "review_state": review_state,
+        "strategy_fingerprint": submission["strategy_fingerprint"],
+        "prior_validation_id": prior["validation_id"],
+        "prior_receipt_hash": prior["receipt_hash"],
+        "prior_outcome": prior["outcome"],
+        "prior_receipt": _published(prior),
+        "validation_id": receipt["validation_id"],
+        "receipt_hash": receipt["receipt_hash"],
+        "outcome": receipt["outcome"],
+        "validation_reason": receipt["reason"],
+        "reason": reason,
+        "evidence": dict(evidence),
+        "revalidated_at": _now(),
+        "opened_protected_source": False,
+        "query_debited": False,
+    }
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "revalidated",
+        "round_id": record["round_id"],
+        "version_id": submission["version_id"],
+        "review_state": review_state,
+        "strategy_fingerprint": submission["strategy_fingerprint"],
+        "previous_validation_id": prior["validation_id"],
+        "previous_receipt_hash": prior["receipt_hash"],
+        "previous_outcome": prior["outcome"],
+        "validation_id": receipt["validation_id"],
+        "receipt_hash": receipt["receipt_hash"],
+        "outcome": receipt["outcome"],
+        "reason": receipt["reason"],
+        "evidence": dict(evidence),
+    }
+    body["result"] = result
+    body["revalidation_id"] = _hash(body)
+    return body
+
+
+def revalidate(
+    project: Path,
+    store: Path,
+    snapshot_store: Path,
+    round_id: str,
+    version_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Recompute lightweight Validation after the evidence source or platform changed."""
+    from prajnatrade.protected_eval import evaluation_store, write_trusted_record_once
+
+    reason = _text(reason, "reason")
+    trusted = evaluation_store(store)
+    if trusted.is_relative_to(project.resolve()):
+        raise ValueError("Trusted evaluation store must be outside the research project.")
+    with _round_lock(project, round_id):
+        with _project(project) as connection:
+            record = _project_round(connection, round_id)
+            trusted_record = _load_round_file(_round_path(trusted, round_id), round_id)
+            if trusted_record != record:
+                raise ValueError(
+                    "The research round copy does not match the trusted approval."
+                )
+            if _closure(connection, round_id) is not None:
+                raise ProtocolError(
+                    "ROUND_CLOSED", "revalidation", "inspect",
+                    "A closed research round cannot revalidate another version.",
+                )
+            submission = _submission(
+                connection, round_id, version_id, phase="revalidation"
+            )
+            state = _review_state(connection, version_id)
+            if state == "ended":
+                raise ProtocolError(
+                    "VERSION_ENDED", "revalidation", "inspect",
+                    "An ended version is terminal and cannot be revalidated.",
+                )
+            if state == "approved":
+                raise ProtocolError(
+                    "REVIEW_CONFLICT", "revalidation", "inspect",
+                    "An approved version keeps its admitted receipt; end it before "
+                    "revalidating a fresh review.",
+                )
+            row = connection.execute(
+                "SELECT validation_id, receipt_json FROM research_loop_validations "
+                "WHERE version_id = ?",
+                (version_id,),
+            ).fetchone()
+            if row is None:
+                raise ProtocolError(
+                    "VALIDATION_NOT_PASSED", "revalidation", "correct",
+                    "Revalidation requires a completed lightweight Validation "
+                    "receipt to record as historical evidence.",
+                )
+            prior = _load_trusted_receipt(
+                trusted, row["validation_id"], row["receipt_json"]
+            )
+            campaign = campaign_discovery(project, record["campaign_id"])
+            evidence = _discovery_evidence(
+                snapshot_store,
+                campaign,
+                record,
+                submission["locked"]["snapshot_id"],
+            )
+            runtime = _current_runtime(campaign)
+            evidence["previous_snapshot_id"] = submission["locked"]["snapshot_id"]
+            evidence["snapshot_changed"] = (
+                evidence["snapshot_id"] != submission["locked"]["snapshot_id"]
+            )
+            evidence["runtime_changed"] = runtime != campaign["evaluation"].get(
+                "runtime"
+            )
+            evidence["engine_runtime_identity"] = runtime
+            evidence["replay_engine_identity"] = replay_engine_identity()
+            # A repeated revalidation must key the same evidence epoch, so the
+            # identity uses the base (non-revalidated) receipt as its anchor.
+            base_validation_id = prior["validation_id"]
+            previous_revalidation = connection.execute(
+                "SELECT revalidation_json FROM research_loop_revalidations "
+                "WHERE validation_id = ?",
+                (prior["validation_id"],),
+            ).fetchone()
+            if previous_revalidation is not None:
+                base_validation_id = json.loads(
+                    previous_revalidation["revalidation_json"]
+                )["prior_validation_id"]
+            validation_id = _revalidation_identity(
+                record, submission, campaign, evidence, base_validation_id, reason
+            )
+            stored = connection.execute(
+                "SELECT revalidation_json FROM research_loop_revalidations "
+                "WHERE validation_id = ?",
+                (validation_id,),
+            ).fetchone()
+            if stored is not None:
+                body = _verify_revalidation(json.loads(stored["revalidation_json"]))
+                return {
+                    **body["result"],
+                    "revalidation_id": body["revalidation_id"],
+                    "reused": True,
+                }
+            attempts = _attempt_rows(connection, validation_id)
+            resumed = bool(attempts)
+            attempt = len(attempts) + 1
+            for item in attempts:
+                if item["status"] == "running":
+                    connection.execute(
+                        "UPDATE research_loop_validation_attempts "
+                        "SET status = 'interrupted' WHERE validation_id = ? AND attempt = ?",
+                        (validation_id, item["attempt"]),
+                    )
+            connection.execute(
+                "INSERT INTO research_loop_validation_attempts "
+                "(validation_id, attempt, status, attempt_json) "
+                "VALUES (?, ?, 'running', ?)",
+                (
+                    validation_id,
+                    attempt,
+                    _json(
+                        {
+                            "round_id": round_id,
+                            "version_id": version_id,
+                            "validation_id": validation_id,
+                            "attempt": attempt,
+                            "revalidation": True,
+                            "prior_validation_id": prior["validation_id"],
+                            "reason": reason,
+                            "replay_engine_identity": evidence["replay_engine_identity"],
+                            "started_at": _now(),
+                        }
+                    ),
+                ),
+            )
+            attempt_context = (validation_id, attempt)
+        _write_running_marker(
+            trusted, attempt_context[0], record, submission, attempt_context[1]
+        )
+        _failpoint(VALIDATION_FAILPOINT)
+        replay = _replay(
+            project, snapshot_store, record, submission, campaign, evidence
+        )
+        receipt = _receipt(
+            record,
+            submission,
+            validation_id=attempt_context[0],
+            attempts=attempt_context[1],
+            resumed=resumed,
+            replay=replay,
+        )
+        _write_terminal_receipt(trusted, attempt_context[0], receipt)
+        body = _revalidation_body(
+            record,
+            submission,
+            prior,
+            receipt,
+            reason=reason,
+            review_state=state,
+            evidence=evidence,
+        )
+        path = _revalidation_path(trusted, body["revalidation_id"])
+        if path.is_file():
+            existing = _verify_revalidation(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+            if existing != body:
+                raise ValueError("A revalidation record is immutable and cannot change.")
+        else:
+            write_trusted_record_once(path, body)
+        with _project(project) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE research_loop_validation_attempts SET status = 'completed', "
+                "attempt_json = ? WHERE validation_id = ? AND attempt = ?",
+                (
+                    _json(
+                        {
+                            "round_id": round_id,
+                            "version_id": version_id,
+                            "validation_id": receipt["validation_id"],
+                            "attempt": attempt_context[1],
+                            "revalidation": True,
+                            "outcome": receipt["outcome"],
+                            "receipt_hash": receipt["receipt_hash"],
+                            "finished_at": _now(),
+                        }
+                    ),
+                    attempt_context[0],
+                    attempt_context[1],
+                ),
+            )
+            connection.execute(
+                "DELETE FROM research_loop_validations WHERE version_id = ?",
+                (version_id,),
+            )
+            connection.execute(
+                "INSERT INTO research_loop_validations "
+                "(validation_id, version_id, receipt_json) VALUES (?, ?, ?)",
+                (
+                    validation_id,
+                    version_id,
+                    _json(_published(receipt)),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO research_loop_revalidations "
+                "(revalidation_id, version_id, validation_id, "
+                "prior_validation_id, revalidation_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    body["revalidation_id"],
+                    version_id,
+                    validation_id,
+                    prior["validation_id"],
+                    _json(body),
+                ),
+            )
+    return {
+        **body["result"],
+        "revalidation_id": body["revalidation_id"],
+        "reused": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# round status
+# ---------------------------------------------------------------------------
 
 
 def _validation_summary(
@@ -1497,7 +2581,7 @@ def _validation_summary(
             "SELECT count(*) FROM research_loop_validation_attempts WHERE validation_id = ?",
             (terminal["validation_id"],),
         ).fetchone()[0]
-        return {
+        summary = {
             "validation_id": terminal["validation_id"],
             "status": "completed",
             "outcome": receipt["outcome"],
@@ -1505,6 +2589,15 @@ def _validation_summary(
             "observation": receipt.get("observation"),
             "attempts": attempts,
         }
+        revalidated = connection.execute(
+            "SELECT revalidation_id, prior_validation_id FROM "
+            "research_loop_revalidations WHERE validation_id = ?",
+            (terminal["validation_id"],),
+        ).fetchone()
+        if revalidated is not None:
+            summary["revalidation_id"] = revalidated["revalidation_id"]
+            summary["revalidated_from"] = revalidated["prior_validation_id"]
+        return summary
     running: dict[str, Any] | None = None
     for row in connection.execute(
         "SELECT validation_id, attempt, status, attempt_json FROM "
@@ -1520,6 +2613,55 @@ def _validation_summary(
         (running["validation_id"],),
     ).fetchone()[0]
     return running
+
+
+def _review_summary(
+    connection: sqlite3.Connection, version_id: str,
+) -> dict[str, Any]:
+    latest = _latest_review(connection, version_id)
+    if latest is None:
+        return {
+            "state": "pending",
+            "decision": None,
+            "decision_id": None,
+            "reviewer": None,
+            "reason": None,
+            "decided_at": None,
+            "summary": None,
+        }
+    if latest["decision"] == "approve":
+        summary: dict[str, Any] | None = {
+            "observation_sessions": latest["observation"]["observation_sessions"],
+            "accepted_risks": latest["observation"]["accepted_risks"],
+            "observation_reason": latest["observation"]["observation_reason"],
+            "tracking": latest["tracking"],
+        }
+    elif latest["decision"] == "return":
+        summary = latest["return"]
+    else:
+        summary = latest["end"]
+    return {
+        "state": latest["review_state"],
+        "decision": latest["decision"],
+        "decision_id": latest["decision_id"],
+        "reviewer": latest["reviewer"],
+        "reason": latest["reason"],
+        "decided_at": latest["decided_at"],
+        "summary": summary,
+    }
+
+
+def _version_observation(
+    connection: sqlite3.Connection, version_id: str,
+) -> dict[str, Any]:
+    validated = _validation_summary(connection, version_id)
+    recommended = validated.get("observation")
+    row = connection.execute(
+        "SELECT observation_json FROM research_loop_observations WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()
+    confirmed = json.loads(row["observation_json"]) if row is not None else None
+    return {"recommended": recommended, "confirmed": confirmed}
 
 
 def _round_observation(
@@ -1558,9 +2700,11 @@ def _round_status_body(
         (round_id,),
     ):
         body = json.loads(row["submission_json"])
+        version_id = body["version_id"]
+        review_state = _review_state(connection, version_id)
         submissions.append(
             {
-                "version_id": body["version_id"],
+                "version_id": version_id,
                 "submission_id": body["submission_id"],
                 "experiment_id": body["experiment_id"],
                 "change": body["change"],
@@ -1570,10 +2714,23 @@ def _round_status_body(
                 "risks": body["risks"],
                 "related_experiment_ids": body["related_experiment_ids"],
                 "strategy_fingerprint": body["strategy_fingerprint"],
-                "validation": _validation_summary(connection, body["version_id"]),
-                "review_state": _review_state(connection, body["version_id"]),
+                "validation": _validation_summary(connection, version_id),
+                "review_state": review_state,
+                "review": _review_summary(connection, version_id),
+                "observation": _version_observation(connection, version_id),
+                "tracking": _latest_tracking(connection, version_id),
             }
         )
+    tracked = [
+        {
+            "version_id": item["version_id"],
+            "release_id": item["tracking"]["release_id"],
+            "enabled_signal_date": item["tracking"]["enabled_signal_date"],
+            "state": item["tracking"]["state"],
+        }
+        for item in submissions
+        if item["tracking"] is not None
+    ]
     closure = _closure(connection, round_id)
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -1595,7 +2752,16 @@ def _round_status_body(
         "budget": dict(kickoff["budget"]),
         "submissions": submissions,
         "observation": _round_observation(connection, round_id),
-        "tracking": {"status": "not_tracking", "release_ids": [], "committed_sessions": 0},
+        "tracking": {
+            "status": (
+                "tracking"
+                if any(item["state"] == "approved" for item in tracked)
+                else ("ended" if tracked else "not_tracking")
+            ),
+            "release_ids": [item["release_id"] for item in tracked],
+            "versions": tracked,
+            "committed_sessions": 0,
+        },
     }
     if closure is not None:
         result["closure"] = closure
