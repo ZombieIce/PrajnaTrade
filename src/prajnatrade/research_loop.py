@@ -92,6 +92,16 @@ METRIC_TOLERANCE = 1e-9
 SCORING_MODES = ("valid_observations", "consecutive_sessions")
 DATA_AVAILABILITY = "next_open"
 BENCHMARK = "equal_weight_buy_and_hold"
+VALIDATION_PROTOCOL_LEGACY = {
+    "schema_version": 1,
+    "name": "discovery-replay",
+    "validation_kind": "discovery_replay",
+}
+VALIDATION_PROTOCOL_TRAILING = {
+    "schema_version": 1,
+    "name": "trailing-70-30",
+    "validation_kind": "trailing_validation",
+}
 ROUND_NAME = "research-loop-rounds"
 VALIDATION_NAME = "research-loop-validations"
 REVIEW_NAME = "research-loop-reviews"
@@ -372,11 +382,12 @@ def _round_contract(source: object) -> dict[str, Any]:
             "disclosed_risks", "scoring_policy", "observation", "invalidation", "reviewer",
             "approval_reason",
         },
+        frozenset({"validation_policy"}),
     )
     comparison = _object(payload["comparison"], {"benchmark", "statement"})
     if comparison["benchmark"] != BENCHMARK:
         raise ValueError(f"comparison.benchmark must be {BENCHMARK}.")
-    return {
+    contract = {
         "objective": _text(payload["objective"], "objective"),
         "constraints": _texts(payload["constraints"], "constraints"),
         "comparison": {
@@ -392,6 +403,26 @@ def _round_contract(source: object) -> dict[str, Any]:
         "reviewer": _text(payload["reviewer"], "reviewer"),
         "approval_reason": _text(payload["approval_reason"], "approval_reason"),
     }
+    if "validation_policy" in payload:
+        contract["validation_policy"] = payload["validation_policy"]
+    return contract
+
+
+def _validation_policy(raw: object) -> dict[str, int]:
+    """Normalize the v2 round's automatic Validation allowance."""
+    if not isinstance(raw, dict) or set(raw) != {"auto_validation_limit"}:
+        raise ProtocolError(
+            "VALIDATION_POLICY_REQUIRED", "round", "correct",
+            "A round on a Campaign with a frozen Discovery split requires "
+            "validation_policy.auto_validation_limit.",
+        )
+    limit = raw["auto_validation_limit"]
+    if type(limit) is not int or limit <= 0:
+        raise ProtocolError(
+            "VALIDATION_POLICY_REQUIRED", "round", "correct",
+            "validation_policy.auto_validation_limit must be a positive integer.",
+        )
+    return {"auto_validation_limit": limit}
 
 
 def _frozen_scoring_policy(policy: object) -> dict[str, Any]:
@@ -487,6 +518,20 @@ def prepare_round(
     campaign = campaign_discovery(project, campaign_id)
     evaluation = campaign["evaluation"]
     frozen = _frozen_scoring_policy(evaluation.get("history_policy"))
+    split = evaluation.get("discovery_split")
+    if split is None:
+        if "validation_policy" in contract:
+            raise ProtocolError(
+                "DISCOVERY_SPLIT_NOT_FROZEN", "round", "correct",
+                "validation_policy requires a Campaign created with "
+                "--discovery-split.",
+            )
+    else:
+        split = snapshot.verify_discovery_split(split)
+        if split["development"]["content_hash"] != campaign["snapshot_hash"]:
+            raise ValueError(
+                "The Campaign's Discovery development binding changed."
+            )
     if store.resolve().is_relative_to(project.resolve()):
         raise ValueError("Trusted evaluation store must be outside the research project.")
     direction = direction_id(direction_key)
@@ -518,6 +563,12 @@ def prepare_round(
             "max_seconds": campaign["discovery_budget"]["max_seconds"],
         },
     }
+    if split is not None:
+        kickoff["protocol"] = dict(VALIDATION_PROTOCOL_TRAILING)
+        kickoff["research_partition"] = split
+        kickoff["validation_policy"] = _validation_policy(
+            contract.pop("validation_policy", None)
+        )
     body = {
         "schema_version": SCHEMA_VERSION,
         "round_id": round_id,
@@ -568,6 +619,17 @@ def _require_campaign_binding(record: dict[str, Any], campaign: Mapping[str, Any
             record["kickoff"]["scoring_policy"]["frozen"], evaluation.get("history_policy"),
         ),
     }
+    split = record["kickoff"].get("research_partition")
+    if split is not None:
+        frozen_split = evaluation.get("discovery_split")
+        if not isinstance(frozen_split, Mapping):
+            raise ValueError(
+                "The Campaign Discovery split changed after the research round opened."
+            )
+        bindings["Discovery split"] = (split["split_hash"], frozen_split.get("split_hash"))
+        bindings["Discovery development content"] = (
+            split["development"]["content_hash"], campaign["snapshot_hash"],
+        )
     for label, (expected, actual) in bindings.items():
         if expected != actual:
             raise ValueError(f"The Campaign {label} changed after the research round opened.")
@@ -642,14 +704,22 @@ def _locked_strategy(attempt: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _protocol_hash(kickoff: Mapping[str, Any]) -> str:
-    return _hash(
-        {
-            "schema_version": SCHEMA_VERSION,
-            "comparison": kickoff["comparison"],
-            "hard_conditions": kickoff["hard_conditions"],
-            "selection_rules": kickoff["selection_rules"],
+    body: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "comparison": kickoff["comparison"],
+        "hard_conditions": kickoff["hard_conditions"],
+        "selection_rules": kickoff["selection_rules"],
+    }
+    # Protocol v1 hashes only the legacy contract fields.  Protocol v2 also
+    # binds the trailing-validation protocol block and the frozen split so a
+    # locked version traces to the partition protocol it was scored under.
+    if "protocol" in kickoff:
+        body["protocol"] = kickoff["protocol"]
+        split = kickoff["research_partition"]
+        body["research_partition"] = {
+            key: split[key] for key in ("split_hash", "development", "trailing")
         }
-    )
+    return _hash(body)
 
 
 def _scoring_policy_hash(kickoff: Mapping[str, Any]) -> str:
@@ -734,6 +804,7 @@ def submit(
                 "A closed research round cannot accept a new version.",
             )
         campaign = campaign_discovery(project, record["campaign_id"])
+        _require_campaign_binding(record, campaign)
         attempts = campaign_experiment_history(project, record["campaign_id"])
         experiment = next(
             (item for item in attempts if item["experiment_id"] == experiment_id), None
@@ -797,6 +868,13 @@ def submit(
                 "strategy_executor": evaluation.get("strategy_executor", {"kind": "none"}),
                 "runtime": evaluation["runtime"],
                 "strategy": strategy,
+                **(
+                    {
+                        "protocol": record["kickoff"]["protocol"],
+                        "research_partition": record["kickoff"]["research_partition"],
+                    }
+                    if "protocol" in record["kickoff"] else {}
+                ),
             },
         }
         previous = connection.execute(
@@ -1640,6 +1718,22 @@ def _submission(
     return body
 
 
+def _require_lightweight_validation(record: Mapping[str, Any], command: str) -> None:
+    """Fail closed for v2 rounds until the formal trailing Validation entry exists.
+
+    A round with a frozen split records protocol v2 and is scored by the
+    trailing-segment Validation protocol.  Replaying the full Discovery
+    interval as lightweight Validation would score the trailing segment without
+    that protocol and issue a misleading receipt, so this build refuses it
+    instead of silently falling back.
+    """
+    if "research_partition" in record["kickoff"]:
+        raise ValueError(
+            f"The trailing 70/30 Validation protocol does not support {command}; "
+            "v2 rounds use formal trailing Validation, not the v1 Discovery replay."
+        )
+
+
 def validate(
     project: Path,
     store: Path,
@@ -1659,6 +1753,7 @@ def validate(
             trusted_record = _load_round_file(_round_path(trusted, round_id), round_id)
             if trusted_record != record:
                 raise ValueError("The research round copy does not match the trusted approval.")
+            _require_lightweight_validation(record, "round validate")
             if _closure(connection, round_id) is not None:
                 raise ProtocolError(
                     "ROUND_CLOSED", "validation", "inspect",
@@ -3044,6 +3139,7 @@ def revalidate(
                 raise ValueError(
                     "The research round copy does not match the trusted approval."
                 )
+            _require_lightweight_validation(record, "round revalidate")
             if _closure(connection, round_id) is not None:
                 raise ProtocolError(
                     "ROUND_CLOSED", "revalidation", "inspect",
@@ -3481,25 +3577,28 @@ def _round_status_body(
         body = json.loads(row["submission_json"])
         version_id = body["version_id"]
         review_state = _review_state(connection, version_id)
-        submissions.append(
-            {
-                "version_id": version_id,
-                "submission_id": body["submission_id"],
-                "experiment_id": body["experiment_id"],
-                "change": body["change"],
-                "question": body["question"],
-                "expected_change": body["expected_change"],
-                "revisit_condition": body["revisit_condition"],
-                "risks": body["risks"],
-                "related_experiment_ids": body["related_experiment_ids"],
-                "strategy_fingerprint": body["strategy_fingerprint"],
-                "validation": _validation_summary(connection, version_id),
-                "review_state": review_state,
-                "review": _review_summary(connection, version_id),
-                "observation": _version_observation(connection, version_id),
-                "tracking": _latest_tracking(connection, version_id),
-            }
-        )
+        entry = {
+            "version_id": version_id,
+            "submission_id": body["submission_id"],
+            "experiment_id": body["experiment_id"],
+            "change": body["change"],
+            "question": body["question"],
+            "expected_change": body["expected_change"],
+            "revisit_condition": body["revisit_condition"],
+            "risks": body["risks"],
+            "related_experiment_ids": body["related_experiment_ids"],
+            "strategy_fingerprint": body["strategy_fingerprint"],
+            "validation": _validation_summary(connection, version_id),
+            "review_state": review_state,
+            "review": _review_summary(connection, version_id),
+            "observation": _version_observation(connection, version_id),
+            "tracking": _latest_tracking(connection, version_id),
+        }
+        locked = body["locked"]
+        if "protocol" in locked:
+            entry["protocol"] = locked["protocol"]
+            entry["research_partition"] = locked["research_partition"]
+        submissions.append(entry)
     tracked = [
         {
             "version_id": item["version_id"],
@@ -3520,6 +3619,7 @@ def _round_status_body(
         "campaign_id": record["campaign_id"],
         "scope": record["scope"],
         "data_kind": record["data_kind"],
+        "protocol": dict(kickoff.get("protocol", VALIDATION_PROTOCOL_LEGACY)),
         "kickoff": {
             field: kickoff[field]
             for field in (
@@ -3541,6 +3641,9 @@ def _round_status_body(
             "versions": tracked,
         },
     }
+    if "research_partition" in kickoff:
+        result["research_partition"] = kickoff["research_partition"]
+        result["validation_policy"] = kickoff["validation_policy"]
     if closure is not None:
         result["closure"] = closure
     return result

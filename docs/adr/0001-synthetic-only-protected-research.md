@@ -89,6 +89,44 @@ protected evidence.
    a `manual_tracking` version is a different admission source, not a protected
    release.
 
+## Discovery split and trailing Validation (issue #50)
+
+Issue #50 revises the #43 Validation interval: the frozen Discovery interval is
+split 70/30 so that a locked version can be checked on a later, unedited part of
+Discovery after research has stopped changing it.
+
+1. **The split covers the Campaign's sealed Discovery interval only.** Under
+   protocol v2, `development_sessions = N * 70 // 100` (floor) of the Discovery
+   sessions and the remainder goes to the trailing side; the two segments are
+   contiguous, disjoint and exhaustive. The descriptor records the boundary
+   rule, both segments' real dates, session counts and content hashes, the
+   sealed full Discovery partition hash and a canonical `split_hash`. The
+   sealed 60/20/20 `discovery`/`validation`/`final_holdout` layout is
+   unchanged; the split never crosses into the sealed protected partitions.
+2. **The Campaign copy holds development data only.** With `campaign create
+   --discovery-split 70/30` the research project stores just the development
+   slice and computes the baseline, scoring start and every experiment over it,
+   so Discovery reads approved development data by construction. The trailing
+   segment stays in the sealed snapshot.
+3. **No protected read and no query debit.** The trailing segment is part of
+   the sealed Discovery payload and is read through `snapshot.read_discovery`
+   exactly like the v1 evidence; formal trailing Validation is Discovery
+   evidence, not #37 protected Validation, not a protected allowance and not a
+   Final Holdout step. Its receipts record `opened_protected_source: false`
+   and `query_debited: false`.
+4. **Old records keep their protocols.** A round without a frozen split stays
+   protocol v1 (`discovery-replay`): its kickoff shape, protocol hash, locked
+   version and receipt are unchanged, and it refuses a `validation_policy`.
+   A v2 round records `trailing-70-30`/`trailing_validation`, the frozen split
+   and the round's automatic Validation limit; its protocol hash folds the
+   protocol and split, so its versions trace to the partition protocol they
+   were locked under. A v2 round never falls back to the v1 Discovery replay.
+   Issue #43 and issue #17 records are read under their original recorded
+   protocol and are not re-judged or migrated.
+5. **Synthetic stays labelled.** The split tests are mechanism tests on
+   synthetic sealed snapshots; they do not establish real forward evidence and
+   do not change the #17 acceptance verdict.
+
 ## Original decision (issue #17)
 
 1. **Synthetic only.** Every sealed snapshot, evaluation, release, forward
