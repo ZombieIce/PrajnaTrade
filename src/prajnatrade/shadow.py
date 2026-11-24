@@ -90,7 +90,7 @@ from prajnatrade import dividend, release, shadow_calendar, snapshot
 from prajnatrade.backtest import _validate_weights
 from prajnatrade.container_executor import executor_from_config
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.experiment import runtime_identity
+from prajnatrade.experiment import runtime_matches
 from prajnatrade.isolation import IsolationError
 from prajnatrade.snapshot_baseline import (
     _is_executable_open,
@@ -1637,8 +1637,10 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
             config = evaluation["strategy_executor"]
             if (
                 (artifact.get("workflow") != release.RESEARCH_HOLDOUT and artifact["scope"] != "real")
-                or runtime_identity(config, execution_rules=evaluation["execution_rules"])
-                != evaluation["runtime"]
+                or not runtime_matches(
+                    evaluation["runtime"], config, execution_rules=evaluation["execution_rules"],
+                    history_policy=evaluation.get("history_policy"),
+                )
             ):
                 raise ValueError("The frozen Python execution runtime is unavailable.")
             version = normalize_strategy_spec({**strategy, "parameters": parameters})
