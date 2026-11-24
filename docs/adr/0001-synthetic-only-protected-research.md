@@ -114,6 +114,31 @@ Discovery after research has stopped changing it.
    evidence, not #37 protected Validation, not a protected allowance and not a
    Final Holdout step. Its receipts record `opened_protected_source: false`
    and `query_debited: false`.
+   - **One counted read per version, reserved before the read.** A v2 round
+     freezes an automatic Validation limit. The first trailing read of a
+     distinct locked version reserves one immutable
+     `research_loop_validation_uses` row inside the round lock and the same
+     SQLite write transaction, before any attempt row, trusted write or sealed
+     read; the reservation and the receipt carry it (`usage`). A resume, replay,
+     receipt view or revalidation of the same version never consumes again, and
+     an interrupted, failed or insufficient read keeps its row. Exhausting the
+     limit refuses the next read before it happens, with no attempt and no
+     trusted record.
+   - **Known gaps are free.** Only sealed manifest metadata is read before the
+     reservation: a declared gap inside the trailing segment, or a frozen
+     research interval that does not match the sealed Discovery descriptor,
+     blocks with `VALIDATION_DATA_GAP` and `counted: false`. History shortfalls
+     and gaps discovered by the run are evidence verdicts and count.
+   - **Post-read mismatches keep the use.** A payload whose data kind, frozen
+     partition hash, prior history, as-of projection or recomputed split fails
+     verification is refused with `VALIDATION_PARTITION_MISMATCH` after the
+     reservation, so the counted read stays auditable.
+   - **Revalidation keeps the version's single use.** A corrected successor
+     must preserve the frozen development slice hash, data kind/schema, prior
+     history, interval/session dates and as-of; the trailing segment is then
+     recomputed and a new formal epoch records the prior receipt, the
+     original/recomputed validation records and the trailing affected diff. A
+     changed development slice is `EVIDENCE_DEVELOPMENT_MISMATCH`.
 4. **Old records keep their protocols.** A round without a frozen split stays
    protocol v1 (`discovery-replay`): its kickoff shape, protocol hash, locked
    version and receipt are unchanged, and it refuses a `validation_policy`.
@@ -123,9 +148,15 @@ Discovery after research has stopped changing it.
    were locked under. A v2 round never falls back to the v1 Discovery replay.
    Issue #43 and issue #17 records are read under their original recorded
    protocol and are not re-judged or migrated.
-5. **Synthetic stays labelled.** The split tests are mechanism tests on
-   synthetic sealed snapshots; they do not establish real forward evidence and
-   do not change the #17 acceptance verdict.
+5. **The formal receipt keeps its own protocol.** A v2 receipt records
+   `validation_kind: "trailing_validation"`, the frozen protocol/split, the
+   development/trailing/scoring/warmup/provenance records, the counted `usage`
+   and the verdict summary. The additive fields are published only when
+   present, so a v1 `discovery_replay` receipt keeps its exact #43 shape and is
+   still read under its original protocol; `replay` remains a v1-only check.
+6. **Synthetic stays labelled.** The split and formal-Validation tests are
+   mechanism tests on synthetic sealed snapshots; they do not establish real
+   forward evidence and do not change the #17 acceptance verdict.
 
 ## Original decision (issue #17)
 

@@ -826,9 +826,9 @@ top-level `protocol` (a v1 round defaults to `discovery-replay`),
 `research_partition` and `validation_policy` for v2, and per-version `protocol`
 and `research_partition` on every locked submission. That is how the operator
 verifies the development dates to research within and the trailing dates that
-will be scored without opening any payload. The formal trailing-segment
-Validation receipt protocol is part of the #50 series; a v2 round never falls
-back to the v1 full-interval replay.
+will be scored without opening any payload. `round validate` on a v2 round runs
+the [formal trailing-segment Validation](#formal-trailing-validation-protocol-v2);
+it never falls back to the v1 full-interval replay.
 
 `round status` is granted to the agent and reads the project only:
 
@@ -886,13 +886,14 @@ prajnatrade round validate --project ./strategy-A --store /trusted/evaluations \
   --version-id "$VERSION"
 ```
 
-This section is the protocol v1 (`discovery-replay`) Validation path. A v2
-round records `validation_kind: trailing_validation` and is scored by the #50
-formal trailing-segment Validation entry over the frozen trailing slice, with
-the development slice as prehistory; it is not a full-interval Discovery
-replay and this build refuses to fall back to one.
+`round validate` follows the protocol recorded in the round kickoff. A
+**protocol v1** round (`discovery-replay`) uses the full-interval Discovery
+replay described in this section. A **protocol v2** round
+(`trailing_validation`) uses the
+[formal trailing-segment Validation](#formal-trailing-validation-protocol-v2)
+below; it never falls back to the v1 replay.
 
-Lightweight Validation replays the locked candidate and the equal-weight
+Protocol v1 replays the locked candidate and the equal-weight
 benchmark over the Campaign's frozen Discovery interval, using the same sealed
 snapshot, point-in-time cutoffs, execution rules, costs, initial cash and
 scoring start as Discovery. It reuses the Discovery evidence and introduces no
@@ -930,6 +931,110 @@ validation identity returns the stored receipt with `reused: true`. If the
 process is interrupted, the retry keeps the same identity, records a new
 `attempt` row and reports `attempts`/`resumed: true`; it does not spend a
 protected allowance or a new attempt.
+
+##### Formal trailing Validation (protocol v2)
+
+A v2 round scores the locked version and the equal-weight benchmark on the
+**trailing segment only**. The development segment is the prehistory, so the
+first trailing session can score immediately; the candidate and the benchmark
+each open with the frozen `initial_cash` and the same costs, execution rules,
+signal window and locked `history_requirements` as Discovery. Nothing after the
+decision date is visible to that decision, and no protected partition is opened
+(`opened_protected_source: false`, `query_debited: false`).
+
+The trusted read is counted once per locked version. `round validate`:
+
+1. **Pre-read gate (zero count).** Reads only the sealed `manifest.json`
+   metadata and refuses before any count when the frozen research interval does
+   not match the sealed Discovery descriptor, or when any `raw_bars`,
+   `derived`, `corporate_actions` or `availability` gap in the manifest falls
+   inside the trailing date range. The rejection is
+   `VALIDATION_DATA_GAP` (exit 2) with the gaps, the trailing segment and
+   `counted: false`; the ledger stays empty.
+2. **Atomic reservation (one use per version).** Under the round lock and one
+   SQLite write transaction, and before any attempt row, trusted write or sealed
+   read: an existing use for this version is reused (resume or revalidation);
+   otherwise, when `count(automatic uses) < auto_validation_limit`, the next
+   `automatic` row is inserted; otherwise the command is refused with
+   `VALIDATION_ALLOWANCE_EXHAUSTED` (exit 2, `next_action: "admit"`, context
+   `round_state: "awaiting_validation_admission"` and the allowance). That
+   refusal writes no attempt, no trusted record and reads nothing. Two versions
+   racing the last slot serialize: exactly one reserves the use and reads.
+3. **One sealed read.** The Discovery payload is read once with the Campaign's
+   frozen `as_of`. Its data kind, sealed full Discovery partition hash and
+   prior-history hash must match the frozen record, and recomputing
+   `snapshot.discovery_split` from the same projection must reproduce the frozen
+   development and trailing slice hashes. A post-read mismatch is
+   `VALIDATION_PARTITION_MISMATCH` (exit 2) and the reserved use stays counted.
+4. **Trailing-only scoring.** The candidate and benchmark run over the trailing
+   segment from its first session; every trailing session is expected to be
+   scored (a valuation or signal gap is `COVERAGE_INSUFFICIENT`).
+
+The formal receipt is write-once in the trusted store and published to the
+project with the additive allowlist. Its fields are `schema_version`,
+`round_id`, `version_id`, `validation_id`, `status`, `validation_kind:
+"trailing_validation"`, `outcome`, `reason`, `protocol` (split hash, boundary
+rule, research interval), `development` and `trailing` (start, end, sessions,
+content hash), `scoring` (start, end, sessions, valued sessions), `warmup`
+(source, development bounds, prior-history hash, first ready date),
+`provenance` (snapshot, both slice hashes, as-of, round/version/submission/
+experiment), `usage` (kind, sequence, use ID, admission ID), `summary`
+(scoring, candidate, benchmark, delta, verdict), `metrics`, `checks`, `runs`
+(candidate and benchmark records with fills and metrics), `observation`,
+`opened_protected_source`, `query_debited` and `receipt_hash`. The `usage` block
+is deterministic from the immutable use row, so a retry reproduces a
+byte-identical receipt without consuming again. `round validate` output adds an
+`allowance` summary (`auto_limit`, `automatic_used`, `manual_used`,
+`total_used`, `remaining`).
+
+The checks are `data_availability`, `scoring_start`, `coverage`, `position`,
+`segment` (the verified frozen descriptor, hashes and as-of) and
+`hard_conditions`; there is no `replay` check and no `costs` check (costs are
+reported in the summary). The verdict precedence is:
+
+| `outcome` | `reason` | meaning |
+| --- | --- | --- |
+| `failed` | `HARD_CONDITION_NOT_MET` | At least one round hard condition failed. |
+| `insufficient_evidence` | `SCORING_START_INSUFFICIENT` | The required history is not ready at the trailing first session. |
+| `insufficient_evidence` | `COVERAGE_INSUFFICIENT` | Signal/valuation gaps or an incomplete trailing window. |
+| `insufficient_evidence` | `POSITION_EVIDENCE_INSUFFICIENT` | The account neither established the preregistered position nor explicitly targeted cash. |
+| `insufficient_evidence` | `METRICS_NOT_READY` | A hard-condition metric is unavailable. |
+| `passed` | `null` | Every check holds and every hard condition is met. |
+
+A `failed` or `insufficient_evidence` verdict is evidence, not a protocol
+rejection: the command exits 0, the receipt records the reason and the reserved
+use stays counted.
+
+**Interruption and replay.** An interrupted run keeps its `running` attempt and
+its use; a retry records the next attempt, reuses the same `validation_id` and
+use, and completes with the identical receipt. A terminal replay returns the
+stored receipt (`reused: true`) without reading or counting again. A known-gap
+block, an exhausted allowance and a partition mismatch are protocol rejections
+and write no receipt.
+
+**Corrected successors.** A v2 `round revalidate` verifies that the successor
+preserves the frozen development slice hash, data kind and schema, prior
+history, research interval/session dates and as-of, then recomputes the
+trailing candidate and benchmark with the same protocol, prehistory, costs and
+thresholds. It records a new formal epoch with `evidence`,
+`prior_validation_id`, `prior_receipt_hash`, `prior_outcome`,
+`original_validation`, `recomputed_validation` and `affected` (changed
+rows/sessions, NAV changes, fill changes, ending-equity delta and a summary
+reason). The version's single use is kept (no new count), replaying the
+revalidation returns the stored record, and `round validate` on that version is
+`REVALIDATION_SUPERSEDED`. A successor that changed the development slice is
+refused with `EVIDENCE_DEVELOPMENT_MISMATCH` (the other checks keep the
+`EVIDENCE_*` family).
+
+**Status.** For a v2 round, `round status` adds the per-round
+`validation_allowance` (`auto_limit`, `automatic_used`, `manual_used`,
+`total_used`, `remaining` and the `uses` rows with sequence, version, validation
+ID, kind, admission ID and consumed-at) and `lifecycle` (`research`,
+`awaiting_validation_admission` once every automatic slot is used, or
+`converged` when the round is closed). A version's `validation` summary keeps
+its legacy fields and adds `kind`, `protocol`, `scoring`, `warmup` and `usage`
+when the stored receipt has them. The agent sees these counters and dates only;
+it never sees a sealed payload, the per-session curves or the run detail.
 
 After a corrected data source or a platform fix, use `round revalidate` when
 the original selection reason still holds:
@@ -1173,10 +1278,10 @@ print `error: ...` on stderr and exit 2.
 | Command | Side | Success `status` | Evidence-bearing statuses (exit 0) | Rejection (exit 2) |
 | --- | --- | --- | --- | --- |
 | `round open` | operator | `opened` | — | `ROUND_ALREADY_OPENED`, `SCORING_POLICY_NOT_FROZEN`, `VALIDATION_POLICY_REQUIRED`, `DISCOVERY_SPLIT_NOT_FROZEN` |
-| `round status` | operator, agent | `ok` (or `open`/`closed` for one round) | — | `ROUND_NOT_FOUND` |
+| `round status` | operator, agent | `ok` (or `open`/`closed` for one round); v2 adds `validation_allowance`, `validation_policy` and `lifecycle` | — | `ROUND_NOT_FOUND` |
 | `round submit` | agent | `submitted` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE` |
-| `round validate` | operator | `completed` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `REVALIDATION_SUPERSEDED` |
-| `round revalidate` | operator | `revalidated` | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REPLAY_MISMATCH`, `EVIDENCE_SNAPSHOT_NOT_FOUND`, `EVIDENCE_NOT_SUCCESSOR`, `EVIDENCE_DATA_KIND_MISMATCH`, `EVIDENCE_INTERVAL_MISMATCH`, `EVIDENCE_PRIOR_HISTORY_MISMATCH`, `EVIDENCE_AS_OF_VIOLATION`, `EVIDENCE_INTEGRITY_VIOLATION`, `EVIDENCE_SNAPSHOT_AMBIGUOUS` |
+| `round validate` | operator | `completed` (v2 adds `validation_kind`/`protocol`/`development`/`trailing`/`scoring`/`warmup`/`provenance`/`usage`/`summary`/`allowance`) | `passed`, `failed`, `insufficient_evidence` (exit 0; a v2 `failed`/`insufficient_evidence` keeps its counted use) | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `REVALIDATION_SUPERSEDED`, `VALIDATION_DATA_GAP`, `VALIDATION_ALLOWANCE_EXHAUSTED`, `VALIDATION_PARTITION_MISMATCH` |
+| `round revalidate` | operator | `revalidated` (v2 adds `validation_kind`/`evidence`/`original_validation`/`recomputed_validation`/`affected`) | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REPLAY_MISMATCH`, `EVIDENCE_SNAPSHOT_NOT_FOUND`, `EVIDENCE_NOT_SUCCESSOR`, `EVIDENCE_DATA_KIND_MISMATCH`, `EVIDENCE_INTERVAL_MISMATCH`, `EVIDENCE_DEVELOPMENT_MISMATCH`, `EVIDENCE_PRIOR_HISTORY_MISMATCH`, `EVIDENCE_AS_OF_VIOLATION`, `EVIDENCE_INTEGRITY_VIOLATION`, `EVIDENCE_SNAPSHOT_AMBIGUOUS` |
 | `round review` | operator | `approved` / `returned` / `ended` | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `RISK_NOT_ACCEPTED`, `OBSERVATION_REQUIRED`, `REVIEW_CONFLICT`, `VERSION_ENDED`, `CALENDAR_COVERAGE_MISSING`, `RELEASE_NOT_FOUND`, `RELEASE_INTEGRITY_FAILED`, `INVALID_TRANSITION`, `ADMISSION_INVALID` |
 | `round close` | operator | `closed` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `VERSION_ENDED` |
 | `round evidence status` | operator | `ok` (per-version `state`: `tracking` / `review_due` / `observation_extended` / `paused` / `ended`) | — | `ROUND_NOT_FOUND`, unknown version |
