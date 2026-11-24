@@ -243,6 +243,20 @@ CREATE TABLE IF NOT EXISTS research_loop_admissions (
     admission_json TEXT NOT NULL,
     UNIQUE (round_id, version_id)
 );
+CREATE TABLE IF NOT EXISTS research_loop_details (
+    detail_access_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL REFERENCES research_loop_rounds(round_id),
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    validation_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    resolution_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_loop_feedback (
+    feedback_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL REFERENCES research_loop_rounds(round_id),
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    feedback_json TEXT NOT NULL
+);
 """
 
 
@@ -512,8 +526,12 @@ def _round_path(store: Path, round_id: str) -> Path:
 
 
 def _verify_round(record: dict[str, Any], round_id: str) -> None:
+    # ``opened_at`` and the derived cross-round ``reuse_disclosure`` are stored
+    # alongside the approved kickoff but are deliberately outside its hash.
     body = {
-        key: value for key, value in record.items() if key not in {"kickoff_hash", "opened_at"}
+        key: value
+        for key, value in record.items()
+        if key not in {"kickoff_hash", "opened_at", "reuse_disclosure"}
     }
     if record.get("round_id") != round_id or record.get("kickoff_hash") != _hash(body):
         raise ValueError("Research round fingerprint mismatch.")
@@ -641,7 +659,7 @@ def prepare_round(
 
 
 def _opened(record: dict[str, Any], *, reused: bool) -> dict[str, Any]:
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "status": "opened",
         "reused": reused,
@@ -654,6 +672,9 @@ def _opened(record: dict[str, Any], *, reused: bool) -> dict[str, Any]:
         "kickoff": record["kickoff"],
         "kickoff_hash": record["kickoff_hash"],
     }
+    if "reuse_disclosure" in record:
+        result["reuse_disclosure"] = record["reuse_disclosure"]
+    return result
 
 
 def _require_campaign_binding(record: dict[str, Any], campaign: Mapping[str, Any]) -> None:
@@ -691,6 +712,106 @@ def _require_campaign_binding(record: dict[str, Any], campaign: Mapping[str, Any
             raise ValueError(f"The Campaign {label} changed after the research round opened.")
 
 
+def _receipt_used_interval(receipt: Mapping[str, Any]) -> dict[str, str] | None:
+    """The interval a published Validation receipt actually used.
+
+    A formal trailing receipt records its ``trailing`` segment.  A legacy
+    receipt records the replayed Discovery scoring interval in ``replay`` (its
+    ``scoring`` block is additive for protocol v2).  Old receipts keep being
+    read under their original protocol.
+    """
+    trailing = receipt.get("trailing")
+    if isinstance(trailing, Mapping) and {"start", "end"} <= set(trailing):
+        return {"start": str(trailing["start"]), "end": str(trailing["end"])}
+    replay = receipt.get("replay")
+    if isinstance(replay, Mapping):
+        candidate = replay.get("candidate")
+        if isinstance(candidate, Mapping) and {
+            "start_date", "end_date"
+        } <= set(candidate):
+            return {
+                "start": str(candidate["start_date"]),
+                "end": str(candidate["end_date"]),
+            }
+    scoring = receipt.get("scoring")
+    if isinstance(scoring, Mapping) and {"start", "end"} <= set(scoring):
+        return {"start": str(scoring["start"]), "end": str(scoring["end"])}
+    return None
+
+
+def _reuse_disclosure(
+    connection: sqlite3.Connection, prepared: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Disclose the intervals and feedback a previous round used on this snapshot.
+
+    Derived once, at v2 ``round open``, from the project's own published
+    receipts and feedback rows: no sealed payload is read and no protected
+    record is touched.  The result is outside ``kickoff_hash`` and is written
+    once with the trusted round record, so a replay returns the stored
+    disclosure instead of a value that a later prior round could change.
+    """
+    kickoff = prepared["kickoff"]
+    snapshot_id = kickoff["frozen_campaign"]["snapshot_id"]
+    trailing = kickoff["research_partition"]["trailing"]
+    previous_rounds: list[dict[str, Any]] = []
+    disclosed_feedback: list[dict[str, Any]] = []
+    for row in connection.execute(
+        "SELECT r.round_id, r.campaign_id, r.kickoff_json, c.snapshot_id, "
+        "c.evaluation_json FROM research_loop_rounds r "
+        "JOIN campaigns c ON c.campaign_id = r.campaign_id ORDER BY r.rowid"
+    ):
+        used_snapshot = row["snapshot_id"]
+        if not used_snapshot:
+            used_snapshot = json.loads(row["evaluation_json"]).get("snapshot_id")
+        if used_snapshot != snapshot_id:
+            continue
+        receipt_row = connection.execute(
+            "SELECT v.receipt_json FROM research_loop_validations v "
+            "JOIN research_loop_submissions s USING (version_id) "
+            "WHERE s.round_id = ? ORDER BY v.rowid LIMIT 1",
+            (row["round_id"],),
+        ).fetchone()
+        if receipt_row is None:
+            continue
+        used = _receipt_used_interval(json.loads(receipt_row["receipt_json"]))
+        if used is None:
+            continue
+        start = max(used["start"], trailing["start"])
+        end = min(used["end"], trailing["end"])
+        prior_kickoff = json.loads(row["kickoff_json"])
+        protocol = prior_kickoff.get("protocol", VALIDATION_PROTOCOL_LEGACY)
+        previous_rounds.append(
+            {
+                "round_id": row["round_id"],
+                "campaign_id": row["campaign_id"],
+                "protocol": protocol["name"],
+                "used": used,
+                "overlap": {"start": start, "end": end} if start <= end else None,
+            }
+        )
+        for feedback_row in connection.execute(
+            "SELECT f.feedback_json FROM research_loop_feedback f "
+            "JOIN research_loop_submissions s ON s.version_id = f.version_id "
+            "WHERE s.round_id = ? ORDER BY f.rowid",
+            (row["round_id"],),
+        ):
+            body = json.loads(feedback_row["feedback_json"])
+            disclosed_feedback.append(
+                {
+                    "feedback_id": body["feedback_id"],
+                    "round_id": body["round_id"],
+                    "version_id": body["version_id"],
+                    "impact": body["impact"],
+                }
+            )
+    return {
+        "snapshot_id": snapshot_id,
+        "previous_rounds": previous_rounds,
+        "feedback": disclosed_feedback,
+        "overlapping": any(item["overlap"] is not None for item in previous_rounds),
+    }
+
+
 def open_round(
     project: Path, store: Path, prepared: dict[str, Any],
 ) -> dict[str, Any]:
@@ -725,8 +846,26 @@ def open_round(
             if trusted_record != stored:
                 raise ValueError("The trusted research round copy differs from the project copy.")
             return _opened(trusted_record, reused=True)
-        stored = write_trusted_record_once(target, prepared)
-        if stored != prepared:
+        candidate = prepared
+        if "research_partition" in prepared["kickoff"]:
+            if target.is_file():
+                # Crash window: the trusted round was written before the
+                # project projection.  Reuse its once-computed disclosure (a
+                # prior round created meanwhile must not rewrite history).
+                trusted_record = _load_round_file(target, round_id)
+                if trusted_record["kickoff_hash"] != prepared["kickoff_hash"]:
+                    raise ProtocolError(
+                        "ROUND_ALREADY_OPENED", "round", "inspect",
+                        "The Campaign already has a different approved research round.",
+                    )
+                candidate = trusted_record
+            else:
+                candidate = {
+                    **prepared,
+                    "reuse_disclosure": _reuse_disclosure(connection, prepared),
+                }
+        stored = write_trusted_record_once(target, candidate)
+        if stored != candidate:
             raise ProtocolError(
                 "ROUND_ALREADY_OPENED", "round", "inspect",
                 "The Campaign already has a different approved research round.",
@@ -734,9 +873,9 @@ def open_round(
         connection.execute(
             "INSERT INTO research_loop_rounds (round_id, campaign_id, kickoff_json) "
             "VALUES (?, ?, ?)",
-            (round_id, prepared["campaign_id"], _json(prepared)),
+            (round_id, prepared["campaign_id"], _json(candidate)),
         )
-    return _opened(prepared, reused=False)
+    return _opened(candidate, reused=False)
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +966,9 @@ def _submitted(body: dict[str, Any], *, reused: bool, requested: str | None = No
         "strategy_fingerprint": body["strategy_fingerprint"],
         "locked": body["locked"],
     }
+    for field in ("revision_of", "feedback_ids"):
+        if field in body:
+            result[field] = body[field]
     if requested is not None and requested != body["submission_id"]:
         result["requested_submission_id"] = requested
     return result
@@ -842,7 +984,7 @@ def submit(
             "experiment_id", "change", "question", "expected_change", "revisit_condition",
             "risks",
         },
-        frozenset({"related_experiment_ids"}),
+        frozenset({"related_experiment_ids", "revision_of", "feedback_ids"}),
     )
     experiment_id = _text(payload["experiment_id"], "experiment_id")
     change = _text(payload["change"], "change")
@@ -851,6 +993,13 @@ def submit(
     revisit_condition = _text(payload["revisit_condition"], "revisit_condition")
     risks = _texts(payload["risks"], "risks")
     related = _texts(payload.get("related_experiment_ids", []), "related_experiment_ids")
+    revision_of = payload.get("revision_of")
+    if revision_of is not None:
+        revision_of = _require_hex(revision_of, "revision")
+    feedback_ids = payload.get("feedback_ids", [])
+    feedback_ids = sorted(set(_texts(feedback_ids, "feedback_ids")))
+    for feedback_id in feedback_ids:
+        _require_hex(feedback_id, "feedback")
     submission_id = _text(submission_id, "submission_id")
     with _round_lock(project, round_id), _project(project) as connection:
         record = _project_round(connection, round_id)
@@ -896,6 +1045,40 @@ def submit(
             base_costs,
             protocol_hash,
         )
+        # Revision and feedback links are provenance, not identity: they are
+        # validated here but deliberately excluded from ``version_id``.
+        if revision_of is not None:
+            if revision_of == version_id:
+                raise _rejected(
+                    "REVISION_CONFLICT", "submission", "correct",
+                    "A version cannot revise itself.",
+                )
+            prior = connection.execute(
+                "SELECT 1 FROM research_loop_submissions "
+                "WHERE round_id = ? AND version_id = ?",
+                (round_id, revision_of),
+            ).fetchone()
+            if prior is None:
+                raise _rejected(
+                    "REVISION_NOT_FOUND", "submission", "correct",
+                    "revision_of must name a prior version locked in this round.",
+                )
+        for feedback_id in feedback_ids:
+            row = connection.execute(
+                "SELECT round_id, version_id FROM research_loop_feedback "
+                "WHERE feedback_id = ?",
+                (feedback_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["round_id"] != round_id
+                or row["version_id"] == version_id
+            ):
+                raise _rejected(
+                    "FEEDBACK_LINK_INVALID", "submission", "correct",
+                    "feedback_ids must link feedback from prior versions of this "
+                    "round, never another round or the version being locked.",
+                )
         body = {
             "schema_version": SCHEMA_VERSION,
             "round_id": round_id,
@@ -909,6 +1092,8 @@ def submit(
             "revisit_condition": revisit_condition,
             "risks": sorted(set(risks)),
             "related_experiment_ids": sorted(set(related)),
+            **({"revision_of": revision_of} if revision_of is not None else {}),
+            **({"feedback_ids": feedback_ids} if feedback_ids else {}),
             "strategy_fingerprint": strategy_fingerprint,
             "experiment_hash": experiment_hash,
             "locked": {
@@ -3025,6 +3210,377 @@ def admit(
         return _admission_result(connection, record, stored, reused=False)
 
 
+# ---------------------------------------------------------------------------
+# Controlled Validation detail queries (protocol v2 and legacy receipts)
+# ---------------------------------------------------------------------------
+
+# The fixed allowlist projects the *published* project receipt only.  It never
+# names ``curves`` (trusted-only per-session evidence), a sealed payload, a
+# ledger row or a price, so a detail query cannot widen the agent boundary.
+_DETAIL_RECORD_NAMES = (
+    "summary", "metrics.candidate", "metrics.benchmark", "runs.candidate",
+    "runs.benchmark", "fills.candidate", "fills.benchmark", "observation",
+    "protocol", "provenance", "usage", "development", "trailing", "scoring",
+    "warmup", "replay",
+)
+_DETAIL_CHECK_GROUPS = (
+    "data_availability", "scoring_start", "coverage", "position", "costs",
+    "replay", "segment", "hard_conditions",
+)
+_DETAIL_MISSING = object()
+
+_FEEDBACK_IDENTITY_FIELDS = (
+    "schema_version", "round_id", "version_id", "validation_id", "receipt_hash",
+    "impact", "detail_access_id", "next_experiment_id",
+)
+
+
+def _detail_block(receipt: Mapping[str, Any], record: str) -> object:
+    """The published receipt block a record name projects (``_DETAIL_MISSING``)."""
+    if record == "summary":
+        return receipt.get("summary", _DETAIL_MISSING)
+    if record.startswith("metrics.") or record.startswith("runs."):
+        side = record.split(".", 1)[1]
+        block = receipt.get(record.split(".", 1)[0])
+        if isinstance(block, Mapping) and side in block:
+            return block[side]
+        return _DETAIL_MISSING
+    if record.startswith("fills."):
+        side = record.split(".", 1)[1]
+        runs = receipt.get("runs")
+        if isinstance(runs, Mapping) and isinstance(runs.get(side), Mapping):
+            return runs[side].get("fills", _DETAIL_MISSING)
+        return _DETAIL_MISSING
+    if record.startswith("checks."):
+        group = record.split(".", 1)[1]
+        checks = receipt.get("checks")
+        if isinstance(checks, Mapping) and group in checks:
+            return checks[group]
+        return _DETAIL_MISSING
+    return receipt.get(record, _DETAIL_MISSING)
+
+
+def _detail_request(round_id: str, version_id: str, receipt: Mapping[str, Any], source: object):
+    payload = _object(source, {"question", "records"})
+    question = _text(payload["question"], "question")
+    records = _texts(payload["records"], "records")
+    if not records:
+        raise ValueError("records must name at least one published receipt block.")
+    normalized = sorted(set(records))
+    unknown = [
+        record
+        for record in normalized
+        if record not in _DETAIL_RECORD_NAMES
+        and not (
+            record.startswith("checks.")
+            and record.split(".", 1)[1] in _DETAIL_CHECK_GROUPS
+        )
+    ]
+    if unknown:
+        raise _rejected(
+            "DETAIL_RECORD_UNKNOWN", "detail", "correct",
+            "The requested record is not in the published detail allowlist.",
+            records=unknown,
+        )
+    request = {
+        "schema_version": SCHEMA_VERSION,
+        "round_id": round_id,
+        "version_id": version_id,
+        "validation_id": receipt["validation_id"],
+        "receipt_hash": receipt["receipt_hash"],
+        "question": question,
+        "records": normalized,
+    }
+    details: dict[str, Any] = {}
+    unavailable: list[str] = []
+    for record in normalized:
+        value = _detail_block(receipt, record)
+        if value is _DETAIL_MISSING:
+            unavailable.append(record)
+        else:
+            details[record] = value
+    if unavailable:
+        raise _rejected(
+            "DETAIL_RECORD_UNAVAILABLE", "detail", "inspect",
+            "A requested record is not part of this published Validation receipt.",
+            records=unavailable,
+        )
+    return request, details
+
+
+def _verify_detail(row: sqlite3.Row) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load one content-addressed detail request and its stored resolution."""
+    request = json.loads(row["request_json"])
+    if not isinstance(request, dict) or request.get("detail_access_id") != row["detail_access_id"]:
+        raise ValueError("Validation detail request fingerprint mismatch.")
+    if _hash(
+        {key: value for key, value in request.items() if key != "detail_access_id"}
+    ) != row["detail_access_id"]:
+        raise ValueError("Validation detail request fingerprint mismatch.")
+    resolution = json.loads(row["resolution_json"])
+    if not isinstance(resolution, dict) or not isinstance(resolution.get("details"), dict):
+        raise ValueError("Invalid Validation detail resolution.")
+    return request, resolution
+
+
+def _detail_view(
+    request: Mapping[str, Any],
+    resolution: Mapping[str, Any],
+    *,
+    reused: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "completed",
+        "reused": reused,
+        **dict(request),
+        "details": resolution["details"],
+        "recorded_at": resolution["recorded_at"],
+    }
+
+
+def _detail_rows(
+    connection: sqlite3.Connection, version_id: str,
+) -> list[sqlite3.Row]:
+    return list(
+        connection.execute(
+            "SELECT detail_access_id, round_id, version_id, validation_id, "
+            "request_json, resolution_json FROM research_loop_details "
+            "WHERE version_id = ? ORDER BY rowid",
+            (version_id,),
+        )
+    )
+
+
+def _version_details(
+    connection: sqlite3.Connection, version_id: str,
+) -> list[dict[str, Any]]:
+    """The status projection: recorded questions without duplicating answers."""
+    listed: list[dict[str, Any]] = []
+    for row in _detail_rows(connection, version_id):
+        request, resolution = _verify_detail(row)
+        listed.append(
+            {
+                "detail_access_id": row["detail_access_id"],
+                "question": request["question"],
+                "records": list(request["records"]),
+                "recorded_at": resolution["recorded_at"],
+            }
+        )
+    return listed
+
+
+def detail(
+    project: Path, round_id: str, version_id: str, source: object,
+) -> dict[str, Any]:
+    """Answer one specific question from the version's *published* receipt.
+
+    Agent + operator command, project database only: the resolution is projected
+    from the project's published receipt and never re-reads the sealed snapshot,
+    the trusted per-session curves or a ledger.  A detail query is not a
+    Validation read: it writes no use row and never changes the allowance.
+    """
+    with _round_lock(project, round_id), _project(project) as connection:
+        _project_round(connection, round_id)
+        _submission(connection, round_id, version_id, phase="detail")
+        row = connection.execute(
+            "SELECT validation_id, receipt_json FROM research_loop_validations "
+            "WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if row is None:
+            raise _rejected(
+                "VALIDATION_NOT_PASSED", "detail", "validate",
+                "A detail question needs a terminal published Validation receipt.",
+            )
+        receipt = json.loads(row["receipt_json"])
+        if receipt.get("status") != "completed" or "receipt_hash" not in receipt:
+            raise _rejected(
+                "VALIDATION_NOT_PASSED", "detail", "validate",
+                "A detail question needs a terminal published Validation receipt.",
+            )
+        receipt = {**receipt, "validation_id": row["validation_id"]}
+        request, details = _detail_request(round_id, version_id, receipt, source)
+        detail_access_id = _hash(request)
+        stored_request = {**request, "detail_access_id": detail_access_id}
+        existing = connection.execute(
+            "SELECT detail_access_id, request_json, resolution_json "
+            "FROM research_loop_details WHERE detail_access_id = ?",
+            (detail_access_id,),
+        ).fetchone()
+        if existing is not None:
+            existing_request, existing_resolution = _verify_detail(existing)
+            return _detail_view(
+                existing_request, existing_resolution, reused=True
+            )
+        resolution = {
+            "status": "completed",
+            "details": details,
+            "recorded_at": _now(),
+        }
+        connection.execute(
+            "INSERT OR IGNORE INTO research_loop_details "
+            "(detail_access_id, round_id, version_id, validation_id, request_json, "
+            "resolution_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                detail_access_id,
+                round_id,
+                version_id,
+                receipt["validation_id"],
+                _json(stored_request),
+                _json(resolution),
+            ),
+        )
+        stored = connection.execute(
+            "SELECT detail_access_id, request_json, resolution_json "
+            "FROM research_loop_details WHERE detail_access_id = ?",
+            (detail_access_id,),
+        ).fetchone()
+        stored_request_json, stored_resolution = _verify_detail(stored)
+        return _detail_view(
+            stored_request_json,
+            stored_resolution,
+            reused=stored_resolution != resolution,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Validation feedback and the revision link
+# ---------------------------------------------------------------------------
+
+
+def _verify_feedback(body: object) -> dict[str, Any]:
+    if not isinstance(body, dict) or not set(_FEEDBACK_IDENTITY_FIELDS) <= body.keys():
+        raise ValueError("Invalid Validation feedback record.")
+    feedback_id = body.get("feedback_id")
+    _require_hex(feedback_id, "feedback")
+    if feedback_id != _hash(
+        {field: body[field] for field in _FEEDBACK_IDENTITY_FIELDS}
+    ):
+        raise ValueError("Validation feedback fingerprint mismatch.")
+    if not isinstance(body.get("recorded_at"), str) or not body["recorded_at"]:
+        raise ValueError("Invalid Validation feedback timestamp.")
+    return body
+
+
+def _version_feedback(
+    connection: sqlite3.Connection, version_id: str,
+) -> list[dict[str, Any]]:
+    return [
+        _verify_feedback(json.loads(row["feedback_json"]))
+        for row in connection.execute(
+            "SELECT feedback_json FROM research_loop_feedback "
+            "WHERE version_id = ? ORDER BY rowid",
+            (version_id,),
+        )
+    ]
+
+
+def _feedback_result(
+    body: Mapping[str, Any], *, reused: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "recorded",
+        "reused": reused,
+        "feedback": dict(body),
+    }
+
+
+def feedback(
+    project: Path, round_id: str, version_id: str, source: object,
+) -> dict[str, Any]:
+    """Link V1's Validation evidence (and one recorded detail) to what it changed."""
+    with _round_lock(project, round_id), _project(project) as connection:
+        record = _project_round(connection, round_id)
+        submission = _submission(connection, round_id, version_id, phase="feedback")
+        row = connection.execute(
+            "SELECT validation_id, receipt_json FROM research_loop_validations "
+            "WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if row is None:
+            raise _rejected(
+                "VALIDATION_NOT_PASSED", "feedback", "validate",
+                "Feedback needs a terminal published Validation receipt.",
+            )
+        receipt = json.loads(row["receipt_json"])
+        if receipt.get("status") != "completed" or "receipt_hash" not in receipt:
+            raise _rejected(
+                "VALIDATION_NOT_PASSED", "feedback", "validate",
+                "Feedback needs a terminal published Validation receipt.",
+            )
+        payload = _object(
+            source, {"impact", "detail_access_id", "next_experiment_id"}
+        )
+        impact = _text(payload["impact"], "impact")
+        detail_access_id = payload["detail_access_id"]
+        if detail_access_id is not None:
+            detail_access_id = _require_hex(detail_access_id, "detail access")
+            request_row = connection.execute(
+                "SELECT round_id, version_id, request_json FROM research_loop_details "
+                "WHERE detail_access_id = ?",
+                (detail_access_id,),
+            ).fetchone()
+            request = (
+                json.loads(request_row["request_json"])
+                if request_row is not None
+                else None
+            )
+            if (
+                request_row is None
+                or request_row["round_id"] != round_id
+                or request_row["version_id"] != version_id
+                or request["validation_id"] != row["validation_id"]
+                or request["receipt_hash"] != receipt["receipt_hash"]
+            ):
+                raise _rejected(
+                    "DETAIL_NOT_FOUND", "feedback", "detail",
+                    "The referenced detail access does not belong to this "
+                    "version's published Validation receipt.",
+                )
+        next_experiment_id = payload["next_experiment_id"]
+        if next_experiment_id is not None:
+            next_experiment_id = _text(next_experiment_id, "next_experiment_id")
+            attempts = campaign_experiment_history(project, record["campaign_id"])
+            known = any(
+                item["experiment_id"] == next_experiment_id for item in attempts
+            )
+            if not known or next_experiment_id == submission["experiment_id"]:
+                raise _rejected(
+                    "FEEDBACK_LINK_INVALID", "feedback", "correct",
+                    "Feedback must link another experiment in the same Campaign.",
+                )
+        identity = {
+            "schema_version": SCHEMA_VERSION,
+            "round_id": round_id,
+            "version_id": version_id,
+            "validation_id": row["validation_id"],
+            "receipt_hash": receipt["receipt_hash"],
+            "impact": impact,
+            "detail_access_id": detail_access_id,
+            "next_experiment_id": next_experiment_id,
+        }
+        feedback_id = _hash(identity)
+        existing = connection.execute(
+            "SELECT feedback_json FROM research_loop_feedback WHERE feedback_id = ?",
+            (feedback_id,),
+        ).fetchone()
+        if existing is not None:
+            return _feedback_result(_verify_feedback(json.loads(existing["feedback_json"])), reused=True)
+        body = {**identity, "feedback_id": feedback_id, "recorded_at": _now()}
+        connection.execute(
+            "INSERT OR IGNORE INTO research_loop_feedback "
+            "(feedback_id, round_id, version_id, feedback_json) VALUES (?, ?, ?, ?)",
+            (feedback_id, round_id, version_id, _json(body)),
+        )
+        stored = connection.execute(
+            "SELECT feedback_json FROM research_loop_feedback WHERE feedback_id = ?",
+            (feedback_id,),
+        ).fetchone()
+        return _feedback_result(_verify_feedback(json.loads(stored["feedback_json"])), reused=False)
+
+
 def load_tracking_receipt(store: str | Path, validation_id: str) -> dict[str, Any]:
     """Public seam: load one completed lightweight Validation receipt safely.
 
@@ -4723,9 +5279,13 @@ def _validation_summary(
         for field, name in (
             ("validation_kind", "kind"),
             ("protocol", "protocol"),
+            ("development", "development"),
+            ("trailing", "trailing"),
             ("scoring", "scoring"),
             ("warmup", "warmup"),
+            ("provenance", "provenance"),
             ("usage", "usage"),
+            ("summary", "summary"),
         ):
             if field in receipt:
                 summary[name] = receipt[field]
@@ -4878,11 +5438,16 @@ def _round_status_body(
             "related_experiment_ids": body["related_experiment_ids"],
             "strategy_fingerprint": body["strategy_fingerprint"],
             "validation": _validation_summary(connection, version_id),
+            "details": _version_details(connection, version_id),
+            "feedback": _version_feedback(connection, version_id),
             "review_state": review_state,
             "review": _review_summary(connection, version_id),
             "observation": _version_observation(connection, version_id),
             "tracking": _latest_tracking(connection, version_id),
         }
+        for field in ("revision_of", "feedback_ids"):
+            if field in body:
+                entry[field] = body[field]
         locked = body["locked"]
         if "protocol" in locked:
             entry["protocol"] = locked["protocol"]
@@ -4933,6 +5498,8 @@ def _round_status_body(
     if "research_partition" in kickoff:
         result["research_partition"] = kickoff["research_partition"]
         result["validation_policy"] = kickoff["validation_policy"]
+        if "reuse_disclosure" in record:
+            result["reuse_disclosure"] = record["reuse_disclosure"]
         allowance = _validation_allowance_status(connection, record)
         if allowance is not None:
             result["validation_allowance"] = allowance

@@ -179,9 +179,56 @@ Discovery after research has stopped changing it.
    and the verdict summary. The additive fields are published only when
    present, so a v1 `discovery_replay` receipt keeps its exact #43 shape and is
    still read under its original protocol; `replay` remains a v1-only check.
-6. **Synthetic stays labelled.** The split and formal-Validation tests are
-   mechanism tests on synthetic sealed snapshots; they do not establish real
-   forward evidence and do not change the #17 acceptance verdict.
+6. **The receipt summary is a deliberate agent grant.** A v2 `round status`
+   publishes the formal receipt's `summary` (candidate and benchmark return,
+   drawdown, fees, slippage, turnover, fills, orders and ending equity, the
+   delta and the verdict reason) plus the frozen protocol/development/trailing/
+   scoring/warmup/provenance/usage blocks. This is intended: the agent must be
+   able to propose a testable revision. The grant does not include the
+   trusted-only per-session `curves`, any ledger row or price, the
+   `query_debited`/`opened_protected_source` internals, sealed payloads or
+   protected records, and it does not weaken the human boundary: a per-version
+   review decision's reviewer/reason and a manual admission's reviewer/reason
+   stay operator-only, as do the protected flows. Legacy v1 summaries keep their
+   original shape.
+7. **A detail query is a controlled projection, not a read.** `round detail`
+   (agent + operator, project database only, no `--store`) records a non-empty
+   question and a fixed allowlist of records over the version's **published**
+   project receipt, under a content-addressed `detail_access_id`; identical
+   requests replay the stored resolution. Unknown or unavailable records are
+   typed rejections, and a version without a terminal receipt has nothing to
+   project. It never projects `curves` (trusted-only per-session evidence),
+   never re-reads a sealed payload or ledger, never consumes a Validation use or
+   an admission, and never changes the allowance. Feedback is the recorded
+   impact linked to that receipt (and optionally one detail access and the next
+   known Campaign experiment); it is content-addressed, replayable and not a
+   read. A later submission may cite a prior version (`revision_of`) and prior
+   feedback (`feedback_ids`) as validated provenance in its body; these links
+   are deliberately outside `version_id`, because a revision is the same
+   experiment content whether or not its provenance is cited.
+8. **Reused evidence is disclosed across rounds.** A v2 round open on a
+   snapshot that an earlier round of the same project already used records one
+   `reuse_disclosure`: each earlier round's protocol and the interval its
+   published receipt actually used (a formal `trailing` segment or the legacy
+   replay's scoring interval), its intersection with the new trailing segment,
+   and the feedback recorded on those versions. The disclosure is derived once
+   from the project's own published receipts and feedback rows, stored outside
+   `kickoff_hash` in the trusted round record and its project copy, and returned
+   unchanged on replay, including when the trusted record exists but its project
+   projection crashed. Protocol-v1 rounds get no disclosure; old receipts keep
+   being read under their original protocol rather than re-judged.
+9. **The selection basis is traceable from the public CLI.** A synthetic
+   mechanism test follows snapshot → round → version → experiment → locked
+   protocol → actual development and scoring dates → warmup source →
+   usage/allowance (including a manual admission read) → feedback → review state
+   → tracking using only `round status` and one `round detail` with
+   `records: ["provenance"]`, without re-reading sealed data. This proves the
+   mechanism #35 needs; the real receipt linking those facts and real forward
+   acceptance remain #35's gate and are not claimed here.
+10. **Synthetic stays labelled.** The split, formal-Validation, summary/detail/
+    feedback, reuse-disclosure and traceability tests are mechanism tests on
+    synthetic sealed snapshots; they do not establish real forward evidence and
+    do not change the #17 acceptance verdict.
 
 ## Original decision (issue #17)
 

@@ -26,7 +26,7 @@ PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
 The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
-CI run); at the time of writing this branch collects **470 tests**. CI
+CI run); at the time of writing this branch collects **483 tests**. CI
 (`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
 Python 3.12; `lint` runs `ruff check .`.
 
@@ -120,6 +120,32 @@ read keeps its use and resume converges, close-at-limit records
 `selected_validation`/`validation_allowance`, early no-candidate close with
 Campaign budget remaining still works, and a protocol-v1 round keeps its legacy
 status/closure/receipt shapes. The file is fast and not marked `isolation`.
+
+## Validation feedback, detail and cross-round reuse tests (#50-T4)
+
+`tests/test_validation_feedback_cli.py` covers the T4 traceability surface. It
+drives the agent and operator CLI on the same synthetic 70/30 split Campaigns as
+#50-T2/T3 and imports the formal-validation, split, review, admission and
+research-loop builders. It asserts: the v2 receipt `summary` (return, drawdown,
+costs, fills, verdict reason) reaches `round status` and the agent view while
+`equity_curve`/`curves`, ledger/paths, `query_debited`/
+`opened_protected_source` internals and review reviewer/reason stay hidden, and
+a legacy summary keeps its v1 shape; `round detail` records the question and
+normalized records, returns only the requested published blocks, replays without
+a new row or Validation use, and rejects unknown/unavailable records and a
+version without a receipt; `round feedback` links a detail access and the next
+Campaign experiment, replays by content and never consumes a use, and
+`revision_of`/`feedback_ids` are validated provenance outside `version_id`, with
+V2 re-scored on the same protocol, trailing segment, benchmark cash, costs and
+thresholds; a returned V1 is re-approved on its stored formal receipt while a
+`failed` or `insufficient_evidence` formal receipt cannot be approved; a v2
+`round open` discloses the prior round's used interval, overlap and feedback on
+the same snapshot and reuses the stored disclosure across the trusted-write
+crash window while the old receipt keeps reading under `discovery-replay`; and a
+synthetic #35 chain links snapshot, round, version, experiment, real development
+and scoring dates, warmup source, allowance usage (including a manual admission
+read), feedback, review state and tracking. The file is fast and not marked
+`isolation`.
 
 ## Docker tests
 

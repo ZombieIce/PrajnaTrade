@@ -721,14 +721,18 @@ The Mock provider can emit deterministic Python when opted in, but a Mock
 campaign is never evidence of model novelty or investable performance. Results
 are research evidence, not investment advice or a guarantee of future returns.
 
-### Research Loop and Evidence Loop (#43)
+### Research Loop and Evidence Loop (#43, #50)
 
-Issue #43 is the default simulated-tracking workflow. A **Research Loop** runs
-one approved round over a Campaign: approve the round contract, lock successful
-Discovery versions, replay them as lightweight Validation, then record one
-current human review state per version from immutable decisions. An **Evidence
-Loop** is the independent Shadow Live account of a version admitted to
-simulated tracking and the observation review that follows.
+Issue #43 is the default simulated-tracking workflow, extended by #50 with a
+frozen 70/30 Discovery-to-Validation protocol. A **Research Loop** runs one
+approved round over a Campaign: approve the round contract, lock successful
+Discovery versions, score them as lightweight Validation (protocol v1) or
+formal trailing-segment Validation (protocol v2), read the published receipt's
+summary and ask specific questions of its published detail, record the feedback
+that a revision links back to, then record one current human review state per
+version from immutable decisions. An **Evidence Loop** is the independent
+Shadow Live account of a version admitted to simulated tracking and the
+observation review that follows.
 
 Admission here is a **manual simulated-tracking decision**. It is not the
 protected `evaluation`/Final Holdout flow and not a conditional `release`: it
@@ -820,6 +824,13 @@ experiment runs:
   (`{"schema_version": 1, "name": "trailing-70-30", "validation_kind":
   "trailing_validation"}`), the frozen `research_partition` descriptor and
   `validation_policy`; a v1 kickoff keeps its exact old shape and hash.
+- Opening a v2 round on a snapshot that an earlier round in the same project
+  already used computes one **reuse disclosure** (see
+  [cross-round reuse disclosure](#cross-round-reuse-disclosure)): the earlier
+  round's protocol and the interval its published receipt actually used, the
+  intersection with this round's trailing segment, and the feedback recorded
+  against that round's versions. It is stored once with the round record,
+  outside `kickoff_hash`, so a replay returns the stored disclosure.
 
 `round status` exposes the same split to the operator and the agent:
 top-level `protocol` (a v1 round defaults to `discovery-replay`),
@@ -838,15 +849,20 @@ prajnatrade-agent round status --project ./strategy-A [--round-id "$ROUND"]
 
 Without `--round-id` it lists every round. Each round reports `status` (`open`
 or `closed`), the approved kickoff, the budget, and for each locked submission
-its Validation summary, current `review_state`, the return instructions
-recorded when a version was returned, the recommended and confirmed
-observation and a tracking summary, plus any closure. A protocol-v2 round also
-reports the frozen split, the automatic Validation limit and use counters, the
-recorded manual admissions (IDs, version, granted-at and derived use state) and
-`lifecycle`. The round kickoff keeps the authorizing reviewer and approval
-reason; the agent view never exposes a per-version review decision's reviewer
-or reason, a manual admission's reviewer or reason, any ledger row, ledger
-price, accounting detail, sealed payload or protected outcome.
+its Validation summary, the recorded detail accesses and feedback, the V2
+`revision_of`/`feedback_ids` links, current `review_state`, the return
+instructions recorded when a version was returned, the recommended and
+confirmed observation and a tracking summary, plus any closure. A protocol-v2
+round also reports the frozen split, the automatic Validation limit and use
+counters, the recorded manual admissions (IDs, version, granted-at and derived
+use state), `lifecycle` and the `reuse_disclosure` stored at open. The round
+kickoff keeps the authorizing reviewer and approval reason; the agent view never
+exposes a per-version review decision's reviewer or reason, a manual
+admission's reviewer or reason, any ledger row, ledger price or per-session
+curve, `query_debited`/`opened_protected_source` internals, sealed payloads or
+protected outcomes. The deliberate v2 grant is the receipt **summary** —
+return, drawdown, costs, fills and the verdict reason — while legacy v1
+summaries keep their original shape.
 
 #### 2. Lock a version for review
 
@@ -880,6 +896,16 @@ so the version traces to the partition protocol it will be scored under). The
 same `submission_id` with the same content returns the stored version with
 `reused: true`; the same ID with different content is `SUBMISSION_CONFLICT`; the
 same content under another submission ID resolves to the same `version_id`.
+
+A revision links its provenance without changing the version identity. The
+optional `revision_of` names a prior version already locked in this round
+(never the version being submitted, `REVISION_NOT_FOUND`/`REVISION_CONFLICT`),
+and `feedback_ids` names feedback recorded on prior versions of this round
+(never another round or the version being locked, `FEEDBACK_LINK_INVALID`). Both
+are stored in the submission body and shown by `round status`; they are
+deliberately excluded from `version_id`, so a V2 experiment submits to the same
+content address with or without the link. The ordinary idempotency and conflict
+rules compare them while they are part of the submission content.
 
 #### 3. Lightweight Validation (no protected allowance)
 
@@ -1040,10 +1066,15 @@ the derived `used`/`consumed_validation_id`; the reviewer identity and reason
 stay out of the agent view) and `lifecycle` (`research`,
 `awaiting_validation_admission` once every automatic slot is used, or
 `converged` when the round is closed). A version's `validation` summary keeps
-its legacy fields and adds `kind`, `protocol`, `scoring`, `warmup` and `usage`
-when the stored receipt has them. The agent sees these counters, dates and the
-admission IDs only; it never sees a sealed payload, the per-session curves, the
-run detail or the admission's reviewer/reason.
+its legacy fields and adds `kind`, `protocol`, `development`, `trailing`,
+`scoring`, `warmup`, `provenance`, `usage` and the receipt `summary` when the
+stored receipt has them. Each submission also lists its recorded `details`
+(access ID, question, records, recorded-at) and `feedback` rows, plus the
+`revision_of`/`feedback_ids` it linked. The agent sees the summary numbers,
+these counters, dates and the admission IDs; it never sees a sealed payload,
+the per-session `curves`, ledger rows/prices, `query_debited`/
+`opened_protected_source` internals, the review decision's reviewer/reason or
+the admission's reviewer/reason.
 
 ##### Manual Validation admission (protocol v2)
 
@@ -1107,6 +1138,134 @@ beside the automatic counters (`remaining` is always the automatic remainder).
 With every automatic slot used, `lifecycle` stays
 `awaiting_validation_admission` even after a manual read, exactly as frozen in
 the round policy; it becomes `converged` only when the round closes.
+
+##### Validation detail and feedback (protocol v2 and legacy)
+
+The summary is the entry point; a specific question is answered by projecting
+the **published** project receipt. `round detail` is granted to the agent and
+the operator and takes no `--store`:
+
+```sh
+prajnatrade-agent round detail --project ./strategy-A --round-id "$ROUND" \
+  --version-id "$VERSION" --input detail.json
+```
+
+```json
+{"question": "Which trailing sessions carried the drawdown?",
+ "records": ["summary", "checks.position", "provenance"]}
+```
+
+`records` is a fixed allowlist over the published receipt: `summary`,
+`metrics.candidate`, `metrics.benchmark`, `checks.<group>` for every published
+check group (`data_availability`, `scoring_start`, `coverage`, `position`,
+`costs`, `replay`, `segment`, `hard_conditions`), `runs.candidate`,
+`runs.benchmark`, `fills.candidate`, `fills.benchmark`, `observation`,
+`protocol`, `provenance`, `usage`, `development`, `trailing`, `scoring`,
+`warmup`, and `replay` for a legacy receipt. A record name outside the allowlist
+is `DETAIL_RECORD_UNKNOWN`; an allowed name that this receipt does not publish
+is `DETAIL_RECORD_UNAVAILABLE`; a version without a terminal receipt is
+`VALIDATION_NOT_PASSED`. The resolution is never derived from the trusted
+per-session `curves`, a sealed payload or a ledger.
+
+`detail_access_id` is a canonical hash of the round, version, validation ID,
+`receipt_hash`, question and normalized (sorted, de-duplicated) records. The
+output is `{"schema_version", "status": "completed", "reused",
+"detail_access_id", "round_id", "version_id", "validation_id", "receipt_hash",
+"question", "records", "details", "recorded_at"}`. Identical requests replay the
+stored resolution with `reused: true`; another question is another recorded
+access. A detail query is **not** a Validation read: it writes no use row,
+never consumes an admission and leaves the allowance unchanged. `round status`
+lists each version's `details` as access ID, question, records and recorded-at
+without duplicating the stored resolution.
+
+`round feedback` links that evidence to what it changed:
+
+```sh
+prajnatrade-agent round feedback --project ./strategy-A --round-id "$ROUND" \
+  --version-id "$VERSION" --input feedback.json
+```
+
+```json
+{"impact": "The trailing drawdown says the slower lookback should be tried next.",
+ "detail_access_id": "…", "next_experiment_id": "exp-…"}
+```
+
+Feedback requires a terminal receipt for that version. A supplied
+`detail_access_id` must belong to this round, version and receipt
+(`DETAIL_NOT_FOUND`); a supplied `next_experiment_id` must be another known
+experiment of the same Campaign (`FEEDBACK_LINK_INVALID`). The record keeps
+`feedback_id`, round, version, `validation_id`, `receipt_hash`, impact, both
+links and `recorded_at`. `feedback_id` content-addresses the immutable body
+(the timestamp is stored alongside), so identical content replays the stored
+row with `reused: true`, and recording feedback is never a Validation read.
+`round status` shows each version's `feedback` rows.
+
+A V2 submission then cites the prior version and the feedback with
+`revision_of` and `feedback_ids` (see [lock a version](#2-lock-a-version-for-review)):
+
+```json
+{"experiment_id": "exp-…", "change": "…", "question": "…",
+ "expected_change": "…", "revisit_condition": "…", "risks": ["…"],
+ "revision_of": "…V1 version_id…", "feedback_ids": ["…feedback_id…"]}
+```
+
+The links are provenance, not identity: they are validated, stored in the
+submission body and shown in `round status`, but excluded from `version_id`.
+V2 is scored by the same round protocol on the same trailing segment, benchmark,
+initial cash, costs and hard-condition thresholds as V1.
+
+##### Cross-round reuse disclosure
+
+A snapshot may be re-partitioned in a new Campaign (one Campaign per round).
+When a v2 round opens on a snapshot that an earlier round of the same project
+already used, the kickoff records one top-level `reuse_disclosure` (outside
+`kickoff_hash`):
+
+```json
+{"snapshot_id": "…",
+ "previous_rounds": [{"round_id": "…", "campaign_id": "…",
+                      "protocol": "discovery-replay",
+                      "used": {"start": "2024-01-04", "end": "2024-01-09"},
+                      "overlap": {"start": "2024-01-07", "end": "2024-01-09"}}],
+ "feedback": [{"feedback_id": "…", "round_id": "…", "version_id": "…",
+               "impact": "…"}],
+ "overlapping": true}
+```
+
+The previously used interval comes from the prior round's published receipt:
+a formal trailing receipt uses its `trailing` segment, and a legacy receipt
+uses the **replayed scoring interval** (`replay.candidate.start_date`/
+`end_date`, after the Campaign warmup). `overlap` is the intersection with this
+round's trailing segment (or `null`), and `feedback` lists the prior round's
+feedback rows. The value is computed once on the first open, stored in the
+trusted round record and its project copy, and returned unchanged on replay —
+even if another prior round opens meanwhile. If the trusted round file exists
+without its project row (a crash between the two writes), the stored disclosure
+is reused rather than re-derived. Protocol-v1 rounds get no disclosure, and old
+receipts keep being read under their original protocol.
+
+##### Traceability of the selection basis (#35, synthetic)
+
+`round status` plus one `round detail` with `records: ["provenance"]` traces a
+version without re-reading sealed data:
+
+```sh
+prajnatrade-agent round detail --project ./strategy-A --round-id "$ROUND" \
+  --version-id "$VERSION" --input provenance.json
+# {"question": "Show the full selection basis of V1.",
+#  "records": ["provenance", "summary", "usage"]}
+```
+
+The chain is snapshot → round → version → experiment → locked protocol →
+development and scoring dates → warmup source → usage/allowance → feedback →
+review state → tracking. `round status` carries the round/protocol/split,
+version, submission, experiment, `validation` (kind/protocol/development/
+trailing/scoring/warmup/provenance/usage/summary), `details`, `feedback`,
+`review_state` and `tracking`; a manual admission read appears as a `manual`
+use row and a consumed admission; the published `provenance` block names the
+snapshot, the frozen partition and both slice content hashes. This is a
+synthetic mechanism check: it does not collect the real #35 receipt or claim
+real-chain evidence.
 
 After a corrected data source or a platform fix, use `round revalidate` when
 the original selection reason still holds:
@@ -1356,12 +1515,14 @@ print `error: ...` on stderr and exit 2.
 
 | Command | Side | Success `status` | Evidence-bearing statuses (exit 0) | Rejection (exit 2) |
 | --- | --- | --- | --- | --- |
-| `round open` | operator | `opened` | — | `ROUND_ALREADY_OPENED`, `SCORING_POLICY_NOT_FROZEN`, `VALIDATION_POLICY_REQUIRED`, `DISCOVERY_SPLIT_NOT_FROZEN` |
-| `round status` | operator, agent | `ok` (or `open`/`closed` for one round); v2 adds `validation_allowance`, `validation_policy`, `admissions` and `lifecycle` | — | `ROUND_NOT_FOUND` |
-| `round submit` | agent | `submitted` | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE` |
+| `round open` | operator | `opened` (v2 adds the stored `reuse_disclosure`) | — | `ROUND_ALREADY_OPENED`, `SCORING_POLICY_NOT_FROZEN`, `VALIDATION_POLICY_REQUIRED`, `DISCOVERY_SPLIT_NOT_FROZEN` |
+| `round status` | operator, agent | `ok` (or `open`/`closed` for one round); per version adds `details` and `feedback` and v2 adds the receipt `summary`, `validation_allowance`, `validation_policy`, `admissions`, `lifecycle` and `reuse_disclosure` | — | `ROUND_NOT_FOUND` |
+| `round submit` | agent | `submitted` (with the optional `revision_of`/`feedback_ids` provenance links) | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `SUBMISSION_CONFLICT`, `EXPERIMENT_NOT_ELIGIBLE`, `REVISION_NOT_FOUND`, `REVISION_CONFLICT`, `FEEDBACK_LINK_INVALID` |
 | `round validate` | operator | `completed` (v2 adds `validation_kind`/`protocol`/`development`/`trailing`/`scoring`/`warmup`/`provenance`/`usage`/`summary`/`allowance`) | `passed`, `failed`, `insufficient_evidence` (exit 0; a v2 `failed`/`insufficient_evidence` keeps its counted use) | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `REVALIDATION_SUPERSEDED`, `VALIDATION_DATA_GAP`, `VALIDATION_ALLOWANCE_EXHAUSTED`, `VALIDATION_PARTITION_MISMATCH` |
 | `round revalidate` | operator | `revalidated` (v2 adds `validation_kind`/`evidence`/`original_validation`/`recomputed_validation`/`affected`) | `passed`, `failed`, `insufficient_evidence` | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `ROUND_CLOSED`, `VERSION_ENDED`, `REPLAY_MISMATCH`, `EVIDENCE_SNAPSHOT_NOT_FOUND`, `EVIDENCE_NOT_SUCCESSOR`, `EVIDENCE_DATA_KIND_MISMATCH`, `EVIDENCE_INTERVAL_MISMATCH`, `EVIDENCE_DEVELOPMENT_MISMATCH`, `EVIDENCE_PRIOR_HISTORY_MISMATCH`, `EVIDENCE_AS_OF_VIOLATION`, `EVIDENCE_INTEGRITY_VIOLATION`, `EVIDENCE_SNAPSHOT_AMBIGUOUS` |
 | `round admit` | operator | `admitted` | `reused: true` replay (`admission.used` shows a consumed grant) | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VERSION_ENDED`, `REVIEW_CONFLICT`, `ADMISSION_CONFLICT`, `VALIDATION_ALREADY_COMPLETED`, `VALIDATION_POLICY_REQUIRED` |
+| `round detail` | operator, agent | `completed` (`reused: true` for an identical request) | — | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `DETAIL_RECORD_UNKNOWN`, `DETAIL_RECORD_UNAVAILABLE`, `VALIDATION_NOT_PASSED` |
+| `round feedback` | operator, agent | `recorded` (`reused: true` for identical content) | — | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `VALIDATION_NOT_PASSED`, `DETAIL_NOT_FOUND`, `FEEDBACK_LINK_INVALID` |
 | `round review` | operator | `approved` / `returned` / `ended` | `reused: true` replay | `ROUND_NOT_FOUND`, `SUBMISSION_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `RISK_NOT_ACCEPTED`, `OBSERVATION_REQUIRED`, `REVIEW_CONFLICT`, `VERSION_ENDED`, `CALENDAR_COVERAGE_MISSING`, `RELEASE_NOT_FOUND`, `RELEASE_INTEGRITY_FAILED`, `INVALID_TRANSITION`, `ADMISSION_INVALID` |
 | `round close` | operator | `closed` (v2 adds `validation_allowance` and, when selected, `selected_validation`) | `reused: true` replay | `ROUND_NOT_FOUND`, `ROUND_CLOSED`, `VALIDATION_NOT_PASSED`, `VERSION_ENDED` |
 | `round evidence status` | operator | `ok` (per-version `state`: `tracking` / `review_due` / `observation_extended` / `paused` / `ended`) | — | `ROUND_NOT_FOUND`, unknown version |
@@ -1375,8 +1536,12 @@ receipt records the `outcome` and `reason`; approval is refused later.
 **Synthetic scope.** This is a synthetic mechanism test: synthetic snapshots,
 synthetic prices, a synthetic feed and no broker, real order, credential or
 network. The public-CLI tests demonstrate the #43 round, receipt, review and
-observation rules; they are not evidence of real forward performance, do not
-satisfy the #35 real-chain gate and do not change the #17 acceptance verdict.
+observation rules and the #50 split, formal Validation, admission, detail,
+feedback, reuse-disclosure and traceability mechanisms; they are not evidence of
+real forward performance, do not satisfy the #35 real-chain gate (which needs a
+real receipt linking the snapshot, round, version, warmup source, actual
+development and scoring dates, usage and feedback) and do not change the #17
+acceptance verdict.
 
 ### Direction-bound research (#37)
 
@@ -2674,8 +2839,8 @@ carry real-scope evidence. Anything short of the full gate is reported as
 that the six-scenario rule was not met. The command is operator-only:
 `prajnatrade-agent` has no `acceptance` command.
 
-Issue #43 adds synthetic Research Loop and Evidence Loop tracking only; it adds
-no acceptance scenario and does not change the #17 verdict.
+Issues #43 and #50 add synthetic Research Loop and Evidence Loop tracking only;
+they add no acceptance scenario and do not change the #17 verdict.
 
 **The overall #17 verdict remains blocked.** The tests and CLI scenario and
 the historical real five-ETF baseline, bounded Mock campaign and controlled

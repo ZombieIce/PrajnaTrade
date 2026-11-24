@@ -489,6 +489,23 @@ def _add_research_loop_workflow(
     submit.add_argument("--round-id", required=True)
     submit.add_argument("--submission-id", required=True)
     submit.add_argument("--input", required=True, type=Path)
+
+    detail = rounds.add_parser(
+        "detail", help="answer one question from a version's published Validation receipt"
+    )
+    detail.add_argument("--project", required=True, type=Path)
+    detail.add_argument("--round-id", required=True)
+    detail.add_argument("--version-id", required=True)
+    detail.add_argument("--input", required=True, type=Path)
+
+    feedback = rounds.add_parser(
+        "feedback", help="record what a version's Validation receipt changed"
+    )
+    feedback.add_argument("--project", required=True, type=Path)
+    feedback.add_argument("--round-id", required=True)
+    feedback.add_argument("--version-id", required=True)
+    feedback.add_argument("--input", required=True, type=Path)
+
     if agent_only:
         return
 
@@ -1082,6 +1099,20 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                     args.reviewer,
                     args.reason,
                 )
+        elif args.round_action == "detail":
+            result = research_loop.detail(
+                args.project,
+                args.round_id,
+                args.version_id,
+                json.loads(args.input.read_text(encoding="utf-8")),
+            )
+        elif args.round_action == "feedback":
+            result = research_loop.feedback(
+                args.project,
+                args.round_id,
+                args.version_id,
+                json.loads(args.input.read_text(encoding="utf-8")),
+            )
         elif args.round_action == "admit":
             result = research_loop.admit(
                 args.project,
