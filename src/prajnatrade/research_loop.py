@@ -1,4 +1,4 @@
-"""Research rounds, locked submissions and lightweight Validation (spec #43, T1).
+"""Research rounds, lightweight Validation, review admission and revalidation (spec #43).
 
 This module is the manual simulated-tracking admission path.  It is deliberately
 separate from the protected ``evaluation``/``holdout`` flow and from conditional
@@ -11,9 +11,18 @@ Contract resolutions that the shared design contract leaves implicit:
 
 * ``round_id`` reuses :func:`research_direction.direction_id`, so a direction
   keeps its identity across renamed keys and new Campaigns.
-* ``validation_id`` includes the *current* accounting-engine fingerprint, so a
-  platform fix yields a new identity and re-runs the replay.  The receipt records
-  both the Campaign's frozen runtime and the current one.
+* ``validation_id`` includes the *current* accounting-engine fingerprint, so an
+  accounting-platform fix yields a new identity and re-runs the replay.  The
+  running attempt records the current runtime.
+* Review decisions are immutable content-addressed epochs per version with
+  exactly one current state.  Approval binds the stored terminal passed receipt,
+  writes a write-once ``manual_tracking`` release artifact and appends one
+  ``enable`` event at the first approved calendar session after the decision; it
+  never runs Validation again, so re-selecting a version reuses its receipt.
+* ``replay_engine_identity`` fingerprints this module's own replay/metric code.
+  ``validation_id`` does not cover it, so :func:`revalidate` binds it together
+  with the current runtime and evidence source into the new identity and records
+  the superseded receipt as historical evidence.
 * Inputs that cannot be replayed at all (a different snapshot store, a drifted
   Campaign binding) are protocol rejections; evidence verdicts are
   ``passed`` / ``failed`` / ``insufficient_evidence`` and exit 0.
@@ -2052,11 +2061,6 @@ def review(
         trusted_record = _load_round_file(_round_path(trusted, round_id), round_id)
         if trusted_record != record:
             raise ValueError("The research round copy does not match the trusted approval.")
-        if _closure(connection, round_id) is not None:
-            raise ProtocolError(
-                "ROUND_CLOSED", "review", "inspect",
-                "A closed research round cannot record another review decision.",
-            )
         submission = _submission(connection, round_id, version_id, phase="review")
         kickoff = record["kickoff"]
         binding = _review_binding(connection, record, submission, trusted)
@@ -2131,6 +2135,11 @@ def review(
                     else None
                 ),
             )
+        if _closure(connection, round_id) is not None:
+            raise ProtocolError(
+                "ROUND_CLOSED", "review", "inspect",
+                "A closed research round cannot record another review decision.",
+            )
         _refuse_transition(_review_state(connection, version_id), decision)
         body: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
@@ -2195,6 +2204,7 @@ def _discovery_evidence(
     snapshot_store: Path,
     campaign: Mapping[str, Any],
     record: Mapping[str, Any],
+    locked_snapshot_id: str,
 ) -> dict[str, Any]:
     """Find the one sealed snapshot that reproduces the frozen Discovery partition."""
     evaluation = campaign["evaluation"]
@@ -2242,12 +2252,18 @@ def _discovery_evidence(
             "The supplied snapshot store cannot reproduce the frozen Discovery "
             "partition; the original selection reason no longer holds.",
         )
-    if len(matches) > 1:
-        raise ValueError(
-            "The snapshot store has more than one snapshot matching the frozen "
-            "Discovery partition; keep exactly the corrected snapshot."
-        )
-    return next(iter(matches.values()))
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if locked_snapshot_id in matches:
+        candidates = [
+            item for name, item in matches.items() if name != locked_snapshot_id
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+    raise ValueError(
+        "The snapshot store has more than one snapshot matching the frozen "
+        "Discovery partition; keep exactly the corrected snapshot."
+    )
 
 
 def _revalidation_identity(
@@ -2382,7 +2398,12 @@ def revalidate(
                 trusted, row["validation_id"], row["receipt_json"]
             )
             campaign = campaign_discovery(project, record["campaign_id"])
-            evidence = _discovery_evidence(snapshot_store, campaign, record)
+            evidence = _discovery_evidence(
+                snapshot_store,
+                campaign,
+                record,
+                submission["locked"]["snapshot_id"],
+            )
             runtime = _current_runtime(campaign)
             evidence["previous_snapshot_id"] = submission["locked"]["snapshot_id"]
             evidence["snapshot_changed"] = (

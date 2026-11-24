@@ -1048,6 +1048,20 @@ def test_review_decisions_replay_and_conflicting_decisions_are_refused(
         },
     )
     ok(close_round(project, round_id, close_source))
+    # Replaying an already-recorded decision is still idempotent after closure;
+    # only a new decision is refused.
+    replayed_after_close = ok(
+        approve_version(
+            project,
+            store,
+            round_id,
+            version["version_id"],
+            calendar,
+            approval_source,
+        )
+    )
+    assert replayed_after_close["reused"] is True
+    assert replayed_after_close["decision_id"] == approved["decision_id"]
     rejected(
         review(
             project,
@@ -1120,14 +1134,24 @@ def test_revalidate_after_a_corrected_snapshot_records_prior_receipt(tmp_path: P
 
     # Correcting only the later partitions keeps the Discovery replay and version
     # identity, but changes the bound evidence source and forces a fresh receipt.
-    corrected_store, corrected = seal_payload(
-        tmp_path, "corrected-snapshots", corrected_payload(payload, 10)
+    # Sealing the corrected snapshot into the same store leaves two snapshots
+    # that reproduce the frozen Discovery partition; the locked one is not the
+    # fresh evidence source.
+    corrected = ok(
+        cli(
+            "snapshot",
+            "seal",
+            "--input",
+            str(write_json(tmp_path / "corrected.json", corrected_payload(payload, 10))),
+            "--store",
+            str(snapshots),
+        )
     )
     revalidated = ok(
         revalidate_version(
             project,
             store,
-            corrected_store,
+            snapshots,
             round_id,
             version["version_id"],
             reason="Platform fix corrected the protected evidence source; Discovery is unchanged.",
@@ -1177,7 +1201,7 @@ def test_revalidate_after_a_corrected_snapshot_records_prior_receipt(tmp_path: P
         revalidate_version(
             project,
             store,
-            corrected_store,
+            snapshots,
             round_id,
             version["version_id"],
             reason="Platform fix corrected the protected evidence source; Discovery is unchanged.",
@@ -1206,7 +1230,7 @@ def test_revalidate_after_a_corrected_snapshot_records_prior_receipt(tmp_path: P
         revalidate_version(
             project,
             store,
-            corrected_store,
+            snapshots,
             round_id,
             version["version_id"],
             reason="An approved version cannot be revalidated.",
@@ -1230,7 +1254,7 @@ def test_revalidate_after_a_corrected_snapshot_records_prior_receipt(tmp_path: P
         revalidate_version(
             project,
             store,
-            corrected_store,
+            snapshots,
             round_id,
             version["version_id"],
             reason="An ended version cannot be revalidated.",
