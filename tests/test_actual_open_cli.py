@@ -32,6 +32,7 @@ from test_research_loop_cli import (
 )
 
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES, EXECUTION_PRICE_BASIS
 
 SYMBOLS = ETF_SYMBOLS
 SESSIONS = 15
@@ -55,7 +56,7 @@ CONFLICT_EVIDENCE = ("conflict-vendor-a", "conflict-vendor-b")
 OPEN_SOURCE = {"source": "synthetic-tdx-unadjusted", "evidence_id": PRICE_EVIDENCE}
 EXECUTION_EVIDENCE_SCHEMA_VERSION = 1
 EXECUTION_EVIDENCE_POLICY = {
-    "price_basis": "unadjusted_open",
+    "price_basis": EXECUTION_PRICE_BASIS,
     "price_source": "raw_bars[].open_source -> evidence.items",
     "status_evidence": "raw_bars[].status_evidence_id -> evidence.items",
     "halted_open": (
@@ -665,8 +666,6 @@ def test_schema_v2_keeps_its_contract_and_has_no_execution_evidence(
 # Public CLI: a normal open and a resumed-halt open fill identically
 # ---------------------------------------------------------------------------
 
-ACTUAL_OPEN_RULES = "actual-open-v1"
-
 
 def campaign_run(
     root: Path,
@@ -674,6 +673,7 @@ def campaign_run(
     payload: dict,
     *,
     execution_rules: str = ACTUAL_OPEN_RULES,
+    slippage_bps: int = 0,
 ) -> dict:
     """Initialize a project, seal the payload, create the Campaign and submit."""
     project = root / f"{name}-project"
@@ -685,7 +685,7 @@ def campaign_run(
             "--snapshot-id", sealed["snapshot_id"],
             "--attempts", "2", "--max-seconds", "60",
             "--initial-cash", "100000", "--transaction-cost-bps", "5",
-            "--slippage-bps", "0",
+            "--slippage-bps", str(slippage_bps),
             "--execution-rules", execution_rules,
         )
     )
@@ -761,7 +761,8 @@ def test_normal_open_and_resumed_halt_fill_identically_at_the_actual_open(
             assert {fill["symbol"] for fill in side["fills"]} == set(SYMBOLS)
             assert {fill["raw_open"] for fill in side["fills"]} == {10.0}
             assert all(
-                fill["price_basis"] == "unadjusted_open" for fill in side["fills"]
+                fill["price_basis"] == EXECUTION_PRICE_BASIS
+                for fill in side["fills"]
             )
             assert all(fill["open_evidence"] == OPEN_SOURCE for fill in side["fills"])
         assert _fill_signature(candidate) == _fill_signature(benchmark)
@@ -818,6 +819,97 @@ def test_normal_open_and_resumed_halt_fill_identically_at_the_actual_open(
     }
 
 
+SLIPPAGE_BPS = 10
+
+
+def test_normal_open_and_resumed_halt_share_the_nonzero_slippage_formula(
+    tmp_path: Path,
+) -> None:
+    """#57 AC2: normal and resumed-halt samples use the same slippage too.
+
+    The base price, order and fees were already identical with zero slippage;
+    a non-zero ``--slippage-bps`` must move both samples' fill prices by the
+    same rate, charge the same recorded slippage and leave the same cash.
+    """
+    execution_day = day_at(1)
+    base_open = 10.2
+    normal_payload = schema_v3_fixture(8)
+    # The normal sample trades at the very same actual daily open: only its
+    # trading status differs from the resumed-halt row.
+    raw_row(normal_payload, execution_day, SYMBOLS[0]).update(
+        open=base_open, high=base_open
+    )
+    resumed_payload = schema_v3_fixture(8)
+    make_actual_open_halt(
+        resumed_payload, execution_day, SYMBOLS[0], open_price=base_open
+    )
+    samples = {
+        "normal": campaign_run(
+            tmp_path, "slippage-normal", normal_payload, slippage_bps=SLIPPAGE_BPS
+        ),
+        "resumed": campaign_run(
+            tmp_path, "slippage-resumed", resumed_payload, slippage_bps=SLIPPAGE_BPS
+        ),
+    }
+
+    fee_rate = 5 / 10_000
+    slippage_rate = SLIPPAGE_BPS / 10_000
+    # Each symbol targets 20000 of the 100000 initial cash at its raw open; the
+    # frozen proportional scale fits the whole purchase into the cash after the
+    # 10bp slippage and the 5bp fee: 1 / ((1 + slippage) * (1 + fee)).
+    scale = 1.0 / ((1.0 + slippage_rate) * (1.0 + fee_rate))
+    observed = {}
+    for name, sample in samples.items():
+        run = sample["experiment"]["discovery"]
+        fills = run["fills"]
+        assert [fill["date"] for fill in fills] == [execution_day] * len(SYMBOLS)
+        assert {fill["symbol"] for fill in fills} == set(SYMBOLS)
+        for fill in fills:
+            raw_open = float(base_open if fill["symbol"] == SYMBOLS[0] else 10.0)
+            # The fill price is the actual unadjusted open moved by the frozen
+            # slippage, then the frozen fee is charged on that execution price.
+            assert fill["raw_open"] == pytest.approx(raw_open)
+            assert fill["price"] == pytest.approx(raw_open * (1.0 + slippage_rate))
+            assert fill["quantity"] == pytest.approx(20_000.0 / raw_open * scale)
+            assert fill["notional"] == pytest.approx(
+                fill["quantity"] * fill["raw_open"]
+            )
+            assert fill["slippage"] == pytest.approx(
+                fill["quantity"] * (fill["price"] - fill["raw_open"])
+            )
+            assert fill["fee"] == pytest.approx(
+                fill["quantity"] * fill["price"] * fee_rate
+            )
+        assert run["metrics"]["slippage_paid"] > 0
+        assert run["metrics"]["slippage_paid"] == pytest.approx(99.8501748126936)
+        assert run["metrics"]["fees_paid"] == pytest.approx(49.97501249375314)
+        execution_point = next(
+            point for point in run["equity_curve"] if point["date"] == execution_day
+        )
+        # Cash after the fills: the 100000 initial cash minus every recorded
+        # notional and fee (slippage is already inside the execution price).
+        outlay = sum(fill["notional"] + fill["fee"] for fill in fills)
+        assert execution_point["cash"] == pytest.approx(0.0, abs=1e-9)
+        assert 100_000.0 - outlay - run["metrics"]["slippage_paid"] == pytest.approx(
+            0.0, abs=1e-9
+        )
+        observed[name] = {
+            "fills": _fill_signature(run),
+            "slippage": run["metrics"]["slippage_paid"],
+            "fees": run["metrics"]["fees_paid"],
+            "cash": execution_point["cash"],
+        }
+
+    # Same base price, order, fees and slippage: identical recorded fills,
+    # identical slippage cost and identical post-fill cash in both samples.
+    assert observed["normal"]["fills"] == observed["resumed"]["fills"]
+    assert observed["normal"]["slippage"] == pytest.approx(
+        observed["resumed"]["slippage"]
+    )
+    assert observed["normal"]["fees"] == pytest.approx(observed["resumed"]["fees"])
+    assert observed["normal"]["cash"] == pytest.approx(observed["resumed"]["cash"])
+
+
 # ---------------------------------------------------------------------------
 # Research Loop: a v1 receipt names the snapshot and execution protocol
 # ---------------------------------------------------------------------------
@@ -870,5 +962,5 @@ def test_v1_round_receipt_records_snapshot_and_execution_provenance(
         "snapshot_id": campaign["snapshot_id"],
         "snapshot_schema_version": 3,
         "execution_rule_version": ACTUAL_OPEN_RULES,
-        "price_basis": "unadjusted_open",
+        "price_basis": EXECUTION_PRICE_BASIS,
     }

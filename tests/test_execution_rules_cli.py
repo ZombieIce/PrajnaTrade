@@ -3,7 +3,6 @@
 import pytest
 from cli_helpers import agent_cli, cli, ok, validation_service, write_json
 from test_actual_open_cli import (
-    ACTUAL_OPEN_RULES,
     OPEN_SOURCE,
     day_at,
     derived_row,
@@ -19,6 +18,7 @@ from test_protected_eval_cli import create_campaign, seal_snapshot, submit_exper
 from test_research_direction_cli import approve_round, kickoff_input, propose, run_validation
 
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES, EXECUTION_PRICE_BASIS
 
 FEE_RATE = 5 / 10_000
 #: The frozen ``experiment._execution_policy`` block of ``actual-open-v1``.
@@ -231,7 +231,7 @@ def test_actual_open_basket_fills_each_symbol_at_its_own_open(tmp_path):
         assert [fill["side"] for fill in fills] == ["buy"] * 4
         assert [fill["raw_open"] for fill in fills] == [10.5, 10.0, 10.0, 10.0]
         assert fills[0]["open_evidence"] == halted["open_source"] == OPEN_SOURCE
-        assert all(fill["price_basis"] == "unadjusted_open" for fill in fills)
+        assert all(fill["price_basis"] == EXECUTION_PRICE_BASIS for fill in fills)
         for fill in fills:
             assert fill["fee"] == pytest.approx(fill["notional"] * FEE_RATE)
         assert run["metrics"]["fills"] == 4
