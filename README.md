@@ -230,9 +230,11 @@ corporate-action rules, requires `raw_price_basis: "unadjusted"` to be
   that disagree. It requires `open: null`, at least two entries with distinct
   non-empty `source` names, every `evidence_id` sealed, positive finite opens
   and at least two distinct open values. A conflict is never silently resolved.
-  It may appear on any status: a `trading` row that carries one stores
-  `open: null`, keeps high/low/close/volume and carries no halt window, so a
-  disputed opening print is never forced into an executable open.
+  It may appear on a `trading` or `partial_halt` row: a `trading` row that
+  carries one stores `open: null`, keeps high/low/close/volume and carries no
+  halt window, so a disputed opening print is never forced into an executable
+  open. A `suspended` row cannot carry one — a confirmed no-trade day has no
+  open to disagree about.
 
 A schema-3 `partial_halt` row **may** carry the day's actual unadjusted daily
 open — the first print after a resume on a halted-at-open day — together with
@@ -245,8 +247,7 @@ The schema-3 manifest adds one additive, schema-3-only block,
 `execution_evidence`:
 
 ```json
-{"schema_version": 1,
- "policy": {"price_basis": "unadjusted_open",
+{"policy": {"price_basis": "unadjusted_open",
             "price_source": "raw_bars[].open_source -> evidence.items",
             "status_evidence": "raw_bars[].status_evidence_id -> evidence.items",
             "halted_open": "the day's actual unadjusted daily open for an order effective before the open"},

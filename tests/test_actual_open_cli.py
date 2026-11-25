@@ -54,7 +54,6 @@ STATUS_EVIDENCE = "halt-notices-2024"
 CONFLICT_EVIDENCE = ("conflict-vendor-a", "conflict-vendor-b")
 #: The per-row open price source echoed onto an ``actual-open-v1`` fill.
 OPEN_SOURCE = {"source": "synthetic-tdx-unadjusted", "evidence_id": PRICE_EVIDENCE}
-EXECUTION_EVIDENCE_SCHEMA_VERSION = 1
 EXECUTION_EVIDENCE_POLICY = {
     "price_basis": EXECUTION_PRICE_BASIS,
     "price_source": "raw_bars[].open_source -> evidence.items",
@@ -416,7 +415,10 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
     assert manifest["raw_price_basis"] == "unadjusted"
     assert manifest["evidence"] == payload["evidence"]
     evidence = manifest["execution_evidence"]
-    assert evidence["schema_version"] == EXECUTION_EVIDENCE_SCHEMA_VERSION
+    # The manifest's own ``schema_version`` already gates this block; the inner
+    # copy was unread and is gone.
+    assert "schema_version" not in evidence
+    assert set(evidence) == {"policy", "rows", "counts"}
     assert evidence["policy"] == EXECUTION_EVIDENCE_POLICY
     assert evidence["rows"] == [
         {
@@ -581,6 +583,16 @@ def _partial_halt_without_a_halt(payload: dict) -> None:
     row.pop("halt")
 
 
+def _conflict_on_a_suspended_row(payload: dict) -> None:
+    # A confirmed no-trade day has no open to disagree about: a source conflict
+    # is only meaningful where a price could have traded.
+    row = make_confirmed_suspension(payload, day_at(0), SYMBOLS[0])
+    probe = schema_v3_fixture()
+    row["open_conflict"] = make_open_conflict(
+        probe, day_at(0), SYMBOLS[0]
+    )["open_conflict"]
+
+
 def _trading_conflict_missing_a_price(payload: dict) -> None:
     row = make_open_conflict(payload, day_at(0), SYMBOLS[0])
     row.update(trading_status="trading", close=None)
@@ -607,6 +619,7 @@ def _trading_conflict_missing_a_price(payload: dict) -> None:
         (_conflict_with_negative_open, "open_conflict open"),
         (_conflict_with_identical_opens, "open_conflict"),
         (_partial_halt_without_a_halt, "halt"),
+        (_conflict_on_a_suspended_row, "open_conflict"),
         (_trading_conflict_missing_a_price, "trading raw bar"),
     ],
 )

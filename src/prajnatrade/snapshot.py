@@ -24,7 +24,6 @@ DISCOVERY_PRIOR_HISTORY = "discovery_prior_history"
 #: The schema-3 raw-bar keys that bind an executable open and a trading-status
 #: notice to sealed evidence.  Schema 2 rejects them so its contract stays crisp.
 SCHEMA_3_ROW_KEYS = ("open_source", "status_evidence_id", "open_conflict")
-EXECUTION_EVIDENCE_SCHEMA_VERSION = 1
 EXECUTION_EVIDENCE_POLICY = {
     "price_basis": "unadjusted_open",
     "price_source": "raw_bars[].open_source -> evidence.items",
@@ -254,6 +253,11 @@ def _open_conflict(row: dict, evidence_ids: set[str]) -> None:
     value = row.get("open_conflict")
     if value is None:
         return
+    if row.get("trading_status") == "suspended":
+        raise ValueError(
+            "A suspended raw bar cannot carry open_conflict: a confirmed "
+            "no-trade day has no open to disagree about."
+        )
     if row.get("open") is not None:
         raise ValueError(
             "An open_conflict raw bar must not store an executable open price."
@@ -495,7 +499,6 @@ def _execution_evidence(index: dict[tuple[str, str], dict], sessions: list[str])
             counts[record["classification"]] += 1
     rows.sort(key=lambda row: (row["date"], row["symbol"]))
     return {
-        "schema_version": EXECUTION_EVIDENCE_SCHEMA_VERSION,
         "policy": dict(EXECUTION_EVIDENCE_POLICY),
         "rows": rows,
         "counts": counts,

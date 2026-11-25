@@ -36,7 +36,9 @@ Two failure modes drove this decision:
    separate evidence id that proves trading status only and must differ from the
    open's price source. A `partial_halt` row may carry the day's actual
    unadjusted daily open. Two sealed opens that disagree are stored as an
-   `open_conflict` with `open: null` and are never silently resolved. The
+   `open_conflict` with `open: null` and are never silently resolved; a
+   `suspended` row cannot carry one, because a confirmed no-trade day has no
+   open to disagree about. The
    manifest adds a schema-3-only `execution_evidence` block that classifies every
    non-trading sealed session/symbol as `actual_open_after_halt`,
    `confirmed_no_trade`, `missing_required_open`, `source_conflict` or
