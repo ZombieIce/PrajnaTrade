@@ -43,17 +43,28 @@ corporate actions `fc5f334a53c9441f689762a2f6b52725f956e3ff0569717a6a85b2031864a
 The evidence block hash (canonical JSON of `manifest.evidence`) is
 `c356216e030b248c7c1ec59516e3987eb5dad54e4447a8c17417dc5dbc71ca73`.
 
-## Commands run
+## Reproduce the historical schema-2 result
 
-`PYTHONPATH=src` below means the package plus the dependencies declared in
-`pyproject.toml`; `$STORE` is `~/PrajnaTrade-trusted/real-etf-snapshot/store`
-and `$WORKDIR` is a temporary directory outside Git (the script also defaults
-one when `--workdir` is omitted).
+Run the acquisition, seal, baseline and reconciliation at
+[the original schema-2 revision](https://github.com/ZombieIce/PrajnaTrade/commit/8a6fbcdfb15c3d1819c499c72fd18c22b9ebac06).
+The current acquisition script emits schema 3. Use the original probe cache
+with its file modification times preserved, since those timestamps enter the
+evidence and row metadata. The commands below use a temporary checkout, evidence
+directory and store. Install the dependencies from the historical checkout's
+`pyproject.toml` before sealing or running the baselines.
 
 ```sh
-# 1. Build real.json from the researched probe cache (default, no network).
+REPLAY_DIR="$(mktemp -d)"
+WORKDIR="$REPLAY_DIR/build"
+STORE="$REPLAY_DIR/store"
+SNAPSHOT_ID=b07823329f95b2f3d6a8d7e5fb7660941eda25150dc2b7a3ae8086357e02d41d
+git worktree add --detach "$REPLAY_DIR/checkout" 8a6fbcdfb15c3d1819c499c72fd18c22b9ebac06
+cd "$REPLAY_DIR/checkout"
+
+# 1. Build real.json from the archived probe cache.
 python3 scripts/acquire_real_etf_snapshot.py \
   --cache-dir /tmp/research24 \
+  --store "$STORE" \
   --workdir "$WORKDIR" \
   --output "$WORKDIR/real.json"
 
@@ -86,9 +97,10 @@ python3 -m pytest -q -m "not isolation"
 
 `--refetch` re-downloads the Tencent bars, the 59 SZSE month responses and the
 announcement PDFs into `<workdir>/refetch`; the reproducible default run uses
-only the researched cache. Re-running step 1 reproduces `real.json`
-byte-for-byte (SHA-256 `1fe96ff206aeb1c333d6f916cae5b39333458572e58397707e153ca799438b64`),
-and re-sealing returns the same snapshot ID.
+only the researched cache. With the original cache and pinned revision, step 1
+reproduces `real.json` byte-for-byte (SHA-256
+`1fe96ff206aeb1c333d6f916cae5b39333458572e58397707e153ca799438b64`),
+and step 2 returns the snapshot ID shown above.
 
 ## What is real, asserted and missing
 
