@@ -12,12 +12,15 @@ with #35.
 from __future__ import annotations
 
 import importlib.util
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 
 import pytest
-from cli_helpers import cli, ok, repo_root
-from test_actual_open_cli import seal_v3
+from cli_helpers import cli, ok, rejected, repo_root
+from test_actual_open_cli import derived_row, raw_row, seal_v3
+from test_discovery_split_cli import manifest
+from test_formal_validation_cli import formal_scenario, round_uses, validate_current
 from test_protected_eval_cli import create_campaign, submit_experiment
 
 from prajnatrade.data import ETF_SYMBOLS
@@ -36,6 +39,16 @@ SESSION_DATES = (
     "2024-01-11",
     "2024-01-12",
 )
+FORMAL_SESSIONS = (
+    *SESSION_DATES,
+    "2024-01-15",
+    "2024-01-16",
+    "2024-01-17",
+    "2024-01-18",
+    "2024-01-19",
+    "2024-01-22",
+)
+TRAILING_HALT_DAY = FORMAL_SESSIONS[7]
 HALT_DAY = SESSION_DATES[1]
 RESUME_DAY = SESSION_DATES[2]
 HALTED = ETF_SYMBOLS[0]
@@ -44,9 +57,10 @@ PRICE_EVIDENCE_ID = "price-tencent-unadjusted"
 PRICE_SOURCE = "tencent:unadjusted"
 HALT_EVIDENCE_ID = f"halt-{HALTED}-{SESSION_DATES[0]}"
 SUSPENDED_EVIDENCE_ID = f"halt-{SUSPENDED}-{SESSION_DATES[0]}"
-COLLECTED_AT = "2024-01-15T18:00:00+08:00"
+COLLECTED_AT = "2024-01-23T18:00:00+08:00"
 
 
+@cache
 def _acquisition_module() -> ModuleType:
     """Import the checked-in script by path: its ``main`` is guarded."""
     spec = importlib.util.spec_from_file_location(
@@ -58,11 +72,11 @@ def _acquisition_module() -> ModuleType:
     return module
 
 
-def _vendor_bar(open_price: float = 10.0) -> list[str]:
+def _vendor_bar(day: str, open_price: float = 10.0) -> list[str]:
     """One Tencent unadjusted daily bar (date, open, close, high, low, volume)."""
     close = round(open_price + 0.2, 6)
     return [
-        "date",
+        day,
         str(open_price),
         str(close),
         str(round(close + 0.1, 6)),
@@ -71,11 +85,13 @@ def _vendor_bar(open_price: float = 10.0) -> list[str]:
     ]
 
 
-def _vendor_bars() -> dict[str, dict[str, list[str]]]:
+def _vendor_bars(
+    sessions: tuple[str, ...] = SESSION_DATES,
+) -> dict[str, dict[str, list[str]]]:
     bars = {
         symbol: {
-            day: _vendor_bar(10.5 if (symbol, day) == (HALTED, HALT_DAY) else 10.0)
-            for day in SESSION_DATES
+            day: _vendor_bar(day, 10.5 if (symbol, day) == (HALTED, HALT_DAY) else 10.0)
+            for day in sessions
         }
         for symbol in ETF_SYMBOLS
     }
@@ -129,38 +145,34 @@ def _evidence_items() -> list[dict]:
     ]
 
 
-def _build_payload() -> dict:
+def _build_payload(
+    *,
+    sessions: tuple[str, ...] = SESSION_DATES,
+    bars: dict | None = None,
+    halts: list[dict] | None = None,
+) -> dict:
     module = _acquisition_module()
     return module.build_snapshot_input(
-        sessions=list(SESSION_DATES),
-        bars=_vendor_bars(),
-        halts=_halt_rows(),
+        sessions=list(sessions),
+        bars=bars if bars is not None else _vendor_bars(sessions),
+        halts=halts if halts is not None else _halt_rows(),
         dividends=[],
         evidence=_evidence_items(),
         price_evidence_id=PRICE_EVIDENCE_ID,
-        halt_evidence_ids={
-            (HALTED, SESSION_DATES[0]): HALT_EVIDENCE_ID,
-            (SUSPENDED, SESSION_DATES[0]): SUSPENDED_EVIDENCE_ID,
-        },
-        halt_references={
-            (HALTED, SESSION_DATES[0]): f"https://example.invalid/{HALT_EVIDENCE_ID}.pdf",
-            (SUSPENDED, SESSION_DATES[0]): (
-                f"https://example.invalid/{SUSPENDED_EVIDENCE_ID}.pdf"
-            ),
+        halt_notice_evidence={
+            (symbol, SESSION_DATES[0]): {
+                "id": evidence_id,
+                "reference": f"https://example.invalid/{evidence_id}.pdf",
+            }
+            for symbol, evidence_id in (
+                (HALTED, HALT_EVIDENCE_ID), (SUSPENDED, SUSPENDED_EVIDENCE_ID)
+            )
         },
         price_collected_at=COLLECTED_AT,
         calendar_collected_at=COLLECTED_AT,
         action_collected_at=COLLECTED_AT,
         derived_collected_at=COLLECTED_AT,
         derivation_evidence=("synthetic:official-halts+unadjusted-bars",),
-    )
-
-
-def _row(payload: dict, day: str, symbol: str) -> dict:
-    return next(
-        row
-        for row in payload["raw_bars"]
-        if (row["date"], row["symbol"]) == (day, symbol)
     )
 
 
@@ -173,7 +185,7 @@ def test_conversion_keeps_the_resume_open_and_emits_schema_3() -> None:
 
     # A normal session keeps the vendor's unadjusted open and cites the price
     # archive.
-    normal = _row(payload, SESSION_DATES[0], HALTED)
+    normal = raw_row(payload, SESSION_DATES[0], HALTED)
     assert normal["trading_status"] == "trading"
     assert normal["open"] == 10.0
     assert normal["open_source"] == {
@@ -183,7 +195,7 @@ def test_conversion_keeps_the_resume_open_and_emits_schema_3() -> None:
 
     # The reviewer's failing step: a halted-at-open session keeps the vendor's
     # actual open (10.5) plus its price source and a distinct halt notice.
-    halted = _row(payload, HALT_DAY, HALTED)
+    halted = raw_row(payload, HALT_DAY, HALTED)
     assert halted["trading_status"] == "partial_halt"
     assert halted["open"] == 10.5
     assert halted["volume"] == 1200
@@ -199,7 +211,7 @@ def test_conversion_keeps_the_resume_open_and_emits_schema_3() -> None:
 
     # A whole-day halt becomes ``suspended`` with null prices and the notice as
     # its trading-status evidence.
-    suspended = _row(payload, HALT_DAY, SUSPENDED)
+    suspended = raw_row(payload, HALT_DAY, SUSPENDED)
     assert suspended["trading_status"] == "suspended"
     assert all(
         suspended[field] is None
@@ -210,6 +222,17 @@ def test_conversion_keeps_the_resume_open_and_emits_schema_3() -> None:
         "start": f"{HALT_DAY}T09:30:00+08:00",
         "end": f"{RESUME_DAY}T09:30:00+08:00",
     }
+
+
+def test_conversion_rejects_a_vendor_bar_for_the_wrong_session() -> None:
+    bars = _vendor_bars()
+    bars[HALTED][HALT_DAY] = _vendor_bar(RESUME_DAY, 10.5)
+
+    with pytest.raises(
+        _acquisition_module().AcquisitionError,
+        match=rf"{HALTED}.*{HALT_DAY}.*{RESUME_DAY}",
+    ):
+        _build_payload(bars=bars)
 
 
 def test_a_full_halt_until_with_a_same_day_resume_keeps_its_open() -> None:
@@ -224,8 +247,8 @@ def test_a_full_halt_until_with_a_same_day_resume_keeps_its_open() -> None:
     """
     module = _acquisition_module()
     bars = _vendor_bars()
-    bars[HALTED][HALT_DAY] = _vendor_bar(10.5)
-    bars[SUSPENDED][HALT_DAY] = _vendor_bar(10.0)
+    bars[HALTED][HALT_DAY] = _vendor_bar(HALT_DAY, 10.5)
+    bars[SUSPENDED][HALT_DAY] = _vendor_bar(HALT_DAY)
     halt = {
         "code": HALTED,
         "announced": SESSION_DATES[0],
@@ -238,8 +261,12 @@ def test_a_full_halt_until_with_a_same_day_resume_keeps_its_open() -> None:
         bars=bars,
         halts=[halt],
         price_evidence_id=PRICE_EVIDENCE_ID,
-        halt_evidence_ids={(HALTED, SESSION_DATES[0]): HALT_EVIDENCE_ID},
-        halt_references={(HALTED, SESSION_DATES[0]): "https://example.invalid/halt.pdf"},
+        halt_notice_evidence={
+            (HALTED, SESSION_DATES[0]): {
+                "id": HALT_EVIDENCE_ID,
+                "reference": "https://example.invalid/halt.pdf",
+            }
+        },
         price_collected_at=COLLECTED_AT,
     )
     row = next(
@@ -313,7 +340,7 @@ def test_converted_halt_open_seals_and_fills_in_discovery(tmp_path: Path) -> Non
         "basket_complete": False,
     }]
     resumed = next(fill for fill in fills if fill["symbol"] == HALTED)
-    sealed_row = _row(payload, HALT_DAY, HALTED)
+    sealed_row = raw_row(payload, HALT_DAY, HALTED)
     assert resumed["raw_open"] == sealed_row["open"] == 10.5
     assert resumed["price"] == pytest.approx(10.5)
     assert resumed["open_evidence"] == sealed_row["open_source"]
@@ -321,6 +348,101 @@ def test_converted_halt_open_seals_and_fills_in_discovery(tmp_path: Path) -> Non
     assert SUSPENDED not in {fill["symbol"] for fill in fills}
     assert discovery["position_evidence"]["basket_build_state"] == "partial"
     assert discovery["position_evidence"]["unfilled_basket_signals"] == 1
+
+
+def _assert_formal_validation_blocked(scenario: dict, evidence: dict) -> None:
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_DATA_GAP", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["allowance"]["automatic_used"] == 0
+    assert blocked["execution_evidence"] == [evidence]
+    assert all(
+        evidence[key] in blocked["error"]["message"]
+        for key in ("date", "symbol", "classification")
+    )
+    assert round_uses(scenario) == []
+    assert not (scenario["store"] / "research-loop-validations").exists()
+
+
+@pytest.mark.parametrize("missing", ["whole-bar", "open-only", "zero-volume"])
+def test_converted_missing_resume_open_blocks_formal_validation(
+    tmp_path: Path, missing: str,
+) -> None:
+    bars = _vendor_bars(FORMAL_SESSIONS)
+    bars[SUSPENDED][HALT_DAY] = _vendor_bar(HALT_DAY)
+    if missing == "whole-bar":
+        del bars[HALTED][TRAILING_HALT_DAY]
+    elif missing == "open-only":
+        bars[HALTED][TRAILING_HALT_DAY][1] = ""
+    else:
+        bars[HALTED][TRAILING_HALT_DAY][-1] = "0"
+    halts = [{**_halt_rows()[0], "date": TRAILING_HALT_DAY}]
+    payload = _build_payload(sessions=FORMAL_SESSIONS, bars=bars, halts=halts)
+    scenario = formal_scenario(
+        tmp_path, payload=payload, limit=1, execution_rules=ACTUAL_OPEN_RULES
+    )
+    assert TRAILING_HALT_DAY in scenario["trailing_dates"]
+    sealed = manifest(scenario["snapshots"], scenario["campaign"]["snapshot_id"])
+    gap = {"date": TRAILING_HALT_DAY, "symbol": HALTED}
+    assert gap in sealed["gaps"]["raw_bars"]
+    assert (gap in sealed["gaps"]["derived"]) is (missing != "open-only")
+    [evidence] = [
+        row for row in sealed["execution_evidence"]["rows"]
+        if row["date"] == TRAILING_HALT_DAY
+    ]
+    assert evidence["symbol"] == HALTED
+    assert evidence["classification"] == "missing_required_open"
+    assert evidence["status_evidence_id"] == HALT_EVIDENCE_ID
+    assert "open_source" not in evidence
+
+    _assert_formal_validation_blocked(scenario, evidence)
+
+
+@pytest.mark.parametrize("volume", ["1200", "0"], ids=["contradiction", "stale-bar"])
+def test_converted_vendor_bar_during_a_whole_day_halt(
+    tmp_path: Path, volume: str,
+) -> None:
+    bars = _vendor_bars(FORMAL_SESSIONS)
+    bars[SUSPENDED][HALT_DAY] = _vendor_bar(HALT_DAY)
+    bars[SUSPENDED][TRAILING_HALT_DAY] = _vendor_bar(TRAILING_HALT_DAY, 99.0)
+    bars[SUSPENDED][TRAILING_HALT_DAY][-1] = volume
+    halts = [{
+        **_halt_rows()[1],
+        "date": TRAILING_HALT_DAY,
+        "resume": f"{TRAILING_HALT_DAY} 15:00",
+    }]
+    payload = _build_payload(sessions=FORMAL_SESSIONS, bars=bars, halts=halts)
+    scenario = formal_scenario(
+        tmp_path, payload=payload, limit=1, execution_rules=ACTUAL_OPEN_RULES,
+    )
+    assert TRAILING_HALT_DAY in scenario["trailing_dates"]
+    sealed = manifest(scenario["snapshots"], scenario["campaign"]["snapshot_id"])
+    gap = {"date": TRAILING_HALT_DAY, "symbol": SUSPENDED}
+    for kind in ("raw_bars", "derived"):
+        assert gap in sealed["gaps"][kind]
+    row = raw_row(payload, TRAILING_HALT_DAY, SUSPENDED)
+    assert row["open"] is None
+    assert row["close"] is None
+    assert derived_row(payload, TRAILING_HALT_DAY, SUSPENDED)["value"] is None
+    assert derived_row(payload, FORMAL_SESSIONS[8], SUSPENDED)["value"] == pytest.approx(1.0)
+
+    [evidence] = [
+        row for row in sealed["execution_evidence"]["rows"]
+        if row["date"] == TRAILING_HALT_DAY
+    ]
+    assert evidence["symbol"] == SUSPENDED
+    assert evidence["status_evidence_id"] == SUSPENDED_EVIDENCE_ID
+    if volume == "0":
+        assert evidence["classification"] == "confirmed_no_trade"
+        validated = ok(validate_current(scenario))
+        assert validated["usage"]["sequence"] == 1
+        assert len(round_uses(scenario)) == 1
+        return
+
+    assert evidence["classification"] == "unknown_status"
+    assert PRICE_EVIDENCE_ID in row["availability_evidence"]
+    _assert_formal_validation_blocked(scenario, evidence)
 
 
 def test_the_conversion_entries_are_importable_without_running_main() -> None:

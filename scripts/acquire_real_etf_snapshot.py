@@ -17,8 +17,9 @@ Schema 3 binds every executable open to sealed evidence (ADR 0002).  A normal
 session keeps the vendor's unadjusted daily open, and a halted-at-open session
 whose halt ends before the close keeps that day's actual open: the row cites
 the vendor price archive as ``open_source`` and the official halt notice as
-``status_evidence_id``.  A session halted for the whole day becomes
-``suspended`` with null prices and the notice as trading-status evidence.
+``status_evidence_id``. Missing resume opens stay declared gaps. A whole-day
+halt becomes ``suspended`` with null prices unless positive vendor volume
+contradicts the notice, in which case the row's status is ``unknown``.
 ``convert_raw_bars`` and ``build_snapshot_input`` are the pure, importable
 conversion entry points; ``_build`` reads the probe files and delegates to them.
 
@@ -29,7 +30,7 @@ reinvests official cash dividends at the ex-date close.
 
 Run the default (cache-based, reproducible) build::
 
-    python3 scripts/acquire_real_etf_snapshot.py \
+    PYTHONPATH=src python3 scripts/acquire_real_etf_snapshot.py \
         --cache-dir /tmp/research24 \
         --store "$HOME/PrajnaTrade-trusted/real-etf-snapshot/store" \
         --workdir "$WORKDIR" \
@@ -51,8 +52,11 @@ import sys
 import tempfile
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
+
+from prajnatrade.snapshot import halt_covers_session
 
 CN_TZ = timezone(timedelta(hours=8))
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
@@ -242,10 +246,6 @@ MONTHS = tuple(
 PRICE_SOURCE = "tencent:unadjusted"
 #: The schema-3 evidence item id the vendor daily opens cite.
 PRICE_EVIDENCE_ID = "price-tencent-unadjusted"
-#: Halt kinds that close the whole session by construction.  ``full_halt_until``
-#: is decided by its halt window: a same-day resume leaves an actual open (the
-#: vendor's daily bar), while a resume on a later session covers the whole day.
-FULL_DAY_HALT_KINDS = ("full_halt", "full_halt_open_end")
 #: The three derivation-evidence statements a re-acquired snapshot records.
 DERIVATION_EVIDENCE = (
     (
@@ -264,6 +264,11 @@ DERIVATION_EVIDENCE = (
         "series is used."
     ),
 )
+
+
+class HaltNoticeEvidence(TypedDict):
+    id: str
+    reference: str
 
 
 class AcquisitionError(RuntimeError):
@@ -341,12 +346,12 @@ def _date_windows(start: str, end: str, days: int) -> list[tuple[str, str]]:
     return windows
 
 
-def _fetch_tencent_bars() -> dict[str, dict[str, list[str]]]:
+def _fetch_tencent_bars() -> dict[str, dict[str, list[str | None]]]:
     """Download unadjusted daily bars for the common window."""
-    result: dict[str, dict[str, list[str]]] = {}
+    result: dict[str, dict[str, list[str | None]]] = {}
     for symbol in SYMBOLS:
         market = MARKETS[symbol]
-        rows: dict[str, list[str]] = {}
+        rows: dict[str, list[str | None]] = {}
         for begin, finish in _date_windows(WINDOW_START, WINDOW_END, 700):
             param = f"{market}{symbol},day,{begin},{finish},640,"
             payload = _fetch_json(
@@ -355,7 +360,7 @@ def _fetch_tencent_bars() -> dict[str, dict[str, list[str]]]:
             )
             block = payload.get("data", {}).get(f"{market}{symbol}", {})
             for bar in block.get("day", []):
-                rows[bar[0]] = [str(value) for value in bar[:6]]
+                rows[bar[0]] = [str(value) if value is not None else None for value in bar[:6]]
         if not rows:
             raise AcquisitionError(f"Tencent returned no bars for {symbol}")
         result[symbol] = rows
@@ -523,15 +528,33 @@ def _halt_window(row: dict[str, Any]) -> dict[str, str] | None:
     return {"start": _at(row["date"], 9, 30), "end": _iso(parsed)}
 
 
-def _bar_values(bar: list[str]) -> tuple[float, float, float, float, float]:
+def _bar_values(
+    bar: list[str | None], *, day: str, symbol: str, allow_missing_open: bool,
+) -> tuple[float | None, float, float, float, float]:
     """Return (open, close, high, low, volume) from a Tencent row (O/C/H/L/V)."""
+    bar_day = bar[0] if bar else None
+    if bar_day != day:
+        raise AcquisitionError(
+            f"Vendor bar date mismatch for {symbol} {day}: row is dated {bar_day!r}"
+        )
     try:
-        open_price, close, high, low, volume = (float(value) for value in bar[1:6])
+        raw_open, raw_close, raw_high, raw_low, raw_volume = bar[1:6]
+        open_price = (
+            None if allow_missing_open and raw_open in (None, "") else float(raw_open)
+        )
+        close, high, low, volume = (
+            float(value) for value in (raw_close, raw_high, raw_low, raw_volume)
+        )
     except (TypeError, ValueError) as error:
         raise AcquisitionError(f"Non-numeric vendor bar: {bar!r}") from error
-    if min(open_price, close, high, low) <= 0 or volume < 0:
+    prices = (close,) if open_price is None else (open_price, close)
+    if (
+        not all(isfinite(value) for value in (*prices, high, low, volume))
+        or min(*prices, high, low) <= 0
+        or volume < 0
+    ):
         raise AcquisitionError(f"Invalid vendor bar: {bar!r}")
-    if high < max(open_price, close) or low > min(open_price, close) or high < low:
+    if high < max(prices) or low > min(prices) or high < low:
         raise AcquisitionError(f"Inconsistent vendor OHLC: {bar!r}")
     return open_price, close, high, low, volume
 
@@ -541,48 +564,13 @@ def halt_evidence_id(code: str, announced: str) -> str:
     return f"halt-{code}-{announced}"
 
 
-def _window_covers_session(window: dict[str, str], day: str) -> bool:
-    """Whether a halt window spans the whole 09:30-15:00 session."""
-    session = datetime.fromisoformat(day).replace(tzinfo=CN_TZ)
-    start = datetime.fromisoformat(window["start"])
-    end = datetime.fromisoformat(window["end"])
-    return (
-        start <= session.replace(hour=9, minute=30)
-        and end >= session.replace(hour=15, minute=0)
-    )
-
-
-def _halt_is_full_day(halt: dict[str, Any], window: dict[str, str] | None) -> bool:
-    """Whether the notice closes the whole session, so it has no actual open."""
-    if halt["kind"] in FULL_DAY_HALT_KINDS:
-        return True
-    return window is not None and _window_covers_session(window, halt["date"])
-
-
-def _halt_evidence(
-    halt: dict[str, Any],
-    halt_evidence_ids: dict[tuple[str, str], str],
-    halt_references: dict[tuple[str, str], str],
-) -> tuple[str, str]:
-    """Return the halt notice's evidence id and its availability-evidence text."""
-    key = (halt["code"], halt["announced"])
-    evidence_id = halt_evidence_ids.get(key)
-    if evidence_id is None:
-        raise AcquisitionError(
-            f"Missing halt evidence id for {halt['code']} {halt['announced']}"
-        )
-    reference = halt_references.get(key, evidence_id)
-    return evidence_id, f"official-halt-notice:{reference} (announced {halt['announced']})"
-
-
 def convert_raw_bars(
     *,
     sessions: list[str],
-    bars: dict[str, dict[str, list[str]]],
+    bars: dict[str, dict[str, list[str | None]]],
     halts: list[dict[str, Any]],
     price_evidence_id: str,
-    halt_evidence_ids: dict[tuple[str, str], str],
-    halt_references: dict[tuple[str, str], str],
+    halt_notice_evidence: dict[tuple[str, str], HaltNoticeEvidence],
     price_collected_at: str,
 ) -> list[dict[str, Any]]:
     """Convert vendor daily bars and official halt rows to schema-3 raw bars.
@@ -592,11 +580,10 @@ def convert_raw_bars(
     (``open_halt``, or a ``full_halt_until`` window that does not cover the
     session) keeps the vendor's actual open as the day's first print after the
     resume, with the price archive as ``open_source`` and the halt notice as a
-    distinct ``status_evidence_id``.  A session the notice closes for the whole
-    day (``full_halt``, ``full_halt_open_end``, or a covering
-    ``full_halt_until`` window) becomes ``suspended`` with null OHLCV and the
-    halt notice as status evidence: an actual open means a trade happened, so
-    a suspended row must not carry one.
+    distinct ``status_evidence_id``. A missing or zero-volume bar cannot
+    establish an actual open. A whole-session halt with no evidence of trading
+    becomes ``suspended`` with null OHLCV. Positive vendor volume contradicts
+    that halt notice, so the row has ``unknown`` trading status and null OHLCV.
     """
     halts_by_key = {(halt["code"], halt["date"]): halt for halt in halts}
     open_source = {"source": PRICE_SOURCE, "evidence_id": price_evidence_id}
@@ -604,91 +591,84 @@ def convert_raw_bars(
     for day in sessions:
         for symbol in SYMBOLS:
             halt = halts_by_key.get((symbol, day))
-            window = _halt_window(halt) if halt is not None else None
-            if halt is not None and _halt_is_full_day(halt, window):
-                if window is None:
-                    raise AcquisitionError(f"Missing full-halt window for {symbol} {day}")
-                evidence_id, reference = _halt_evidence(
-                    halt, halt_evidence_ids, halt_references
-                )
-                rows.append(
-                    {
-                        "date": day,
-                        "symbol": symbol,
-                        "open": None,
-                        "high": None,
-                        "low": None,
-                        "close": None,
-                        "volume": None,
-                        "trading_status": "suspended",
-                        "halt": window,
-                        "status_evidence_id": evidence_id,
-                        "open_available_at": None,
-                        "close_available_at": None,
-                        "available_at": _day_end(halt["announced"]),
-                        "availability_evidence": reference,
-                        "collected_at": price_collected_at,
-                    }
-                )
-                continue
             bar = bars.get(symbol, {}).get(day)
-            if bar is None:
+            if bar is None and halt is None:
                 raise AcquisitionError(f"Missing vendor bar for {symbol} {day}")
-            open_price, close, high, low, volume = _bar_values(bar)
+            open_price, close, high, low, volume = (
+                _bar_values(bar, day=day, symbol=symbol, allow_missing_open=halt is not None)
+                if bar is not None else (None, None, None, None, None)
+            )
+            row = {
+                "date": day,
+                "symbol": symbol,
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "collected_at": price_collected_at,
+            }
+            rows.append(row)
+            price_reference = f"{PRICE_SOURCE}:{symbol}:{day}"
             if halt is None:
-                rows.append(
-                    {
-                        "date": day,
-                        "symbol": symbol,
-                        "open": open_price,
-                        "high": high,
-                        "low": low,
-                        "close": close,
-                        "volume": volume,
-                        "trading_status": "trading",
-                        "halt": None,
-                        "open_source": dict(open_source),
-                        "open_available_at": _at(day, 9, 30),
-                        "close_available_at": _at(day, 15),
-                        "available_at": _at(day, 15),
-                        "availability_evidence": (
-                            f"{PRICE_SOURCE}:{symbol}:{day};"
-                            "rule:09:30-open/15:00-close-assertion"
-                        ),
-                        "collected_at": price_collected_at,
-                    }
+                row.update(
+                    trading_status="trading",
+                    halt=None,
+                    open_source=dict(open_source),
+                    open_available_at=_at(day, 9, 30),
+                    close_available_at=_at(day, 15),
+                    available_at=_at(day, 15),
+                    availability_evidence=f"{price_reference};rule:09:30-open/15:00-close-assertion",
                 )
                 continue
+
+            window = _halt_window(halt)
             if window is None:
-                raise AcquisitionError(f"Missing partial-halt window for {symbol} {day}")
-            evidence_id, reference = _halt_evidence(
-                halt, halt_evidence_ids, halt_references
-            )
-            rows.append(
-                {
-                    "date": day,
-                    "symbol": symbol,
-                    # The daily bar's first print after the resume is the actual
-                    # open an order effective before the open matches at.
-                    "open": open_price,
-                    "high": high,
-                    "low": low,
-                    "close": close,
-                    "volume": volume,
-                    "trading_status": "partial_halt",
-                    "halt": window,
-                    "open_source": dict(open_source),
-                    "status_evidence_id": evidence_id,
-                    "open_available_at": window["end"],
-                    "close_available_at": _at(day, 15),
-                    "available_at": _at(day, 15),
-                    "availability_evidence": (
-                        f"{PRICE_SOURCE}:{symbol}:{day};"
-                        "rule:actual-daily-open-after-resume;"
-                        f"{reference}"
+                raise AcquisitionError(f"Missing halt window for {symbol} {day}")
+            announced = halt["announced"]
+            notice = halt_notice_evidence.get((symbol, announced))
+            if notice is None:
+                raise AcquisitionError(f"Missing halt notice evidence for {symbol} {announced}")
+            reference = f"official-halt-notice:{notice['reference']} (announced {announced})"
+            row["status_evidence_id"] = notice["id"]
+
+            if halt_covers_session(window, day):
+                # Positive vendor volume contradicts the halt notice. Schema 3
+                # records that status as unknown and excludes the vendor prices.
+                disputed = volume is not None and volume > 0
+                row.update(
+                    open=None,
+                    high=None,
+                    low=None,
+                    close=None,
+                    volume=None,
+                    trading_status="unknown" if disputed else "suspended",
+                    halt=None if disputed else window,
+                    open_available_at=None,
+                    close_available_at=None,
+                    available_at=_at(day, 15) if disputed else _day_end(announced),
+                    availability_evidence=(
+                        f"{reference};contradictory-vendor-volume:{price_reference}"
+                        f" (evidence {price_evidence_id})"
+                        if disputed else reference
                     ),
-                    "collected_at": price_collected_at,
-                }
+                )
+                continue
+
+            if volume == 0:
+                row.update(open=None, high=None, low=None, close=None)
+            if row["open"] is not None:
+                row["open_source"] = dict(open_source)
+            row.update(
+                trading_status="partial_halt",
+                halt=window,
+                open_available_at=window["end"],
+                close_available_at=_at(day, 15) if row["close"] is not None else None,
+                available_at=_at(day, 15) if bar is not None else _day_end(announced),
+                availability_evidence=(
+                    f"{price_reference};rule:actual-daily-open-after-resume;{reference}"
+                    if bar is not None else reference
+                ),
             )
     return rows
 
@@ -730,8 +710,7 @@ def _build_evidence(
     refetch: Path | None,
     evidence_dir: Path,
     dividends: list[dict[str, Any]],
-    halts: list[dict[str, Any]],
-    halt_urls: dict[tuple[str, str], str],
+    halt_notice_evidence: dict[tuple[str, str], HaltNoticeEvidence],
     resume_url: str,
 ) -> list[dict[str, Any]]:
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -805,19 +784,14 @@ def _build_evidence(
             _day_end(row["announced"]),
             f"dividend-{row['code']}-{row['announced']}.pdf",
         )
-    for row in halts:
-        url = halt_urls.get((row["code"], row["announced"]))
-        if url is None:
-            raise AcquisitionError(
-                f"Missing halt notice URL for {row['code']} {row['announced']}"
-            )
+    for (code, announced), notice in halt_notice_evidence.items():
         add(
-            halt_evidence_id(row["code"], row["announced"]),
+            notice["id"],
             "halt",
-            f"pdfs/halts/{_halt_pdf_name(cache, row['code'], row['announced'])}",
-            url,
-            _day_end(row["announced"]),
-            f"halt-{row['code']}-{row['announced']}.pdf",
+            f"pdfs/halts/{_halt_pdf_name(cache, code, announced)}",
+            notice["reference"],
+            _day_end(announced),
+            f"halt-{code}-{announced}.pdf",
         )
     add(
         "halt-159612-2025-01-13-resume",
@@ -898,13 +872,12 @@ def _dividend_pdf_name(cache: Path, dividend: dict[str, Any]) -> str:
 def build_snapshot_input(
     *,
     sessions: list[str],
-    bars: dict[str, dict[str, list[str]]],
+    bars: dict[str, dict[str, list[str | None]]],
     halts: list[dict[str, Any]],
     dividends: list[dict[str, Any]],
     evidence: list[dict[str, Any]],
     price_evidence_id: str,
-    halt_evidence_ids: dict[tuple[str, str], str],
-    halt_references: dict[tuple[str, str], str],
+    halt_notice_evidence: dict[tuple[str, str], HaltNoticeEvidence],
     price_collected_at: str,
     calendar_collected_at: str,
     action_collected_at: str,
@@ -921,25 +894,20 @@ def build_snapshot_input(
     acceptance test drives this same entry point with synthetic bars and
     notices.
     """
-    closes: dict[str, dict[str, float]] = {symbol: {} for symbol in SYMBOLS}
-    for symbol in SYMBOLS:
-        code_bars = bars.get(symbol)
-        if not isinstance(code_bars, dict):
-            raise AcquisitionError(f"Missing vendor bars for {symbol}")
-        for day in sessions:
-            bar = code_bars.get(day)
-            if bar is not None:
-                closes[symbol][day] = _bar_values(bar)[1]
-    derived = _derived_values(sessions, closes, dividends)
     raw_bars = convert_raw_bars(
         sessions=sessions,
         bars=bars,
         halts=halts,
         price_evidence_id=price_evidence_id,
-        halt_evidence_ids=halt_evidence_ids,
-        halt_references=halt_references,
+        halt_notice_evidence=halt_notice_evidence,
         price_collected_at=price_collected_at,
     )
+
+    closes: dict[str, dict[str, float]] = {symbol: {} for symbol in SYMBOLS}
+    for row in raw_bars:
+        if row["close"] is not None:
+            closes[row["symbol"]][row["date"]] = row["close"]
+    derived = _derived_values(sessions, closes, dividends)
 
     calendar_rows = []
     for day in sessions:
@@ -1101,6 +1069,16 @@ def _build(
     dividends = _window_dividends(dividends_all)
     halts = _window_halts(halts_all, sessions)
     halt_urls = _halt_announcement_index(announcements)
+    halt_notice_evidence: dict[tuple[str, str], HaltNoticeEvidence] = {}
+    for halt in halts:
+        code, announced = halt["code"], halt["announced"]
+        reference = halt_urls.get((code, announced))
+        if reference is None:
+            raise AcquisitionError(f"Missing halt notice URL for {code} {announced}")
+        halt_notice_evidence[code, announced] = {
+            "id": halt_evidence_id(code, announced),
+            "reference": reference,
+        }
     resume_url = _resume_announcement_url(announcements, "159612", "2025-01-13")
 
     for row in dividends:
@@ -1111,14 +1089,10 @@ def _build(
         if row["pay_exchange"] not in session_set:
             raise AcquisitionError(f"Pay date {row['pay_exchange']} is not a session")
 
-    closes: dict[str, dict[str, float]] = {symbol: {} for symbol in SYMBOLS}
     for symbol in SYMBOLS:
         code_bars = bars.get(symbol)
         if not isinstance(code_bars, dict):
             raise AcquisitionError(f"Missing vendor bars for {symbol}")
-        for day, bar in code_bars.items():
-            if day in session_set:
-                closes[symbol][day] = _bar_values(bar)[1]
         unexpected = sorted(
             day
             for day in code_bars
@@ -1126,11 +1100,6 @@ def _build(
         )
         if unexpected:
             raise AcquisitionError(f"{symbol} has non-session bars: {unexpected[:3]}")
-    expected_missing = {"159612": {"2025-01-10", "2025-01-24"}}
-    for symbol in SYMBOLS:
-        missing = session_set - set(closes[symbol])
-        if missing != expected_missing.get(symbol, set()):
-            raise AcquisitionError(f"Unexpected missing sessions for {symbol}: {missing}")
 
     price_collected = _mtime(bars_path)
     calendar_collected = _mtime(calendar_path)
@@ -1145,8 +1114,7 @@ def _build(
         refetch=refetch,
         evidence_dir=evidence_dir,
         dividends=dividends,
-        halts=halts,
-        halt_urls=halt_urls,
+        halt_notice_evidence=halt_notice_evidence,
         resume_url=resume_url,
     )
     payload = build_snapshot_input(
@@ -1156,13 +1124,7 @@ def _build(
         dividends=dividends,
         evidence=evidence,
         price_evidence_id=PRICE_EVIDENCE_ID,
-        halt_evidence_ids={
-            (row["code"], row["announced"]): halt_evidence_id(
-                row["code"], row["announced"]
-            )
-            for row in halts
-        },
-        halt_references=halt_urls,
+        halt_notice_evidence=halt_notice_evidence,
         price_collected_at=price_collected,
         calendar_collected_at=calendar_collected,
         action_collected_at=action_collected,
