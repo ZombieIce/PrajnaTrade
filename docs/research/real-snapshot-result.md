@@ -51,7 +51,8 @@ The current acquisition script emits schema 3. Use the original probe cache
 with its file modification times preserved, since those timestamps enter the
 evidence and row metadata. The commands below use a temporary checkout, evidence
 directory and store. Install the dependencies from the historical checkout's
-`pyproject.toml` before sealing or running the baselines.
+`pyproject.toml` before sealing or running the baselines. Install the `test`
+extra to run step 5.
 
 ```sh
 REPLAY_DIR="$(mktemp -d)"
@@ -92,7 +93,7 @@ python3 scripts/reconcile_real_etf_baseline.py --store "$STORE" --snapshot-id "$
 
 # 5. Lint and tests.
 ruff check .
-python3 -m pytest -q -m "not isolation"
+PYTHONPATH=src python3 -m pytest -q -m "not isolation"
 ```
 
 `--refetch` re-downloads the Tencent bars, the 59 SZSE month responses and the

@@ -12,12 +12,14 @@ with #35.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 from functools import cache
 from pathlib import Path
 from types import ModuleType
 
 import pytest
-from cli_helpers import cli, ok, rejected, repo_root
+from cli_helpers import cli, ok, rejected, repo_root, write_json
 from test_actual_open_cli import derived_row, raw_row, seal_v3
 from test_discovery_split_cli import manifest
 from test_formal_validation_cli import formal_scenario, round_uses, validate_current
@@ -365,7 +367,7 @@ def _assert_formal_validation_blocked(scenario: dict, evidence: dict) -> None:
     assert not (scenario["store"] / "research-loop-validations").exists()
 
 
-@pytest.mark.parametrize("missing", ["whole-bar", "open-only", "zero-volume"])
+@pytest.mark.parametrize("missing", ["whole-bar", "open-only", "zero-open", "no-prices", "zero-volume"])
 def test_converted_missing_resume_open_blocks_formal_validation(
     tmp_path: Path, missing: str,
 ) -> None:
@@ -375,6 +377,10 @@ def test_converted_missing_resume_open_blocks_formal_validation(
         del bars[HALTED][TRAILING_HALT_DAY]
     elif missing == "open-only":
         bars[HALTED][TRAILING_HALT_DAY][1] = ""
+    elif missing == "zero-open":
+        bars[HALTED][TRAILING_HALT_DAY][1] = "0"
+    elif missing == "no-prices":
+        bars[HALTED][TRAILING_HALT_DAY][1:5] = [None] * 4
     else:
         bars[HALTED][TRAILING_HALT_DAY][-1] = "0"
     halts = [{**_halt_rows()[0], "date": TRAILING_HALT_DAY}]
@@ -386,7 +392,7 @@ def test_converted_missing_resume_open_blocks_formal_validation(
     sealed = manifest(scenario["snapshots"], scenario["campaign"]["snapshot_id"])
     gap = {"date": TRAILING_HALT_DAY, "symbol": HALTED}
     assert gap in sealed["gaps"]["raw_bars"]
-    assert (gap in sealed["gaps"]["derived"]) is (missing != "open-only")
+    assert (gap in sealed["gaps"]["derived"]) is (missing not in {"open-only", "zero-open"})
     [evidence] = [
         row for row in sealed["execution_evidence"]["rows"]
         if row["date"] == TRAILING_HALT_DAY
@@ -399,14 +405,20 @@ def test_converted_missing_resume_open_blocks_formal_validation(
     _assert_formal_validation_blocked(scenario, evidence)
 
 
-@pytest.mark.parametrize("volume", ["1200", "0"], ids=["contradiction", "stale-bar"])
+@pytest.mark.parametrize(("volume", "has_prices"), [
+    pytest.param("1200", True, id="contradiction"),
+    pytest.param("1200", False, id="volume-only-contradiction"),
+    pytest.param("0", False, id="empty-stale-bar"),
+])
 def test_converted_vendor_bar_during_a_whole_day_halt(
-    tmp_path: Path, volume: str,
+    tmp_path: Path, volume: str, has_prices: bool,
 ) -> None:
     bars = _vendor_bars(FORMAL_SESSIONS)
     bars[SUSPENDED][HALT_DAY] = _vendor_bar(HALT_DAY)
     bars[SUSPENDED][TRAILING_HALT_DAY] = _vendor_bar(TRAILING_HALT_DAY, 99.0)
     bars[SUSPENDED][TRAILING_HALT_DAY][-1] = volume
+    if not has_prices:
+        bars[SUSPENDED][TRAILING_HALT_DAY][1:5] = [None] * 4
     halts = [{
         **_halt_rows()[1],
         "date": TRAILING_HALT_DAY,
@@ -441,8 +453,41 @@ def test_converted_vendor_bar_during_a_whole_day_halt(
         return
 
     assert evidence["classification"] == "unknown_status"
-    assert PRICE_EVIDENCE_ID in row["availability_evidence"]
+    assert evidence["reason"] == "positive_volume_during_whole_day_halt"
+    assert evidence["status_conflict"] == {
+        "price_evidence_id": PRICE_EVIDENCE_ID,
+        "halt": {
+            "start": f"{TRAILING_HALT_DAY}T09:30:00+08:00",
+            "end": f"{TRAILING_HALT_DAY}T15:00:00+08:00",
+        },
+    }
+    assert {"open", "close", "volume"}.isdisjoint(evidence)
     _assert_formal_validation_blocked(scenario, evidence)
+
+
+@pytest.mark.parametrize("invalid", ["notice-as-price", "intraday-window", "volume", "derived-value"])
+def test_seal_rejects_invalid_halt_conflict_evidence(tmp_path: Path, invalid: str) -> None:
+    bars = _vendor_bars(SESSION_DATES)
+    bars[SUSPENDED][HALT_DAY] = _vendor_bar(HALT_DAY)
+    payload = _build_payload(bars=bars)
+    row = raw_row(payload, HALT_DAY, SUSPENDED)
+    if invalid == "notice-as-price":
+        row["status_conflict"]["price_evidence_id"] = SUSPENDED_EVIDENCE_ID
+        message = "must name a price_archive"
+    elif invalid == "intraday-window":
+        row["status_conflict"]["halt"]["end"] = f"{HALT_DAY}T10:30:00+08:00"
+        message = "requires a whole-day halt window"
+    elif invalid == "volume":
+        row["status_conflict"]["volume"] = 1200
+        message = "requires price_evidence_id and halt"
+    else:
+        derived_row(payload, HALT_DAY, SUSPENDED)["value"] = 10.0
+        message = "must be null on a status_conflict session"
+
+    source = write_json(tmp_path / "invalid-halt-conflict.json", payload)
+    result = cli("snapshot", "seal", "--input", str(source), "--store", str(tmp_path / "store"))
+    assert result.returncode != 0
+    assert message in result.stderr
 
 
 def test_the_conversion_entries_are_importable_without_running_main() -> None:
@@ -452,3 +497,13 @@ def test_the_conversion_entries_are_importable_without_running_main() -> None:
     assert callable(module.build_snapshot_input)
     assert module.PRICE_SOURCE == PRICE_SOURCE
     assert module.halt_evidence_id(HALTED, SESSION_DATES[0]) == HALT_EVIDENCE_ID
+
+
+def test_acquisition_help_runs_directly_without_installed_packages() -> None:
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", str(ACQUISITION_SCRIPT), "--help"],
+        cwd=repo_root(), capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--cache-dir" in result.stdout
+    assert "--output" in result.stdout

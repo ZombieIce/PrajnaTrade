@@ -225,8 +225,8 @@ The [ADR](docs/adr/0002-actual-daily-open-execution.md) records why the fill
 price is a matching base price and never a signal input.
 
 Schema 3 keeps the schema-2 `evidence`, `derivation`, per-field availability and
-corporate-action rules, requires `raw_price_basis: "unadjusted"` to be
-**declared** (there is no absent default), and adds three raw-bar keys:
+corporate-action rules and requires an explicit `raw_price_basis: "unadjusted"`.
+It also adds the following raw-bar fields.
 
 - `open_source: {"source": ..., "evidence_id": ...}` is required exactly when
   `open` is not `null`, on a normal `trading` session and on a `partial_halt`
@@ -251,6 +251,10 @@ corporate-action rules, requires `raw_price_basis: "unadjusted"` to be
   open. A `suspended` row cannot carry one — a confirmed no-trade day has no
   open to disagree about. An explicit `open_conflict: null` is absent, not a
   conflict: the field rules and the manifest classification both ignore it.
+- `status_conflict: {"price_evidence_id": ..., "halt": {"start": ..., "end": ...}}`
+  records an official whole-day halt contradicted by positive vendor volume.
+  It requires `trading_status: "unknown"`, null OHLCV and derived value, a sealed
+  notice in `status_evidence_id` and a sealed price archive in `price_evidence_id`.
 
 A schema-3 `partial_halt` row **may** carry the day's actual unadjusted daily
 open — the first print after a resume on a halted-at-open day — together with
@@ -287,7 +291,7 @@ The schema-3 manifest adds one additive, schema-3-only block,
 The block is a pre-read classification, not a price record: each row carries
 the classification, date, symbol, trading status, halt window/reason and
 evidence **references** only (`open_source`, `status_evidence_id`,
-`conflict_sources`). No actual open and no conflict quote from any sealed
+`conflict_sources`, `status_conflict`). No actual open and no conflict quote from any sealed
 partition may appear in the manifest, so inspecting `snapshot manifest` never
 reveals a Final Holdout price without the controlled read. The sealed
 partition payload still keeps its prices for a counted read.
@@ -307,7 +311,9 @@ symbol, with classification:
 - `source_conflict`: the row carries a non-null `open_conflict`; the manifest
   row exposes the two sources' references as `conflict_sources`, not their
   quotes.
-- `unknown_status`: `trading_status: "unknown"`.
+- `unknown_status`: `trading_status: "unknown"`. With `status_conflict`, the
+  manifest and preflight receipt include both evidence references and the
+  reason `positive_volume_during_whole_day_halt`.
 
 `gaps` keeps its exact historical shape and population for every schema
 version, so old consumers are unchanged: an evidenced actual open is no longer

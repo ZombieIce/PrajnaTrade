@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.trading_status import halt_covers_session as halt_covers_session
 
 KINDS = ("calendar", "raw_bars", "corporate_actions", "derived")
 RAW_FIELDS = ("open", "high", "low", "close", "volume")
@@ -23,7 +24,7 @@ HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 DISCOVERY_PRIOR_HISTORY = "discovery_prior_history"
 #: The schema-3 raw-bar keys that bind an executable open and a trading-status
 #: notice to sealed evidence.  Schema 2 rejects them so its contract stays crisp.
-SCHEMA_3_ROW_KEYS = ("open_source", "status_evidence_id", "open_conflict")
+SCHEMA_3_ROW_KEYS = ("open_source", "status_evidence_id", "open_conflict", "status_conflict")
 #: Evidence roles: an executable open may cite only a price archive, and a
 #: trading-status notice may cite only a halt/suspension/resumption notice.  A
 #: notice proves status, never a price; an archive proves the price, never the
@@ -209,8 +210,8 @@ def _reject_schema_3_row_keys(row: dict) -> None:
     """Keep schema 2's raw-bar contract crisp: no schema-3 evidence keys."""
     if any(key in row for key in SCHEMA_3_ROW_KEYS):
         raise ValueError(
-            "Schema version 2 raw bars cannot store open_source, status_evidence_id "
-            "or open_conflict."
+            "Schema version 2 raw bars cannot store open_source, status_evidence_id, "
+            "open_conflict or status_conflict."
         )
 
 
@@ -251,6 +252,8 @@ def _status_evidence(
     status = row.get("trading_status")
     value = row.get("status_evidence_id")
     if not isinstance(value, str) or not value.strip():
+        if row.get("status_conflict") is not None:
+            raise ValueError("status_conflict requires status_evidence_id.")
         if status in ("partial_halt", "suspended"):
             raise ValueError(
                 "A schema-3 partial_halt or suspended raw bar requires "
@@ -342,6 +345,27 @@ def _real_raw_bar_v2(row: dict, status: str) -> None:
         raise ValueError("An unknown raw bar cannot declare a halt window.")
 
 
+def _status_conflict(row: dict, evidence_kinds: dict[str, str]) -> None:
+    """Validate an official whole-day halt contradicted by a vendor bar."""
+    conflict = row.get("status_conflict")
+    if conflict is None:
+        return
+    if not isinstance(conflict, dict) or set(conflict) != {"price_evidence_id", "halt"}:
+        raise ValueError("status_conflict requires price_evidence_id and halt.")
+    if (
+        row["trading_status"] != "unknown"
+        or row.get("open_conflict") is not None
+        or any(row.get(field) is not None for field in RAW_FIELDS)
+    ):
+        raise ValueError("status_conflict requires unknown status and null OHLCV without open_conflict.")
+    price_id = conflict["price_evidence_id"]
+    if not isinstance(price_id, str) or evidence_kinds.get(price_id) not in PRICE_EVIDENCE_KINDS:
+        raise ValueError("status_conflict price_evidence_id must name a price_archive.")
+    halt = _halt(conflict["halt"], required=True)
+    if not halt_covers_session(halt, row["date"]):
+        raise ValueError("status_conflict requires a whole-day halt window.")
+
+
 def _real_raw_bar_v3(
     row: dict, status: str, evidence_kinds: dict[str, str]
 ) -> None:
@@ -390,6 +414,7 @@ def _real_raw_bar_v3(
     elif row.get("halt") is not None:
         raise ValueError("An unknown raw bar cannot declare a halt window.")
     _status_evidence(row, evidence_kinds, open_source)
+    _status_conflict(row, evidence_kinds)
 
 
 def _real_raw_bar(
@@ -443,6 +468,9 @@ def _real_derived(rows: list[dict], raw_bars: dict[tuple[str, str], dict]) -> No
                 "A real derived value must be null on a suspended session."
             )
 
+        if raw.get("status_conflict") is not None and row.get("value") is not None:
+            raise ValueError("A real derived value must be null on a status_conflict session.")
+
 
 def _complete_row(row: dict, kind: str, *, is_real: bool) -> bool:
     """Whether one row confirms its value; a real partial halt still has a close."""
@@ -458,30 +486,6 @@ def _complete_row(row: dict, kind: str, *, is_real: bool) -> bool:
     return False
 
 
-_SHANGHAI = timezone(timedelta(hours=8))
-
-
-def halt_covers_session(halt: object, day: str) -> bool:
-    """Whether a halt window spans the whole session (09:30-15:00 Shanghai).
-
-    A session the notice closes for the whole day is a confirmed no-trade day;
-    anything less leaves a required open the row does not store. Shared seam:
-    the manifest execution-evidence classification and the ``actual-open-v1``
-    engine's unfilled-symbol reason must agree on it.
-    """
-    if not isinstance(halt, dict):
-        return False
-    try:
-        start = _instant(halt["start"], "halt.start")
-        end = _instant(halt["end"], "halt.end")
-    except (KeyError, ValueError):
-        return False
-    session = datetime.fromisoformat(day).replace(tzinfo=_SHANGHAI)
-    return start <= session.replace(hour=9, minute=30) and session.replace(
-        hour=15, minute=0
-    ) <= end
-
-
 def _execution_evidence_row(row: dict) -> dict | None:
     """Classify one sealed session/symbol for the manifest execution evidence.
 
@@ -489,7 +493,8 @@ def _execution_evidence_row(row: dict) -> dict | None:
     before any controlled partition read, so this row carries the
     classification, date, symbol, trading status, halt window/reason and the
     *references* to sealed evidence (``open_source``, ``status_evidence_id``,
-    ``conflict_sources``) -- never an actual open or a conflict's prices.
+    ``conflict_sources``, ``status_conflict``) -- never an actual open or a
+    conflict's prices or volume.
     """
     status = row["trading_status"]
     conflict = row.get("open_conflict")
@@ -510,6 +515,9 @@ def _execution_evidence_row(row: dict) -> dict | None:
         )
     elif status == "unknown":
         record["classification"] = "unknown_status"
+        if row.get("status_conflict") is not None:
+            record["reason"] = "positive_volume_during_whole_day_halt"
+            record["status_conflict"] = row["status_conflict"]
     elif status == "suspended":
         record["classification"] = "confirmed_no_trade"
     else:

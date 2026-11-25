@@ -113,17 +113,15 @@ Two failure modes drove this decision:
   never turns a confirmed no-trade day into a valuation input: a held symbol
   with no confirmed close remains a valuation gap in the counted run. Schema-1/2 manifests, and
   successors without the block, keep the legacy gaps-only gate exactly.
-- The checked-in acquisition script now emits schema 3 through two pure,
-  importable conversion entries: `convert_raw_bars` keeps a halted-at-open
-  session's vendor actual open (with the price archive as `open_source` and the
-  official halt notice as `status_evidence_id`) and turns a whole-day halt into
-  `suspended` with null prices; `build_snapshot_input` assembles the document
-  that `snapshot seal` accepts. A `full_halt_until` notice is classified by its
-  halt window: a same-day resume keeps the actual open, a resume on a later
-  session covers the day and becomes `suspended`. The real re-acquisition and
-  its 45-row verification (#35) are done separately, so no checked-in real
-  snapshot changes and no real Validation allowance is consumed by this change;
-  all acceptance tests remain synthetic.
+- The acquisition script emits schema 3. `convert_raw_bars` keeps a resumed
+  session's evidenced actual open when there is a usable vendor price and
+  positive volume. A missing resume open remains `missing_required_open` at
+  sealing. The halt window determines whether a `full_halt_until` notice covers
+  the session. A confirmed whole-day halt is `suspended`. Conflicting positive
+  vendor volume yields `unknown_status`, with the notice and archive references
+  in the sealed manifest for formal preflight. `build_snapshot_input` derives
+  total returns from the accepted closes. The 45-row real-data verification
+  remains tracked in #35. Acceptance tests use synthetic fixtures.
 - Under `actual-open-v1` a basket no longer fills all-or-nothing: every
   required symbol (a buy with `weight > ε`, a sell with `shares > ε`) matches
   separately at its own sealed executable open. Sells match before buys in

@@ -30,7 +30,7 @@ reinvests official cash dividends at the ex-date close.
 
 Run the default (cache-based, reproducible) build::
 
-    PYTHONPATH=src python3 scripts/acquire_real_etf_snapshot.py \
+    python3 scripts/acquire_real_etf_snapshot.py \
         --cache-dir /tmp/research24 \
         --store "$HOME/PrajnaTrade-trusted/real-etf-snapshot/store" \
         --workdir "$WORKDIR" \
@@ -56,7 +56,11 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, TypedDict
 
-from prajnatrade.snapshot import halt_covers_session
+# Direct invocation uses the shared rules from this checkout.
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from prajnatrade.trading_status import halt_covers_session  # noqa: E402
 
 CN_TZ = timezone(timedelta(hours=8))
 SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
@@ -528,35 +532,41 @@ def _halt_window(row: dict[str, Any]) -> dict[str, str] | None:
     return {"start": _at(row["date"], 9, 30), "end": _iso(parsed)}
 
 
-def _bar_values(
-    bar: list[str | None], *, day: str, symbol: str, allow_missing_open: bool,
-) -> tuple[float | None, float, float, float, float]:
-    """Return (open, close, high, low, volume) from a Tencent row (O/C/H/L/V)."""
+def _bar_volume(bar: list[str | None], *, day: str, symbol: str) -> float:
+    """Validate the vendor date and read the independently reported volume."""
     bar_day = bar[0] if bar else None
     if bar_day != day:
         raise AcquisitionError(
             f"Vendor bar date mismatch for {symbol} {day}: row is dated {bar_day!r}"
         )
     try:
-        raw_open, raw_close, raw_high, raw_low, raw_volume = bar[1:6]
-        open_price = (
-            None if allow_missing_open and raw_open in (None, "") else float(raw_open)
-        )
-        close, high, low, volume = (
-            float(value) for value in (raw_close, raw_high, raw_low, raw_volume)
-        )
+        volume = float(bar[5])
+    except (IndexError, TypeError, ValueError) as error:
+        raise AcquisitionError(f"Missing or non-numeric vendor volume for {symbol} {day}") from error
+    if not isfinite(volume) or volume < 0:
+        raise AcquisitionError(f"Invalid vendor volume for {symbol} {day}")
+    return volume
+
+
+def _bar_prices(
+    bar: list[str | None], *, allow_missing: bool,
+) -> dict[str, float | None]:
+    """Validate the vendor prices used in a converted bar."""
+    names = ("open", "close", "high", "low")
+    prices: dict[str, float | None] = {}
+    try:
+        for field, raw in zip(names, bar[1:5], strict=True):
+            price = None if allow_missing and raw in (None, "") else float(raw)
+            prices[field] = None if allow_missing and price == 0 else price
     except (TypeError, ValueError) as error:
-        raise AcquisitionError(f"Non-numeric vendor bar: {bar!r}") from error
-    prices = (close,) if open_price is None else (open_price, close)
-    if (
-        not all(isfinite(value) for value in (*prices, high, low, volume))
-        or min(*prices, high, low) <= 0
-        or volume < 0
-    ):
-        raise AcquisitionError(f"Invalid vendor bar: {bar!r}")
-    if high < max(prices) or low > min(prices) or high < low:
+        raise AcquisitionError(f"Non-numeric vendor OHLC: {bar!r}") from error
+    values = [price for price in prices.values() if price is not None]
+    if any(not isfinite(price) or price <= 0 for price in values):
+        raise AcquisitionError(f"Invalid vendor OHLC: {bar!r}")
+    high, low = prices["high"], prices["low"]
+    if (high is not None and high < max(values)) or (low is not None and low > min(values)):
         raise AcquisitionError(f"Inconsistent vendor OHLC: {bar!r}")
-    return open_price, close, high, low, volume
+    return prices
 
 
 def halt_evidence_id(code: str, announced: str) -> str:
@@ -594,23 +604,21 @@ def convert_raw_bars(
             bar = bars.get(symbol, {}).get(day)
             if bar is None and halt is None:
                 raise AcquisitionError(f"Missing vendor bar for {symbol} {day}")
-            open_price, close, high, low, volume = (
-                _bar_values(bar, day=day, symbol=symbol, allow_missing_open=halt is not None)
-                if bar is not None else (None, None, None, None, None)
-            )
+            volume = _bar_volume(bar, day=day, symbol=symbol) if bar is not None else None
             row = {
                 "date": day,
                 "symbol": symbol,
-                "open": open_price,
-                "high": high,
-                "low": low,
-                "close": close,
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": None,
                 "volume": volume,
                 "collected_at": price_collected_at,
             }
             rows.append(row)
             price_reference = f"{PRICE_SOURCE}:{symbol}:{day}"
             if halt is None:
+                row.update(_bar_prices(bar, allow_missing=False))
                 row.update(
                     trading_status="trading",
                     halt=None,
@@ -636,11 +644,12 @@ def convert_raw_bars(
                 # Positive vendor volume contradicts the halt notice. Schema 3
                 # records that status as unknown and excludes the vendor prices.
                 disputed = volume is not None and volume > 0
+                if disputed:
+                    row["status_conflict"] = {
+                        "price_evidence_id": price_evidence_id,
+                        "halt": window,
+                    }
                 row.update(
-                    open=None,
-                    high=None,
-                    low=None,
-                    close=None,
                     volume=None,
                     trading_status="unknown" if disputed else "suspended",
                     halt=None if disputed else window,
@@ -655,8 +664,8 @@ def convert_raw_bars(
                 )
                 continue
 
-            if volume == 0:
-                row.update(open=None, high=None, low=None, close=None)
+            if bar is not None and volume is not None and volume > 0:
+                row.update(_bar_prices(bar, allow_missing=True))
             if row["open"] is not None:
                 row["open_source"] = dict(open_source)
             row.update(
