@@ -560,11 +560,19 @@ def _position_evidence(
     }
     if execution_rule_version == ACTUAL_OPEN_RULES:
         latest = positive_attempts[-1] if positive_attempts else None
-        evidence["basket_build_state"] = (
-            "none"
-            if latest is None
-            else "completed" if latest["basket_complete"] else "partial"
-        )
+        # ``partial`` means the last positive target started building: at least
+        # one fill and at least one unfilled required symbol.  A target that
+        # produced no fill at all is ``unfilled``; a complete one is
+        # ``completed``; no positive target is ``none``.
+        if latest is None:
+            state = "none"
+        elif latest["basket_complete"]:
+            state = "completed"
+        elif latest["filled_symbols"]:
+            state = "partial"
+        else:
+            state = "unfilled"
+        evidence["basket_build_state"] = state
         evidence["unfilled_basket_signals"] = sum(
             1 for attempt in positive_attempts or [] if attempt["unfilled"]
         )

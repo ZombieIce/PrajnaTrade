@@ -398,7 +398,9 @@ def test_actual_open_sell_then_buy_uses_realized_sell_net(tmp_path):
     assert _holdings(blocked_run, switch_day)[seller]["quantity"] == pytest.approx(
         9995.002498750624
     )
-    assert blocked_run["position_evidence"]["basket_build_state"] == "partial"
+    # The last positive target produced no fill at all, so the last basket was
+    # not even started: ``unfilled`` is distinct from a partial build.
+    assert blocked_run["position_evidence"]["basket_build_state"] == "unfilled"
     assert blocked_run["position_evidence"]["unfilled_basket_signals"] == 1
     # The suspended session has no reliable mark; the retained shares are valued
     # from the next confirmed close only.
@@ -553,7 +555,7 @@ def test_actual_open_unfilled_orders_do_not_retry(tmp_path):
     assert benchmark["equity_curve"][-1]["cash"] == pytest.approx(100_000.0)
     assert benchmark["metrics"]["orders_unfilled"] == 1
     assert benchmark["metrics"]["orders_partially_filled"] == 0
-    assert benchmark["position_evidence"]["basket_build_state"] == "partial"
+    assert benchmark["position_evidence"]["basket_build_state"] == "unfilled"
     assert benchmark["position_evidence"]["unfilled_basket_signals"] == 1
 
     # The legacy retry rule does reuse the blocked entry signal on the next
