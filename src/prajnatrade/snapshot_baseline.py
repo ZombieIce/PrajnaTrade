@@ -956,18 +956,47 @@ def _match_actual_open_day(
     """Match every required symbol at its own executable open, sells first.
 
     A required symbol without an executable open is recorded unfilled and keeps
-    its cash or shares. Holdings without an executable open are left out of the
-    open equity that sizes the targets, so no stale price sizes an order.
+    its cash or shares.  A *held* symbol without one makes the day's total
+    equity unknowable: retargeting the priced holdings against a partial open
+    equity would force sales the strategy never asked for.  The whole day is
+    then unfilled — cash, shares and costs stay untouched, the unpriced symbols
+    keep their sealed-row reason and every priced required symbol is recorded
+    as ``equity_basis_unknown``.  With no held symbol unpriced, matching stays
+    per symbol, so an entry basket still fills its priced symbols.
     """
     required = [
         symbol
         for symbol in ETF_SYMBOLS
         if weights.get(symbol, 0.0) > _EPSILON or shares[symbol] > _EPSILON
     ]
+    unpriced = [
+        symbol for symbol in required if open_prices.get(symbol) is None
+    ]
+    if any(shares[symbol] > _EPSILON for symbol in unpriced):
+        attempt = {
+            "signal_date": signal["date"],
+            "date": day,
+            "attempts": 1,
+            "status": "not_filled",
+            "filled_symbols": [],
+            "unfilled": [
+                {
+                    "symbol": symbol,
+                    "reason": (
+                        "equity_basis_unknown"
+                        if open_prices.get(symbol) is not None
+                        else _unfilled_reason(raw_bars.get((day, symbol)))
+                    ),
+                }
+                for symbol in required
+            ],
+            "basket_complete": False,
+        }
+        no_costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
+        return attempt, [], cash, shares, no_costs
     unfilled = [
         {"symbol": symbol, "reason": _unfilled_reason(raw_bars.get((day, symbol)))}
-        for symbol in required
-        if open_prices.get(symbol) is None
+        for symbol in unpriced
     ]
     open_equity = cash + math.fsum(
         shares[symbol] * float(open_prices[symbol])

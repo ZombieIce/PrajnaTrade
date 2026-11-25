@@ -365,8 +365,10 @@ def test_actual_open_sell_then_buy_uses_realized_sell_net(tmp_path):
     assert holdings[seller]["quantity"] == 0.0
     assert holdings[buyer]["quantity"] == pytest.approx(9985.012491255622)
 
-    # A suspended seller contributes no buying power: B cannot borrow the
-    # expected proceeds, A keeps its shares and no fee is charged on the switch.
+    # A suspended seller is a held symbol without a trustworthy open, so the
+    # day's equity basis is unknowable: no fill is matched at all, A keeps its
+    # shares, B is never bought and no fee is charged on the switch.  The
+    # priced buyer is still listed unfilled with the equity-basis reason.
     blocked_payload = _engineering_closes(schema_v3_fixture(10))
     make_confirmed_suspension(blocked_payload, switch_day, seller)
     blocked = _v3_run(
@@ -384,7 +386,10 @@ def test_actual_open_sell_then_buy_uses_realized_sell_net(tmp_path):
     assert blocked_attempts[1] == {
         "signal_date": day_at(3), "date": switch_day, "attempts": 1,
         "status": "not_filled", "filled_symbols": [],
-        "unfilled": [{"symbol": seller, "reason": "confirmed_no_trade"}],
+        "unfilled": [
+            {"symbol": seller, "reason": "confirmed_no_trade"},
+            {"symbol": buyer, "reason": "equity_basis_unknown"},
+        ],
         "basket_complete": False,
     }
     assert [fill["date"] for fill in blocked_run["fills"]] == [entry_day]
@@ -400,6 +405,94 @@ def test_actual_open_sell_then_buy_uses_realized_sell_net(tmp_path):
     assert _holdings(blocked_run, switch_day)[seller]["close"] is None
     assert blocked_run["equity_curve"][-1]["nav"] == pytest.approx(99950.02498750624)
     assert blocked_run["metrics"]["ending_equity"] == pytest.approx(99950.02498750624)
+
+
+def test_actual_open_held_no_trade_freezes_the_whole_account_for_the_day(tmp_path):
+    """#56 A1: a held symbol without a trustworthy open makes equity unknowable.
+
+    The priced holdings must not be retargeted against a reduced open equity, so
+    the day makes no fills at all: the other holding is not sold and the account
+    is unchanged.  The next priced decision rebalances normally.
+    """
+    entry_day, frozen_day, rebalance_day = day_at(3), day_at(4), day_at(5)
+    held, retained, entering = ETF_SYMBOLS[0], ETF_SYMBOLS[1], ETF_SYMBOLS[2]
+    payload = schema_v3_fixture(10)
+    for symbol, values in (
+        (held, (100.0, 100.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0)),
+        (retained, (100.0, 100.0, 120.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0)),
+        (entering, (100.0, 100.0, 100.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0)),
+    ):
+        for index, value in enumerate(values):
+            derived_row(payload, day_at(index), symbol)["value"] = value
+    # A whole-day halt is a confirmed no-trade: no executable open, but a
+    # confirmed close still values the retained shares.
+    make_whole_day_halt(payload, frozen_day, held)
+    sample = _v3_run(
+        tmp_path, "held-halt", payload,
+        family="momentum",
+        parameters={"lookback": 2, "top_k": 2, "cash_if_negative": False},
+    )
+    candidate, benchmark = _sides(sample["experiment"])
+
+    attempts = {
+        attempt["date"]: attempt
+        for attempt in candidate["order_attempts"]
+        if attempt["date"] in {entry_day, frozen_day}
+    }
+    assert list(attempts) == [entry_day, frozen_day]
+    assert attempts[entry_day]["filled_symbols"] == [held, retained]
+    # Every required symbol is recorded: the unpriced holding keeps its sealed
+    # reason, the priced ones state that the day's equity basis is unknown.
+    assert attempts[frozen_day] == {
+        "signal_date": entry_day,
+        "date": frozen_day,
+        "attempts": 1,
+        "status": "not_filled",
+        "filled_symbols": [],
+        "unfilled": [
+            {"symbol": held, "reason": "confirmed_no_trade"},
+            {"symbol": retained, "reason": "equity_basis_unknown"},
+            {"symbol": entering, "reason": "equity_basis_unknown"},
+        ],
+        "basket_complete": False,
+    }
+    assert [fill["date"] for fill in candidate["fills"] if fill["date"] == frozen_day] == []
+
+    points = {point["date"]: point for point in candidate["equity_curve"]}
+    before, frozen = points[entry_day], points[frozen_day]
+    assert frozen["cash"] == pytest.approx(before["cash"])
+    assert frozen["nav"] == pytest.approx(before["nav"])
+    assert frozen["holdings"][held] == before["holdings"][held]
+    assert frozen["holdings"][retained] == before["holdings"][retained]
+    assert frozen["holdings"][retained]["quantity"] > 0
+    # No other holding was sold: the retained parcel is exactly the entry fill.
+    entry_fills = {
+        fill["symbol"]: fill for fill in candidate["fills"] if fill["date"] == entry_day
+    }
+    assert frozen["holdings"][retained]["quantity"] == pytest.approx(
+        entry_fills[retained]["quantity"]
+    )
+    assert not [
+        fill
+        for fill in candidate["fills"]
+        if fill["date"] <= frozen_day and fill["side"] == "sell"
+    ]
+
+    # The next priced decision sizes and rebalances on a known equity basis
+    # again: both old holdings are sold and the new target is bought.
+    rebalance = [fill for fill in candidate["fills"] if fill["date"] == rebalance_day]
+    assert [(fill["side"], fill["symbol"]) for fill in rebalance] == [
+        ("sell", held), ("sell", retained), ("buy", entering), ("buy", "159612"),
+    ]
+    assert points[rebalance_day]["cash"] == pytest.approx(0.0, abs=1e-9)
+    assert points[rebalance_day]["holdings"][held]["quantity"] == 0.0
+    assert points[rebalance_day]["holdings"][retained]["quantity"] == 0.0
+    assert points[rebalance_day]["holdings"][entering]["quantity"] > 0
+    # The candidate and the frozen benchmark share the same entry point: the
+    # equal-weight benchmark holds and never re-emits, so it never freezes.
+    assert [
+        attempt for attempt in benchmark["order_attempts"] if attempt["date"] == frozen_day
+    ] == []
 
 
 def test_actual_open_unfilled_orders_do_not_retry(tmp_path):
