@@ -92,14 +92,25 @@ non-trading sealed session/symbol, and the `actual_open_after_halt` /
 `unknown_status` counts, plus that the historical `gaps` shape is unchanged and
 an evidenced actual open is no longer a raw-bar gap. The `execution_evidence`
 block carries exactly `policy`, `rows` and `counts` (the manifest's own
-`schema_version` gates it; there is no unread inner copy). Negative seal cases
-reject a missing or unsealed price source, a resumption-status notice reused as
-the price source, a missing `status_evidence_id`, an undeclared
-`raw_price_basis`, every malformed `open_conflict` (an executable open, fewer
+`schema_version` gates it; there is no unread inner copy) and it carries
+references only: a Final Holdout halted-at-open row (actual open `12.34`) and a
+source conflict (`12.34`/`12.39`) must not put either quote into
+`snapshot manifest`, no evidence row has an `open` or `open_conflict` key, a
+conflict exposes the two sources as `conflict_sources`, and the sealed
+Discovery payload still returns its prices. Negative seal cases reject a
+missing or unsealed price source, a resumption-status notice reused as the
+price source and a price archive reused as the status notice (the evidence role
+kinds), a missing `status_evidence_id`, an undeclared `raw_price_basis`, an
+actual open whose halt window covers the whole session or whose `volume` is
+zero (a hand-built row also checks `is_executable_open` and `unfilled_reason`
+directly), a null `open_conflict` that would otherwise hide a trading row's
+missing open, every malformed `open_conflict` (an executable open, fewer
 than two sources, duplicate sources, unsealed evidence, non-positive or
 identical opens, including on a `trading` row that keeps its other OHLCV
 fields, and on a `suspended` row where a no-trade day has no open to dispute)
-and a schema-2 row carrying any of the three schema-3 keys. The public-CLI
+and a schema-2 row carrying any of the three schema-3 keys. A valid trading row
+carrying `open_conflict: null` seals with no execution-evidence row (an explicit
+null is absent, not a conflict). The public-CLI
 price test runs the same target on a normal-open sample, a resumed-halt sample
 with the same daily open and a variant whose execution-day close differs: both
 the candidate and the benchmark must produce the same fill date, base price,
@@ -193,9 +204,16 @@ given (the default keeps every existing record at `next-open-v1`).
   `confirmed_no_trade` suspension inside the trailing segment is not a
   `VALIDATION_DATA_GAP`: the read proceeds, records exactly one automatic use,
   and still ends `insufficient_evidence`/`COVERAGE_INSUFFICIENT` because the
-  held suspended close is a valuation gap. A trailing `availability` gap that no
-  `execution_evidence` row classifies is still unexplained and rejects with
-  `counted: false`, `execution_evidence: []` and the per-kind `gaps`.
+  held suspended close is a valuation gap. Evidence explains only the gap kinds
+  it proves: keeping a trailing `actual_open_after_halt` row but removing that
+  ETF's derived `available_at` on the same day rejects `VALIDATION_DATA_GAP`
+  with `counted: false`, 0/1 uses, the `availability` gap naming the
+  date/symbol and no receipt/use (`actual_open_after_halt` explains `raw_bars`
+  only). A trailing `availability` gap that no `execution_evidence` row
+  explains is still unexplained and rejects with `counted: false`,
+  `execution_evidence: []` and the per-kind `gaps`. An explicit
+  `open_conflict: null` on a valid trailing trading row is not a conflict: the
+  manifest has no row for it and the read passes and counts one use.
 - **329-day positive.** The fixture is `schema_v3_fixture(1824)` with
   `corporate_actions` cleared and a deterministic `1 + 0.005 * index` drift on
   raw OHLC and derived values, so the momentum candidate buys the alphabetically

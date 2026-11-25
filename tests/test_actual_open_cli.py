@@ -15,7 +15,7 @@ Test ownership: this module owns the reusable schema-3 fixture builders
 
 from __future__ import annotations
 
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -32,7 +32,12 @@ from test_research_loop_cli import (
 )
 
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES, EXECUTION_PRICE_BASIS
+from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_RULES,
+    EXECUTION_PRICE_BASIS,
+    is_executable_open,
+    unfilled_reason,
+)
 
 SYMBOLS = ETF_SYMBOLS
 SESSIONS = 15
@@ -52,6 +57,8 @@ PRICE_EVIDENCE = "prices-2024"
 STATUS_EVIDENCE = "halt-notices-2024"
 #: Two conflicting vendor feeds used by the source-conflict fixture.
 CONFLICT_EVIDENCE = ("conflict-vendor-a", "conflict-vendor-b")
+#: The vendor names cited by the source-conflict fixture.
+CONFLICT_SOURCES = ("synthetic-vendor-a", "synthetic-vendor-b")
 #: The per-row open price source echoed onto an ``actual-open-v1`` fill.
 OPEN_SOURCE = {"source": "synthetic-tdx-unadjusted", "evidence_id": PRICE_EVIDENCE}
 EXECUTION_EVIDENCE_POLICY = {
@@ -82,6 +89,14 @@ def _at(day: str, hour: int, minute: int = 0) -> str:
 
 def _open_source() -> dict:
     return dict(OPEN_SOURCE)
+
+
+def conflict_references() -> list[dict]:
+    """The evidence references a manifest conflict row may expose; no quotes."""
+    return [
+        {"source": source, "evidence_id": evidence_id}
+        for source, evidence_id in zip(CONFLICT_SOURCES, CONFLICT_EVIDENCE, strict=True)
+    ]
 
 
 def _evidence_items() -> dict:
@@ -331,12 +346,12 @@ def make_open_conflict(
         open_conflict={
             "sources": [
                 {
-                    "source": "synthetic-vendor-a",
+                    "source": CONFLICT_SOURCES[0],
                     "evidence_id": CONFLICT_EVIDENCE[0],
                     "open": opens[0],
                 },
                 {
-                    "source": "synthetic-vendor-b",
+                    "source": CONFLICT_SOURCES[1],
                     "evidence_id": CONFLICT_EVIDENCE[1],
                     "open": opens[1],
                 },
@@ -426,7 +441,6 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
             "symbol": SYMBOLS[0],
             "trading_status": "partial_halt",
             "classification": "actual_open_after_halt",
-            "open": 10.2,
             "open_source": dict(OPEN_SOURCE),
             "halt": {"start": _at(actual_day, 9, 30), "end": _at(actual_day, 10, 30)},
             "status_evidence_id": STATUS_EVIDENCE,
@@ -461,7 +475,7 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
             "symbol": SYMBOLS[4],
             "trading_status": "partial_halt",
             "classification": "source_conflict",
-            "open_conflict": raw_row(payload, conflict_day, SYMBOLS[4])["open_conflict"],
+            "conflict_sources": conflict_references(),
             "halt": {"start": _at(conflict_day, 9, 30), "end": _at(conflict_day, 10, 30)},
             "status_evidence_id": STATUS_EVIDENCE,
         },
@@ -476,9 +490,7 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
             "symbol": SYMBOLS[1],
             "trading_status": "trading",
             "classification": "source_conflict",
-            "open_conflict": raw_row(
-                payload, trading_conflict_day, SYMBOLS[1]
-            )["open_conflict"],
+            "conflict_sources": conflict_references(),
         },
     ]
     assert evidence["counts"] == {
@@ -506,6 +518,127 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
     )
     assert read["schema_version"] == 3
     assert read["data_kind"] == "real"
+
+
+def test_schema_v3_manifest_keeps_execution_evidence_references_only(
+    tmp_path: Path,
+) -> None:
+    """A1: ``snapshot manifest`` never exposes a sealed partition's quotes.
+
+    The reviewer placed a halted-at-open row whose actual open is ``12.34`` and
+    a source conflict quoting ``12.34``/``12.39`` in the Final Holdout
+    partition, then ran ``snapshot manifest`` without a controlled read.  The
+    pre-read block may carry the classification, date, symbol, trading status,
+    halt window and evidence references only -- never an actual open or a
+    conflict's quotes.  The sealed partition payload still keeps its prices.
+    """
+    payload = schema_v3_fixture()
+    discovery_halt_day = day_at(2)
+    make_actual_open_halt(payload, discovery_halt_day, SYMBOLS[0], open_price=10.2)
+    holdout_halt_day = day_at(13)
+    make_actual_open_halt(payload, holdout_halt_day, SYMBOLS[1], open_price=12.34)
+    holdout_conflict_day = day_at(14)
+    make_open_conflict(payload, holdout_conflict_day, SYMBOLS[2], opens=(12.34, 12.39))
+    sealed = seal_v3(tmp_path, payload)
+
+    result = cli(
+        "snapshot", "manifest", "--store", str(sealed["store"]),
+        "--id", sealed["snapshot_id"],
+    )
+    assert result.returncode == 0, result.stderr
+    manifest = ok(result)
+    # No quote from any sealed partition appears anywhere in the manifest text.
+    assert "12.34" not in result.stdout
+    assert "12.39" not in result.stdout
+
+    rows = manifest["execution_evidence"]["rows"]
+    assert all("open" not in row for row in rows)
+    assert all("open_conflict" not in row for row in rows)
+    halted = next(
+        row
+        for row in rows
+        if (row["date"], row["symbol"]) == (holdout_halt_day, SYMBOLS[1])
+    )
+    assert set(halted) == {
+        "date", "symbol", "trading_status", "classification", "halt",
+        "status_evidence_id", "open_source",
+    }
+    assert halted["classification"] == "actual_open_after_halt"
+    assert halted["trading_status"] == "partial_halt"
+    assert halted["open_source"] == OPEN_SOURCE
+    assert halted["status_evidence_id"] == STATUS_EVIDENCE
+    assert halted["halt"] == {
+        "start": _at(holdout_halt_day, 9, 30),
+        "end": _at(holdout_halt_day, 10, 30),
+    }
+    conflict = next(
+        row
+        for row in rows
+        if (row["date"], row["symbol"]) == (holdout_conflict_day, SYMBOLS[2])
+    )
+    assert conflict["classification"] == "source_conflict"
+    assert "open_conflict" not in conflict
+    assert conflict["conflict_sources"] == conflict_references()
+
+    # The references the reviewer needs are still visible in the manifest text.
+    for reference in (
+        OPEN_SOURCE["evidence_id"], STATUS_EVIDENCE, *CONFLICT_EVIDENCE,
+    ):
+        assert reference in result.stdout
+    assert holdout_halt_day in result.stdout
+    assert holdout_conflict_day in result.stdout
+
+    # The sealed payload keeps its prices; only the pre-read manifest is redacted.
+    read = ok(
+        cli(
+            "snapshot", "read", "--store", str(sealed["store"]),
+            "--id", sealed["snapshot_id"], "--partition", "discovery",
+        )
+    )
+    discovery_row = next(
+        row
+        for row in read["data"]["raw_bars"]
+        if (row["date"], row["symbol"]) == (discovery_halt_day, SYMBOLS[0])
+    )
+    assert discovery_row["open"] == 10.2
+    assert discovery_row["open_source"] == OPEN_SOURCE
+
+
+def test_a_null_open_conflict_is_absent_not_a_source_conflict(tmp_path: Path) -> None:
+    """A4: an explicit null ``open_conflict`` is not a disagreement.
+
+    The seal already ignored ``open_conflict: null``; the manifest classifier
+    treated the key itself as a conflict and labelled a valid trading row
+    ``source_conflict``.  The row is unchanged: it seals, gets no
+    execution-evidence row and never blocks the pre-read gate.
+    """
+    payload = schema_v3_fixture()
+    day = day_at(8)
+    row = raw_row(payload, day, SYMBOLS[0])
+    assert row["open"] == 10.0
+    row["open_conflict"] = None
+    sealed = seal_v3(tmp_path, payload)
+
+    rows = sealed["manifest"]["execution_evidence"]["rows"]
+    assert (day, SYMBOLS[0]) not in {
+        (evidence["date"], evidence["symbol"]) for evidence in rows
+    }
+    assert sealed["manifest"]["execution_evidence"]["counts"]["source_conflict"] == 0
+    # The sealed payload still carries the valid trading row and its open source.
+    read = ok(
+        cli(
+            "snapshot", "read", "--store", str(sealed["store"]),
+            "--id", sealed["snapshot_id"], "--partition", "discovery",
+        )
+    )
+    sealed_row = next(
+        item
+        for item in read["data"]["raw_bars"]
+        if (item["date"], item["symbol"]) == (day, SYMBOLS[0])
+    )
+    assert sealed_row["trading_status"] == "trading"
+    assert sealed_row["open"] == 10.0
+    assert sealed_row["open_source"] == OPEN_SOURCE
 
 
 def _missing_open_source(payload: dict) -> None:
@@ -600,6 +733,40 @@ def _trading_conflict_missing_a_price(payload: dict) -> None:
     row.pop("status_evidence_id")
 
 
+def _status_notice_as_price_source(payload: dict) -> None:
+    """A resumption notice proves trading status, never the price."""
+    row = make_actual_open_halt(payload, day_at(0), SYMBOLS[0])
+    row["open_source"]["evidence_id"] = STATUS_EVIDENCE
+
+
+def _price_archive_as_status_notice(payload: dict) -> None:
+    """A price archive proves the open, not the trading status."""
+    row = make_actual_open_halt(payload, day_at(0), SYMBOLS[0])
+    row["status_evidence_id"] = PRICE_EVIDENCE
+
+
+def _actual_open_with_a_whole_day_halt(payload: dict) -> None:
+    """The reviewer's sample: a whole-session halt with a residual open/volume 0."""
+    row = make_actual_open_halt(payload, day_at(0), SYMBOLS[0])
+    row.update(
+        volume=0,
+        halt={"start": _at(day_at(0), 9, 30), "end": _at(day_at(0), 15, 0)},
+    )
+
+
+def _actual_open_with_zero_volume(payload: dict) -> None:
+    row = make_actual_open_halt(payload, day_at(0), SYMBOLS[0])
+    row["volume"] = 0
+
+
+def _null_conflict_hides_a_missing_open(payload: dict) -> None:
+    """A null conflict must not excuse a trading row's missing open."""
+    row = raw_row(payload, day_at(0), SYMBOLS[0])
+    row.update(open=None)
+    row.pop("open_source")
+    row["open_conflict"] = None
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -607,9 +774,11 @@ def _trading_conflict_missing_a_price(payload: dict) -> None:
         (_unknown_open_source_evidence, "open_source evidence_id"),
         (_empty_open_source_name, "open_source source"),
         (_extra_open_source_member, "open_source"),
+        (_status_notice_as_price_source, "open_source evidence_id must name a price_archive"),
         (_missing_status_evidence, "status_evidence_id"),
         (_unknown_status_evidence, "status_evidence_id"),
         (_status_evidence_reuses_the_price_source, "status_evidence_id"),
+        (_price_archive_as_status_notice, "trading-status evidence item"),
         (_suspended_without_status_evidence, "status_evidence_id"),
         (_missing_raw_price_basis, "raw_price_basis"),
         (_conflict_with_an_open, "open_conflict"),
@@ -619,6 +788,9 @@ def _trading_conflict_missing_a_price(payload: dict) -> None:
         (_conflict_with_negative_open, "open_conflict open"),
         (_conflict_with_identical_opens, "open_conflict"),
         (_partial_halt_without_a_halt, "halt"),
+        (_actual_open_with_a_whole_day_halt, "halt window covering the whole session"),
+        (_actual_open_with_zero_volume, "positive volume"),
+        (_null_conflict_hides_a_missing_open, "trading raw bar"),
         (_conflict_on_a_suspended_row, "open_conflict"),
         (_trading_conflict_missing_a_price, "trading raw bar"),
     ],
@@ -632,6 +804,50 @@ def test_schema_v3_seal_rejects_invalid_execution_evidence(
     assert result.returncode != 0
     assert not result.stdout
     assert message in result.stderr
+
+
+def test_a_hand_built_whole_day_halt_open_is_never_executable() -> None:
+    """A2: the engine re-checks volume and the halt window, not just the seal.
+
+    Belt and braces for a hand-built or already-sealed row: the seal refuses
+    these shapes, but the ``actual-open-v1`` predicate and the unfilled reason
+    must independently refuse to fill a whole-day halt or a zero-volume bar.
+    """
+    day = day_at(0)
+    row = {
+        "date": day,
+        "symbol": SYMBOLS[0],
+        "trading_status": "partial_halt",
+        "open": 10.0,
+        "high": 10.0,
+        "low": 10.0,
+        "close": 10.0,
+        "volume": 1000,
+        "open_source": dict(OPEN_SOURCE),
+        "status_evidence_id": STATUS_EVIDENCE,
+        "halt": {"start": _at(day, 9, 30), "end": _at(day, 15, 0)},
+    }
+    cutoff = datetime.fromisoformat(_at(day, 9, 30))
+    assert not is_executable_open(
+        row, cutoff, data_kind="real", execution_rule_version=ACTUAL_OPEN_RULES
+    )
+    assert unfilled_reason(row) == "confirmed_no_trade"
+
+    # A zero-volume row with a partial halt window is not a fill either: an
+    # actual open means a trade happened.
+    row["halt"] = {"start": _at(day, 9, 30), "end": _at(day, 10, 30)}
+    row["volume"] = 0
+    assert not is_executable_open(
+        row, cutoff, data_kind="real", execution_rule_version=ACTUAL_OPEN_RULES
+    )
+    assert unfilled_reason(row) == "missing_required_open"
+
+    # The same row with positive volume and a halt that ends before the close
+    # is the evidenced halted-at-open case and stays executable.
+    row["volume"] = 1000
+    assert is_executable_open(
+        row, cutoff, data_kind="real", execution_rule_version=ACTUAL_OPEN_RULES
+    )
 
 
 def test_schema_v2_keeps_its_contract_and_has_no_execution_evidence(

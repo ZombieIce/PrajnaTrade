@@ -181,6 +181,14 @@ _EXECUTION_EVIDENCE_BENIGN = ("actual_open_after_halt", "confirmed_no_trade")
 _EXECUTION_EVIDENCE_BLOCKING = (
     "missing_required_open", "source_conflict", "unknown_status",
 )
+#: Which manifest gap kinds a benign execution-evidence row actually explains.
+#: A trusted daily open proves the raw bar (and a confirmed no-trade day also
+#: proves its null derived value); neither says anything about availability or
+#: corporate-action terms, so those gaps are never explained by evidence.
+_EXECUTION_EVIDENCE_EXPLAINS = {
+    "actual_open_after_halt": ("raw_bars",),
+    "confirmed_no_trade": ("raw_bars", "derived"),
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS research_loop_rounds (
@@ -1928,20 +1936,24 @@ def _trailing_gaps(
     metadata: Mapping[str, Any],
     start: str,
     end: str,
-    explained: Collection[tuple[str, object]] = (),
+    explained: Mapping[str, Collection[tuple[str, object]]] | None = None,
 ) -> dict[str, list[Any]]:
     """The sealed manifest's per-kind gaps inside ``[start, end]``.
 
     Metadata only: the evidence-classified gate and the legacy gaps-only gate
-    judge exactly this range-filtered projection, differing only in which
-    ``(date, symbol)`` pairs an execution-evidence row already explains.
+    judge exactly this range-filtered projection.  ``explained`` maps each gap
+    kind to the ``(date, symbol)`` pairs that kind's evidence covers, so a
+    benign row explains only the fields it proves; without it every entry is
+    judged.
     """
+    explained_by_kind = explained or {}
     return {
         kind: [
             entry for entry in metadata.get("gaps", {}).get(kind, [])
             if isinstance(entry, Mapping)
             and start <= str(entry.get("date")) <= end
-            and (str(entry.get("date")), entry.get("symbol")) not in explained
+            and (str(entry.get("date")), entry.get("symbol"))
+            not in explained_by_kind.get(kind, ())
         ]
         for kind in _GAP_KINDS
     }
@@ -1956,11 +1968,15 @@ def _formal_execution_evidence_gate(
     """Classify the trailing segment from sealed execution evidence only.
 
     Metadata-only, like the legacy gap check: it never opens the Discovery
-    payload and runs before the counted reservation.  ``actual_open_after_halt``
-    and ``confirmed_no_trade`` rows explain their session/symbol; the three
-    blocking classifications reject with the sealed row itself.  A trailing gap
-    whose ``(date, symbol)`` no evidence row mentions is still unexplained and
-    blocks, so a v3 manifest cannot silently skip an unclassified hole.
+    payload and runs before the counted reservation.  A benign row explains
+    only the gap kinds its evidence covers -- ``actual_open_after_halt`` the
+    ``raw_bars`` gap, ``confirmed_no_trade`` the ``raw_bars`` and ``derived``
+    gaps -- so a trusted halt open can never mask a same-day availability or
+    corporate-action gap.  The three blocking classifications reject with the
+    sealed row itself (their own gap entries are suppressed only so they are
+    not reported twice).  A trailing gap whose ``(date, symbol)`` no evidence
+    row mentions for that kind is still unexplained and blocks, so a v3
+    manifest cannot silently skip an unclassified hole.
     """
     start, end = trailing["start"], trailing["end"]
     sealed_rows = evidence.get("rows")
@@ -1981,9 +1997,17 @@ def _formal_execution_evidence_gate(
         row for row in rows
         if row.get("classification") in _EXECUTION_EVIDENCE_BLOCKING
     ]
-    explained = {
-        (str(row.get("date")), row.get("symbol")) for row in benign + blocking
+    explained: dict[str, set[tuple[str, object]]] = {
+        kind: set() for kind in _GAP_KINDS
     }
+    for row in benign:
+        pair = (str(row.get("date")), row.get("symbol"))
+        for kind in _EXECUTION_EVIDENCE_EXPLAINS.get(row.get("classification"), ()):
+            explained[kind].add(pair)
+    for row in blocking:
+        pair = (str(row.get("date")), row.get("symbol"))
+        for kind in _GAP_KINDS:
+            explained[kind].add(pair)
     gaps = _trailing_gaps(metadata, start, end, explained)
     unexplained = {kind: entries for kind, entries in gaps.items() if entries}
     if not blocking and not unexplained:
