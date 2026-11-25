@@ -17,7 +17,7 @@ from prajnatrade.backtest import (
     equal_weight_buy_and_hold,
 )
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.snapshot import read_discovery
+from prajnatrade.snapshot import halt_covers_session, read_discovery
 
 #: Asia/Shanghai is the trading-time anchor for both baselines and Shadow Live.
 CN_TZ = timezone(timedelta(hours=8))
@@ -1032,29 +1032,9 @@ def _unfilled_reason(row: dict | None) -> str:
     # fill: the required open is missing.
     if "open_conflict" in row:
         return "missing_required_open"
-    if status == "partial_halt" and _halt_covers_session(
-        row.get("halt"), row.get("date")
-    ):
+    if status == "partial_halt" and halt_covers_session(row.get("halt"), row.get("date")):
         return "confirmed_no_trade"
     return "missing_required_open"
-
-
-def _halt_covers_session(halt: object, day: object) -> bool:
-    """Whether a sealed halt window spans the session's 09:30-15:00 window."""
-    if not isinstance(halt, Mapping) or not isinstance(day, str):
-        return False
-    try:
-        start = datetime.fromisoformat(halt["start"])
-        end = datetime.fromisoformat(halt["end"])
-        session = datetime.fromisoformat(day).replace(tzinfo=_CN_TZ)
-    except (KeyError, TypeError, ValueError):
-        return False
-    if start.tzinfo is None or end.tzinfo is None:
-        return False
-    return (
-        start <= session.replace(hour=9, minute=30)
-        and session.replace(hour=15, minute=0) <= end
-    )
 
 
 def _close_available(row: dict, cutoff: datetime, data_kind: str) -> bool:
