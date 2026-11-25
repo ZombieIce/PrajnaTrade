@@ -277,9 +277,14 @@ classification:
 `gaps` keeps its exact historical shape and population for every schema
 version, so old consumers are unchanged: an evidenced actual open is no longer
 declared as a raw-bar gap, while a confirmed no-trade day, a missing required
-open and a source conflict still are. The formal trailing pre-read gate keeps
-blocking any declared trailing gap; it does not consult `execution_evidence`
-yet.
+open and a source conflict still are. The formal trailing pre-read gate reads
+`execution_evidence` when the sealed manifest claims schema 3 (see
+[the gate](#formal-trailing-validation-protocol-v2)): a trailing
+`actual_open_after_halt` or `confirmed_no_trade` row explains its gap, while
+`missing_required_open`, `source_conflict` and `unknown_status` block the read
+with zero uses. A trailing gap no evidence row classifies is still unexplained
+and blocks. Schema-1/2 manifests, and successors without the block, keep the
+legacy gaps-only gate exactly.
 
 ### Discovery snapshot equal-weight baseline (MVP-04)
 
@@ -1070,12 +1075,27 @@ decision date is visible to that decision, and no protected partition is opened
 The trusted read is counted once per locked version. `round validate`:
 
 1. **Pre-read gate (zero count).** Reads only the sealed `manifest.json`
-   metadata and refuses before any count when the frozen research interval does
-   not match the sealed Discovery descriptor, or when any `raw_bars`,
-   `derived`, `corporate_actions` or `availability` gap in the manifest falls
-   inside the trailing date range. The rejection is
-   `VALIDATION_DATA_GAP` (exit 2) with the gaps, the trailing segment and
-   `counted: false`; the ledger stays empty.
+   metadata, never the Discovery payload, and refuses before any count when the
+   frozen research interval does not match the sealed Discovery descriptor.
+   - On a schema-3 manifest that carries the `execution_evidence` block, the
+     trailing `actual_open_after_halt` and `confirmed_no_trade` rows are benign
+     and explain their `(date, symbol)`: a trusted halted open and a proven
+     no-trade day do not block the read. A trailing `missing_required_open`,
+     `source_conflict` or `unknown_status` row blocks, and so does any trailing
+     `raw_bars`, `derived`, `corporate_actions` or `availability` gap whose
+     `(date, symbol)` no evidence row classifies (an unexplained gap).
+   - Otherwise (schema 1/2, or a successor manifest without the block) any gap
+     in those four kinds inside the trailing date range blocks, exactly as
+     before.
+   The rejection is `VALIDATION_DATA_GAP` (exit 2, `counted: false`,
+   `next_action: "inspect"`) with `trailing`, `allowance`, the blocking
+   `execution_evidence` rows as sealed (date, symbol, trading status,
+   classification, reason, halt and evidence ids) and the per-kind `gaps` that
+   stayed unexplained; the message names the first blocking date, symbol and
+   classification. The ledger stays empty and the payload is not read. The gate
+   is a read gate only: valuation still follows the confirmed-close rules, so a
+   held `confirmed_no_trade` symbol with no close remains a valuation gap and
+   the counted run can end `insufficient_evidence`/`COVERAGE_INSUFFICIENT`.
 2. **Atomic reservation (one use per version).** Under the round lock and one
    SQLite write transaction, and before any attempt row, trusted write or sealed
    read: an existing use for this version is reused (resume or revalidation);
@@ -1105,12 +1125,17 @@ rule, research interval), `development` and `trailing` (start, end, sessions,
 content hash), `scoring` (start, end, sessions, valued sessions), `warmup`
 (source, development bounds, prior-history hash, first ready date),
 `provenance` (snapshot, both slice hashes, as-of, round/version/submission/
-experiment), `usage` (kind, sequence, use ID, admission ID), `summary`
+experiment, plus the additive #56 identity `snapshot_schema_version`,
+`execution_rule_version` and `price_basis: "unadjusted_open"`), `usage` (kind,
+sequence, use ID, admission ID), `summary`
 (scoring, candidate, benchmark, delta, verdict), `metrics`, `checks`, `runs`
 (candidate and benchmark records with fills and metrics), `observation`,
 `opened_protected_source`, `query_debited` and `receipt_hash`. The `usage` block
 is deterministic from the immutable use row, so a retry reproduces a
-byte-identical receipt without consuming again. `round validate` output adds an
+byte-identical receipt without consuming again. The three #56 identity keys are
+flat additive members of the already-published `provenance` block; a receipt
+stored before the actual-open work has no such keys and keeps its recorded shape
+(readers use `.get`). `round validate` output adds an
 `allowance` summary (`auto_limit`, `automatic_used`, `manual_used`,
 `total_used`, `remaining`).
 

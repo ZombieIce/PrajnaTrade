@@ -75,6 +75,16 @@ Two failure modes drove this decision:
 - A bare `{date, symbol}` gap is no longer the only way to describe a
   halted-at-open day: the snapshot distinguishes a trusted actual open from a
   confirmed no-trade and from an unknown or conflicted price.
+- The formal trailing pre-read gate (#59) classifies the trailing segment from
+  the sealed `execution_evidence` before it reads the payload. Trailing
+  `actual_open_after_halt` and `confirmed_no_trade` rows are benign and explain
+  their `(date, symbol)` gap; trailing `missing_required_open`, `source_conflict`
+  and `unknown_status` rows reject `VALIDATION_DATA_GAP` with zero uses, naming
+  the first date/symbol/classification, and so does a trailing gap that no
+  evidence row classifies. The gate is metadata-only and never turns a
+  confirmed no-trade day into a valuation input: a held symbol with no confirmed
+  close remains a valuation gap in the counted run. Schema-1/2 manifests, and
+  successors without the block, keep the legacy gaps-only gate exactly.
 - Schema 2 remains the acquisition output until the real re-acquisition is done
   separately; no real Validation allowance is consumed by this change, and all
   acceptance tests remain synthetic.
