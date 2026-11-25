@@ -1695,14 +1695,32 @@ Validation. Strategies supply target weights to the shared accounting engine.
 | --- | --- | --- |
 | `next-open-v1` (default) | Attempt the whole target once at the next session's open. A required unavailable open leaves it unfilled. | Attempt once at the next session's open. |
 | `retry-initial-v1` | Retry a blocked positive target at subsequent opens until the first position is established, the partition ends, or a new target replaces it. An explicit cash target cancels a pending entry. | Attempt once at the next session's open. |
-| `actual-open-v1` | Attempt the whole target once at the next session's open. An order effective before the open fills at the sealed actual unadjusted daily open, including a halted-at-open session whose bar carries that open and its price source; the 09:30 availability cutoff does not gate that fill. A required unavailable open still leaves the whole attempt unfilled. | Attempt once at the next session's open. |
+| `actual-open-v1` | Match each required symbol once at the next session's open: a buy is a target weight above zero and a sell is a held position. A symbol with an executable open fills at the sealed actual unadjusted daily open, including a halted-at-open session whose bar carries that open and its price source (the 09:30 availability cutoff does not gate that fill). A symbol without one is recorded unfilled with a reason derived from its sealed row and keeps its cash or shares. Sells match before buys in frozen symbol order; buys are funded by initial cash plus realized sell net, and a proportional scale keeps them within that cash. | Same per-symbol rule: sells, then buys, funded by initial cash plus realized sell net. |
 
 Campaigns created before the version flag keep the `next-open-v1` behavior.
 `actual-open-v1` fills a halted-at-open session only from a schema-3 row that
 seals the actual daily open and its price source; a schema-2 row keeps the older
-behaviour. It never retries a blocked initial entry.
-The selected rule is part of the Campaign evaluation fingerprint and is copied
-into the approved Research round and protected evaluation plan.
+behaviour. It records one attempt per target with `status` `filled`,
+`partially_filled` or `not_filled`, the `filled_symbols` that matched, the
+`unfilled` symbols with their sealed-row reason (`confirmed_no_trade`,
+`missing_required_open`, `unknown_trading_status` or `missing_bar`) and a
+`basket_complete` flag. A symbol whose row is `suspended` or whose
+`partial_halt` window covers the whole session is a confirmed no-trade day; a
+`partial_halt` without a trusted actual open or a conflicted/missing price is a
+missing required open. A partially filled plan is recorded as it happened and
+marked not yet built: unfilled buy cash stays in cash, unsold shares stay in the
+account, and holdings without an executable open are left out of the open equity
+that sizes the targets (never a stale price). `actual-open-v1` never retries
+automatically — a later strategy decision re-emits a target, or the plan expires
+at the partition end; `retry-initial-v1` keeps the legacy retry and is not
+extended. Discovery metrics add `orders_partially_filled` for this rule (a
+partial attempt still counts in `orders_unfilled`), and `position_evidence` adds
+`basket_build_state` (`completed`, `partial` or `none`, from the most recent
+positive-target attempt) and `unfilled_basket_signals` (positive-target attempts
+with an unfilled required symbol). Legacy rules keep their exact old attempt,
+metric and position-evidence shapes. The selected rule is part of the Campaign
+evaluation fingerprint and is copied into the approved Research round and
+protected evaluation plan.
 
 To preregister separate scoring prerequisites, include this object under
 `validation_settings` in the kickoff JSON.
@@ -2912,7 +2930,8 @@ common committed real forward sessions).
   frozen strategy family is generated Python is blocked
   (`UNSUPPORTED_STRATEGY`): Shadow Live does not run generated Python locally.
 - The release artifact's evaluation-time `execution_rules` describe the sealed
-  runner (e.g. `missing_required_open: whole_rebalance_not_filled`). Shadow Live
+  runner: `missing_required_open` is `whole_rebalance_not_filled` under the
+  legacy rules and `symbol_not_filled` under `actual-open-v1`. Shadow Live
   follows #9/#32 instead: a confirmed missing open expires only that order, and
   orders are concrete frozen quantities that are never resized at settlement.
 - Buy quantities account for the frozen fees and slippage at the signal close;
