@@ -2148,9 +2148,6 @@ def _formal_snapshot_record(
         "prior_history_hash": receipt.get("prior_history_hash"),
         "data_kind": receipt["data_kind"],
         "scope": evaluation["data_kind"],
-        # #56 identity carried beside the branch evidence for the receipt's
-        # provenance; legacy stored receipts simply do not have it.
-        "schema_version": receipt["schema_version"],
     }
 
 
@@ -2293,6 +2290,9 @@ def _formal_runs(
         "scoring_start": scoring_start,
         "data": data,
         "receipt": receipt,
+        # The #56 identity lives beside the snapshot block, never inside it:
+        # ``checks.data_availability.snapshot`` keeps its exact pre-#56 shape.
+        "snapshot_schema_version": receipt["schema_version"],
         "snapshot": _formal_snapshot_record(
             receipt,
             record,
@@ -2456,7 +2456,7 @@ def _formal_receipt(
             "trailing_content_hash": split["trailing"]["content_hash"],
             # Additive #56 identity, flat like the merged v1 receipt: a reviewer
             # can read which snapshot contract and execution rule scored this.
-            "snapshot_schema_version": runs["snapshot"]["schema_version"],
+            "snapshot_schema_version": runs["snapshot_schema_version"],
             "execution_rule_version": submission["locked"]["execution_rules"].get(
                 "version", NEXT_OPEN_RULES
             ),

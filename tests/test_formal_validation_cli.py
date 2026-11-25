@@ -50,7 +50,11 @@ from test_research_loop_cli import (
 )
 
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES, EXECUTION_PRICE_BASIS
+from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_RULES,
+    EXECUTION_PRICE_BASIS,
+    NEXT_OPEN_RULES,
+)
 from test_actual_open_cli import (
     OPEN_SOURCE,
     day_at,
@@ -400,6 +404,22 @@ def test_formal_validation_scores_only_the_trailing_segment(tmp_path: Path) -> N
     assert validated["provenance"]["experiment_id"] == (
         scenario["experiment"]["experiment_id"]
     )
+    # The #56 identity lives beside the availability block, never inside it:
+    # ``checks.data_availability.snapshot`` keeps its exact pre-#56 shape.
+    availability = validated["checks"]["data_availability"]["snapshot"]
+    assert availability == {
+        "verified": True,
+        "snapshot_id": scenario["campaign"]["snapshot_id"],
+        "partition_content_hash": split["partition"]["content_hash"],
+        "prior_history_hash": None,
+        "scope": "synthetic",
+        "data_kind": "synthetic",
+        "as_of": None,
+    }
+    assert "schema_version" not in availability
+    assert validated["provenance"]["snapshot_schema_version"] == 1
+    assert validated["provenance"]["execution_rule_version"] == NEXT_OPEN_RULES
+    assert validated["provenance"]["price_basis"] == EXECUTION_PRICE_BASIS
     assert validated["usage"]["kind"] == "automatic"
     assert validated["usage"]["sequence"] == 1
     assert validated["usage"]["admission_id"] is None
