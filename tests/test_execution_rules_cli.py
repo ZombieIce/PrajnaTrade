@@ -11,6 +11,7 @@ from test_actual_open_cli import (
     make_missing_required_open,
     make_unknown_status,
     make_whole_day_halt,
+    raw_row,
     schema_v3_fixture,
     seal_v3,
 )
@@ -186,6 +187,88 @@ def test_discovery_and_validation_match_the_same_retried_target(tmp_path):
 # ---------------------------------------------------------------------------
 
 MOMENTUM = {"lookback": 2, "top_k": 1, "cash_if_negative": False}
+
+
+def test_actual_open_ignores_the_published_time_of_a_pre_open_order(tmp_path):
+    """B1: the reviewer's 15:05 repro fills 5/5 under either trading status.
+
+    Five ETFs are ordered before the open and one symbol's sealed actual open
+    is 10 in both samples, while its quote is only published at 15:05.  The
+    order was effective before the open, so ``actual-open-v1`` matches it
+    retrospectively: a normal ``trading`` row fills exactly like a resumed
+    ``partial_halt`` row, with the same fill date, base price, quantity, fee and
+    cash for the candidate and the benchmark.  A ``next-open-v1`` control keeps
+    its exact 09:30 publication gate and still refuses that open.
+    """
+    execution_day = day_at(1)
+    late_symbol = ETF_SYMBOLS[0]
+    published_at = f"{execution_day}T15:05:00+08:00"
+    normal_payload = schema_v3_fixture(8)
+    raw_row(normal_payload, execution_day, late_symbol)[
+        "open_available_at"
+    ] = published_at
+    halted_payload = schema_v3_fixture(8)
+    halted_row = make_actual_open_halt(halted_payload, execution_day, late_symbol)
+    halted_row["open_available_at"] = published_at
+
+    expected_attempt = {
+        "signal_date": day_at(0),
+        "date": execution_day,
+        "attempts": 1,
+        "status": "filled",
+        "filled_symbols": list(ETF_SYMBOLS),
+        "unfilled": [],
+        "basket_complete": True,
+    }
+    observed = {}
+    samples = {
+        "normal": _v3_run(tmp_path, "late-normal", normal_payload),
+        "halted": _v3_run(tmp_path, "late-halted", halted_payload),
+    }
+    for name, sample in samples.items():
+        candidate, benchmark = _sides(sample["experiment"])
+        for run in (candidate, benchmark):
+            # The same open of 10 fills all five symbols in both samples.
+            assert run["order_attempts"] == [expected_attempt]
+            assert [fill["date"] for fill in run["fills"]] == (
+                [execution_day] * len(ETF_SYMBOLS)
+            )
+            assert [fill["symbol"] for fill in run["fills"]] == list(ETF_SYMBOLS)
+            assert {fill["raw_open"] for fill in run["fills"]} == {10.0}
+            assert all(fill["open_evidence"] == OPEN_SOURCE for fill in run["fills"])
+        assert candidate["fills"] == benchmark["fills"]
+        assert candidate["equity_curve"] == benchmark["equity_curve"]
+        assert candidate["metrics"] == benchmark["metrics"]
+        observed[name] = {
+            "fills": candidate["fills"],
+            "ending_cash": candidate["equity_curve"][-1]["cash"],
+            "ending_equity": candidate["metrics"]["ending_equity"],
+        }
+    # Only the trading status differs between the samples: the recorded fills,
+    # cash and ending equity are identical.
+    assert observed["normal"]["fills"] == observed["halted"]["fills"]
+    assert observed["normal"]["ending_cash"] == pytest.approx(
+        observed["halted"]["ending_cash"]
+    )
+    assert observed["normal"]["ending_equity"] == pytest.approx(
+        observed["halted"]["ending_equity"]
+    )
+
+    # Control: the legacy rule keeps its 09:30 publication gate exactly, so the
+    # late quote still leaves the attempt unfilled.
+    control = _v3_run(
+        tmp_path, "late-control", normal_payload, execution_rules="next-open-v1",
+    )
+    for run in _sides(control["experiment"]):
+        assert run["order_attempts"][0] == {
+            "signal_date": day_at(0),
+            "date": execution_day,
+            "attempts": 1,
+            "status": "not_filled",
+            "reason": "missing_or_unconfirmed_open",
+            "missing_symbols": [late_symbol],
+        }
+        assert all(fill["date"] != execution_day for fill in run["fills"])
 
 
 def _engineering_closes(payload):
@@ -409,12 +492,103 @@ def test_actual_open_sell_then_buy_uses_realized_sell_net(tmp_path):
     assert blocked_run["metrics"]["ending_equity"] == pytest.approx(99950.02498750624)
 
 
-def test_actual_open_held_no_trade_freezes_the_whole_account_for_the_day(tmp_path):
-    """#56 A1: a held symbol without a trustworthy open makes equity unknowable.
+def test_actual_open_explicit_exits_execute_when_another_holding_is_unpriced(
+    tmp_path,
+):
+    """B3: a suspended holding does not block a fully determined exit.
 
-    The priced holdings must not be retargeted against a reduced open equity, so
-    the day makes no fills at all: the other holding is not sold and the account
-    is unchanged.  The next priced decision rebalances normally.
+    The reviewer's scenario: hold A and B with both target weights at zero.  A
+    is suspended for the day, so its open (and therefore the day's total
+    equity) is unknown, but B's exit size is independent of total equity.  B
+    sells in full at its own trusted open, cash equals the realized sell net, A
+    keeps every share and is recorded with its sealed-row reason.
+    """
+    entry_day, exit_day = day_at(3), day_at(4)
+    seller, retained = ETF_SYMBOLS[0], ETF_SYMBOLS[1]
+    # Nine sessions seal to a five-session Discovery interval: the entry fills
+    # on its fourth session and the exit is attempted on its last one.
+    payload = schema_v3_fixture(9)
+    for symbol, values in (
+        (seller, (100.0, 100.0, 110.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0)),
+        (retained, (100.0, 100.0, 105.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0)),
+    ):
+        for index, value in enumerate(values):
+            derived_row(payload, day_at(index), symbol)["value"] = value
+    for symbol in ETF_SYMBOLS[2:]:
+        for index in range(9):
+            derived_row(payload, day_at(index), symbol)["value"] = 100.0
+    make_confirmed_suspension(payload, exit_day, seller)
+
+    sample = _v3_run(
+        tmp_path, "explicit-exit", payload,
+        family="momentum",
+        parameters={"lookback": 2, "top_k": 2, "cash_if_negative": True},
+    )
+    candidate, benchmark = _sides(sample["experiment"])
+
+    entry_attempt, exit_attempt = [
+        attempt for attempt in candidate["order_attempts"]
+        if attempt["date"] in {entry_day, exit_day}
+    ]
+    assert entry_attempt["status"] == "filled"
+    assert entry_attempt["filled_symbols"] == [seller, retained]
+    # The explicit exit executes; the suspended holding keeps its sealed-row
+    # reason and no equity-dependent order is invented.
+    assert exit_attempt == {
+        "signal_date": day_at(3),
+        "date": exit_day,
+        "attempts": 1,
+        "status": "partially_filled",
+        "filled_symbols": [retained],
+        "unfilled": [{"symbol": seller, "reason": "confirmed_no_trade"}],
+        "basket_complete": False,
+    }
+    entry_fills = {
+        fill["symbol"]: fill for fill in candidate["fills"] if fill["date"] == entry_day
+    }
+    exit_fills = [fill for fill in candidate["fills"] if fill["date"] == exit_day]
+    assert [(fill["symbol"], fill["side"]) for fill in exit_fills] == [
+        (retained, "sell")
+    ]
+    sell = exit_fills[0]
+    # The whole retained parcel exits at its actual open; the fee is the frozen
+    # 5 bps and cash is exactly the realized sell net.
+    assert sell["quantity"] == pytest.approx(entry_fills[retained]["quantity"])
+    assert sell["raw_open"] == 10.0
+    assert sell["notional"] == pytest.approx(sell["quantity"] * 10.0)
+    assert sell["fee"] == pytest.approx(sell["notional"] * FEE_RATE)
+    realized_net = sell["notional"] - sell["fee"]
+
+    points = {point["date"]: point for point in candidate["equity_curve"]}
+    before, after = points[entry_day], points[exit_day]
+    assert before["cash"] == pytest.approx(0.0, abs=1e-9)
+    assert after["cash"] == pytest.approx(realized_net)
+    assert after["holdings"][seller]["quantity"] == pytest.approx(
+        entry_fills[seller]["quantity"]
+    )
+    assert after["holdings"][seller]["close"] is None
+    assert after["holdings"][retained]["quantity"] == 0.0
+    # The suspension has no confirmed close, so the day's NAV stays unknown.
+    assert after["nav"] is None
+    assert not [
+        fill for fill in candidate["fills"] if fill["date"] == exit_day
+        and fill["side"] == "buy"
+    ]
+    # The frozen equal-weight benchmark holds and never re-emits, so it has no
+    # exit attempt to compare against.
+    assert [
+        attempt for attempt in benchmark["order_attempts"] if attempt["date"] == exit_day
+    ] == []
+
+
+def test_actual_open_held_no_trade_sells_only_the_explicit_exit(tmp_path):
+    """#56 A1: an unpriced holding forbids equity-dependent orders only.
+
+    A whole-day halt removes the day's total equity basis, so the priced holding
+    whose target still asks for a positive weight is not bought or retargeted.
+    The other holding's target is an explicit exit, sized independently of
+    equity: it sells in full at its open and its cash funds the next priced
+    decision.  The next priced decision rebalances normally.
     """
     entry_day, frozen_day, rebalance_day = day_at(3), day_at(4), day_at(5)
     held, retained, entering = ETF_SYMBOLS[0], ETF_SYMBOLS[1], ETF_SYMBOLS[2]
@@ -443,48 +617,53 @@ def test_actual_open_held_no_trade_freezes_the_whole_account_for_the_day(tmp_pat
     }
     assert list(attempts) == [entry_day, frozen_day]
     assert attempts[entry_day]["filled_symbols"] == [held, retained]
-    # Every required symbol is recorded: the unpriced holding keeps its sealed
-    # reason, the priced ones state that the day's equity basis is unknown.
+    # The unpriced holding keeps its sealed-row reason; the priced explicit exit
+    # executes, and the order that depends on the unknown equity basis is
+    # recorded unfilled.
     assert attempts[frozen_day] == {
         "signal_date": entry_day,
         "date": frozen_day,
         "attempts": 1,
-        "status": "not_filled",
-        "filled_symbols": [],
+        "status": "partially_filled",
+        "filled_symbols": [retained],
         "unfilled": [
             {"symbol": held, "reason": "confirmed_no_trade"},
-            {"symbol": retained, "reason": "equity_basis_unknown"},
             {"symbol": entering, "reason": "equity_basis_unknown"},
         ],
         "basket_complete": False,
     }
-    assert [fill["date"] for fill in candidate["fills"] if fill["date"] == frozen_day] == []
-
-    points = {point["date"]: point for point in candidate["equity_curve"]}
-    before, frozen = points[entry_day], points[frozen_day]
-    assert frozen["cash"] == pytest.approx(before["cash"])
-    assert frozen["nav"] == pytest.approx(before["nav"])
-    assert frozen["holdings"][held] == before["holdings"][held]
-    assert frozen["holdings"][retained] == before["holdings"][retained]
-    assert frozen["holdings"][retained]["quantity"] > 0
-    # No other holding was sold: the retained parcel is exactly the entry fill.
     entry_fills = {
         fill["symbol"]: fill for fill in candidate["fills"] if fill["date"] == entry_day
     }
-    assert frozen["holdings"][retained]["quantity"] == pytest.approx(
-        entry_fills[retained]["quantity"]
-    )
-    assert not [
-        fill
-        for fill in candidate["fills"]
-        if fill["date"] <= frozen_day and fill["side"] == "sell"
+    frozen_fills = [
+        fill for fill in candidate["fills"] if fill["date"] == frozen_day
     ]
+    assert [(fill["symbol"], fill["side"]) for fill in frozen_fills] == [
+        (retained, "sell")
+    ]
+    sell = frozen_fills[0]
+    assert sell["quantity"] == pytest.approx(entry_fills[retained]["quantity"])
+    assert sell["raw_open"] == 10.0
+    assert sell["notional"] == pytest.approx(sell["quantity"] * 10.0)
+    assert sell["fee"] == pytest.approx(sell["notional"] * FEE_RATE)
+
+    points = {point["date"]: point for point in candidate["equity_curve"]}
+    before, frozen = points[entry_day], points[frozen_day]
+    # The explicit exit's cash is real; the halted holding keeps its parcel and
+    # is marked from its confirmed close, so the day's NAV drops only by the fee.
+    assert frozen["cash"] == pytest.approx(sell["notional"] - sell["fee"])
+    assert frozen["nav"] == pytest.approx(before["nav"] - sell["fee"])
+    assert frozen["holdings"][held] == before["holdings"][held]
+    assert frozen["holdings"][held]["close"] == 10.0
+    assert frozen["holdings"][retained]["quantity"] == 0.0
+    assert not [fill for fill in frozen_fills if fill["side"] == "buy"]
 
     # The next priced decision sizes and rebalances on a known equity basis
-    # again: both old holdings are sold and the new target is bought.
+    # again: the halted holding is sold and the new target is bought.  The
+    # explicit exit already left the account, so it has no second sell here.
     rebalance = [fill for fill in candidate["fills"] if fill["date"] == rebalance_day]
     assert [(fill["side"], fill["symbol"]) for fill in rebalance] == [
-        ("sell", held), ("sell", retained), ("buy", entering), ("buy", "159612"),
+        ("sell", held), ("buy", entering), ("buy", "159612"),
     ]
     assert points[rebalance_day]["cash"] == pytest.approx(0.0, abs=1e-9)
     assert points[rebalance_day]["holdings"][held]["quantity"] == 0.0

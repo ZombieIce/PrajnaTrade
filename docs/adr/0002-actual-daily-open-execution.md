@@ -61,13 +61,18 @@ Two failure modes drove this decision:
 2. **`actual-open-v1` matches at the actual daily open.** Under the opt-in
    execution rule, an order effective before the open fills at the sealed actual
    unadjusted daily open, including on a halted-at-open session whose bar carries
-   that open and its price source. The 09:30 per-field availability cutoff does
-   not gate that fill: a daily bar's actual open is only knowable after the
+   that open and its price source. Neither trading status is gated by the
+   open's publication time: a daily bar's actual open is only knowable after the
    close, and the fill is retrospective matching of an order that already
-   existed. Signal inputs keep their own point-in-time cutoffs, and the daily
-   receipt never needs to infer the first trade minute. A normal open and a
-   resumed-halt open with the same daily open produce the same fill date, base
-   price, quantity, fee and cash.
+   existed. The predicate is therefore uniform — `trading` needs a valid open
+   and positive volume; `partial_halt` additionally needs the sealed price
+   source and a halt window that does not cover the session. The same open
+   therefore fills the same basket whether the session is marked normal or
+   halted, and the two samples produce the same fill date, base price,
+   quantity, fee and cash. Signal inputs keep their own point-in-time cutoffs,
+   and the daily receipt never needs to infer the first trade minute. The
+   legacy `next-open-v1`/`retry-initial-v1` rules keep their 09:30 per-field
+   availability cutoffs exactly.
 
 3. **The fill price is never a signal input.** The actual open is used only for
    matching; using a value published after the close to decide the same session's
@@ -108,10 +113,17 @@ Two failure modes drove this decision:
   never turns a confirmed no-trade day into a valuation input: a held symbol
   with no confirmed close remains a valuation gap in the counted run. Schema-1/2 manifests, and
   successors without the block, keep the legacy gaps-only gate exactly.
-- Schema 2 remains the acquisition output of the checked-in script until the
-  real re-acquisition (#35) is done separately; schema 3 is the new real
-  contract a re-acquired snapshot must declare. No real Validation allowance is
-  consumed by this change, and all acceptance tests remain synthetic.
+- The checked-in acquisition script now emits schema 3 through two pure,
+  importable conversion entries: `convert_raw_bars` keeps a halted-at-open
+  session's vendor actual open (with the price archive as `open_source` and the
+  official halt notice as `status_evidence_id`) and turns a whole-day halt into
+  `suspended` with null prices; `build_snapshot_input` assembles the document
+  that `snapshot seal` accepts. A `full_halt_until` notice is classified by its
+  halt window: a same-day resume keeps the actual open, a resume on a later
+  session covers the day and becomes `suspended`. The real re-acquisition and
+  its 45-row verification (#35) are done separately, so no checked-in real
+  snapshot changes and no real Validation allowance is consumed by this change;
+  all acceptance tests remain synthetic.
 - Under `actual-open-v1` a basket no longer fills all-or-nothing: every
   required symbol (a buy with `weight > ε`, a sell with `shares > ε`) matches
   separately at its own sealed executable open. Sells match before buys in
@@ -122,21 +134,30 @@ Two failure modes drove this decision:
   other required symbols still fill.
 - A *held* symbol without an executable open makes the day's total equity
   unknowable: its open would size the other holdings' targets, and excluding it
-  would force sales of priced holdings the strategy never asked for. The whole
-  day is then recorded as `not_filled` with no fills and zero costs, every
-  required symbol in `unfilled` (the unpriced ones with their sealed-row reason,
-  the priced ones as `equity_basis_unknown`), and the account unchanged. An
-  entry basket (no holdings) keeps filling its priced symbols per symbol.
+  would force retargeting of priced holdings the strategy never asked for.
+  Every equity-dependent order (a required symbol with a target weight above
+  zero) is then recorded as `equity_basis_unknown` with no buy matched, while an
+  explicit exit (target weight at or below the epsilon, shares above it) is
+  sized independently of total equity and still sells in full at its own usable
+  open. The unpriced symbols keep their sealed-row reason; any exit fill makes
+  the attempt `partially_filled`, and `basket_complete` stays false while any
+  required symbol is unfilled. An entry basket (no holdings) keeps filling its
+  priced symbols per symbol.
 - A partially filled plan is recorded as `partially_filled` with
   `basket_complete: false` and marked not yet built in `position_evidence`;
   unfilled buy cash and unsold shares stay in the account. The attempt states
   are mirrored by `position_evidence.basket_build_state`: `completed`,
   `partial` (that attempt filled at least one symbol and left at least one
   required symbol unfilled), `unfilled` (that attempt produced no fill at all)
-  or `none` (no positive target). `actual-open-v1` never retries automatically:
-  a later strategy decision emits a new target, or the plan expires at the
-  partition end. `next-open-v1` and `retry-initial-v1` keep the all-or-nothing
-  attempt, their exact result keys and the legacy initial-entry retry.
+  or `none` (no positive target). A formal Validation receipt publishes each
+  side's build state in `checks.position` when the run carries it, and the
+  formal position prerequisite is unmet while either side's latest build is
+  `partial` or `unfilled`: four of five required fills are accounted honestly,
+  but a plan that required the whole basket is not a satisfied scoring premise.
+  `actual-open-v1` never retries automatically: a later strategy decision emits
+  a new target, or the plan expires at the partition end. `next-open-v1` and
+  `retry-initial-v1` keep the all-or-nothing attempt, their exact result keys
+  and the legacy initial-entry retry.
 - The shared matching primitive skips a symbol whose open is absent or not a
   positive price rather than trading at price 0, so an unfilled symbol cannot
   corrupt the ledger. Without a missing price its result is unchanged.

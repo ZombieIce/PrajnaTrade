@@ -151,6 +151,9 @@ OPERATORS = {
     "==": operator.eq,
 }
 _POSITION_STATES = {"initial_position_established", "intentional_cash"}
+#: Basket-build states that leave a required basket unfinished; a formal
+#: position prerequisite is not satisfied while either side reports one.
+_UNFINISHED_BUILD_STATES = {"partial", "unfilled"}
 _OBSERVATION_FORMULA = (
     "ceil(sessions / max(1, opportunities)) * minimum_opportunities, "
     "clamped to [minimum_opportunities, 252]"
@@ -1426,7 +1429,7 @@ def _gap_summary(gaps: list[dict[str, Any]]) -> dict[str, Any]:
 def _position_summary(run: Mapping[str, Any]) -> dict[str, Any]:
     evidence = run["position_evidence"]
     readiness = run.get("history_readiness") or {}
-    return {
+    summary = {
         "state": evidence["state"],
         "invested_sessions": evidence["invested_sessions"],
         "first_position_signal_date": evidence["first_position_signal_date"],
@@ -1435,6 +1438,12 @@ def _position_summary(run: Mapping[str, Any]) -> dict[str, Any]:
         "unfilled_orders": run["metrics"]["orders_unfilled"],
         "intentional_cash_sessions": list(readiness.get("ready_cash_sessions", [])),
     }
+    # Additive #56 basket-build disclosure, published only when the run carries
+    # it, so every legacy position-evidence shape stays byte-identical.
+    for key in ("basket_build_state", "unfilled_basket_signals"):
+        if key in evidence:
+            summary[key] = evidence[key]
+    return summary
 
 
 def observation_recommendation(
@@ -1758,11 +1767,24 @@ def _data_availability_check(
 def _position_check(
     candidate: Mapping[str, Any], benchmark: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """The formal position prerequisite for both sides of the frozen comparison.
+
+    A side satisfies it when its position evidence state targets a real
+    position or explicit cash *and* its latest basket build is not still
+    unfinished: a plan that required the whole basket and filled only part of it
+    (``partial``) or none of it (``unfilled``) leaves the scored premise unmet
+    even though shares were bought.  A run without a build state (the legacy
+    execution rules) is judged by its position state alone, exactly as before.
+    """
+    def satisfied(run: Mapping[str, Any]) -> bool:
+        evidence = run["position_evidence"]
+        if evidence["state"] not in _POSITION_STATES:
+            return False
+        build_state = evidence.get("basket_build_state")
+        return build_state is None or build_state not in _UNFINISHED_BUILD_STATES
+
     return {
-        "ok": (
-            candidate["position_evidence"]["state"] in _POSITION_STATES
-            and benchmark["position_evidence"]["state"] in _POSITION_STATES
-        ),
+        "ok": satisfied(candidate) and satisfied(benchmark),
         "candidate": _position_summary(candidate),
         "benchmark": _position_summary(benchmark),
     }

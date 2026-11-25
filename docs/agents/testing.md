@@ -26,8 +26,8 @@ PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
 The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
-CI run; **521 tests** collected after #56, of which 371 are fast and 150 are the
-`isolation`/Docker selections). CI (`.github/workflows/tests.yml`) runs the full
+CI run; **539 tests** collected after the #56 review rounds, of which 389 are
+fast and 150 are the `isolation`/Docker selections). CI (`.github/workflows/tests.yml`) runs the full
 suite on `macos-latest` with Python 3.12; `lint` runs `ruff check .`.
 
 ## Isolation tests
@@ -104,7 +104,7 @@ kinds), a missing `status_evidence_id`, an undeclared `raw_price_basis`, an
 actual open whose halt window covers the whole session or whose `volume` is
 zero (a hand-built row also checks `is_executable_open` and `unfilled_reason`
 directly), a null `open_conflict` that would otherwise hide a trading row's
-missing open, every malformed `open_conflict` (an executable open, fewer
+missing open, and every malformed `open_conflict` (an executable open, fewer
 than two sources, duplicate sources, unsealed evidence, non-positive or
 identical opens, including on a `trading` row that keeps its other OHLCV
 fields, and on a `suspended` row where a no-trade day has no open to dispute)
@@ -121,7 +121,11 @@ pair and recomputes every fill price as the sealed actual open moved by that
 rate, asserts the recorded slippage cost is identical and reconciles the
 post-fill cash against the same fee/slippage formulas. A v1 `round validate`
 receipt on a schema-3 `actual-open-v1` Campaign asserts the additive provenance
-identity. The file is fast and not marked `isolation`.
+identity. A public-seam check fixes the retrospective rule: a `trading` row
+whose actual open is published at 15:05 is executable under `actual-open-v1`
+(positive volume still required) while `next-open-v1`/`retry-initial-v1` and
+the synthetic `available_at` seam keep their exact 09:30 gates. The file is
+fast and not marked `isolation`.
 
 `tests/test_execution_rules_cli.py` owns the matching behaviour of the frozen
 execution rules and imports those schema-3 builders. For #58 it drives
@@ -138,6 +142,12 @@ schema-3 Campaigns through the public CLI and asserts:
   and position evidence. Changing only the suspended symbol's tradability makes
   it fill and the account delta is recomputed from the new fill and the
   proportional scale.
+- **Retrospective matching.** The reviewer's repro: five ETFs are ordered
+  before the open and one symbol's actual open is 10 in both samples while its
+  quote is published only at 15:05. Marked normal and marked resumed-halt, both
+  samples fill 5/5 with the same fill date, base price, quantity, fee and cash
+  for the candidate and the benchmark; a `next-open-v1` control keeps the 09:30
+  gate and records the late symbol as a missing open.
 - **Sell then buy.** A declarative `momentum` strategy (`lookback: 2`,
   `top_k: 1`, `cash_if_negative: false`) over engineered per-symbol closes
   starts fully invested in A, then targets B with no original cash. The fills
@@ -148,12 +158,23 @@ schema-3 Campaigns through the public CLI and asserts:
   confirmed mark, fees and cash are unchanged, the attempt is `not_filled`, A's
   unfilled reason is `confirmed_no_trade` and the priced buyer is listed with
   `equity_basis_unknown`.
-- **Held no-trade freeze.** With two holdings and a target that would sell one
-  of them, a confirmed whole-day halt on the other holding freezes the day: no
-  sell or buy fill, the priced required symbols are `equity_basis_unknown`, the
-  account (cash, both holdings, NAV) is unchanged, and the next priced decision
-  sizes and rebalances normally. This is the case that used to retarget the
-  priced holdings against a reduced open equity and sell them.
+- **Explicit exit vs unknown equity.** With two holdings whose target weights
+  are both zero, a confirmed suspension of A leaves the day's equity basis
+  unknown but B's exit is sized independently: B sells in full at its trusted
+  open, cash equals the realized sell net, A keeps every share and is recorded
+  `confirmed_no_trade`, and the attempt is `partially_filled` with
+  `filled_symbols: [B]`. The reviewer's suspended-seller sample and the
+  weight-positive freeze sample (`equity_basis_unknown` for every
+  equity-dependent order) are both covered.
+- **Held no-trade equity basis.** With two holdings and a target that asks for
+  a positive weight on one of them, a confirmed whole-day halt on the other
+  holding leaves equity unknown: no buy or retargeting fill, the priced
+  equity-dependent order is `equity_basis_unknown`, while the priced holding
+  whose target is zero is an explicit exit and sells in full for its realized
+  net. The halted holding keeps its parcel and confirmed-close mark, NAV drops
+  only by the exit fee, and the next priced decision sizes and rebalances
+  normally. This is the case that used to retarget the priced holdings against
+  a reduced open equity and sell them.
 - **Build state.** The last positive-target attempt drives
   `position_evidence.basket_build_state`: the five-ETF entry basket is
   `partial`, a completed target is `completed`, and a blocked attempt that
@@ -167,6 +188,25 @@ schema-3 Campaigns through the public CLI and asserts:
   blocked attempt and never moves cash. The same payload under
   `retry-initial-v1` reuses the blocked signal on the next open and keeps its
   exact legacy attempt shape and legacy metrics/position-evidence key sets.
+
+`tests/test_acquisition_conversion_cli.py` covers the #57 acquisition
+conversion without any network or real artifact. It imports the checked-in
+`scripts/acquire_real_etf_snapshot.py` by path (its `main` is guarded), feeds
+synthetic Tencent-shaped vendor bars and synthetic `open_halt` /
+`full_halt_until` notices with synthetic `price_archive`/`halt` evidence items,
+and calls the pure `build_snapshot_input` (which delegates to
+`convert_raw_bars`). It asserts schema 3, a normal row's vendor open and price
+source, the halted row's actual open `10.5` with the vendor `open_source` and a
+distinct halt-notice `status_evidence_id`, and the whole-day row's null prices
+with its halt notice. A `full_halt_until` notice with a same-day resume keeps
+its actual open (the real 2026-11-20 case), while one whose resume is on a later
+session covers the day and becomes `suspended`. The same converted document is sealed through the public
+CLI and scored under `actual-open-v1`: the `execution_evidence` classifications
+are `actual_open_after_halt` / `confirmed_no_trade`, the equal-weight Discovery
+fill on the halt day uses base price `10.5` and echoes the sealed
+`open_evidence`, and the confirmed no-trade symbol never fills (4/5). The real
+45-row verification stays with #35; the file is fast and not marked
+`isolation`.
 
 ## Formal trailing Validation tests (#50-T2)
 
@@ -255,6 +295,16 @@ given (the default keeps every existing record at `next-open-v1`).
   `unadjusted_open`, and the Discovery candidate's development fill and the
   formal candidate's trailing fill carry the same sealed `open_evidence` shape
   and the same fee/slippage formula (`price == raw_open`, fee on that price).
+- **Formal position prerequisite.** One split schema-3 `actual-open-v1`
+  Campaign carries a confirmed suspended symbol on the benchmark's entry day
+  (the first trailing session); the pre-read gate accepts it as benign. The run
+  proceeds and consumes exactly one counted use, but the benchmark filled only
+  4/5 required symbols, so the receipt is
+  `insufficient_evidence`/`POSITION_EVIDENCE_INSUFFICIENT` with
+  `checks.position.ok` false, both sides' `basket_build_state` published
+  (`partial` for the benchmark, `completed` for the candidate), the benchmark's
+  four fills and `fill_count` recorded, and the #56 `provenance` identity
+  intact.
 
 The 329-day tests are subprocess-heavy (about 8-11 CLI calls each, a ~4.4 MB
 payload, ~10 s per test) but not marked `isolation`; the file is still fast

@@ -42,7 +42,11 @@ cross-import those builders rather than copying them. A unit check of the
 (the module seam, not a test copy). The #58
 `test_execution_rules_cli.py` matching tests and the #59
 `test_formal_validation_cli.py` gate/329-day tests import the schema-3 builders
-from `test_actual_open_cli.py`; the production rule identity
+from `test_actual_open_cli.py`. `test_acquisition_conversion_cli.py` owns the
+synthetic acquisition-conversion fixture: it imports the checked-in
+`scripts/acquire_real_etf_snapshot.py` by path (its `main` is guarded) and
+drives its pure `convert_raw_bars`/`build_snapshot_input` entries, then seals
+and scores the result through the public CLI. The production rule identity
 (`ACTUAL_OPEN_RULES`, `EXECUTION_PRICE_BASIS`) is imported from
 `prajnatrade.snapshot_baseline`, never re-declared in a test. Each scenario builder
 (`formal_scenario`, `v2_round_input`, `split_campaign`, `admit`,
