@@ -207,11 +207,14 @@ receipt instead of assuming synthetic.
 ### Real schema-version-3 snapshots (actual daily open, #56)
 
 `snapshot seal` also accepts `{"schema_version": 3, "data_kind": "real"}` input.
-Schema 3 is the new real contract for actual-open execution and supersedes
-schema 2 for new snapshots; a schema-2 manifest and every receipt stored under
-it keep their exact historical bytes, shape and meaning. The test suite uses
-synthetic fixtures. The [ADR](docs/adr/0002-actual-daily-open-execution.md)
-records why the fill price is a matching base price and never a signal input.
+Schema 3 is the new real contract for research snapshots: it is what a
+re-acquired snapshot must declare for actual-open execution, while the
+checked-in acquisition script still emits schema 2 until the real
+re-acquisition tracked by #35 (out of scope here), so no checked-in real
+snapshot changes. A schema-2 manifest and every receipt stored under it keep
+their exact historical bytes, shape and meaning. The test suite uses synthetic
+fixtures. The [ADR](docs/adr/0002-actual-daily-open-execution.md) records why
+the fill price is a matching base price and never a signal input.
 
 Schema 3 keeps the schema-2 `evidence`, `derivation`, per-field availability and
 corporate-action rules, requires `raw_price_basis: "unadjusted"` to be
@@ -445,7 +448,9 @@ cash, and dividend receivables. Missing required inputs produce signal gaps,
 unfilled orders, or unavailable NAV rather than substituted prices. Each
 experiment includes fills, order attempts, the NAV curve, fingerprints, and an
 equal-weight buy-and-hold comparison over the same Discovery interval and
-evaluation settings.
+evaluation settings. An experiment result also echoes `snapshot_schema_version`
+(additive #56 identity), so a stored receipt shows which sealed contract
+produced it; results stored before this change have no such key.
 
 Create a Campaign with `--discovery-warmup-sessions N` to freeze one scoring
 start for every strategy version and the equal-weight benchmark. The first
@@ -1726,31 +1731,50 @@ Validation. Strategies supply target weights to the shared accounting engine.
 Campaigns created before the version flag keep the `next-open-v1` behavior.
 `actual-open-v1` fills a halted-at-open session only from a schema-3 row that
 seals the actual daily open and its price source; a schema-2 row keeps the older
-behaviour. It records one attempt per target with `status` `filled`,
-`partially_filled` or `not_filled`, the `filled_symbols` that matched, the
-`unfilled` symbols with their sealed-row reason (`confirmed_no_trade`,
+behaviour. `campaign create` freezes the final policy block for this rule:
+`source: sealed_partition.raw_bars.open`, `basis: unadjusted`, `attempts: 1`,
+`halted_open: actual_daily_open_when_evidenced`,
+`partial_halt_open_availability: not_gated_by_0930`,
+`missing_required_open: symbol_not_filled`,
+`partial_fill: recorded_per_symbol`,
+`funding: initial_cash_plus_realized_sell_net`, `order: sells_before_buys` and
+`matching: per_symbol`. It records one attempt per target with `status`
+`filled`, `partially_filled` or `not_filled`, the `filled_symbols` that matched,
+the `unfilled` symbols with their sealed-row reason (`confirmed_no_trade`,
 `missing_required_open`, `unknown_trading_status` or `missing_bar`) and a
 `basket_complete` flag. `unfilled` is about the missing open, not about whether a
 trade was needed: a required symbol whose open is missing is recorded unfilled
 even if its target would have equalled its holding, while a required symbol that
 does have an executable open but needs no trade emits no fill row and stays out
-of both lists. A symbol whose row is `suspended` or whose
-`partial_halt` window covers the whole session is a confirmed no-trade day; a
-`partial_halt` without a trusted actual open or a conflicted/missing price is a
-missing required open. A partially filled plan is recorded as it happened and
-marked not yet built: unfilled buy cash stays in cash, unsold shares stay in the
-account, and holdings without an executable open are left out of the open equity
-that sizes the targets (never a stale price). `actual-open-v1` never retries
-automatically — a later strategy decision re-emits a target, or the plan expires
-at the partition end; `retry-initial-v1` keeps the legacy retry and is not
-extended. Discovery metrics add `orders_partially_filled` for this rule (a
-partial attempt still counts in `orders_unfilled`), and `position_evidence` adds
-`basket_build_state` (`completed`, `partial` or `none`, from the most recent
-positive-target attempt) and `unfilled_basket_signals` (positive-target attempts
-with an unfilled required symbol). Legacy rules keep their exact old attempt,
-metric and position-evidence shapes. The selected rule is part of the Campaign
-evaluation fingerprint and is copied into the approved Research round and
-protected evaluation plan.
+of both lists. A symbol whose row is `suspended` or whose `partial_halt` window
+covers the whole session is a confirmed no-trade day; a `partial_halt` without a
+trusted actual open or a conflicted/missing price is a missing required open.
+
+A held symbol (`shares > ε`) without an executable open makes the day's total
+equity basis unknowable: sizing the priced holdings against a partial open
+equity would force sales the strategy never asked for. The whole day is then
+recorded as `not_filled` with `filled_symbols: []`, `basket_complete: false`
+and every required symbol in `unfilled` — the unpriced ones with their
+sealed-row reason and the priced ones with `equity_basis_unknown` — while cash,
+shares and costs stay untouched. An entry basket (no holdings yet) keeps
+per-symbol matching, so its priced symbols still fill.
+
+A partially filled plan is recorded as it happened and marked not yet built:
+unfilled buy cash stays in cash and unsold shares stay in the account.
+`actual-open-v1` never retries automatically — a later strategy decision
+re-emits a target, or the plan expires at the partition end;
+`retry-initial-v1` keeps the legacy retry and is not extended. Discovery metrics
+add `orders_partially_filled` for this rule (a partial attempt still counts in
+`orders_unfilled`), and `position_evidence` adds `basket_build_state` and
+`unfilled_basket_signals` (positive-target attempts with an unfilled required
+symbol). `basket_build_state` is `completed` when the most recent
+positive-target attempt completed, `partial` only when that attempt filled at
+least one symbol and left at least one required symbol unfilled, `unfilled`
+when that attempt produced no fill at all, and `none` when there was no positive
+target. Legacy rules keep their exact old attempt, metric and
+position-evidence shapes. The selected rule is part of the Campaign evaluation
+fingerprint and is copied into the approved Research round and protected
+evaluation plan.
 
 To preregister separate scoring prerequisites, include this object under
 `validation_settings` in the kickoff JSON.

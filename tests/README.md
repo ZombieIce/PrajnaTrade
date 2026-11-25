@@ -30,10 +30,17 @@ Scenario fixtures stay with the module that owns them:
 `sealed_snapshot_input` in `test_experiment_cli.py`, the #43 round builders
 (`round_input`, `open_round`, `submit_version`, `validate_version`) in
 `test_research_loop_cli.py`, the 70/30 split builders (`split_campaign`,
-`stored_campaign`, `v2_round_input`) in `test_discovery_split_cli.py`, and the
+`stored_campaign`, `v2_round_input`) in `test_discovery_split_cli.py`, the
+schema-3 builders (`schema_v3_fixture`, `seal_v3`, `day_at`, `raw_row` and the
+halt/suspension/conflict mutators) in `test_actual_open_cli.py`, and the
 corrected-successor builders in `test_corrected_evidence_cli.py`; the review,
 evidence, formal-validation, admission and validation-feedback tests
-cross-import those builders rather than copying them. Each scenario builder
+cross-import those builders rather than copying them. The #58
+`test_execution_rules_cli.py` matching tests and the #59
+`test_formal_validation_cli.py` gate/329-day tests import the schema-3 builders
+from `test_actual_open_cli.py`; the production rule identity
+(`ACTUAL_OPEN_RULES`, `EXECUTION_PRICE_BASIS`) is imported from
+`prajnatrade.snapshot_baseline`, never re-declared in a test. Each scenario builder
 (`formal_scenario`, `v2_round_input`, `split_campaign`, `admit`,
 `approve_version`, ...) stays owned by the module that first needed it.  The existing `from
 test_protected_eval_cli import ...` cross-imports still work; import generic

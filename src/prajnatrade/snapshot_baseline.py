@@ -1,3 +1,18 @@
+"""Point-in-time Discovery accounting shared by the candidate and benchmark.
+
+``next-open-v1`` (the default) and ``retry-initial-v1`` keep the legacy
+all-or-nothing basket attempt at the next session's open.  ``actual-open-v1``
+matches every required symbol separately at the sealed actual unadjusted daily
+open, including an evidenced halted-at-open session; a symbol without an
+executable open is recorded unfilled with its sealed-row reason.  Sells match
+before buys in frozen symbol order and buys are funded from initial cash plus
+realized sell net.  A held symbol without a trustworthy open makes that day's
+total equity basis unknowable, so the day fills nothing at all and records the
+priced required symbols as ``equity_basis_unknown`` (ADR 0002); only an entry
+basket with no holdings still fills its priced symbols per symbol.  The rule
+never retries automatically.
+"""
+
 from __future__ import annotations
 
 import math

@@ -70,7 +70,10 @@ Two failure modes drove this decision:
    or under `actual-open-v1` identifies the sealed snapshot schema version,
    execution rule version and `unadjusted_open` price basis; a legacy schema-1/2
    receipt under a legacy rule keeps its exact old shape, and receipts stored
-   before this change are read under their recorded shape.
+   before this change are read under their recorded shape. A formal trailing
+   receipt carries the same flat identity in its `provenance`, read from the
+   sealed read receipt rather than from the availability `snapshot` block,
+   which keeps its pre-#56 shape.
 
 ## Consequences
 
@@ -87,9 +90,10 @@ Two failure modes drove this decision:
   confirmed no-trade day into a valuation input: a held symbol with no confirmed
   close remains a valuation gap in the counted run. Schema-1/2 manifests, and
   successors without the block, keep the legacy gaps-only gate exactly.
-- Schema 2 remains the acquisition output until the real re-acquisition is done
-  separately; no real Validation allowance is consumed by this change, and all
-  acceptance tests remain synthetic.
+- Schema 2 remains the acquisition output of the checked-in script until the
+  real re-acquisition (#35) is done separately; schema 3 is the new real
+  contract a re-acquired snapshot must declare. No real Validation allowance is
+  consumed by this change, and all acceptance tests remain synthetic.
 - Under `actual-open-v1` a basket no longer fills all-or-nothing: every
   required symbol (a buy with `weight > ε`, a sell with `shares > ε`) matches
   separately at its own sealed executable open. Sells match before buys in
@@ -97,14 +101,24 @@ Two failure modes drove this decision:
   sell net, and a symbol without an executable open is recorded unfilled with a
   reason derived from its sealed row (`confirmed_no_trade`,
   `missing_required_open`, `unknown_trading_status`, `missing_bar`) while the
-  other required symbols still fill. A partially filled plan is recorded as
-  `partially_filled` with `basket_complete: false` and marked not yet built in
-  `position_evidence`; unfilled buy cash and unsold shares stay in the account,
-  and holdings without an executable open are left out of the open equity that
-  sizes targets. `actual-open-v1` never retries automatically: a later strategy
-  decision emits a new target, or the plan expires at the partition end.
-  `next-open-v1` and `retry-initial-v1` keep the all-or-nothing attempt, their
-  exact result keys and the legacy initial-entry retry.
+  other required symbols still fill.
+- A *held* symbol without an executable open makes the day's total equity
+  unknowable: its open would size the other holdings' targets, and excluding it
+  would force sales of priced holdings the strategy never asked for. The whole
+  day is then recorded as `not_filled` with no fills and zero costs, every
+  required symbol in `unfilled` (the unpriced ones with their sealed-row reason,
+  the priced ones as `equity_basis_unknown`), and the account unchanged. An
+  entry basket (no holdings) keeps filling its priced symbols per symbol.
+- A partially filled plan is recorded as `partially_filled` with
+  `basket_complete: false` and marked not yet built in `position_evidence`;
+  unfilled buy cash and unsold shares stay in the account. The attempt states
+  are mirrored by `position_evidence.basket_build_state`: `completed`,
+  `partial` (that attempt filled at least one symbol and left at least one
+  required symbol unfilled), `unfilled` (that attempt produced no fill at all)
+  or `none` (no positive target). `actual-open-v1` never retries automatically:
+  a later strategy decision emits a new target, or the plan expires at the
+  partition end. `next-open-v1` and `retry-initial-v1` keep the all-or-nothing
+  attempt, their exact result keys and the legacy initial-entry retry.
 - The shared matching primitive skips a symbol whose open is absent or not a
   positive price rather than trading at price 0, so an unfilled symbol cannot
   corrupt the ledger. Without a missing price its result is unchanged.
