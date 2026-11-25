@@ -94,8 +94,9 @@ an evidenced actual open is no longer a raw-bar gap. Negative seal cases reject 
 missing or unsealed price source, a resumption-status notice reused as the price
 source, a missing `status_evidence_id`, an undeclared `raw_price_basis`, every
 malformed `open_conflict` (an executable open, fewer than two sources, duplicate
-sources, unsealed evidence, non-positive or identical opens) and a schema-2 row
-carrying any of the three schema-3 keys. The public-CLI price test runs the same
+sources, unsealed evidence, non-positive or identical opens, including on a
+`trading` row that keeps its other OHLCV fields) and a schema-2 row carrying any
+of the three schema-3 keys. The public-CLI price test runs the same
 target on a normal-open sample, a resumed-halt sample with the same daily open
 and a variant whose execution-day close differs: both the candidate and the
 benchmark must produce the same fill date, base price, quantity, fee, ending

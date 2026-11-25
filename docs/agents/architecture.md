@@ -134,8 +134,9 @@ Schema-version-2 historical Discovery is supported by snapshot sealing,
 baselines and declarative campaigns. Schema-version-3 sealing adds the
 actual-daily-open execution semantics and its `execution_evidence` metadata;
 acquisition still emits schema 2 and no real Validation allowance is consumed
-by the mechanism. Issue #24 verified the real five-ETF baseline. Issue #26 verified the bounded Mock campaign, including OS isolation
-for the actual research run and a reconciled interruption and resume.
+by the mechanism. Issue #24 verified the real five-ETF baseline. Issue #26
+verified the bounded Mock campaign, including OS isolation for the actual
+research run and a reconciled interruption and resume.
 Protected evaluation, release and Shadow Live remain synthetic or replay.
 The #43 Research Loop and Evidence Loop and the #50 split/formal-Validation
 mechanisms are synthetic simulated-tracking mechanisms only; they add no

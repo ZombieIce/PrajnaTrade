@@ -959,7 +959,7 @@ def _buy_target(
             "quantity": quantity,
             "raw_open": raw_open,
             "price": execution_price,
-            "price_basis": EXECUTION_PRICE_BASIS,
+            "price_basis": "unadjusted_open",
             "notional": notional,
             "fee": fee,
             "slippage": slippage,
