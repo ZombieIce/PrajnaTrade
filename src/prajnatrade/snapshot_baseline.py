@@ -26,7 +26,12 @@ _TARGET_WEIGHTS = {symbol: 1.0 / len(ETF_SYMBOLS) for symbol in ETF_SYMBOLS}
 _EPSILON = 1e-12
 NEXT_OPEN_RULES = "next-open-v1"
 RETRY_INITIAL_RULES = "retry-initial-v1"
-EXECUTION_RULE_VERSIONS = (NEXT_OPEN_RULES, RETRY_INITIAL_RULES)
+#: Fill an order effective before the open at the sealed, evidenced actual daily
+#: open, including a halted-at-open session whose bar carries that open (ADR 0002).
+ACTUAL_OPEN_RULES = "actual-open-v1"
+EXECUTION_RULE_VERSIONS = (NEXT_OPEN_RULES, RETRY_INITIAL_RULES, ACTUAL_OPEN_RULES)
+#: The sealed execution basis echoed by every fill and by a round receipt.
+EXECUTION_PRICE_BASIS = "unadjusted_open"
 
 
 def run_discovery_strategy(
@@ -252,7 +257,10 @@ def run_partition_strategy(
             open_prices = {
                 symbol: (
                     float(row["open"])
-                    if _is_executable_open(row, open_cutoff, data_kind=data_kind)
+                    if _is_executable_open(
+                        row, open_cutoff, data_kind=data_kind,
+                        execution_rule_version=execution_rule_version,
+                    )
                     else None
                 )
                 for symbol in ETF_SYMBOLS
@@ -300,7 +308,14 @@ def run_partition_strategy(
                 )
                 for fill in day_fills:
                     fill["raw_open"] = open_prices[fill["symbol"]]
-                    fill["price_basis"] = "unadjusted_open"
+                    fill["price_basis"] = EXECUTION_PRICE_BASIS
+                    if execution_rule_version == ACTUAL_OPEN_RULES:
+                        open_source = raw_bars[(day, fill["symbol"])].get("open_source")
+                        if isinstance(open_source, Mapping):
+                            fill["open_evidence"] = {
+                                "source": open_source["source"],
+                                "evidence_id": open_source["evidence_id"],
+                            }
                 fills.extend(day_fills)
                 fees_paid += costs["fees"]
                 slippage_paid += costs["slippage"]
@@ -869,14 +884,26 @@ def _instant_by(value: object, cutoff: datetime) -> bool:
 
 
 def _is_executable_open(
-    row: dict | None, cutoff: datetime, *, data_kind: str = "synthetic"
+    row: dict | None,
+    cutoff: datetime,
+    *,
+    data_kind: str = "synthetic",
+    execution_rule_version: str = NEXT_OPEN_RULES,
 ) -> bool:
-    if (
-        row is None
-        or row.get("trading_status") != "trading"
-        or not _valid_price(row.get("open"))
-        or not _valid_price(row.get("volume"))
-    ):
+    """Whether one raw bar confirms an open the execution rule may fill at.
+
+    Legacy rules execute only a normal trading session whose open is known by
+    the 09:30 cutoff.  ``actual-open-v1`` also executes a halted-at-open session
+    whose sealed bar carries the actual daily open and its price source: that
+    daily open is only knowable after the close, and it is a matching base price
+    for an order effective before the open, never a signal input (ADR 0002).
+    """
+    if row is None or not _valid_price(row.get("open")):
+        return False
+    status = row.get("trading_status")
+    if execution_rule_version == ACTUAL_OPEN_RULES and status == "partial_halt":
+        return isinstance(row.get("open_source"), Mapping)
+    if status != "trading" or not _valid_price(row.get("volume")):
         return False
     if data_kind == "real":
         return _instant_by(row.get("open_available_at"), cutoff)
@@ -932,7 +959,7 @@ def _buy_target(
             "quantity": quantity,
             "raw_open": raw_open,
             "price": execution_price,
-            "price_basis": "unadjusted_open",
+            "price_basis": EXECUTION_PRICE_BASIS,
             "notional": notional,
             "fee": fee,
             "slippage": slippage,

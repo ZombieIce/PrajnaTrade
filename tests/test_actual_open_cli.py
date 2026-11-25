@@ -616,3 +616,152 @@ def test_schema_v2_keeps_its_contract_and_has_no_execution_evidence(
         assert result.returncode != 0
         assert not result.stdout
         assert key in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Public CLI: a normal open and a resumed-halt open fill identically
+# ---------------------------------------------------------------------------
+
+ACTUAL_OPEN_RULES = "actual-open-v1"
+
+
+def campaign_run(
+    root: Path,
+    name: str,
+    payload: dict,
+    *,
+    execution_rules: str = ACTUAL_OPEN_RULES,
+) -> dict:
+    """Initialize a project, seal the payload, create the Campaign and submit."""
+    project = root / f"{name}-project"
+    sealed = seal_v3(root, payload, store=f"{name}-store", name=name)
+    ok(cli("project", "init", "--project", str(project)))
+    campaign = ok(
+        cli(
+            "campaign", "create", "--project", str(project), "--store", str(sealed["store"]),
+            "--snapshot-id", sealed["snapshot_id"],
+            "--attempts", "2", "--max-seconds", "60",
+            "--initial-cash", "100000", "--transaction-cost-bps", "5",
+            "--slippage-bps", "0",
+            "--execution-rules", execution_rules,
+        )
+    )
+    experiment = ok(
+        cli(
+            "experiment", "submit", "--project", str(project),
+            "--input", str(write_json(root / f"{name}-experiment.json", {
+                "schema_version": 1,
+                "campaign_id": campaign["campaign_id"],
+                "submission_id": "equal",
+                "hypothesis": "Equal weights fill at the sealed actual daily open.",
+                "strategy": {"family": "equal_weight"},
+                "parameters": {},
+            })),
+        )
+    )
+    return {"sealed": sealed, "campaign": campaign, "experiment": experiment}
+
+
+def _runs(experiment: dict) -> tuple[dict, dict]:
+    discovery = experiment["discovery"]
+    return discovery, discovery["baseline_comparison"]["baseline"]
+
+
+def _fill_signature(run: dict) -> list[tuple]:
+    return [
+        (
+            fill["date"], fill["symbol"], fill["side"], fill["quantity"],
+            fill["raw_open"], fill["price"], fill["notional"], fill["fee"],
+            fill["slippage"], fill["price_basis"],
+        )
+        for fill in run["fills"]
+    ]
+
+
+def test_normal_open_and_resumed_halt_fill_identically_at_the_actual_open(
+    tmp_path: Path,
+) -> None:
+    execution_day = day_at(1)
+    normal_payload = schema_v3_fixture(8)
+    resumed_payload = schema_v3_fixture(8)
+    make_actual_open_halt(resumed_payload, execution_day, SYMBOLS[0])
+    changed_close_payload = schema_v3_fixture(8)
+    changed_row = make_actual_open_halt(changed_close_payload, execution_day, SYMBOLS[0])
+    changed_row.update(close=10.8, high=10.8)
+
+    samples = {
+        "normal": campaign_run(tmp_path, "normal", normal_payload),
+        "resumed": campaign_run(tmp_path, "resumed", resumed_payload),
+        "changed-close": campaign_run(tmp_path, "changed-close", changed_close_payload),
+    }
+
+    observed = {}
+    for name, sample in samples.items():
+        campaign, experiment = sample["campaign"], sample["experiment"]
+        execution = campaign["execution_rules"]
+        assert execution["version"] == ACTUAL_OPEN_RULES
+        assert execution["execution"]["basis"] == "unadjusted"
+        assert execution["execution"]["attempts"] == 1
+        assert execution["execution"]["halted_open"] == "actual_daily_open_when_evidenced"
+        assert (
+            execution["execution"]["partial_halt_open_availability"]
+            == "not_gated_by_0930"
+        )
+        # The Discovery result identifies the sealed snapshot schema version and
+        # the Campaign identifies the frozen execution rule version.
+        assert experiment["snapshot_schema_version"] == 3
+        candidate, benchmark = _runs(experiment)
+        for side in (candidate, benchmark):
+            assert [fill["date"] for fill in side["fills"]] == (
+                [execution_day] * len(SYMBOLS)
+            )
+            assert {fill["symbol"] for fill in side["fills"]} == set(SYMBOLS)
+            assert {fill["raw_open"] for fill in side["fills"]} == {10.0}
+            assert all(
+                fill["price_basis"] == "unadjusted_open" for fill in side["fills"]
+            )
+            assert all(fill["open_evidence"] == OPEN_SOURCE for fill in side["fills"])
+        assert _fill_signature(candidate) == _fill_signature(benchmark)
+        execution_point = next(
+            point for point in candidate["equity_curve"] if point["date"] == execution_day
+        )
+        observed[name] = {
+            "fills": _fill_signature(candidate),
+            "ending_cash": candidate["equity_curve"][-1]["cash"],
+            "ending_equity": candidate["metrics"]["ending_equity"],
+            "execution_nav": execution_point["nav"],
+        }
+
+    # Equal daily open, order and costs: same fill date, base price, quantity,
+    # fee and ending cash for the candidate and the benchmark in every sample.
+    assert observed["normal"]["fills"] == observed["resumed"]["fills"]
+    assert observed["resumed"]["fills"] == observed["changed-close"]["fills"]
+    for name in observed:
+        assert observed[name]["ending_cash"] == pytest.approx(
+            observed["normal"]["ending_cash"]
+        )
+        assert observed[name]["ending_equity"] == pytest.approx(
+            observed["normal"]["ending_equity"]
+        )
+    # The halted session is marked from its confirmed close only for valuation;
+    # the pre-submitted order's fills do not move.
+    assert observed["changed-close"]["execution_nav"] > observed["resumed"]["execution_nav"]
+
+    # The fill is the resumed session's sealed actual open, not a 09:30 guess.
+    resumed_fills = {
+        fill["symbol"]: fill for fill in samples["resumed"]["experiment"]["discovery"]["fills"]
+    }
+    halted_row = raw_row(resumed_payload, execution_day, SYMBOLS[0])
+    assert resumed_fills[SYMBOLS[0]]["open_evidence"] == halted_row["open_source"]
+    assert resumed_fills[SYMBOLS[0]]["raw_open"] == halted_row["open"]
+
+    # Control: the same halted row is not executable under the legacy rule, so
+    # the identical result above is the new rule's doing.
+    legacy = campaign_run(
+        tmp_path, "legacy", resumed_payload, execution_rules="next-open-v1"
+    )
+    for side in _runs(legacy["experiment"]):
+        assert side["order_attempts"][0]["date"] == execution_day
+        assert side["order_attempts"][0]["status"] == "not_filled"
+        assert side["order_attempts"][0]["missing_symbols"] == [SYMBOLS[0]]
+        assert all(fill["date"] != execution_day for fill in side["fills"])
