@@ -1018,10 +1018,12 @@ def _match_actual_open_day(
         for symbol in ETF_SYMBOLS
         if weights.get(symbol, 0.0) > _EPSILON or shares[symbol] > _EPSILON
     ]
-    unpriced = [
-        symbol for symbol in required if open_prices.get(symbol) is None
-    ]
-    if any(shares[symbol] > _EPSILON for symbol in unpriced):
+    unfilled_reasons = {
+        symbol: unfilled_reason(raw_bars.get((day, symbol)))
+        for symbol in required
+        if open_prices.get(symbol) is None
+    }
+    if any(shares[symbol] > _EPSILON for symbol in unfilled_reasons):
         # Only explicit exits are independent of the unknown equity basis: no
         # other symbol may change, so every price-dependent order stays unfilled.
         exits = {
@@ -1035,57 +1037,27 @@ def _match_actual_open_day(
             symbol: 0.0 if symbol in exits else shares[symbol]
             for symbol in ETF_SYMBOLS
         }
-        day_fills, cash, shares, costs = _rebalance_at_open(
-            pd.Timestamp(day),
-            open_prices,
-            target_shares,
-            cash,
-            shares,
-            fee_rate,
-            slippage_rate,
-        )
-        traded = {fill["symbol"] for fill in day_fills}
-        unfilled = [
-            {
-                "symbol": symbol,
-                "reason": (
-                    "equity_basis_unknown"
-                    if open_prices.get(symbol) is not None
-                    else unfilled_reason(raw_bars.get((day, symbol)))
-                ),
-            }
+        # Successful exits are removed from the unfilled list after matching.
+        unfilled_reasons.update(
+            (symbol, "equity_basis_unknown")
             for symbol in required
-            if symbol not in traded
-        ]
-        attempt = {
-            "signal_date": signal["date"],
-            "date": day,
-            "attempts": 1,
-            "status": "partially_filled" if day_fills else "not_filled",
-            "filled_symbols": [
-                symbol for symbol in ETF_SYMBOLS if symbol in traded
-            ],
-            "unfilled": unfilled,
-            "basket_complete": not unfilled,
-        }
-        return attempt, day_fills, cash, shares, costs
-    unfilled = [
-        {"symbol": symbol, "reason": unfilled_reason(raw_bars.get((day, symbol)))}
-        for symbol in unpriced
-    ]
-    open_equity = cash + math.fsum(
-        shares[symbol] * float(open_prices[symbol])
-        for symbol in ETF_SYMBOLS
-        if open_prices.get(symbol) is not None
-    )
-    target_shares = {
-        symbol: (
-            open_equity * weights.get(symbol, 0.0) / float(open_prices[symbol])
             if open_prices.get(symbol) is not None
-            else 0.0
         )
-        for symbol in ETF_SYMBOLS
-    }
+    else:
+        open_equity = cash + math.fsum(
+            shares[symbol] * float(open_prices[symbol])
+            for symbol in ETF_SYMBOLS
+            if open_prices.get(symbol) is not None
+        )
+        target_shares = {
+            symbol: (
+                open_equity * weights.get(symbol, 0.0) / float(open_prices[symbol])
+                if open_prices.get(symbol) is not None
+                else 0.0
+            )
+            for symbol in ETF_SYMBOLS
+        }
+
     day_fills, cash, shares, costs = _rebalance_at_open(
         pd.Timestamp(day),
         open_prices,
@@ -1096,6 +1068,11 @@ def _match_actual_open_day(
         slippage_rate,
     )
     traded = {fill["symbol"] for fill in day_fills}
+    unfilled = [
+        {"symbol": symbol, "reason": unfilled_reasons[symbol]}
+        for symbol in required
+        if symbol in unfilled_reasons and symbol not in traded
+    ]
     attempt = {
         "signal_date": signal["date"],
         "date": day,
