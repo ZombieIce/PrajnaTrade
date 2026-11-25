@@ -30,6 +30,7 @@ from prajnatrade.snapshot import (
     slice_content,
 )
 from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_RULES,
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
@@ -175,12 +176,21 @@ def _execution_policy(version: str) -> dict[str, Any]:
             initial_entry_retry="next_open_until_filled_or_superseded",
             retry_scope="before_first_position_is_established",
         )
+    elif version == ACTUAL_OPEN_RULES:
+        # Ticket #57 stage: the sealed actual daily open is a matching base
+        # price only. The basket attempt stays all-or-nothing until the
+        # per-symbol stage records each symbol separately.
+        rules["execution"].update(
+            halted_open="actual_daily_open_when_evidenced",
+            partial_halt_open_availability="not_gated_by_0930",
+        )
     return rules
 
 
 def _campaign_evaluation(
     *,
     data_kind: str,
+    snapshot_schema_version: int,
     snapshot_id: str,
     partition_content_hash: str,
     as_of: str | None,
@@ -205,6 +215,7 @@ def _campaign_evaluation(
         "partition_content_hash": partition_content_hash,
         "as_of": as_of,
         "data_kind": data_kind,
+        "snapshot_schema_version": snapshot_schema_version,
         "initial_cash": initial_cash,
         "transaction_cost_bps": transaction_cost_bps,
         "slippage_bps": slippage_bps,
@@ -331,6 +342,7 @@ def campaign_create(
         baseline_options = {"history_requirements": [], "scoring_start": history_policy["scoring_start"]}
     evaluation = _campaign_evaluation(
         data_kind=data_kind,
+        snapshot_schema_version=receipt["schema_version"],
         snapshot_id=snapshot_id,
         partition_content_hash=partition_hash,
         as_of=as_of,
@@ -984,6 +996,10 @@ def _run_attempt(
         if family == "python":
             result["strategy"] = dict(request["strategy"])
             result["executor"] = _executor_evidence(executor_config, executor_evidence)
+        # Additive identity echo: the sealed snapshot protocol this result was
+        # computed under (a Campaign stored before #56 lacks the evaluation key).
+        if "snapshot_schema_version" in config:
+            result["snapshot_schema_version"] = config["snapshot_schema_version"]
         if time.monotonic() - started >= remaining:
             raise _TimeExpired()
     except _TimeExpired:

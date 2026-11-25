@@ -169,11 +169,13 @@ extends to `trading`, `partial_halt`, `suspended`, and `unknown`:
 - `trading`: non-null open/high/low/close/volume, positive OHLC, non-negative
   volume, and both per-field timestamps present. The 09:30 open and the close
   are treated as available at those declared timestamps by market rule.
-- `partial_halt`: there is no executable 09:30 open, so `open` must be `null`
-  and a `halt: {"start": ..., "end": ...}` window is required. `high`, `low`,
-  `close`, and `volume` may describe the resumed session; `open_available_at`
-  is the resume availability, and a present close needs `close_available_at`.
-  The vendor's post-resume first trade must not be stored in `open`.
+- `partial_halt` (schema 2): there is no executable 09:30 open, so `open` must
+  be `null` and a `halt: {"start": ..., "end": ...}` window is required. `high`,
+  `low`, `close`, and `volume` may describe the resumed session;
+  `open_available_at` is the resume availability, and a present close needs
+  `close_available_at`. The vendor's post-resume first trade must not be stored
+  in `open`; schema 3 below replaces this rule with the evidenced actual daily
+  open.
 - `suspended`: open/high/low/close/volume are all `null`; `halt` is optional.
   This represents full-day halts such as `159612` on 2025-01-10 and 2025-01-24.
 - `unknown`: nulls are allowed and the row is treated as a gap.
@@ -196,10 +198,88 @@ say continuous trading starts at 09:30, while the archived bar only proves the
 day's OHLC after the close. A real snapshot must therefore report coverage and
 gaps, and a real label is not proof of point-in-time availability. A real
 `partial_halt` session with a confirmed close still counts toward the common
-range (for example a window ending on 2026-11-20), while its missing open and
-any suspended session remain listed gaps. Both `seal` and `snapshot read`
-receipts report `schema_version` and `data_kind`, so the baseline takes the kind
-from the sealed receipt instead of assuming synthetic.
+range (for example a window ending on 2026-11-20). Under schema 2 its missing
+open and any suspended session remain listed gaps; under schema 3 an evidenced
+actual open is not a gap. Both `seal` and `snapshot read` receipts report
+`schema_version` and `data_kind`, so the baseline takes the kind from the sealed
+receipt instead of assuming synthetic.
+
+### Real schema-version-3 snapshots (actual daily open, #56)
+
+`snapshot seal` also accepts `{"schema_version": 3, "data_kind": "real"}` input.
+Schema 3 is the new real contract for actual-open execution and supersedes
+schema 2 for new snapshots; a schema-2 manifest and every receipt stored under
+it keep their exact historical bytes, shape and meaning. The test suite uses
+synthetic fixtures. The [ADR](docs/adr/0002-actual-daily-open-execution.md)
+records why the fill price is a matching base price and never a signal input.
+
+Schema 3 keeps the schema-2 `evidence`, `derivation`, per-field availability and
+corporate-action rules, requires `raw_price_basis: "unadjusted"` to be
+**declared** (there is no absent default), and adds three raw-bar keys:
+
+- `open_source: {"source": ..., "evidence_id": ...}` is required exactly when
+  `open` is not `null`, on a normal `trading` session and on a `partial_halt`
+  session alike. It names the sealed price archive (a non-empty vendor/feed
+  name) and its `evidence.items[].id`, binding every executable open to its
+  sealed price source. A row without an open cannot carry one.
+- `status_evidence_id` is the `evidence.items[].id` of the official
+  suspension/resumption notice. It is required for `partial_halt` and
+  `suspended` rows and must differ from that row's `open_source.evidence_id`: a
+  resumption notice proves trading status, never a price.
+- `open_conflict: {"sources": [...]}` records two or more sealed vendor opens
+  that disagree. It requires `open: null`, at least two entries with distinct
+  non-empty `source` names, every `evidence_id` sealed, positive finite opens
+  and at least two distinct open values. A conflict is never silently resolved.
+  It may appear on any status: a `trading` row that carries one stores
+  `open: null`, keeps high/low/close/volume and carries no halt window, so a
+  disputed opening print is never forced into an executable open.
+
+A schema-3 `partial_halt` row **may** carry the day's actual unadjusted daily
+open — the first print after a resume on a halted-at-open day — together with
+its `open_source`. A halt window is still required, and a confirmed close still
+counts toward the common range. `trading`, `suspended` and `unknown` keep their
+schema-2 meaning, and schema 2 still rejects all three new keys and still
+forbids an `open` on `partial_halt`.
+
+The schema-3 manifest adds one additive, schema-3-only block,
+`execution_evidence`:
+
+```json
+{"schema_version": 1,
+ "policy": {"price_basis": "unadjusted_open",
+            "price_source": "raw_bars[].open_source -> evidence.items",
+            "status_evidence": "raw_bars[].status_evidence_id -> evidence.items",
+            "halted_open": "the day's actual unadjusted daily open for an order effective before the open"},
+ "rows": [{"date": "...", "symbol": "159612", "trading_status": "partial_halt",
+           "classification": "actual_open_after_halt",
+           "halt": {"start": "...", "end": "..."},
+           "status_evidence_id": "...", "open": 3.301,
+           "open_source": {"source": "...", "evidence_id": "..."}}],
+ "counts": {"actual_open_after_halt": 1, "confirmed_no_trade": 0,
+            "missing_required_open": 0, "source_conflict": 0, "unknown_status": 0}}
+```
+
+It has one row per sealed session/symbol whose `trading_status` is not
+`trading` or that carries an `open_conflict`, sorted by date and symbol, with
+classification:
+
+- `actual_open_after_halt`: `partial_halt` with a valid `open` and
+  `open_source`.
+- `confirmed_no_trade`: `suspended`, or `partial_halt` with `open: null`, no
+  conflict, whose halt window covers the whole session (`start <= 09:30` and
+  `15:00 <= end`).
+- `missing_required_open`: `partial_halt` with `open: null`, no conflict and a
+  halt that does not cover the session (`reason:
+  "partial_halt_without_actual_open"`).
+- `source_conflict`: the row carries `open_conflict`.
+- `unknown_status`: `trading_status: "unknown"`.
+
+`gaps` keeps its exact historical shape and population for every schema
+version, so old consumers are unchanged: an evidenced actual open is no longer
+declared as a raw-bar gap, while a confirmed no-trade day, a missing required
+open and a source conflict still are. The formal trailing pre-read gate keeps
+blocking any declared trailing gap; it does not consult `execution_evidence`
+yet.
 
 ### Discovery snapshot equal-weight baseline (MVP-04)
 
@@ -943,7 +1023,13 @@ protected partition and never writes a query debit; the receipt records
 The replay must match Discovery on the scoring interval, scoreable sessions,
 fills and ending cash within the `1e-9` tolerance. The receipt's check groups
 are `data_availability`, `scoring_start`, `coverage`, `position`, `costs`,
-`replay` and `hard_conditions`. The verdict is:
+`replay` and `hard_conditions`. A receipt created after the actual-open work
+computed on a schema-3 snapshot or under `actual-open-v1` also carries an
+additive `provenance` block naming the sealed input and the frozen execution
+protocol: `snapshot_id`, `snapshot_schema_version`, `execution_rule_version`
+and `price_basis: "unadjusted_open"`. A legacy schema-1/2 receipt under a
+legacy execution rule keeps its exact old shape (no `provenance` block), and so
+does a receipt stored before this change. The verdict is:
 
 | `outcome` | `reason` | meaning |
 | --- | --- | --- |
@@ -1609,8 +1695,12 @@ Validation. Strategies supply target weights to the shared accounting engine.
 | --- | --- | --- |
 | `next-open-v1` (default) | Attempt the whole target once at the next session's open. A required unavailable open leaves it unfilled. | Attempt once at the next session's open. |
 | `retry-initial-v1` | Retry a blocked positive target at subsequent opens until the first position is established, the partition ends, or a new target replaces it. An explicit cash target cancels a pending entry. | Attempt once at the next session's open. |
+| `actual-open-v1` | Attempt the whole target once at the next session's open. An order effective before the open fills at the sealed actual unadjusted daily open, including a halted-at-open session whose bar carries that open and its price source; the 09:30 availability cutoff does not gate that fill. A required unavailable open still leaves the whole attempt unfilled. | Attempt once at the next session's open. |
 
 Campaigns created before the version flag keep the `next-open-v1` behavior.
+`actual-open-v1` fills a halted-at-open session only from a schema-3 row that
+seals the actual daily open and its price source; a schema-2 row keeps the older
+behaviour. It never retries a blocked initial entry.
 The selected rule is part of the Campaign evaluation fingerprint and is copied
 into the approved Research round and protected evaluation plan.
 

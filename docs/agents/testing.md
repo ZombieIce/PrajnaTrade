@@ -80,6 +80,31 @@ unchanged v1 kickoff/locked/receipt shape, and includes one direct unit test of
 `snapshot.verify_discovery_split` for tampered descriptors and payloads. The
 file is fast and not marked `isolation`.
 
+## Actual daily open tests (#56)
+
+`tests/test_actual_open_cli.py` covers the schema-3 real contract and the
+`actual-open-v1` execution rule. It owns the reusable synthetic schema-3 fixture
+builders (`schema_v3_fixture`, `seal_v3`, `day_at` and the halt/suspension/
+conflict mutators); #58 and #59 import them instead of copying them. It seals a
+schema-3 manifest and asserts the `execution_evidence` policy block, one row per
+non-trading sealed session/symbol, and the `actual_open_after_halt` /
+`confirmed_no_trade` / `missing_required_open` / `source_conflict` /
+`unknown_status` counts, plus that the historical `gaps` shape is unchanged and
+an evidenced actual open is no longer a raw-bar gap. Negative seal cases reject a
+missing or unsealed price source, a resumption-status notice reused as the price
+source, a missing `status_evidence_id`, an undeclared `raw_price_basis`, every
+malformed `open_conflict` (an executable open, fewer than two sources, duplicate
+sources, unsealed evidence, non-positive or identical opens, including on a
+`trading` row that keeps its other OHLCV fields) and a schema-2 row carrying any
+of the three schema-3 keys. The public-CLI price test runs the same
+target on a normal-open sample, a resumed-halt sample with the same daily open
+and a variant whose execution-day close differs: both the candidate and the
+benchmark must produce the same fill date, base price, quantity, fee, ending
+cash and sealed `open_evidence`, the close variant may change only that day's
+valuation, and a `next-open-v1` control cannot fill the halted day. A v1
+`round validate` receipt on a schema-3 `actual-open-v1` Campaign asserts the
+additive provenance identity. The file is fast and not marked `isolation`.
+
 ## Formal trailing Validation tests (#50-T2)
 
 `tests/test_formal_validation_cli.py` covers protocol-v2 `round validate` and
