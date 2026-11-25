@@ -20,7 +20,16 @@ from pathlib import Path
 
 import pytest
 from cli_helpers import cli, ok, write_json
+from test_experiment_cli import campaign_options
+from test_protected_eval_cli import submit_experiment
 from test_real_snapshot import schema_v2_fixture
+from test_research_loop_cli import (
+    open_round,
+    round_input,
+    submit_version,
+    validate_version,
+    version_input,
+)
 
 from prajnatrade.data import ETF_SYMBOLS
 
@@ -386,6 +395,13 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
     make_open_conflict(payload, conflict_day, SYMBOLS[4])
     unknown_day = day_at(7)
     make_unknown_status(payload, unknown_day, SYMBOLS[0])
+    # A disputed opening print may also be declared on a trading-status row: it
+    # keeps every other OHLCV field and open: null, and carries no halt.
+    trading_conflict_day = day_at(8)
+    trading_conflict = make_open_conflict(payload, trading_conflict_day, SYMBOLS[1])
+    trading_conflict.update(trading_status="trading")
+    trading_conflict.pop("halt")
+    trading_conflict.pop("status_evidence_id")
 
     sealed = seal_v3(tmp_path, payload)
 
@@ -452,12 +468,21 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
             "trading_status": "unknown",
             "classification": "unknown_status",
         },
+        {
+            "date": trading_conflict_day,
+            "symbol": SYMBOLS[1],
+            "trading_status": "trading",
+            "classification": "source_conflict",
+            "open_conflict": raw_row(
+                payload, trading_conflict_day, SYMBOLS[1]
+            )["open_conflict"],
+        },
     ]
     assert evidence["counts"] == {
         "actual_open_after_halt": 1,
         "confirmed_no_trade": 2,
         "missing_required_open": 1,
-        "source_conflict": 1,
+        "source_conflict": 2,
         "unknown_status": 1,
     }
     # ``gaps`` keeps its historical shape and population: a confirmed no-trade
@@ -468,6 +493,16 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
     assert {"date": conflict_day, "symbol": SYMBOLS[4]} in manifest["gaps"]["raw_bars"]
     assert {"date": suspended_day, "symbol": SYMBOLS[1]} in manifest["gaps"]["derived"]
     assert {"date": actual_day, "symbol": SYMBOLS[0]} not in manifest["gaps"]["raw_bars"]
+    assert {"date": trading_conflict_day, "symbol": SYMBOLS[1]} in manifest["gaps"]["raw_bars"]
+
+    read = ok(
+        cli(
+            "snapshot", "read", "--store", str(sealed["store"]),
+            "--id", sealed["snapshot_id"], "--partition", "discovery",
+        )
+    )
+    assert read["schema_version"] == 3
+    assert read["data_kind"] == "real"
 
 
 def _missing_open_source(payload: dict) -> None:
@@ -545,6 +580,13 @@ def _partial_halt_without_a_halt(payload: dict) -> None:
     row.pop("halt")
 
 
+def _trading_conflict_missing_a_price(payload: dict) -> None:
+    row = make_open_conflict(payload, day_at(0), SYMBOLS[0])
+    row.update(trading_status="trading", close=None)
+    row.pop("halt")
+    row.pop("status_evidence_id")
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -564,6 +606,7 @@ def _partial_halt_without_a_halt(payload: dict) -> None:
         (_conflict_with_negative_open, "open_conflict open"),
         (_conflict_with_identical_opens, "open_conflict"),
         (_partial_halt_without_a_halt, "halt"),
+        (_trading_conflict_missing_a_price, "trading raw bar"),
     ],
 )
 def test_schema_v3_seal_rejects_invalid_execution_evidence(
@@ -760,8 +803,72 @@ def test_normal_open_and_resumed_halt_fill_identically_at_the_actual_open(
     legacy = campaign_run(
         tmp_path, "legacy", resumed_payload, execution_rules="next-open-v1"
     )
+    legacy_fills = []
     for side in _runs(legacy["experiment"]):
         assert side["order_attempts"][0]["date"] == execution_day
         assert side["order_attempts"][0]["status"] == "not_filled"
         assert side["order_attempts"][0]["missing_symbols"] == [SYMBOLS[0]]
         assert all(fill["date"] != execution_day for fill in side["fills"])
+        legacy_fills.extend(side["fills"])
+    # A legacy fill keeps its exact old shape and never carries the new echo.
+    assert legacy_fills
+    assert set(legacy_fills[0]) == {
+        "date", "symbol", "side", "quantity", "price", "notional", "fee",
+        "slippage", "raw_open", "price_basis",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Research Loop: a v1 receipt names the snapshot and execution protocol
+# ---------------------------------------------------------------------------
+
+
+def test_v1_round_receipt_records_snapshot_and_execution_provenance(
+    tmp_path: Path,
+) -> None:
+    payload = schema_v3_fixture(15)
+    project = tmp_path / "receipt-project"
+    source = write_json(tmp_path / "receipt-snapshot.json", payload)
+    ok(cli("project", "init", "--project", str(project)))
+    campaign = ok(
+        cli(
+            *campaign_options(project, source, attempts=6, max_seconds=180),
+            "--discovery-warmup-sessions", "4",
+            "--execution-rules", ACTUAL_OPEN_RULES,
+        )
+    )
+    snapshots = project.parent / f"{project.name}-snapshot-store"
+    experiment = submit_experiment(
+        project, campaign["campaign_id"], tmp_path / "receipt-experiment.json",
+        "equal", "Equal weights replay at the sealed actual daily open.",
+        "equal_weight", {},
+    )
+    trusted = tmp_path / "trusted"
+    opened = ok(
+        open_round(
+            project, trusted, campaign["campaign_id"],
+            write_json(tmp_path / "receipt-round.json", round_input()),
+        )
+    )
+    version = ok(
+        submit_version(
+            project, opened["round_id"], "version-1",
+            write_json(
+                tmp_path / "receipt-version.json",
+                version_input(experiment["experiment_id"]),
+            ),
+        )
+    )
+    receipt = ok(
+        validate_version(
+            project, trusted, snapshots, opened["round_id"], version["version_id"],
+        )
+    )
+
+    assert receipt["outcome"] == "passed", receipt["checks"]
+    assert receipt["provenance"] == {
+        "snapshot_id": campaign["snapshot_id"],
+        "snapshot_schema_version": 3,
+        "execution_rule_version": ACTUAL_OPEN_RULES,
+        "price_basis": "unadjusted_open",
+    }

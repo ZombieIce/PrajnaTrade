@@ -96,6 +96,8 @@ from prajnatrade.experiment import (
 )
 from prajnatrade.research_direction import direction_id
 from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_RULES,
+    EXECUTION_PRICE_BASIS,
     NEXT_OPEN_RULES,
     run_discovery_equal_weight,
     run_partition_strategy,
@@ -1302,6 +1304,7 @@ def _evidence_runs(
             "prior_history_hash": receipt.get("prior_history_hash"),
             "scope": source["data_kind"],
             "data_kind": source["data_kind"],
+            "schema_version": receipt["schema_version"],
             "as_of": cutoff,
         },
     }
@@ -1847,6 +1850,22 @@ def _receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    # Additive #56 identity, published only for the new protocol: a schema-3
+    # snapshot or the actual-open execution rule.  A legacy schema-1/2 v1
+    # receipt under a legacy rule keeps its exact old keys and receipt hash.
+    snapshot_schema_version = replay["snapshot"].get("schema_version")
+    execution_rule_version = submission["locked"]["execution_rules"].get(
+        "version", NEXT_OPEN_RULES
+    )
+    if (
+        type(snapshot_schema_version) is int and snapshot_schema_version >= 3
+    ) or execution_rule_version == ACTUAL_OPEN_RULES:
+        receipt["provenance"] = {
+            "snapshot_id": replay["snapshot"]["snapshot_id"],
+            "snapshot_schema_version": snapshot_schema_version,
+            "execution_rule_version": execution_rule_version,
+            "price_basis": EXECUTION_PRICE_BASIS,
+        }
     if corrected is not None:
         receipt.update(dict(corrected))
     receipt["receipt_hash"] = _hash(receipt)

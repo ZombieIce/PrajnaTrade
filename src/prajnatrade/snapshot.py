@@ -319,7 +319,15 @@ def _real_raw_bar_v3(row: dict, status: str, evidence_ids: set[str]) -> None:
     _open_conflict(row, evidence_ids)
     open_source = _open_source_evidence(row, evidence_ids)
     if status == "trading":
-        if any(row.get(field) is None for field in RAW_FIELDS):
+        # A disputed open is stored once as open_conflict (with open: null), so a
+        # trading row may also carry it; every other OHLCV field is still
+        # required and no halt window is allowed.
+        required = (
+            tuple(field for field in RAW_FIELDS if field != "open")
+            if "open_conflict" in row
+            else RAW_FIELDS
+        )
+        if any(row.get(field) is None for field in required):
             raise ValueError(
                 "A trading raw bar requires open, high, low, close and volume."
             )
