@@ -264,11 +264,14 @@ def test_actual_open_basket_fills_each_symbol_at_its_own_open(tmp_path):
     assert candidate["metrics"] == benchmark["metrics"]
     assert candidate["position_evidence"] == benchmark["position_evidence"]
 
-    # Change only the suspended symbol's tradability: it now has a trusted
-    # actual open, so five symbols match. The withheld 19960 is deployed at 10,
-    # the whole target scales by 100000/100050 = 0.9995002498750625 and the
-    # account moves by -9.499059993812615: five fees (49.97501249375313) and
-    # the fifth parcel notional (19990.00499750125) replace the 19960 cash.
+    # Change only the suspended symbol's tradability: it now trades normally at
+    # its sealed open of 10, so all five symbols match. The extra parcel buys
+    # 1999.0004997501248 shares worth 19990.00499750125 plus a 9.995002498750626
+    # fee from the 19960 withheld cash, and funding it scales the whole target
+    # by 100000/100050 = 0.9995002498750625. The ending account is:
+    #   0 cash + 59970.01499250375 (three normal) + 19038.09999762024 (resumed)
+    #   + 19990.00499750125 (new parcel) = 98998.11998762524,
+    # i.e. 99007.61904761905 - 9.499059993812615 = 98998.11998762524.
     tradable_payload = schema_v3_fixture(8)
     make_actual_open_halt(tradable_payload, execution_day, resumed, open_price=10.5)
     tradable = _v3_run(tmp_path, "basket-tradable", tradable_payload)

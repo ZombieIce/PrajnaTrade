@@ -1026,9 +1026,14 @@ def _unfilled_reason(row: dict | None) -> str:
     status = row.get("trading_status")
     if status == "unknown":
         return "unknown_trading_status"
-    if status == "suspended" or (
-        status == "partial_halt"
-        and _halt_covers_session(row.get("halt"), row.get("date"))
+    if status == "suspended":
+        return "confirmed_no_trade"
+    # A sealed source conflict is never resolved into a confirmed no-trade or a
+    # fill: the required open is missing.
+    if "open_conflict" in row:
+        return "missing_required_open"
+    if status == "partial_halt" and _halt_covers_session(
+        row.get("halt"), row.get("date")
     ):
         return "confirmed_no_trade"
     return "missing_required_open"
