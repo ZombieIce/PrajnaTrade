@@ -212,6 +212,52 @@ def test_conversion_keeps_the_resume_open_and_emits_schema_3() -> None:
     }
 
 
+def test_a_full_halt_until_with_a_same_day_resume_keeps_its_open() -> None:
+    """The real 2026-11-20 case: ``full_halt_until`` can be a partial halt.
+
+    The vendor kind only says the halt starts at the open; its halt window
+    decides whether the session traded.  A same-day resume leaves the vendor's
+    actual open, exactly like ``open_halt``, and the converted row stays a
+    sealable ``partial_halt`` (marking it ``suspended`` would also contradict
+    the vendor close that makes its derived value non-null).  A resume on a
+    later session covers the whole day and stays ``suspended``.
+    """
+    module = _acquisition_module()
+    bars = _vendor_bars()
+    bars[HALTED][HALT_DAY] = _vendor_bar(10.5)
+    bars[SUSPENDED][HALT_DAY] = _vendor_bar(10.0)
+    halt = {
+        "code": HALTED,
+        "announced": SESSION_DATES[0],
+        "kind": "full_halt_until",
+        "date": HALT_DAY,
+        "resume": f"{HALT_DAY} 10:30",
+    }
+    rows = module.convert_raw_bars(
+        sessions=list(SESSION_DATES),
+        bars=bars,
+        halts=[halt],
+        price_evidence_id=PRICE_EVIDENCE_ID,
+        halt_evidence_ids={(HALTED, SESSION_DATES[0]): HALT_EVIDENCE_ID},
+        halt_references={(HALTED, SESSION_DATES[0]): "https://example.invalid/halt.pdf"},
+        price_collected_at=COLLECTED_AT,
+    )
+    row = next(
+        row for row in rows if (row["date"], row["symbol"]) == (HALT_DAY, HALTED)
+    )
+    assert row["trading_status"] == "partial_halt"
+    assert row["open"] == 10.5
+    assert row["open_source"] == {
+        "source": PRICE_SOURCE,
+        "evidence_id": PRICE_EVIDENCE_ID,
+    }
+    assert row["status_evidence_id"] == HALT_EVIDENCE_ID
+    assert row["halt"] == {
+        "start": f"{HALT_DAY}T09:30:00+08:00",
+        "end": f"{HALT_DAY}T10:30:00+08:00",
+    }
+
+
 def test_converted_halt_open_seals_and_fills_in_discovery(tmp_path: Path) -> None:
     """Conversion -> seal -> Campaign -> Discovery fill keeps the resume open.
 

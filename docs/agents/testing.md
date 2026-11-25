@@ -26,8 +26,8 @@ PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
 The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
-CI run; **521 tests** collected after #56, of which 371 are fast and 150 are the
-`isolation`/Docker selections). CI (`.github/workflows/tests.yml`) runs the full
+CI run; **539 tests** collected after the #56 review rounds, of which 389 are
+fast and 150 are the `isolation`/Docker selections). CI (`.github/workflows/tests.yml`) runs the full
 suite on `macos-latest` with Python 3.12; `lint` runs `ruff check .`.
 
 ## Isolation tests
@@ -198,7 +198,9 @@ and calls the pure `build_snapshot_input` (which delegates to
 `convert_raw_bars`). It asserts schema 3, a normal row's vendor open and price
 source, the halted row's actual open `10.5` with the vendor `open_source` and a
 distinct halt-notice `status_evidence_id`, and the whole-day row's null prices
-with its halt notice. The same converted document is sealed through the public
+with its halt notice. A `full_halt_until` notice with a same-day resume keeps
+its actual open (the real 2026-11-20 case), while one whose resume is on a later
+session covers the day and becomes `suspended`. The same converted document is sealed through the public
 CLI and scored under `actual-open-v1`: the `execution_evidence` classifications
 are `actual_open_after_halt` / `confirmed_no_trade`, the equal-weight Discovery
 fill on the halt day uses base price `10.5` and echoes the sealed

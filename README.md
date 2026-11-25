@@ -215,10 +215,11 @@ actual open (citing the price archive and the official halt notice as separate
 evidence roles) and turns a whole-day halt into `suspended` with null prices,
 and `build_snapshot_input` assembles the document `snapshot seal` accepts. The
 real re-acquisition and its 45-row verification are tracked by #35 (out of scope
-here), so no checked-in real snapshot changes. A schema-2 manifest and every receipt stored under it keep
-their exact historical bytes, shape and meaning. The test suite uses synthetic
-fixtures. The [ADR](docs/adr/0002-actual-daily-open-execution.md) records why
-the fill price is a matching base price and never a signal input.
+here), so no checked-in real snapshot changes. A schema-2 manifest and every
+receipt stored under it keep their exact historical bytes, shape and meaning.
+The test suite uses synthetic fixtures.
+The [ADR](docs/adr/0002-actual-daily-open-execution.md) records why the fill
+price is a matching base price and never a signal input.
 
 Schema 3 keeps the schema-2 `evidence`, `derivation`, per-field availability and
 corporate-action rules, requires `raw_price_basis: "unadjusted"` to be
