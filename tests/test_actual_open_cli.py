@@ -35,6 +35,7 @@ from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot_baseline import (
     ACTUAL_OPEN_RULES,
     EXECUTION_PRICE_BASIS,
+    RETRY_INITIAL_RULES,
     is_executable_open,
     unfilled_reason,
 )
@@ -846,6 +847,48 @@ def test_a_hand_built_whole_day_halt_open_is_never_executable() -> None:
     # is the evidenced halted-at-open case and stays executable.
     row["volume"] = 1000
     assert is_executable_open(
+        row, cutoff, data_kind="real", execution_rule_version=ACTUAL_OPEN_RULES
+    )
+
+
+def test_an_actual_open_is_not_gated_by_its_publication_time() -> None:
+    """B1: an order effective before the open matches retrospectively.
+
+    The reviewer's sample: a symbol's sealed actual open is 10, but the quote is
+    published at 15:05.  Under ``actual-open-v1`` a normal ``trading`` row is no
+    more gated by that publication time than a resumed ``partial_halt`` row;
+    the legacy rules keep their exact 09:30 per-field / ``available_at`` cutoff.
+    """
+    day = day_at(0)
+    cutoff = datetime.fromisoformat(_at(day, 9, 30))
+    row = {
+        "date": day,
+        "symbol": SYMBOLS[0],
+        "trading_status": "trading",
+        "open": 10.0,
+        "high": 10.0,
+        "low": 10.0,
+        "close": 10.0,
+        "volume": 1000,
+        "open_source": _open_source(),
+        "open_available_at": _at(day, 15, 5),
+        "close_available_at": _at(day, 15, 5),
+        "available_at": _at(day, 15, 5),
+        "availability_evidence": f"synthetic:tdx:{day}:close-batch",
+    }
+    assert is_executable_open(
+        row, cutoff, data_kind="real", execution_rule_version=ACTUAL_OPEN_RULES
+    )
+    # The legacy rules keep their publication gates exactly.
+    assert not is_executable_open(row, cutoff, data_kind="real")
+    assert not is_executable_open(
+        row, cutoff, data_kind="real", execution_rule_version=RETRY_INITIAL_RULES
+    )
+    assert not is_executable_open(row, cutoff, data_kind="synthetic")
+    # An actual open is a real trade under either status: zero volume is still
+    # not executable.
+    row["volume"] = 0
+    assert not is_executable_open(
         row, cutoff, data_kind="real", execution_rule_version=ACTUAL_OPEN_RULES
     )
 

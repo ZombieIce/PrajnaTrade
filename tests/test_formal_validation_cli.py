@@ -602,6 +602,63 @@ def test_discovery_and_formal_validation_score_one_frozen_actual_open_rule(
     assert set(fills["discovery"]) == set(fills["formal"])
 
 
+def test_a_partial_benchmark_build_fails_the_formal_position_check(
+    tmp_path: Path,
+) -> None:
+    """B4: a 4/5 entry basket is evidence, not a satisfied scoring premise.
+
+    The benchmark's entry day carries one confirmed suspended symbol, which the
+    pre-read gate accepts as benign.  The run proceeds and spends exactly one
+    use, but the benchmark filled only four of its five required symbols, so the
+    formal position prerequisite is not met: the receipt is
+    ``insufficient_evidence`` / ``POSITION_EVIDENCE_INSUFFICIENT`` and records
+    the four fills and both sides' build state.
+    """
+    entry_day = day_at(6)
+    suspended = ETF_SYMBOLS[2]
+    payload = schema_v3_fixture(15)
+    make_confirmed_suspension(payload, entry_day, suspended)
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="partial-build",
+        execution_rules=ACTUAL_OPEN_RULES,
+    )
+    split = scenario["split"]
+    assert split["trailing"]["start"] == entry_day
+    assert split["trailing"]["sessions"] == 3
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "insufficient_evidence"
+    assert validated["reason"] == "POSITION_EVIDENCE_INSUFFICIENT"
+    position = validated["checks"]["position"]
+    assert position["ok"] is False
+    # Both sides publish their build state; only the benchmark is partial, but
+    # either side failing the premise fails the check.
+    assert position["benchmark"]["basket_build_state"] == "partial"
+    assert position["benchmark"]["unfilled_basket_signals"] == 1
+    assert position["benchmark"]["fills"] == 4
+    assert position["candidate"]["basket_build_state"] == "completed"
+    assert position["candidate"]["unfilled_basket_signals"] == 0
+    assert position["candidate"]["fills"] == 1
+
+    # The four fills are accounted honestly and the suspended symbol never
+    # fills; the receipt keeps its #56 identity.
+    benchmark = validated["runs"]["benchmark"]
+    assert benchmark["fill_count"] == 4
+    assert [fill["symbol"] for fill in benchmark["fills"]] == [
+        symbol for symbol in ETF_SYMBOLS if symbol != suspended
+    ]
+    assert all(fill["date"] == entry_day for fill in benchmark["fills"])
+    assert validated["provenance"]["snapshot_schema_version"] == 3
+    assert validated["provenance"]["execution_rule_version"] == ACTUAL_OPEN_RULES
+    assert validated["provenance"]["price_basis"] == EXECUTION_PRICE_BASIS
+
+    # A completed run is evidence: the counted read happened and its use stays.
+    assert validated["usage"]["sequence"] == 1
+    assert _validation_ledger_counts(scenario) == (1, 1)
+
+
 def test_formal_validation_is_distinguishable_from_the_v1_replay(tmp_path: Path) -> None:
     formal = formal_scenario(tmp_path, payload=drifting_snapshot(15), name="formal")
     formal_receipt = ok(validate_current(formal))

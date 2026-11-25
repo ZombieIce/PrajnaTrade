@@ -3,14 +3,16 @@
 ``next-open-v1`` (the default) and ``retry-initial-v1`` keep the legacy
 all-or-nothing basket attempt at the next session's open.  ``actual-open-v1``
 matches every required symbol separately at the sealed actual unadjusted daily
-open, including an evidenced halted-at-open session; a symbol without an
-executable open is recorded unfilled with its sealed-row reason.  Sells match
-before buys in frozen symbol order and buys are funded from initial cash plus
-realized sell net.  A held symbol without a trustworthy open makes that day's
-total equity basis unknowable, so the day fills nothing at all and records the
-priced required symbols as ``equity_basis_unknown`` (ADR 0002); only an entry
-basket with no holdings still fills its priced symbols per symbol.  The rule
-never retries automatically.
+open under a retrospective rule: no open's publication time gates an order that
+was effective before the open.  A symbol without an executable open is recorded
+unfilled with its sealed-row reason.  Sells match before buys in frozen symbol
+order and buys are funded from initial cash plus realized sell net.  A held
+symbol without a trustworthy open makes that day's total equity basis
+unknowable, so every equity-dependent order is unfilled with
+``equity_basis_unknown`` and no buy is matched (ADR 0002); an explicit exit of
+another holding is still sized independently of equity and sells in full, and
+an entry basket with no holdings still fills its priced symbols per symbol.  The
+rule never retries automatically.
 """
 
 from __future__ import annotations
@@ -957,23 +959,27 @@ def is_executable_open(
     """Whether one raw bar confirms an open the execution rule may fill at.
 
     Legacy rules execute only a normal trading session whose open is known by
-    the 09:30 cutoff.  ``actual-open-v1`` also executes a halted-at-open session
-    whose sealed bar carries the actual daily open and its price source: that
-    daily open is only knowable after the close, and it is a matching base price
-    for an order effective before the open, never a signal input (ADR 0002).
-    An actual open also has to be a real trade: the bar needs positive volume,
-    and its halt window cannot cover the whole session (that is a confirmed
-    no-trade day, which has no executable open).
+    the 09:30 cutoff.  ``actual-open-v1`` instead matches an order that was
+    already effective before the open retrospectively, so no publication time
+    gates the fill: a ``trading`` row needs a valid open and positive volume,
+    and a ``partial_halt`` row also needs the sealed price source and a halt
+    window that does not cover the whole session (a covered session is a
+    confirmed no-trade day).  The daily open is a matching base price only,
+    never a signal input; signal inputs keep their own point-in-time cutoffs
+    (ADR 0002).
     """
     if row is None or not _valid_price(row.get("open")):
         return False
     status = row.get("trading_status")
-    if execution_rule_version == ACTUAL_OPEN_RULES and status == "partial_halt":
-        return (
-            isinstance(row.get("open_source"), Mapping)
-            and _valid_price(row.get("volume"))
-            and not halt_covers_session(row.get("halt"), row.get("date"))
-        )
+    if execution_rule_version == ACTUAL_OPEN_RULES:
+        if not _valid_price(row.get("volume")):
+            return False
+        if status == "partial_halt":
+            return (
+                isinstance(row.get("open_source"), Mapping)
+                and not halt_covers_session(row.get("halt"), row.get("date"))
+            )
+        return status == "trading"
     if status != "trading" or not _valid_price(row.get("volume")):
         return False
     if data_kind == "real":
@@ -997,10 +1003,14 @@ def _match_actual_open_day(
     A required symbol without an executable open is recorded unfilled and keeps
     its cash or shares.  A *held* symbol without one makes the day's total
     equity unknowable: retargeting the priced holdings against a partial open
-    equity would force sales the strategy never asked for.  The whole day is
-    then unfilled — cash, shares and costs stay untouched, the unpriced symbols
-    keep their sealed-row reason and every priced required symbol is recorded
-    as ``equity_basis_unknown``.  With no held symbol unpriced, matching stays
+    equity would force sales the strategy never asked for, so every
+    equity-dependent order (a required symbol with a target weight above zero)
+    is recorded ``equity_basis_unknown`` and no buy is matched.  An explicit
+    exit -- target weight at or below the epsilon, shares above it -- is sized
+    independently of total equity, so it still sells in full at its own usable
+    open.  The unpriced symbols keep their sealed-row reason; any fill makes the
+    attempt ``partially_filled`` and ``basket_complete`` stays false while any
+    required symbol is unfilled.  With no held symbol unpriced, matching stays
     per symbol, so an entry basket still fills its priced symbols.
     """
     required = [
@@ -1012,27 +1022,53 @@ def _match_actual_open_day(
         symbol for symbol in required if open_prices.get(symbol) is None
     ]
     if any(shares[symbol] > _EPSILON for symbol in unpriced):
+        # Only explicit exits are independent of the unknown equity basis: no
+        # other symbol may change, so every price-dependent order stays unfilled.
+        exits = {
+            symbol
+            for symbol in required
+            if weights.get(symbol, 0.0) <= _EPSILON
+            and shares[symbol] > _EPSILON
+            and open_prices.get(symbol) is not None
+        }
+        target_shares = {
+            symbol: 0.0 if symbol in exits else shares[symbol]
+            for symbol in ETF_SYMBOLS
+        }
+        day_fills, cash, shares, costs = _rebalance_at_open(
+            pd.Timestamp(day),
+            open_prices,
+            target_shares,
+            cash,
+            shares,
+            fee_rate,
+            slippage_rate,
+        )
+        traded = {fill["symbol"] for fill in day_fills}
+        unfilled = [
+            {
+                "symbol": symbol,
+                "reason": (
+                    "equity_basis_unknown"
+                    if open_prices.get(symbol) is not None
+                    else unfilled_reason(raw_bars.get((day, symbol)))
+                ),
+            }
+            for symbol in required
+            if symbol not in traded
+        ]
         attempt = {
             "signal_date": signal["date"],
             "date": day,
             "attempts": 1,
-            "status": "not_filled",
-            "filled_symbols": [],
-            "unfilled": [
-                {
-                    "symbol": symbol,
-                    "reason": (
-                        "equity_basis_unknown"
-                        if open_prices.get(symbol) is not None
-                        else unfilled_reason(raw_bars.get((day, symbol)))
-                    ),
-                }
-                for symbol in required
+            "status": "partially_filled" if day_fills else "not_filled",
+            "filled_symbols": [
+                symbol for symbol in ETF_SYMBOLS if symbol in traded
             ],
-            "basket_complete": False,
+            "unfilled": unfilled,
+            "basket_complete": not unfilled,
         }
-        no_costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
-        return attempt, [], cash, shares, no_costs
+        return attempt, day_fills, cash, shares, costs
     unfilled = [
         {"symbol": symbol, "reason": unfilled_reason(raw_bars.get((day, symbol)))}
         for symbol in unpriced

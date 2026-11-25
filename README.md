@@ -208,10 +208,14 @@ receipt instead of assuming synthetic.
 
 `snapshot seal` also accepts `{"schema_version": 3, "data_kind": "real"}` input.
 Schema 3 is the new real contract for research snapshots: it is what a
-re-acquired snapshot must declare for actual-open execution, while the
-checked-in acquisition script still emits schema 2 until the real
-re-acquisition tracked by #35 (out of scope here), so no checked-in real
-snapshot changes. A schema-2 manifest and every receipt stored under it keep
+re-acquired snapshot must declare for actual-open execution. The checked-in
+acquisition script converts the probe artifacts into schema 3 through two pure,
+importable entries: `convert_raw_bars` keeps a halted-at-open session's vendor
+actual open (citing the price archive and the official halt notice as separate
+evidence roles) and turns a whole-day halt into `suspended` with null prices,
+and `build_snapshot_input` assembles the document `snapshot seal` accepts. The
+real re-acquisition and its 45-row verification are tracked by #35 (out of scope
+here), so no checked-in real snapshot changes. A schema-2 manifest and every receipt stored under it keep
 their exact historical bytes, shape and meaning. The test suite uses synthetic
 fixtures. The [ADR](docs/adr/0002-actual-daily-open-execution.md) records why
 the fill price is a matching base price and never a signal input.
@@ -1075,7 +1079,7 @@ does a receipt stored before this change. The verdict is:
 | `insufficient_evidence` | `REPLAY_MISMATCH` | The replay is not byte-for-value equal to Discovery; a platform or data change needs `round revalidate`. |
 | `insufficient_evidence` | `SCORING_START_INSUFFICIENT` | The frozen scoring start is not ready for the candidate or the benchmark. |
 | `insufficient_evidence` | `COVERAGE_INSUFFICIENT` | Signal/valuation gaps or an incomplete scoring interval; `checks.data_availability` names the exact missing requirement. |
-| `insufficient_evidence` | `POSITION_EVIDENCE_INSUFFICIENT` | The account never established the preregistered position and did not explicitly target cash. |
+| `insufficient_evidence` | `POSITION_EVIDENCE_INSUFFICIENT` | The account never established the preregistered position and did not explicitly target cash, or an actual-open plan's latest basket build is still `partial`/`unfilled`. |
 | `insufficient_evidence` | `COST_EVIDENCE_INSUFFICIENT` | Replayed fees or slippage do not match Discovery. |
 | `insufficient_evidence` | `METRICS_NOT_READY` | A hard-condition metric is unavailable; the condition records `status: unavailable`. |
 
@@ -1179,14 +1183,20 @@ stored before the actual-open work has no such keys and keeps its recorded shape
 The checks are `data_availability`, `scoring_start`, `coverage`, `position`,
 `segment` (the verified frozen descriptor, hashes and as-of) and
 `hard_conditions`; there is no `replay` check and no `costs` check (costs are
-reported in the summary). The verdict precedence is:
+reported in the summary). When a run carries the additive `actual-open-v1`
+basket-build evidence, `checks.position.<side>` publishes its
+`basket_build_state` and `unfilled_basket_signals`, and the position check
+requires that state not to be `partial` or `unfilled` on either side: a plan
+that required the whole basket and filled only part of it records its fills
+honestly but does not satisfy the preregistered position premise. The verdict
+precedence is:
 
 | `outcome` | `reason` | meaning |
 | --- | --- | --- |
 | `failed` | `HARD_CONDITION_NOT_MET` | At least one round hard condition failed. |
 | `insufficient_evidence` | `SCORING_START_INSUFFICIENT` | The required history is not ready at the trailing first session. |
 | `insufficient_evidence` | `COVERAGE_INSUFFICIENT` | Signal/valuation gaps or an incomplete trailing window. |
-| `insufficient_evidence` | `POSITION_EVIDENCE_INSUFFICIENT` | The account neither established the preregistered position nor explicitly targeted cash. |
+| `insufficient_evidence` | `POSITION_EVIDENCE_INSUFFICIENT` | The account neither established the preregistered position nor explicitly targeted cash, or an actual-open plan's latest basket build is still `partial`/`unfilled`. |
 | `insufficient_evidence` | `METRICS_NOT_READY` | A hard-condition metric is unavailable. |
 | `passed` | `null` | Every check holds and every hard condition is met. |
 
@@ -1757,14 +1767,21 @@ Validation. Strategies supply target weights to the shared accounting engine.
 | --- | --- | --- |
 | `next-open-v1` (default) | Attempt the whole target once at the next session's open. A required unavailable open leaves it unfilled. | Attempt once at the next session's open. |
 | `retry-initial-v1` | Retry a blocked positive target at subsequent opens until the first position is established, the partition ends, or a new target replaces it. An explicit cash target cancels a pending entry. | Attempt once at the next session's open. |
-| `actual-open-v1` | Match each required symbol once at the next session's open: a buy is a target weight above zero and a sell is a held position. A symbol with an executable open fills at the sealed actual unadjusted daily open, including a halted-at-open session whose bar carries that open and its price source (the 09:30 availability cutoff does not gate that fill). A symbol without one is recorded unfilled with a reason derived from its sealed row and keeps its cash or shares. Sells match before buys in frozen symbol order; buys are funded by initial cash plus realized sell net, and a proportional scale keeps them within that cash. | Same per-symbol rule: sells, then buys, funded by initial cash plus realized sell net. |
+| `actual-open-v1` | Match each required symbol once at the next session's open: a buy is a target weight above zero and a sell is a held position. A symbol with an executable open fills at the sealed actual unadjusted daily open, including a halted-at-open session whose bar carries that open and its price source. No open's publication time gates the fill: the order was already effective before the open, so matching is retrospective. A `trading` row needs a valid open and positive volume; a `partial_halt` row also needs the sealed price source and a halt window that does not cover the session. A symbol without an executable open is recorded unfilled with a reason derived from its sealed row and keeps its cash or shares. Sells match before buys in frozen symbol order; buys are funded by initial cash plus realized sell net, and a proportional scale keeps them within that cash. | Same per-symbol rule: sells, then buys, funded by initial cash plus realized sell net. |
 
 Campaigns created before the version flag keep the `next-open-v1` behavior.
-`actual-open-v1` fills a halted-at-open session only from a schema-3 row that
-seals the actual daily open with a `price_archive` source, a distinct
-trading-status notice, positive `volume` and a halt window that does not cover
-the whole session; a schema-2 row keeps the older behaviour, and a row failing
-those checks is recorded unfilled with its sealed-row reason. `campaign create`
+`actual-open-v1` executes a schema-3 row from its sealed actual daily open; a
+daily bar's open is only knowable after the close, so neither a normal nor a
+halted session is gated by the quote's publication time. A halted-at-open
+session fills only from a row that seals the actual daily open with a
+`price_archive` source, a distinct trading-status notice, positive `volume` and
+a halt window that does not cover the whole session; a schema-2 row keeps the
+older behaviour, and a row failing those checks is recorded unfilled with its
+sealed-row reason. Signal inputs keep their own point-in-time cutoffs: the
+open's publication time is irrelevant to matching but never makes a
+late-published value available to a strategy. `next-open-v1` and
+`retry-initial-v1` keep their exact 09:30 `open_available_at`/`available_at`
+gates. `campaign create`
 freezes the final policy block for this rule:
 `source: sealed_partition.raw_bars.open`, `basis: unadjusted`, `attempts: 1`,
 `halted_open: actual_daily_open_when_evidenced`,
@@ -1786,12 +1803,16 @@ trusted actual open or a conflicted/missing price is a missing required open.
 
 A held symbol (`shares > ε`) without an executable open makes the day's total
 equity basis unknowable: sizing the priced holdings against a partial open
-equity would force sales the strategy never asked for. The whole day is then
-recorded as `not_filled` with `filled_symbols: []`, `basket_complete: false`
-and every required symbol in `unfilled` — the unpriced ones with their
-sealed-row reason and the priced ones with `equity_basis_unknown` — while cash,
-shares and costs stay untouched. An entry basket (no holdings yet) keeps
-per-symbol matching, so its priced symbols still fill.
+equity would force retargeting the strategy never asked for. Every
+equity-dependent order (a required symbol with a target weight above zero) is
+then recorded unfilled with `equity_basis_unknown` and no buy is matched, while
+an *explicit exit* — target weight at or below the epsilon and shares above it —
+is sized independently of total equity and still sells in full at its own usable
+open. The unpriced symbols keep their sealed-row reason; any exit fill makes the
+attempt `partially_filled`, and `basket_complete` stays false while any required
+symbol is unfilled. Cash moves only by a realized sell net and unsold parcels
+stay in the account. An entry basket (no holdings yet) keeps per-symbol
+matching, so its priced symbols still fill.
 
 A partially filled plan is recorded as it happened and marked not yet built:
 unfilled buy cash stays in cash and unsold shares stay in the account.
