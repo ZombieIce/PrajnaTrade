@@ -1704,7 +1704,11 @@ behaviour. It records one attempt per target with `status` `filled`,
 `partially_filled` or `not_filled`, the `filled_symbols` that matched, the
 `unfilled` symbols with their sealed-row reason (`confirmed_no_trade`,
 `missing_required_open`, `unknown_trading_status` or `missing_bar`) and a
-`basket_complete` flag. A symbol whose row is `suspended` or whose
+`basket_complete` flag. `unfilled` is about the missing open, not about whether a
+trade was needed: a required symbol whose open is missing is recorded unfilled
+even if its target would have equalled its holding, while a required symbol that
+does have an executable open but needs no trade emits no fill row and stays out
+of both lists. A symbol whose row is `suspended` or whose
 `partial_halt` window covers the whole session is a confirmed no-trade day; a
 `partial_halt` without a trusted actual open or a conflicted/missing price is a
 missing required open. A partially filled plan is recorded as it happened and
