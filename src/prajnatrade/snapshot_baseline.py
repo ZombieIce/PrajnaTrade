@@ -275,9 +275,6 @@ def run_partition_strategy(
                     day, signal, weights, open_prices, raw_bars, cash, shares,
                     fee_rate, slippage_rate,
                 )
-                fills.extend(day_fills)
-                fees_paid += costs["fees"]
-                slippage_paid += costs["slippage"]
             else:
                 missing_opens = sorted(
                     symbol
@@ -292,6 +289,8 @@ def run_partition_strategy(
                     "attempts": 1,
                     "status": "not_filled" if missing_opens else "filled",
                 }
+                day_fills = []
+                costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
                 if missing_opens:
                     attempt["reason"] = "missing_or_unconfirmed_open"
                     attempt["missing_symbols"] = missing_opens
@@ -319,12 +318,22 @@ def run_partition_strategy(
                         fee_rate,
                         slippage_rate,
                     )
-                    for fill in day_fills:
-                        fill["raw_open"] = open_prices[fill["symbol"]]
-                        fill["price_basis"] = EXECUTION_PRICE_BASIS
-                    fills.extend(day_fills)
-                    fees_paid += costs["fees"]
-                    slippage_paid += costs["slippage"]
+            # One common tail for both rules: every fill echoes the sealed base
+            # price it matched at, and an actual-open fill also echoes the
+            # sealed price source that produced it.
+            for fill in day_fills:
+                fill["raw_open"] = open_prices[fill["symbol"]]
+                fill["price_basis"] = EXECUTION_PRICE_BASIS
+                if execution_rule_version == ACTUAL_OPEN_RULES:
+                    open_source = raw_bars[(day, fill["symbol"])].get("open_source")
+                    if isinstance(open_source, Mapping):
+                        fill["open_evidence"] = {
+                            "source": open_source["source"],
+                            "evidence_id": open_source["evidence_id"],
+                        }
+            fills.extend(day_fills)
+            fees_paid += costs["fees"]
+            slippage_paid += costs["slippage"]
             order_attempts.append(attempt)
             if positive_order:
                 positive_attempts.append(attempt)
@@ -1028,15 +1037,6 @@ def _match_actual_open_day(
         fee_rate,
         slippage_rate,
     )
-    for fill in day_fills:
-        fill["raw_open"] = open_prices[fill["symbol"]]
-        fill["price_basis"] = EXECUTION_PRICE_BASIS
-        open_source = raw_bars[(day, fill["symbol"])].get("open_source")
-        if isinstance(open_source, Mapping):
-            fill["open_evidence"] = {
-                "source": open_source["source"],
-                "evidence_id": open_source["evidence_id"],
-            }
     traded = {fill["symbol"] for fill in day_fills}
     attempt = {
         "signal_date": signal["date"],
