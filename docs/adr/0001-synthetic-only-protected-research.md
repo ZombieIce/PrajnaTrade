@@ -89,6 +89,170 @@ protected evidence.
    a `manual_tracking` version is a different admission source, not a protected
    release.
 
+## Discovery split and trailing Validation (issue #50)
+
+Issue #50 revises the #43 Validation interval: the frozen Discovery interval is
+split 70/30 so that a locked version can be checked on a later, unedited part of
+Discovery after research has stopped changing it.
+
+1. **The split covers the Campaign's sealed Discovery interval only.** Under
+   protocol v2, `development_sessions = N * 70 // 100` (floor) of the Discovery
+   sessions and the remainder goes to the trailing side; the two segments are
+   contiguous, disjoint and exhaustive. The descriptor records the boundary
+   rule, both segments' real dates, session counts and content hashes, the
+   sealed full Discovery partition hash and a canonical `split_hash`. The
+   sealed 60/20/20 `discovery`/`validation`/`final_holdout` layout is
+   unchanged; the split never crosses into the sealed protected partitions.
+2. **The Campaign copy holds development data only.** With `campaign create
+   --discovery-split 70/30` the research project stores just the development
+   slice and computes the baseline, scoring start and every experiment over it,
+   so Discovery reads approved development data by construction. The trailing
+   segment stays in the sealed snapshot.
+3. **No protected read and no query debit.** The trailing segment is part of
+   the sealed Discovery payload and is read through `snapshot.read_discovery`
+   exactly like the v1 evidence; formal trailing Validation is Discovery
+   evidence, not #37 protected Validation, not a protected allowance and not a
+   Final Holdout step. Its receipts record `opened_protected_source: false`
+   and `query_debited: false`.
+   - **One counted read per version, reserved before the read.** A v2 round
+     freezes an automatic Validation limit. The first trailing read of a
+     distinct locked version reserves one immutable
+     `research_loop_validation_uses` row inside the round lock and the same
+     SQLite write transaction, before any attempt row, trusted write or sealed
+     read; the reservation and the receipt carry it (`usage`). A resume, replay,
+     receipt view or revalidation of the same version never consumes again, and
+     an interrupted, failed or insufficient read keeps its row. Exhausting the
+     limit refuses the next read before it happens, with no attempt and no
+     trusted record.
+   - **Known gaps are free.** Only sealed manifest metadata is read before the
+     reservation: a declared gap inside the trailing segment, or a frozen
+     research interval that does not match the sealed Discovery descriptor,
+     blocks with `VALIDATION_DATA_GAP` and `counted: false`. History shortfalls
+     and gaps discovered by the run are evidence verdicts and count.
+   - **Post-read mismatches keep the use.** A payload whose data kind, frozen
+     partition hash, prior history, as-of projection or recomputed split fails
+     verification is refused with `VALIDATION_PARTITION_MISMATCH` after the
+     reservation, so the counted read stays auditable.
+   - **Revalidation keeps the version's single use.** A corrected successor
+     must preserve the frozen development slice hash, data kind/schema, prior
+     history, interval/session dates and as-of; the trailing segment is then
+     recomputed and a new formal epoch records the prior receipt, the
+     original/recomputed validation records and the trailing affected diff. A
+     changed development slice is `EVIDENCE_DEVELOPMENT_MISMATCH`.
+   - **The automatic limit pauses; a human admits one version.** Once every
+     automatic slot is used, the next automatic trailing read is refused before
+     any read, attempt or trusted write (`VALIDATION_ALLOWANCE_EXHAUSTED`); the
+     round lifecycle becomes `awaiting_validation_admission` while the ordinary
+     `status` stays `open`, and Discovery continues — new experiments and
+     locked versions are still accepted. The researcher may instead select an
+     already approved passing version or close with no candidate; closing stays
+     allowed at the limit or early with Campaign budget remaining, and a new v2
+     closure records the allowance and, when a version is selected, its receipt
+     (`validation_id`/`receipt_hash`/`validation_kind`/`protocol`).
+   - **A manual admission is one version, one read, and granting is not a
+     read.** `round admit` records one write-once, content-addressed manual
+     Validation admission (reviewer, reason, comparison, selection impact)
+     bound to one locked version, in the trusted store plus a project
+     projection; identical content replays, a different admission for that
+     version is a conflict, and a version whose read is already counted or
+     completed cannot be admitted. An admission is allowed only once the
+     round's automatic allowance is exhausted: while `automatic_used <
+     auto_limit` the command refuses with `VALIDATION_ALLOWANCE_REMAINING`
+     so an operator cannot bypass the limit and the paused
+     `awaiting_validation_admission` lifecycle keeps its meaning; the
+     researcher must let the automatic slots be used first. Granting writes
+     no use row and changes no counter. The admitted version's next v2
+     `validate` consumes it atomically as one `manual` use row carrying the
+     `admission_id`; a different version
+     can never consume it, and replay, resume or an interruption never consumes
+     it twice. The receipt `usage` and `round status` distinguish automatic
+     from manual reads; `lifecycle` is `converged` only when the round is
+     closed.
+4. **Old records keep their protocols; new research uses protocol v2.** New
+   research Campaigns must be created with `--discovery-split 70/30`: the flag
+   is opt-in only so protocol-v1 Campaigns, rounds, versions, receipts and
+   closures remain readable for historical compatibility, not because v1 is
+   the current research protocol. A new Campaign's evaluation and create output
+   record `research_protocol` (`trailing-70-30` or `discovery-replay`); a
+   Campaign stored before #50 lacks the field, so readers use `.get` and
+   default to `discovery-replay`. A round without a frozen split stays
+   protocol v1 (`discovery-replay`): its kickoff shape, protocol hash, locked
+   version, receipt and closure body are unchanged, and it refuses a
+   `validation_policy`. A v2 round records
+   `trailing-70-30`/`trailing_validation`, the frozen split and the round's
+   automatic Validation limit; its protocol hash folds the protocol and split,
+   so its versions trace to the partition protocol they were locked under. A
+   v2 round never falls back to the v1 Discovery replay. Issue #43 and issue
+   #17 records are read under their original recorded protocol and are not
+   re-judged or migrated. A closure stored before #50 keeps its exact legacy
+   body and replays by its stored `closure_id`, and a new protocol-v1 closure
+   keeps that same legacy body; only a **new v2 closure** records the
+   allowance and, when a version is selected, its receipt.
+5. **The formal receipt keeps its own protocol.** A v2 receipt records
+   `validation_kind: "trailing_validation"`, the frozen protocol/split, the
+   development/trailing/scoring/warmup/provenance records, the counted `usage`
+   and the verdict summary. The additive fields are published only when
+   present, so a v1 `discovery_replay` receipt keeps its exact #43 shape and is
+   still read under its original protocol; `replay` remains a v1-only check.
+6. **The receipt summary is a deliberate agent grant.** A v2 `round status`
+   publishes the formal receipt's `summary` (candidate and benchmark return,
+   drawdown, fees, slippage, turnover, fills, orders and ending equity, the
+   delta and the verdict reason) plus the frozen protocol/development/trailing/
+   scoring/warmup/provenance/usage blocks. This is intended: the agent must be
+   able to propose a testable revision. The grant does not include the
+   trusted-only per-session `curves`, any ledger row or price, the
+   `query_debited`/`opened_protected_source` internals, sealed payloads or
+   protected records, and it does not weaken the human boundary: a per-version
+   review decision's reviewer/reason and a manual admission's reviewer/reason
+   stay operator-only, as do the protected flows. Legacy v1 summaries keep their
+   original shape.
+7. **A detail query is a controlled projection, not a read.** `round detail`
+   (agent + operator, project database only, no `--store`) records a non-empty
+   question and a fixed allowlist of records over the version's **published**
+   project receipt, under a content-addressed `detail_access_id`; identical
+   requests replay the stored resolution. Unknown or unavailable records are
+   typed rejections, and a version without a terminal receipt has nothing to
+   project. It never projects `curves` (trusted-only per-session evidence),
+   never re-reads a sealed payload or ledger, never consumes a Validation use or
+   an admission, and never changes the allowance. Feedback is the recorded
+   impact linked to that receipt (and optionally one detail access and the next
+   known Campaign experiment); it is content-addressed, replayable and not a
+   read. A later submission may cite a prior version (`revision_of`) and prior
+   feedback (`feedback_ids`) as validated provenance in its body; these links
+   are deliberately outside `version_id`, because a revision is the same
+   experiment content whether or not its provenance is cited.
+8. **Reused evidence is disclosed across rounds.** A v2 round open records one
+   `reuse_disclosure` for every earlier round in the same project whose Campaign
+   used the same sealed `snapshot_id` (`match: "same_snapshot"`) or froze the
+   same development content hash (`match: "same_development"`), so re-splitting
+   a corrected successor that preserves the approved development prehistory is
+   still disclosed; each round is listed once with the snapshot match taking
+   precedence. Each entry records the earlier round's protocol, the interval its
+   published receipt actually used (a formal `trailing` segment or the legacy
+   replay's scoring interval), its intersection with the new trailing segment,
+   the prior round's counted Validation use history (`automatic_used`/
+   `manual_used`/`total_used` and the `uses` rows with version, validation ID,
+   kind, admission ID and sequence; empty/zero for a v1 round), and the feedback
+   recorded on those versions. The disclosure is derived once from the
+   project's own published receipts, Validation-use rows and feedback rows,
+   stored outside `kickoff_hash` in the trusted round record and its project
+   copy, and returned unchanged on replay, including when the trusted record
+   exists but its project projection crashed. Protocol-v1 rounds get no
+   disclosure; old receipts keep being read under their original protocol
+   rather than re-judged.
+9. **The selection basis is traceable from the public CLI.** A synthetic
+   mechanism test follows snapshot → round → version → experiment → locked
+   protocol → actual development and scoring dates → warmup source →
+   usage/allowance (including a manual admission read) → feedback → review state
+   → tracking using only `round status` and one `round detail` with
+   `records: ["provenance"]`, without re-reading sealed data. This proves the
+   mechanism #35 needs; the real receipt linking those facts and real forward
+   acceptance remain #35's gate and are not claimed here.
+10. **Synthetic stays labelled.** The split, formal-Validation, summary/detail/
+    feedback, reuse-disclosure and traceability tests are mechanism tests on
+    synthetic sealed snapshots; they do not establish real forward evidence and
+    do not change the #17 acceptance verdict.
+
 ## Original decision (issue #17)
 
 1. **Synthetic only.** Every sealed snapshot, evaluation, release, forward

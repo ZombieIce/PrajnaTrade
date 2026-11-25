@@ -754,6 +754,206 @@ def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | N
     }
 
 
+SPLIT_SCHEMA_VERSION = 1
+SPLIT_RULE = "leading-development-share"
+SPLIT_BOUNDARY_RULE = "floor(development_sessions = sessions * 70 / 100)"
+SPLIT_DEVELOPMENT_SHARE = 70
+SPLIT_VALIDATION_SHARE = 100 - SPLIT_DEVELOPMENT_SHARE
+_SPLIT_FIELDS = frozenset(
+    {
+        "schema_version", "rule", "ratio", "boundary", "as_of", "partition",
+        "development", "trailing", "split_hash",
+    }
+)
+_SPLIT_SEGMENT_FIELDS = frozenset({"start", "end", "sessions", "content_hash"})
+
+
+def _split_content(content: object) -> dict[str, list[dict]]:
+    """Validate a sealed ``{kind: rows}`` payload and return its four kind arrays."""
+    if not isinstance(content, dict) or set(content) != set(KINDS):
+        raise ValueError(
+            "Discovery content must contain calendar, raw_bars, corporate_actions "
+            "and derived."
+        )
+    for kind in KINDS:
+        rows = content[kind]
+        if not isinstance(rows, list):
+            raise ValueError(f"Discovery content {kind} must be an array.")
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError(f"Discovery content {kind} rows must be objects.")
+    return {kind: content[kind] for kind in KINDS}
+
+
+def _split_sessions(content: dict[str, list[dict]]) -> list[str]:
+    sessions = sorted({_date(row.get("date")) for row in content["calendar"]})
+    if not sessions:
+        raise ValueError("Discovery content has no trading session.")
+    return sessions
+
+
+def _split_segment(descriptor: object, label: str) -> dict:
+    if not isinstance(descriptor, dict) or set(descriptor) != _SPLIT_SEGMENT_FIELDS:
+        raise ValueError(f"The frozen Discovery split {label} descriptor is incomplete.")
+    _date(descriptor["start"])
+    _date(descriptor["end"])
+    if descriptor["start"] > descriptor["end"]:
+        raise ValueError(f"The frozen Discovery split {label} range is reversed.")
+    if type(descriptor["sessions"]) is not int or descriptor["sessions"] < 1:
+        raise ValueError(f"The frozen Discovery split {label} session count is invalid.")
+    if not isinstance(descriptor["content_hash"], str) or not HEX_SHA256.fullmatch(
+        descriptor["content_hash"]
+    ):
+        raise ValueError(f"The frozen Discovery split {label} content hash is invalid.")
+    return {
+        "start": descriptor["start"],
+        "end": descriptor["end"],
+        "sessions": descriptor["sessions"],
+        "content_hash": descriptor["content_hash"],
+    }
+
+
+def slice_content(content: object, start: str, end: str) -> dict[str, list[dict]]:
+    """Copy one date range of a sealed Discovery content payload.
+
+    The payload is the ``{"calendar", "raw_bars", "corporate_actions",
+    "derived"}`` object returned by :func:`read_discovery`; rows keep their
+    sealed canonical order and the four kind arrays are always present.  This is
+    the one place the slice rows are derived, so the frozen split, the
+    development-only Campaign copy and the formal trailing run cannot drift.
+    """
+    rows = _split_content(content)
+    start, end = _date(start), _date(end)
+    if start > end:
+        raise ValueError("A partition slice starts after it ends.")
+    return {
+        kind: [row for row in rows[kind] if start <= _date(row.get("date")) <= end]
+        for kind in KINDS
+    }
+
+
+def partition_slice(content: object, start: str, end: str) -> dict:
+    """Fingerprint one date range of a sealed Discovery content payload.
+
+    The payload is the ``{"calendar", "raw_bars", "corporate_actions",
+    "derived"}`` object returned by :func:`read_discovery`; rows keep their
+    sealed canonical order.  The returned ``content_hash`` is the seal's
+    per-partition convention: the canonical hash of ``{kind: rows}`` for the
+    rows whose date falls inside ``[start, end]``.  The returned ``start`` and
+    ``end`` are the first and last trading session actually covered, so a range
+    aligned to trading sessions reproduces the requested bounds exactly.
+    """
+    sliced = slice_content(content, start, end)
+    sessions = _split_sessions(sliced)
+    return {
+        "start": sessions[0],
+        "end": sessions[-1],
+        "sessions": len(sessions),
+        "content_hash": _hash(sliced),
+    }
+
+
+def discovery_split(
+    content: object, *, development: int = SPLIT_DEVELOPMENT_SHARE,
+    as_of: str | None = None,
+) -> dict:
+    """Freeze the 70/30 split of a Campaign's Discovery interval.
+
+    The split covers the sealed Discovery payload (or its ``as_of``
+    projection), never the sealed ``validation``/``final_holdout`` partitions.
+    ``development_sessions = N * 70 // 100`` (floor); the remainder stays on the
+    trailing side.  Both segments are non-empty and together they are
+    contiguous, disjoint and exhaustive.  Only the leading-development share is
+    implemented; other ratios are rejected.  ``partition.content_hash`` is the
+    hash of the payload the split was computed from (the sealed partition hash
+    for a direct read, the projection hash for an ``as_of`` read), matching
+    :func:`read_discovery`'s ``content_hash`` for that read.
+    """
+    if type(development) is not int or development != SPLIT_DEVELOPMENT_SHARE:
+        raise ValueError("Only the leading 70/30 Discovery split is implemented.")
+    rows = _split_content(content)
+    sessions = _split_sessions(rows)
+    total = len(sessions)
+    development_sessions = total * SPLIT_DEVELOPMENT_SHARE // 100
+    if development_sessions < 1 or total - development_sessions < 1:
+        raise ValueError("A Discovery split needs non-empty development and trailing segments.")
+    if as_of is not None:
+        _instant(as_of, "as_of")
+    body = {
+        "schema_version": SPLIT_SCHEMA_VERSION,
+        "rule": SPLIT_RULE,
+        "ratio": {
+            "development": SPLIT_DEVELOPMENT_SHARE,
+            "validation": SPLIT_VALIDATION_SHARE,
+        },
+        "boundary": SPLIT_BOUNDARY_RULE,
+        "as_of": as_of,
+        "partition": partition_slice(rows, sessions[0], sessions[-1]),
+        "development": partition_slice(
+            rows, sessions[0], sessions[development_sessions - 1]
+        ),
+        "trailing": partition_slice(rows, sessions[development_sessions], sessions[-1]),
+    }
+    return {**body, "split_hash": _hash(body)}
+
+
+def verify_discovery_split(descriptor: object, content: object | None = None) -> dict:
+    """Verify a frozen split descriptor's internal consistency.
+
+    Checks the fixed rule and ratio, the floor boundary, the segment ordering
+    and session arithmetic, the date bounds and every 64-hex fingerprint, and
+    recomputes ``split_hash`` over the descriptor body.  When ``content`` is
+    supplied (the same Discovery payload or ``as_of`` projection the split was
+    frozen from), the descriptor must also reproduce exactly from that payload,
+    including the real session dates and slice fingerprints.  Returns the
+    verified descriptor unchanged.
+    """
+    if not isinstance(descriptor, dict) or set(descriptor) != _SPLIT_FIELDS:
+        raise ValueError("The frozen Discovery split descriptor is incomplete.")
+    if type(descriptor["schema_version"]) is not int or descriptor["schema_version"] != 1:
+        raise ValueError("Unsupported frozen Discovery split schema version.")
+    if descriptor["rule"] != SPLIT_RULE or descriptor["boundary"] != SPLIT_BOUNDARY_RULE:
+        raise ValueError("The frozen Discovery split rule is not the supported 70/30 floor rule.")
+    ratio = descriptor["ratio"]
+    if not isinstance(ratio, dict) or set(ratio) != {"development", "validation"} or any(
+        type(value) is not int for value in ratio.values()
+    ) or ratio != {
+        "development": SPLIT_DEVELOPMENT_SHARE,
+        "validation": SPLIT_VALIDATION_SHARE,
+    }:
+        raise ValueError("The frozen Discovery split ratio is not the supported 70/30 ratio.")
+    partition = _split_segment(descriptor["partition"], "partition")
+    development = _split_segment(descriptor["development"], "development")
+    trailing = _split_segment(descriptor["trailing"], "trailing")
+    if partition["sessions"] < 2:
+        raise ValueError("The frozen Discovery split needs at least two sessions.")
+    if development["sessions"] != partition["sessions"] * SPLIT_DEVELOPMENT_SHARE // 100:
+        raise ValueError("The frozen Discovery split boundary is not the floor 70% rule.")
+    if trailing["sessions"] != partition["sessions"] - development["sessions"]:
+        raise ValueError("The frozen Discovery split does not partition every session.")
+    if development["start"] != partition["start"] or trailing["end"] != partition["end"]:
+        raise ValueError("The frozen Discovery split does not cover the whole interval.")
+    if development["end"] >= trailing["start"]:
+        raise ValueError("The frozen Discovery split segments are not contiguous.")
+    if not isinstance(descriptor["split_hash"], str) or not HEX_SHA256.fullmatch(
+        descriptor["split_hash"]
+    ):
+        raise ValueError("The frozen Discovery split hash is invalid.")
+    if descriptor["as_of"] is not None:
+        _instant(descriptor["as_of"], "as_of")
+    body = {key: value for key, value in descriptor.items() if key != "split_hash"}
+    if descriptor["split_hash"] != _hash(body):
+        raise ValueError("The frozen Discovery split hash does not cover its body.")
+    if content is not None:
+        recomputed = discovery_split(
+            content,
+            development=ratio["development"],
+            as_of=descriptor["as_of"],
+        )
+        if recomputed != descriptor:
+            raise ValueError("The frozen Discovery split does not reproduce from the payload.")
+    return descriptor
+
+
 def _discovery_prior_history(
     store: Path, snapshot_id: str, metadata: dict, cutoff: datetime | None,
 ) -> dict | None:

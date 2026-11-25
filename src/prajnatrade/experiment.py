@@ -21,7 +21,14 @@ from prajnatrade.container_executor import (
     ContainerStrategyExecutor,
     executor_from_config,
 )
-from prajnatrade.snapshot import read_discovery
+from prajnatrade.snapshot import (
+    discovery_split as snapshot_discovery_split,
+)
+from prajnatrade.snapshot import (
+    partition_slice,
+    read_discovery,
+    slice_content,
+)
 from prajnatrade.snapshot_baseline import (
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
@@ -183,10 +190,17 @@ def _campaign_evaluation(
     strategy_executor: dict[str, Any],
     execution_rules: dict[str, Any],
     history_policy: Mapping[str, Any] | None = None,
+    discovery_split: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
     return {
         "engine": "sealed-discovery-v1",
+        # The opt-in 70/30 protocol is the one new research Campaigns must use;
+        # the field is additive so readers of legacy stored Campaigns use
+        # ``.get("research_protocol", "discovery-replay")``.
+        "research_protocol": (
+            "trailing-70-30" if discovery_split is not None else "discovery-replay"
+        ),
         "snapshot_id": snapshot_id,
         "partition_content_hash": partition_content_hash,
         "as_of": as_of,
@@ -199,6 +213,7 @@ def _campaign_evaluation(
         "runtime_dependencies": runtime_dependencies,
         "runtime": _fingerprint(runtime_dependencies),
         **({"history_policy": dict(history_policy)} if history_policy is not None else {}),
+        **({"discovery_split": dict(discovery_split)} if discovery_split is not None else {}),
     }
 
 
@@ -272,6 +287,7 @@ def campaign_create(
     strategy_image: str | None = None,
     executor: ContainerStrategyExecutor | None = None,
     discovery_warmup_sessions: int | None = None,
+    discovery_split: str | None = None,
 ) -> dict[str, object]:
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
@@ -280,12 +296,32 @@ def campaign_create(
     executor_config = _resolve_executor_config(
         strategy_executor, strategy_image, executor,
     )
+    split_ratio = (
+        _discovery_split_ratio(discovery_split) if discovery_split is not None else None
+    )
+    # Read the sealed Discovery payload exactly once; an opt-in split then
+    # restricts the Campaign copy and every later Discovery read to its
+    # development slice.
     receipt = read_discovery(store, snapshot_id, "discovery", as_of)
     data = receipt["data"]
     data_kind = receipt["data_kind"]
+    split_descriptor = (
+        snapshot_discovery_split(
+            data, development=split_ratio[0], as_of=receipt.get("as_of")
+        )
+        if split_ratio is not None else None
+    )
+    if split_descriptor is not None:
+        development = split_descriptor["development"]
+        data = slice_content(data, development["start"], development["end"])
+        sliced = partition_slice(data, development["start"], development["end"])
+        if sliced != development:
+            raise ValueError("The development Discovery slice does not reproduce.")
+        snapshot_hash = development["content_hash"]
+    else:
+        snapshot_hash = receipt["content_hash"]
     content = _discovery_json(data)
-    snapshot_hash = receipt["content_hash"]
-    partition_hash = receipt.get("partition_content_hash", snapshot_hash)
+    partition_hash = receipt.get("partition_content_hash", receipt["content_hash"])
     history_policy = None
     prior_history = None
     baseline_options: dict[str, Any] = {}
@@ -304,6 +340,7 @@ def campaign_create(
         strategy_executor=executor_config,
         execution_rules=execution_policy,
         history_policy=history_policy,
+        discovery_split=split_descriptor,
     )
     baseline = run_discovery_equal_weight(
         data,
@@ -349,6 +386,7 @@ def campaign_create(
         "campaign_id": campaign_id,
         "snapshot_id": snapshot_id,
         "data_kind": data_kind,
+        "research_protocol": evaluation["research_protocol"],
         "fingerprints": {
             "snapshot": snapshot_hash,
             "partition": partition_hash,
@@ -358,6 +396,7 @@ def campaign_create(
         "execution_rules": execution_policy,
         "strategy_executor": executor_config,
         **({"history_policy": history_policy} if history_policy is not None else {}),
+        **({"discovery_split": split_descriptor} if split_descriptor is not None else {}),
     }
 
 
@@ -365,6 +404,32 @@ def _discovery_json(value: object) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
     ).encode("utf-8")
+
+
+def _discovery_split_ratio(raw: object) -> tuple[int, int]:
+    """Parse the opt-in ``--discovery-split development/validation`` pair.
+
+    Both parts must be positive integers summing to 100.  Only the
+    leading-development share is implemented, so anything but ``70/30`` is a
+    clear ``ValueError`` rather than a silently different split.
+    """
+    if not isinstance(raw, str) or raw.count("/") != 1:
+        raise ValueError(
+            "--discovery-split must be a development/validation ratio such as 70/30."
+        )
+    development_text, validation_text = raw.split("/")
+    if not (development_text.isdigit() and validation_text.isdigit()):
+        raise ValueError(
+            "--discovery-split parts must be positive integers summing to 100."
+        )
+    development, validation = int(development_text), int(validation_text)
+    if development <= 0 or validation <= 0 or development + validation != 100:
+        raise ValueError(
+            "--discovery-split parts must be positive integers summing to 100."
+        )
+    if development != 70:
+        raise ValueError("Only the leading 70/30 Discovery split is implemented.")
+    return development, validation
 
 
 def _discovery_history_policy(

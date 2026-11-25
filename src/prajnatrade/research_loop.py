@@ -2,10 +2,25 @@
 
 This module is the manual simulated-tracking admission path.  It is deliberately
 separate from the protected ``evaluation``/``holdout`` flow and from conditional
-``release``: lightweight Validation replays the locked Discovery version over the
-Campaign's frozen Discovery interval using the same sealed snapshot, point-in-time
-cutoffs, execution rules, costs and initial cash.  It never opens a protected
-partition, never authorizes a stage and never writes a query debit.
+``release``: protocol-v1 lightweight Validation replays the locked Discovery
+version over the Campaign's frozen Discovery interval using the same sealed
+snapshot, point-in-time cutoffs, execution rules, costs and initial cash, while
+protocol-v2 formal trailing Validation scores only the frozen trailing segment
+with the development segment as prehistory.  Both protocols read only the sealed
+Discovery payload; neither opens a protected partition, authorizes a stage or
+writes a query debit.
+
+A protocol-v2 round (a Campaign created with ``--discovery-split``) counts one
+trailing read per distinct locked version.  ``round validate`` reserves that use
+atomically before any attempt or sealed read, blocks a declared trailing gap
+from sealed manifest metadata with zero count, reads the payload once at the
+frozen ``as_of``, verifies the data kind, partition/prior-history hashes and the
+recomputed development/trailing slices, then scores the candidate and the
+benchmark from the trailing first session.  ``round revalidate`` keeps the same
+version/use and recomputes the trailing segment on a corrected successor that
+preserves the frozen development slice, recording the original and recomputed
+epochs and the affected diff.  Protocol-v1 rounds keep the #43 replay, receipt
+shape and identity exactly.
 
 Contract resolutions that the shared design contract leaves implicit:
 
@@ -92,10 +107,21 @@ METRIC_TOLERANCE = 1e-9
 SCORING_MODES = ("valid_observations", "consecutive_sessions")
 DATA_AVAILABILITY = "next_open"
 BENCHMARK = "equal_weight_buy_and_hold"
+VALIDATION_PROTOCOL_LEGACY = {
+    "schema_version": 1,
+    "name": "discovery-replay",
+    "validation_kind": "discovery_replay",
+}
+VALIDATION_PROTOCOL_TRAILING = {
+    "schema_version": 1,
+    "name": "trailing-70-30",
+    "validation_kind": "trailing_validation",
+}
 ROUND_NAME = "research-loop-rounds"
 VALIDATION_NAME = "research-loop-validations"
 REVIEW_NAME = "research-loop-reviews"
 REVALIDATION_NAME = "research-loop-revalidations"
+ADMISSION_NAME = "research-loop-admissions"
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
 VALIDATION_TERMINAL_FAILPOINT = "round_validation_after_terminal_receipt"
 EVIDENCE_DECIDE_FAILPOINT = "round_evidence_after_apply"
@@ -132,10 +158,21 @@ _RECEIPT_FIELDS = (
     "reason", "metrics", "checks", "observation", "replay", "receipt_hash",
     "opened_protected_source", "query_debited",
 )
+# Additive fields are published only when the receipt actually carries them, so
+# every legacy (#43) receipt keeps its exact shape.  ``replay`` is absent from a
+# formal trailing receipt by design and is therefore only published when present.
 _OPTIONAL_RECEIPT_FIELDS = (
     "evidence", "original_discovery", "recomputed_discovery", "affected",
-    "prior_validation_id",
+    "prior_validation_id", "validation_kind", "protocol", "development", "trailing",
+    "scoring", "warmup", "provenance", "usage", "summary", "runs",
+    "original_validation", "recomputed_validation",
 )
+VALIDATION_KIND_TRAILING = "trailing_validation"
+_VALIDATION_USE_FIELDS = (
+    "use_id", "round_id", "version_id", "sequence", "kind", "admission_id",
+    "validation_id", "consumed_at",
+)
+_GAP_KINDS = ("raw_bars", "derived", "corporate_actions", "availability")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS research_loop_rounds (
@@ -186,6 +223,39 @@ CREATE TABLE IF NOT EXISTS research_loop_evidence_decisions (
     decision_id TEXT PRIMARY KEY,
     version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
     decision_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_loop_validation_uses (
+    use_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL REFERENCES research_loop_rounds(round_id),
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    sequence INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('automatic', 'manual')),
+    admission_id TEXT,
+    validation_id TEXT NOT NULL,
+    consumed_at TEXT NOT NULL,
+    UNIQUE (round_id, version_id),
+    UNIQUE (round_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS research_loop_admissions (
+    admission_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL REFERENCES research_loop_rounds(round_id),
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    admission_json TEXT NOT NULL,
+    UNIQUE (round_id, version_id)
+);
+CREATE TABLE IF NOT EXISTS research_loop_details (
+    detail_access_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL REFERENCES research_loop_rounds(round_id),
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    validation_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    resolution_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS research_loop_feedback (
+    feedback_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL REFERENCES research_loop_rounds(round_id),
+    version_id TEXT NOT NULL REFERENCES research_loop_submissions(version_id),
+    feedback_json TEXT NOT NULL
 );
 """
 
@@ -272,6 +342,16 @@ def _require_hex(value: object, label: str) -> str:
     ):
         raise ValueError(f"Invalid {label} ID.")
     return value
+
+
+def _rejected(
+    code: str, phase: str, next_action: str, message: str, **context: object,
+) -> ProtocolError:
+    """Build a typed rejection with the machine-readable context the CLI echoes."""
+    error = ProtocolError(code, phase, next_action, message)
+    if context:
+        error.context = context
+    return error
 
 
 @contextmanager
@@ -372,11 +452,12 @@ def _round_contract(source: object) -> dict[str, Any]:
             "disclosed_risks", "scoring_policy", "observation", "invalidation", "reviewer",
             "approval_reason",
         },
+        frozenset({"validation_policy"}),
     )
     comparison = _object(payload["comparison"], {"benchmark", "statement"})
     if comparison["benchmark"] != BENCHMARK:
         raise ValueError(f"comparison.benchmark must be {BENCHMARK}.")
-    return {
+    contract = {
         "objective": _text(payload["objective"], "objective"),
         "constraints": _texts(payload["constraints"], "constraints"),
         "comparison": {
@@ -392,6 +473,26 @@ def _round_contract(source: object) -> dict[str, Any]:
         "reviewer": _text(payload["reviewer"], "reviewer"),
         "approval_reason": _text(payload["approval_reason"], "approval_reason"),
     }
+    if "validation_policy" in payload:
+        contract["validation_policy"] = payload["validation_policy"]
+    return contract
+
+
+def _validation_policy(raw: object) -> dict[str, int]:
+    """Normalize the v2 round's automatic Validation allowance."""
+    if not isinstance(raw, dict) or set(raw) != {"auto_validation_limit"}:
+        raise ProtocolError(
+            "VALIDATION_POLICY_REQUIRED", "round", "correct",
+            "A round on a Campaign with a frozen Discovery split requires "
+            "validation_policy.auto_validation_limit.",
+        )
+    limit = raw["auto_validation_limit"]
+    if type(limit) is not int or limit <= 0:
+        raise ProtocolError(
+            "VALIDATION_POLICY_REQUIRED", "round", "correct",
+            "validation_policy.auto_validation_limit must be a positive integer.",
+        )
+    return {"auto_validation_limit": limit}
 
 
 def _frozen_scoring_policy(policy: object) -> dict[str, Any]:
@@ -425,8 +526,12 @@ def _round_path(store: Path, round_id: str) -> Path:
 
 
 def _verify_round(record: dict[str, Any], round_id: str) -> None:
+    # ``opened_at`` and the derived cross-round ``reuse_disclosure`` are stored
+    # alongside the approved kickoff but are deliberately outside its hash.
     body = {
-        key: value for key, value in record.items() if key not in {"kickoff_hash", "opened_at"}
+        key: value
+        for key, value in record.items()
+        if key not in {"kickoff_hash", "opened_at", "reuse_disclosure"}
     }
     if record.get("round_id") != round_id or record.get("kickoff_hash") != _hash(body):
         raise ValueError("Research round fingerprint mismatch.")
@@ -487,6 +592,20 @@ def prepare_round(
     campaign = campaign_discovery(project, campaign_id)
     evaluation = campaign["evaluation"]
     frozen = _frozen_scoring_policy(evaluation.get("history_policy"))
+    split = evaluation.get("discovery_split")
+    if split is None:
+        if "validation_policy" in contract:
+            raise ProtocolError(
+                "DISCOVERY_SPLIT_NOT_FROZEN", "round", "correct",
+                "validation_policy requires a Campaign created with "
+                "--discovery-split.",
+            )
+    else:
+        split = snapshot.verify_discovery_split(split)
+        if split["development"]["content_hash"] != campaign["snapshot_hash"]:
+            raise ValueError(
+                "The Campaign's Discovery development binding changed."
+            )
     if store.resolve().is_relative_to(project.resolve()):
         raise ValueError("Trusted evaluation store must be outside the research project.")
     direction = direction_id(direction_key)
@@ -518,6 +637,12 @@ def prepare_round(
             "max_seconds": campaign["discovery_budget"]["max_seconds"],
         },
     }
+    if split is not None:
+        kickoff["protocol"] = dict(VALIDATION_PROTOCOL_TRAILING)
+        kickoff["research_partition"] = split
+        kickoff["validation_policy"] = _validation_policy(
+            contract.pop("validation_policy", None)
+        )
     body = {
         "schema_version": SCHEMA_VERSION,
         "round_id": round_id,
@@ -534,7 +659,7 @@ def prepare_round(
 
 
 def _opened(record: dict[str, Any], *, reused: bool) -> dict[str, Any]:
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "status": "opened",
         "reused": reused,
@@ -547,6 +672,9 @@ def _opened(record: dict[str, Any], *, reused: bool) -> dict[str, Any]:
         "kickoff": record["kickoff"],
         "kickoff_hash": record["kickoff_hash"],
     }
+    if "reuse_disclosure" in record:
+        result["reuse_disclosure"] = record["reuse_disclosure"]
+    return result
 
 
 def _require_campaign_binding(record: dict[str, Any], campaign: Mapping[str, Any]) -> None:
@@ -568,9 +696,153 @@ def _require_campaign_binding(record: dict[str, Any], campaign: Mapping[str, Any
             record["kickoff"]["scoring_policy"]["frozen"], evaluation.get("history_policy"),
         ),
     }
+    split = record["kickoff"].get("research_partition")
+    if split is not None:
+        frozen_split = evaluation.get("discovery_split")
+        if not isinstance(frozen_split, Mapping):
+            raise ValueError(
+                "The Campaign Discovery split changed after the research round opened."
+            )
+        bindings["Discovery split"] = (split["split_hash"], frozen_split.get("split_hash"))
+        bindings["Discovery development content"] = (
+            split["development"]["content_hash"], campaign["snapshot_hash"],
+        )
     for label, (expected, actual) in bindings.items():
         if expected != actual:
             raise ValueError(f"The Campaign {label} changed after the research round opened.")
+
+
+def _receipt_used_interval(receipt: Mapping[str, Any]) -> dict[str, str] | None:
+    """The interval a published Validation receipt actually used.
+
+    A formal trailing receipt records its ``trailing`` segment.  A legacy
+    receipt records the replayed Discovery scoring interval in ``replay`` (its
+    ``scoring`` block is additive for protocol v2).  Old receipts keep being
+    read under their original protocol.
+    """
+    trailing = receipt.get("trailing")
+    if isinstance(trailing, Mapping) and {"start", "end"} <= set(trailing):
+        return {"start": str(trailing["start"]), "end": str(trailing["end"])}
+    replay = receipt.get("replay")
+    if isinstance(replay, Mapping):
+        candidate = replay.get("candidate")
+        if isinstance(candidate, Mapping) and {
+            "start_date", "end_date"
+        } <= set(candidate):
+            return {
+                "start": str(candidate["start_date"]),
+                "end": str(candidate["end_date"]),
+            }
+    scoring = receipt.get("scoring")
+    if isinstance(scoring, Mapping) and {"start", "end"} <= set(scoring):
+        return {"start": str(scoring["start"]), "end": str(scoring["end"])}
+    return None
+
+
+def _reuse_disclosure(
+    connection: sqlite3.Connection, prepared: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Disclose the intervals, reads and feedback a previous round used.
+
+    Derived once, at v2 ``round open``, from the project's own published
+    receipts, Validation-use rows and feedback rows: no sealed payload is read
+    and no protected record is touched.  A prior round is matched either on the
+    same sealed ``snapshot_id`` (``match: "same_snapshot"``) or on the same
+    frozen development content hash (``match: "same_development"``), so a
+    corrected successor snapshot that preserves the approved development
+    prehistory is still disclosed; a round is listed once with the stronger
+    snapshot match.  Each entry also carries the prior round's counted read
+    history.  The result is outside ``kickoff_hash`` and is written once with
+    the trusted round record, so a replay returns the stored disclosure instead
+    of a value that a later prior round could change.
+    """
+    kickoff = prepared["kickoff"]
+    snapshot_id = kickoff["frozen_campaign"]["snapshot_id"]
+    development_hash = kickoff["research_partition"]["development"]["content_hash"]
+    trailing = kickoff["research_partition"]["trailing"]
+    previous_rounds: list[dict[str, Any]] = []
+    disclosed_feedback: list[dict[str, Any]] = []
+    for row in connection.execute(
+        "SELECT r.round_id, r.campaign_id, r.kickoff_json, c.snapshot_id, "
+        "c.evaluation_json FROM research_loop_rounds r "
+        "JOIN campaigns c ON c.campaign_id = r.campaign_id ORDER BY r.rowid"
+    ):
+        evaluation = json.loads(row["evaluation_json"])
+        used_snapshot = row["snapshot_id"] or evaluation.get("snapshot_id")
+        prior_split = evaluation.get("discovery_split")
+        prior_development = None
+        if isinstance(prior_split, Mapping):
+            prior_development = prior_split.get("development")
+            prior_development = (
+                prior_development.get("content_hash")
+                if isinstance(prior_development, Mapping) else None
+            )
+        if used_snapshot == snapshot_id:
+            match = "same_snapshot"
+        elif prior_development == development_hash:
+            match = "same_development"
+        else:
+            continue
+        receipt_row = connection.execute(
+            "SELECT v.receipt_json FROM research_loop_validations v "
+            "JOIN research_loop_submissions s USING (version_id) "
+            "WHERE s.round_id = ? ORDER BY v.rowid LIMIT 1",
+            (row["round_id"],),
+        ).fetchone()
+        if receipt_row is None:
+            continue
+        used = _receipt_used_interval(json.loads(receipt_row["receipt_json"]))
+        if used is None:
+            continue
+        start = max(used["start"], trailing["start"])
+        end = min(used["end"], trailing["end"])
+        prior_kickoff = json.loads(row["kickoff_json"])["kickoff"]
+        protocol = prior_kickoff.get("protocol", VALIDATION_PROTOCOL_LEGACY)
+        uses = _validation_uses(connection, row["round_id"])
+        previous_rounds.append(
+            {
+                "round_id": row["round_id"],
+                "campaign_id": row["campaign_id"],
+                "protocol": protocol["name"],
+                "match": match,
+                "used": used,
+                "overlap": {"start": start, "end": end} if start <= end else None,
+                "automatic_used": sum(1 for item in uses if item["kind"] == "automatic"),
+                "manual_used": sum(1 for item in uses if item["kind"] == "manual"),
+                "total_used": len(uses),
+                "uses": [
+                    {
+                        "version_id": item["version_id"],
+                        "validation_id": item["validation_id"],
+                        "kind": item["kind"],
+                        "admission_id": item["admission_id"],
+                        "sequence": item["sequence"],
+                    }
+                    for item in uses
+                ],
+            }
+        )
+        for feedback_row in connection.execute(
+            "SELECT f.feedback_json FROM research_loop_feedback f "
+            "JOIN research_loop_submissions s ON s.version_id = f.version_id "
+            "WHERE s.round_id = ? ORDER BY f.rowid",
+            (row["round_id"],),
+        ):
+            body = json.loads(feedback_row["feedback_json"])
+            disclosed_feedback.append(
+                {
+                    "feedback_id": body["feedback_id"],
+                    "round_id": body["round_id"],
+                    "version_id": body["version_id"],
+                    "impact": body["impact"],
+                }
+            )
+    return {
+        "snapshot_id": snapshot_id,
+        "previous_rounds": previous_rounds,
+        "feedback": disclosed_feedback,
+        "overlapping": any(item["overlap"] is not None for item in previous_rounds),
+    }
 
 
 def open_round(
@@ -607,8 +879,26 @@ def open_round(
             if trusted_record != stored:
                 raise ValueError("The trusted research round copy differs from the project copy.")
             return _opened(trusted_record, reused=True)
-        stored = write_trusted_record_once(target, prepared)
-        if stored != prepared:
+        candidate = prepared
+        if "research_partition" in prepared["kickoff"]:
+            if target.is_file():
+                # Crash window: the trusted round was written before the
+                # project projection.  Reuse its once-computed disclosure (a
+                # prior round created meanwhile must not rewrite history).
+                trusted_record = _load_round_file(target, round_id)
+                if trusted_record["kickoff_hash"] != prepared["kickoff_hash"]:
+                    raise ProtocolError(
+                        "ROUND_ALREADY_OPENED", "round", "inspect",
+                        "The Campaign already has a different approved research round.",
+                    )
+                candidate = trusted_record
+            else:
+                candidate = {
+                    **prepared,
+                    "reuse_disclosure": _reuse_disclosure(connection, prepared),
+                }
+        stored = write_trusted_record_once(target, candidate)
+        if stored != candidate:
             raise ProtocolError(
                 "ROUND_ALREADY_OPENED", "round", "inspect",
                 "The Campaign already has a different approved research round.",
@@ -616,9 +906,9 @@ def open_round(
         connection.execute(
             "INSERT INTO research_loop_rounds (round_id, campaign_id, kickoff_json) "
             "VALUES (?, ?, ?)",
-            (round_id, prepared["campaign_id"], _json(prepared)),
+            (round_id, prepared["campaign_id"], _json(candidate)),
         )
-    return _opened(prepared, reused=False)
+    return _opened(candidate, reused=False)
 
 
 # ---------------------------------------------------------------------------
@@ -642,14 +932,22 @@ def _locked_strategy(attempt: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _protocol_hash(kickoff: Mapping[str, Any]) -> str:
-    return _hash(
-        {
-            "schema_version": SCHEMA_VERSION,
-            "comparison": kickoff["comparison"],
-            "hard_conditions": kickoff["hard_conditions"],
-            "selection_rules": kickoff["selection_rules"],
+    body: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "comparison": kickoff["comparison"],
+        "hard_conditions": kickoff["hard_conditions"],
+        "selection_rules": kickoff["selection_rules"],
+    }
+    # Protocol v1 hashes only the legacy contract fields.  Protocol v2 also
+    # binds the trailing-validation protocol block and the frozen split so a
+    # locked version traces to the partition protocol it was scored under.
+    if "protocol" in kickoff:
+        body["protocol"] = kickoff["protocol"]
+        split = kickoff["research_partition"]
+        body["research_partition"] = {
+            key: split[key] for key in ("split_hash", "development", "trailing")
         }
-    )
+    return _hash(body)
 
 
 def _scoring_policy_hash(kickoff: Mapping[str, Any]) -> str:
@@ -701,6 +999,9 @@ def _submitted(body: dict[str, Any], *, reused: bool, requested: str | None = No
         "strategy_fingerprint": body["strategy_fingerprint"],
         "locked": body["locked"],
     }
+    for field in ("revision_of", "feedback_ids"):
+        if field in body:
+            result[field] = body[field]
     if requested is not None and requested != body["submission_id"]:
         result["requested_submission_id"] = requested
     return result
@@ -716,7 +1017,7 @@ def submit(
             "experiment_id", "change", "question", "expected_change", "revisit_condition",
             "risks",
         },
-        frozenset({"related_experiment_ids"}),
+        frozenset({"related_experiment_ids", "revision_of", "feedback_ids"}),
     )
     experiment_id = _text(payload["experiment_id"], "experiment_id")
     change = _text(payload["change"], "change")
@@ -725,6 +1026,13 @@ def submit(
     revisit_condition = _text(payload["revisit_condition"], "revisit_condition")
     risks = _texts(payload["risks"], "risks")
     related = _texts(payload.get("related_experiment_ids", []), "related_experiment_ids")
+    revision_of = payload.get("revision_of")
+    if revision_of is not None:
+        revision_of = _require_hex(revision_of, "revision")
+    feedback_ids = payload.get("feedback_ids", [])
+    feedback_ids = sorted(set(_texts(feedback_ids, "feedback_ids")))
+    for feedback_id in feedback_ids:
+        _require_hex(feedback_id, "feedback")
     submission_id = _text(submission_id, "submission_id")
     with _round_lock(project, round_id), _project(project) as connection:
         record = _project_round(connection, round_id)
@@ -734,6 +1042,7 @@ def submit(
                 "A closed research round cannot accept a new version.",
             )
         campaign = campaign_discovery(project, record["campaign_id"])
+        _require_campaign_binding(record, campaign)
         attempts = campaign_experiment_history(project, record["campaign_id"])
         experiment = next(
             (item for item in attempts if item["experiment_id"] == experiment_id), None
@@ -769,6 +1078,40 @@ def submit(
             base_costs,
             protocol_hash,
         )
+        # Revision and feedback links are provenance, not identity: they are
+        # validated here but deliberately excluded from ``version_id``.
+        if revision_of is not None:
+            if revision_of == version_id:
+                raise _rejected(
+                    "REVISION_CONFLICT", "submission", "correct",
+                    "A version cannot revise itself.",
+                )
+            prior = connection.execute(
+                "SELECT 1 FROM research_loop_submissions "
+                "WHERE round_id = ? AND version_id = ?",
+                (round_id, revision_of),
+            ).fetchone()
+            if prior is None:
+                raise _rejected(
+                    "REVISION_NOT_FOUND", "submission", "correct",
+                    "revision_of must name a prior version locked in this round.",
+                )
+        for feedback_id in feedback_ids:
+            row = connection.execute(
+                "SELECT round_id, version_id FROM research_loop_feedback "
+                "WHERE feedback_id = ?",
+                (feedback_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["round_id"] != round_id
+                or row["version_id"] == version_id
+            ):
+                raise _rejected(
+                    "FEEDBACK_LINK_INVALID", "submission", "correct",
+                    "feedback_ids must link feedback from prior versions of this "
+                    "round, never another round or the version being locked.",
+                )
         body = {
             "schema_version": SCHEMA_VERSION,
             "round_id": round_id,
@@ -782,6 +1125,8 @@ def submit(
             "revisit_condition": revisit_condition,
             "risks": sorted(set(risks)),
             "related_experiment_ids": sorted(set(related)),
+            **({"revision_of": revision_of} if revision_of is not None else {}),
+            **({"feedback_ids": feedback_ids} if feedback_ids else {}),
             "strategy_fingerprint": strategy_fingerprint,
             "experiment_hash": experiment_hash,
             "locked": {
@@ -797,6 +1142,13 @@ def submit(
                 "strategy_executor": evaluation.get("strategy_executor", {"kind": "none"}),
                 "runtime": evaluation["runtime"],
                 "strategy": strategy,
+                **(
+                    {
+                        "protocol": record["kickoff"]["protocol"],
+                        "research_partition": record["kickoff"]["research_partition"],
+                    }
+                    if "protocol" in record["kickoff"] else {}
+                ),
             },
         }
         previous = connection.execute(
@@ -1299,6 +1651,104 @@ def _affected(
     }
 
 
+def _scoring_start_check(
+    candidate: Mapping[str, Any], benchmark: Mapping[str, Any], scoring_start: str,
+) -> dict[str, Any]:
+    readiness = candidate.get("history_readiness") or {}
+    first_scored_open = readiness.get("first_scored_open")
+    return {
+        "ok": (
+            candidate["start_date"] == scoring_start
+            and benchmark["start_date"] == scoring_start
+            and isinstance(first_scored_open, dict)
+            and first_scored_open.get("ready") is True
+            and readiness.get("first_ready_date") == scoring_start
+        ),
+        "expected": scoring_start,
+        "candidate": {
+            "start_date": candidate["start_date"],
+            "first_ready_date": readiness.get("first_ready_date"),
+            "first_scored_open": first_scored_open,
+        },
+        "benchmark": {"start_date": benchmark["start_date"]},
+    }
+
+
+def _coverage_check(
+    candidate: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    scoring_start: str,
+    expected: list[str],
+) -> dict[str, Any]:
+    expected_end = expected[-1] if expected else None
+
+    def covered(run: Mapping[str, Any]) -> bool:
+        return (
+            run["start_date"] == scoring_start
+            and run["end_date"] == expected_end
+            and run["metrics"]["sessions"] == len(expected)
+            and run["metrics"]["valued_sessions"] == len(expected)
+        )
+
+    def covered_summary(run: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "start_date": run["start_date"],
+            "end_date": run["end_date"],
+            "sessions": run["metrics"]["sessions"],
+            "valued_sessions": run["metrics"]["valued_sessions"],
+        }
+
+    return {
+        "ok": covered(candidate) and covered(benchmark),
+        "expected": {
+            "start": scoring_start,
+            "end": expected_end,
+            "sessions": len(expected),
+        },
+        "candidate": covered_summary(candidate),
+        "benchmark": covered_summary(benchmark),
+    }
+
+
+def _data_availability_check(
+    candidate: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    candidate_valuation = candidate["gaps"]["valuation"]
+    benchmark_valuation = benchmark["gaps"]["valuation"]
+    return {
+        "ok": not (
+            candidate["signal_gaps"]
+            or candidate_valuation
+            or benchmark["signal_gaps"]
+            or benchmark_valuation
+        ),
+        "snapshot": snapshot,
+        "candidate": {
+            "signal_gaps": _gap_summary(candidate["signal_gaps"]),
+            "valuation_gaps": _gap_summary(candidate_valuation),
+        },
+        "benchmark": {
+            "signal_gaps": _gap_summary(benchmark["signal_gaps"]),
+            "valuation_gaps": _gap_summary(benchmark_valuation),
+        },
+    }
+
+
+def _position_check(
+    candidate: Mapping[str, Any], benchmark: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ok": (
+            candidate["position_evidence"]["state"] in _POSITION_STATES
+            and benchmark["position_evidence"]["state"] in _POSITION_STATES
+        ),
+        "candidate": _position_summary(candidate),
+        "benchmark": _position_summary(benchmark),
+    }
+
+
 def _receipt(
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
@@ -1311,7 +1761,6 @@ def _receipt(
     kickoff = record["kickoff"]
     expected = replay["expected_sessions"]
     scoring_start = replay["scoring_start"]
-    expected_end = expected[-1] if expected else None
     evidence_run = recomputed if recomputed is not None else replay
     candidate = evidence_run["candidate"]
     benchmark = evidence_run["benchmark"]
@@ -1332,77 +1781,10 @@ def _receipt(
         replay, reference, reference_name=reference_name
     )
 
-    def covered(run: Mapping[str, Any]) -> bool:
-        return (
-            run["start_date"] == scoring_start
-            and run["end_date"] == expected_end
-            and run["metrics"]["sessions"] == len(expected)
-            and run["metrics"]["valued_sessions"] == len(expected)
-        )
-
-    def covered_summary(run: Mapping[str, Any]) -> dict[str, Any]:
-        return {
-            "start_date": run["start_date"],
-            "end_date": run["end_date"],
-            "sessions": run["metrics"]["sessions"],
-            "valued_sessions": run["metrics"]["valued_sessions"],
-        }
-
-    readiness = candidate.get("history_readiness") or {}
-    first_scored_open = readiness.get("first_scored_open")
-    scoring_start_check = {
-        "ok": (
-            candidate["start_date"] == scoring_start
-            and benchmark["start_date"] == scoring_start
-            and isinstance(first_scored_open, dict)
-            and first_scored_open.get("ready") is True
-            and readiness.get("first_ready_date") == scoring_start
-        ),
-        "expected": scoring_start,
-        "candidate": {
-            "start_date": candidate["start_date"],
-            "first_ready_date": readiness.get("first_ready_date"),
-            "first_scored_open": first_scored_open,
-        },
-        "benchmark": {"start_date": benchmark["start_date"]},
-    }
-    coverage = {
-        "ok": covered(candidate) and covered(benchmark),
-        "expected": {
-            "start": scoring_start,
-            "end": expected_end,
-            "sessions": len(expected),
-        },
-        "candidate": covered_summary(candidate),
-        "benchmark": covered_summary(benchmark),
-    }
-    candidate_valuation = candidate["gaps"]["valuation"]
-    benchmark_valuation = benchmark["gaps"]["valuation"]
-    data_availability = {
-        "ok": not (
-            candidate["signal_gaps"]
-            or candidate_valuation
-            or benchmark["signal_gaps"]
-            or benchmark_valuation
-        ),
-        "snapshot": replay["snapshot"],
-        "candidate": {
-            "signal_gaps": _gap_summary(candidate["signal_gaps"]),
-            "valuation_gaps": _gap_summary(candidate_valuation),
-        },
-        "benchmark": {
-            "signal_gaps": _gap_summary(benchmark["signal_gaps"]),
-            "valuation_gaps": _gap_summary(benchmark_valuation),
-        },
-    }
-    position = {
-        "ok": (
-            candidate["position_evidence"]["state"] in _POSITION_STATES
-            and benchmark["position_evidence"]["state"] in _POSITION_STATES
-        ),
-        "candidate": _position_summary(candidate),
-        "benchmark": _position_summary(benchmark),
-    }
+    scoring_start_check = _scoring_start_check(candidate, benchmark, scoring_start)
+    coverage = _coverage_check(candidate, benchmark, scoring_start, expected)
+    data_availability = _data_availability_check(candidate, benchmark, replay["snapshot"])
+    position = _position_check(candidate, benchmark)
     costs = {
         "ok": all(
             _within(run_metrics["fees_paid"], original_metrics["fees_paid"])
@@ -1490,6 +1872,538 @@ def _verdict(checks: Mapping[str, Any], comparison: Mapping[str, Any]) -> tuple[
 
 
 # ---------------------------------------------------------------------------
+# Formal trailing-segment Validation (protocol v2)
+# ---------------------------------------------------------------------------
+
+
+def _formal_split(record: Mapping[str, Any]) -> dict[str, Any]:
+    return record["kickoff"]["research_partition"]
+
+
+def _formal_manifest_gate(
+    snapshot_store: Path,
+    record: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    allowance: Mapping[str, Any] | None,
+) -> None:
+    """Block a known-bad trailing read from sealed manifest metadata only.
+
+    This runs before the counted reservation, so a blocked read has zero uses.
+    It never opens the Discovery payload and deliberately does not judge the
+    strategy's history sufficiency: a shortfall discovered by the run is an
+    ``insufficient_evidence`` verdict and keeps its counted use.
+    """
+    split = _formal_split(record)
+    evaluation = campaign["evaluation"]
+    metadata = snapshot.manifest(Path(snapshot_store), evaluation["snapshot_id"])
+    descriptor = snapshot.partition_descriptor(metadata, "discovery")
+    frozen, trailing = split["partition"], split["trailing"]
+    if split["as_of"] is None:
+        interval_ok = (
+            frozen["start"] == descriptor["start"]
+            and frozen["end"] == descriptor["end"]
+            and frozen["sessions"] == descriptor["sessions"]
+            and frozen["content_hash"] == descriptor["content_hash"]
+        )
+    else:
+        # An as-of projection may be a strict prefix of the sealed interval.
+        interval_ok = (
+            frozen["start"] >= descriptor["start"]
+            and frozen["end"] <= descriptor["end"]
+            and frozen["sessions"] <= descriptor["sessions"]
+        )
+    if not interval_ok:
+        raise _rejected(
+            "VALIDATION_DATA_GAP", "validation", "inspect",
+            "The frozen research interval does not match the sealed Discovery "
+            "partition; the trailing documents cannot be scored as frozen.",
+            counted=False,
+            allowance=dict(allowance) if allowance is not None else None,
+            frozen={"start": frozen["start"], "end": frozen["end"],
+                    "sessions": frozen["sessions"]},
+            manifest={"start": descriptor["start"], "end": descriptor["end"],
+                      "sessions": descriptor["sessions"]},
+            trailing=dict(trailing),
+        )
+    gaps = {
+        kind: [
+            entry for entry in metadata.get("gaps", {}).get(kind, [])
+            if isinstance(entry, Mapping)
+            and trailing["start"] <= str(entry.get("date")) <= trailing["end"]
+        ]
+        for kind in _GAP_KINDS
+    }
+    blocked = {kind: entries for kind, entries in gaps.items() if entries}
+    if blocked:
+        raise _rejected(
+            "VALIDATION_DATA_GAP", "validation", "inspect",
+            "The sealed manifest declares gaps inside the trailing segment; a "
+            "counted trailing read cannot be honest until they are corrected.",
+            counted=False,
+            allowance=dict(allowance) if allowance is not None else None,
+            gaps=blocked,
+            trailing=dict(trailing),
+        )
+
+
+def _formal_partition_mismatch(
+    receipt: Mapping[str, Any],
+    record: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    *,
+    require_trailing: bool,
+    frozen_read: bool = True,
+) -> str | None:
+    """Verify one sealed Discovery read against the frozen formal protocol.
+
+    A corrected successor keeps the frozen development slice and session dates
+    but legitimately changes the trailing rows and the full partition hash, so
+    the frozen-hash checks apply only to the formal Validation read itself.
+    """
+    split = _formal_split(record)
+    evaluation = campaign["evaluation"]
+    frozen = record["kickoff"]["scoring_policy"]["frozen"]
+    if receipt["data_kind"] != evaluation["data_kind"]:
+        return "The sealed Discovery payload data kind differs from the Campaign."
+    if frozen_read:
+        if receipt.get("partition_content_hash", receipt["content_hash"]) != (
+            evaluation["partition_content_hash"]
+        ):
+            return "The sealed Discovery partition hash differs from the Campaign."
+        if receipt["content_hash"] != split["partition"]["content_hash"]:
+            return "The sealed Discovery view differs from the frozen as-of projection."
+    if receipt.get("prior_history_hash") != frozen.get("prior_history_hash"):
+        return "The sealed Discovery prior history differs from the frozen evidence."
+    content = receipt["data"]
+    if require_trailing:
+        try:
+            snapshot.verify_discovery_split(split, content=content)
+        except ValueError as error:
+            return f"The frozen Discovery split does not reproduce: {error}"
+    development = split["development"]
+    sliced = snapshot.partition_slice(content, development["start"], development["end"])
+    if sliced != development:
+        return "The frozen development slice does not reproduce from the sealed payload."
+    trailing = snapshot.partition_slice(
+        content, split["trailing"]["start"], split["trailing"]["end"]
+    )
+    if (
+        trailing["start"] != split["trailing"]["start"]
+        or trailing["end"] != split["trailing"]["end"]
+        or trailing["sessions"] != split["trailing"]["sessions"]
+    ):
+        return "The frozen trailing session dates changed in the sealed payload."
+    return None
+
+
+def _formal_snapshot_record(
+    receipt: Mapping[str, Any],
+    record: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    *,
+    snapshot_id: str | None = None,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    evaluation = campaign["evaluation"]
+    return {
+        "verified": True,
+        "snapshot_id": snapshot_id or evaluation["snapshot_id"],
+        "partition_content_hash": receipt.get(
+            "partition_content_hash", receipt["content_hash"]
+        ),
+        "as_of": as_of,
+        "prior_history_hash": receipt.get("prior_history_hash"),
+        "data_kind": receipt["data_kind"],
+        "scope": evaluation["data_kind"],
+    }
+
+
+def _formal_segment_record(
+    receipt: Mapping[str, Any], record: Mapping[str, Any], campaign: Mapping[str, Any],
+) -> dict[str, Any]:
+    split = _formal_split(record)
+    return {
+        "ok": True,
+        "validation_kind": VALIDATION_KIND_TRAILING,
+        "split_hash": split["split_hash"],
+        "boundary": split["boundary"],
+        "as_of": split["as_of"],
+        "data_kind": receipt["data_kind"],
+        "partition_content_hash": receipt.get(
+            "partition_content_hash", receipt["content_hash"]
+        ),
+        "frozen_partition_content_hash": campaign["evaluation"]["partition_content_hash"],
+        "prior_history_hash": receipt.get("prior_history_hash"),
+        "research_interval": dict(split["partition"]),
+        "development": dict(split["development"]),
+        "trailing": dict(split["trailing"]),
+        "verified": True,
+    }
+
+
+def _formal_runs(
+    snapshot_store: Path,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    *,
+    receipt: Mapping[str, Any] | None = None,
+    require_trailing: bool = True,
+    phase: str = "validation",
+    read_as_of: str | None = None,
+    frozen_read: bool = True,
+    snapshot_id: str | None = None,
+) -> dict[str, Any]:
+    """Score the locked candidate and benchmark on the trailing segment only."""
+    split = _formal_split(record)
+    evaluation = campaign["evaluation"]
+    source_id = snapshot_id or evaluation["snapshot_id"]
+    if receipt is None:
+        try:
+            receipt = snapshot.read_discovery(
+                Path(snapshot_store),
+                source_id,
+                "discovery",
+                split["as_of"] if frozen_read else read_as_of,
+            )
+        except (OSError, ValueError) as error:
+            raise _rejected(
+                "VALIDATION_PARTITION_MISMATCH", phase, "inspect",
+                f"The sealed Discovery payload cannot be read at the frozen "
+                f"as-of cutoff: {error}",
+                counted=True,
+            ) from error
+    mismatch = _formal_partition_mismatch(
+        receipt,
+        record,
+        campaign,
+        require_trailing=require_trailing,
+        frozen_read=frozen_read,
+    )
+    if mismatch is not None:
+        raise _rejected(
+            "VALIDATION_PARTITION_MISMATCH", phase, "inspect", mismatch, counted=True,
+        )
+    data = receipt["data"]
+    trailing = split["trailing"]
+    sessions = sorted({row["date"] for row in data["calendar"]})
+    scoring_start = trailing["start"]
+    expected = [
+        day for day in sessions if trailing["start"] <= day <= trailing["end"]
+    ]
+    if (
+        not expected
+        or expected[0] != trailing["start"]
+        or expected[-1] != trailing["end"]
+        or len(expected) != trailing["sessions"]
+    ):
+        raise _rejected(
+            "VALIDATION_PARTITION_MISMATCH", phase, "inspect",
+            "The frozen trailing session dates are not the sealed scoring window.",
+            counted=True,
+        )
+    locked = submission["locked"]
+    prior = receipt.get("prior_history")
+    prior_history = (prior["sessions"], prior["derived"]) if prior is not None else None
+    rules = locked["execution_rules"]
+    rule_version = rules.get("version", NEXT_OPEN_RULES)
+    options = {
+        "data_kind": evaluation["data_kind"],
+        "signal_window_sessions": locked["signal_window_sessions"],
+        "prior_history": prior_history,
+        "initial_cash": locked["base_costs"]["initial_cash"],
+        "transaction_cost_bps": locked["base_costs"]["transaction_cost_bps"],
+        "slippage_bps": locked["base_costs"]["slippage_bps"],
+        "execution_rule_version": rule_version,
+        "history_requirements": list(locked["history_requirements"] or []),
+        "scoring_start": scoring_start,
+    }
+    strategy = _strategy_from_locked(locked["strategy"], locked["strategy_executor"])
+    candidate = run_partition_strategy(
+        data,
+        evaluation["snapshot_id"],
+        evaluation["partition_content_hash"],
+        strategy,
+        partition_name="discovery",
+        **options,
+    )
+    benchmark = run_discovery_equal_weight(
+        data,
+        evaluation["snapshot_id"],
+        evaluation["partition_content_hash"],
+        data_kind=evaluation["data_kind"],
+        initial_cash=locked["base_costs"]["initial_cash"],
+        transaction_cost_bps=locked["base_costs"]["transaction_cost_bps"],
+        slippage_bps=locked["base_costs"]["slippage_bps"],
+        execution_rule_version=rule_version,
+        history_requirements=[],
+        scoring_start=scoring_start,
+    )
+    readiness = candidate.get("history_readiness") or {}
+    warmup = {
+        "source": (
+            "sealed_prior_history+development" if prior is not None else "development"
+        ),
+        "start": split["development"]["start"],
+        "end": split["development"]["end"],
+        "sessions": split["development"]["sessions"],
+        "prior_history_hash": receipt.get("prior_history_hash"),
+        "first_ready_date": readiness.get("first_ready_date"),
+    }
+    return {
+        "candidate": candidate,
+        "benchmark": benchmark,
+        "expected_sessions": expected,
+        "scoring_start": scoring_start,
+        "data": data,
+        "receipt": receipt,
+        "snapshot": _formal_snapshot_record(
+            receipt,
+            record,
+            campaign,
+            snapshot_id=source_id,
+            as_of=split["as_of"] if frozen_read else read_as_of,
+        ),
+        "segment": _formal_segment_record(receipt, record, campaign),
+        "warmup": warmup,
+        "as_of": split["as_of"] if frozen_read else read_as_of,
+    }
+
+
+def _formal_run_record(run: Mapping[str, Any]) -> dict[str, Any]:
+    """A formal run record: the #43 record plus its frozen cash basis."""
+    return {**_run_record(run), "initial_cash": run["initial_cash"]}
+
+
+def _formal_verdict(checks: Mapping[str, Any]) -> tuple[str, str | None]:
+    """The formal protocol's verdict precedence (design contract §4)."""
+    if any(item["status"] == "failed" for item in checks["hard_conditions"]):
+        return "failed", "HARD_CONDITION_NOT_MET"
+    if not checks["scoring_start"]["ok"]:
+        return "insufficient_evidence", "SCORING_START_INSUFFICIENT"
+    if not checks["coverage"]["ok"] or not checks["data_availability"]["ok"]:
+        return "insufficient_evidence", "COVERAGE_INSUFFICIENT"
+    if not checks["position"]["ok"]:
+        return "insufficient_evidence", "POSITION_EVIDENCE_INSUFFICIENT"
+    if any(item["status"] == "unavailable" for item in checks["hard_conditions"]):
+        return "insufficient_evidence", "METRICS_NOT_READY"
+    return "passed", None
+
+
+def _formal_summary(
+    candidate_metrics: Mapping[str, Any],
+    benchmark_metrics: Mapping[str, Any],
+    *,
+    scoring: Mapping[str, Any],
+    outcome: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    def side(metrics: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "total_return": metrics["total_return"],
+            "max_drawdown": metrics["max_drawdown"],
+            "fees_paid": metrics["fees_paid"],
+            "slippage_paid": metrics["slippage_paid"],
+            "turnover": metrics["turnover"],
+            "fills": metrics["fills"],
+            "orders_filled": metrics["orders_filled"],
+            "orders_unfilled": metrics["orders_unfilled"],
+            "ending_equity": metrics["ending_equity"],
+        }
+
+    def delta(key: str) -> float | None:
+        left, right = candidate_metrics[key], benchmark_metrics[key]
+        if left is None or right is None:
+            return None
+        return float(left) - float(right)
+
+    return {
+        "scoring": dict(scoring),
+        "candidate": side(candidate_metrics),
+        "benchmark": side(benchmark_metrics),
+        "delta": {
+            "total_return": delta("total_return"),
+            "max_drawdown": delta("max_drawdown"),
+        },
+        "verdict": {"outcome": outcome, "reason": reason},
+    }
+
+
+def _formal_usage(use: Mapping[str, Any]) -> dict[str, Any]:
+    """The immutable, deterministic usage block of a formal receipt."""
+    return {
+        "kind": use["kind"],
+        "admission_id": use["admission_id"],
+        "sequence": use["sequence"],
+        "use_id": use["use_id"],
+    }
+
+
+def _formal_receipt(
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    *,
+    validation_id: str,
+    runs: Mapping[str, Any],
+    use: Mapping[str, Any],
+    corrected: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    kickoff = record["kickoff"]
+    split = _formal_split(record)
+    evaluation = record["kickoff"]["frozen_campaign"]
+    candidate = runs["candidate"]
+    benchmark = runs["benchmark"]
+    candidate_metrics = _metrics(candidate)
+    benchmark_metrics = _metrics(benchmark)
+    expected = runs["expected_sessions"]
+    checks = {
+        "data_availability": _data_availability_check(
+            candidate, benchmark, runs["snapshot"]
+        ),
+        "scoring_start": _scoring_start_check(
+            candidate, benchmark, runs["scoring_start"]
+        ),
+        "coverage": _coverage_check(
+            candidate, benchmark, runs["scoring_start"], expected
+        ),
+        "position": _position_check(candidate, benchmark),
+        "segment": dict(runs["segment"]),
+        "hard_conditions": [
+            _hard_condition(condition, candidate_metrics)
+            for condition in kickoff["hard_conditions"]
+        ],
+    }
+    observation = observation_recommendation(
+        candidate, kickoff["observation"]["minimum_opportunities"]
+    )
+    observation["review_conditions"] = kickoff["observation"]["review_conditions"]
+    outcome, reason = _formal_verdict(checks)
+    scoring = {
+        "start": runs["scoring_start"],
+        "end": split["trailing"]["end"],
+        "sessions": len(expected),
+        "valued_sessions": candidate_metrics["valued_sessions"],
+    }
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "round_id": record["round_id"],
+        "version_id": submission["version_id"],
+        "validation_id": validation_id,
+        "status": "completed",
+        "validation_kind": VALIDATION_KIND_TRAILING,
+        "outcome": outcome,
+        "reason": reason,
+        "protocol": {
+            **VALIDATION_PROTOCOL_TRAILING,
+            "split_hash": split["split_hash"],
+            "boundary": split["boundary"],
+            "research_interval": {
+                "start": split["partition"]["start"],
+                "end": split["partition"]["end"],
+                "sessions": split["partition"]["sessions"],
+            },
+        },
+        "development": dict(split["development"]),
+        "trailing": dict(split["trailing"]),
+        "scoring": scoring,
+        "warmup": dict(runs["warmup"]),
+        "provenance": {
+            "snapshot_id": runs["snapshot"]["snapshot_id"],
+            "partition_content_hash": runs["snapshot"]["partition_content_hash"],
+            "frozen_partition_content_hash": evaluation["partition_content_hash"],
+            "as_of": runs["as_of"],
+            "round_id": record["round_id"],
+            "version_id": submission["version_id"],
+            "submission_id": submission["submission_id"],
+            "experiment_id": submission["experiment_id"],
+            "development_content_hash": split["development"]["content_hash"],
+            "trailing_content_hash": split["trailing"]["content_hash"],
+        },
+        "usage": _formal_usage(use),
+        "summary": _formal_summary(
+            candidate_metrics, benchmark_metrics,
+            scoring=scoring, outcome=outcome, reason=reason,
+        ),
+        "metrics": {"candidate": candidate_metrics, "benchmark": benchmark_metrics},
+        "checks": checks,
+        "runs": {
+            "candidate": _formal_run_record(candidate),
+            "benchmark": _formal_run_record(benchmark),
+        },
+        "observation": observation,
+        # Trusted-only per-session evidence: the detail projection and a later
+        # revalidation's affected diff read this, never the published receipt.
+        "curves": {
+            "candidate": list(candidate["equity_curve"]),
+            "benchmark": list(benchmark["equity_curve"]),
+        },
+        "opened_protected_source": False,
+        "query_debited": False,
+    }
+    if corrected is not None:
+        receipt.update(dict(corrected))
+    receipt["receipt_hash"] = _hash(
+        {key: value for key, value in receipt.items() if key != "receipt_hash"}
+    )
+    return receipt
+
+
+def _formal_validation_record(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """One formal Validation epoch, addressable from a revalidation record."""
+    return {
+        "validation_id": receipt["validation_id"],
+        "outcome": receipt["outcome"],
+        "reason": receipt["reason"],
+        "snapshot_id": receipt["provenance"]["snapshot_id"],
+        "as_of": receipt["provenance"]["as_of"],
+        "partition_content_hash": receipt["provenance"]["partition_content_hash"],
+        "development": dict(receipt["development"]),
+        "trailing": dict(receipt["trailing"]),
+        "scoring": dict(receipt["scoring"]),
+        "warmup": dict(receipt["warmup"]),
+        "candidate": dict(receipt["runs"]["candidate"]),
+        "benchmark": dict(receipt["runs"]["benchmark"]),
+    }
+
+
+def _prior_formal_runs(prior: Mapping[str, Any]) -> dict[str, Any]:
+    """Rebuild the run container an affected diff needs from a formal receipt."""
+    curves = prior.get("curves")
+    if not isinstance(curves, Mapping):
+        raise ValueError(
+            "The prior formal Validation receipt has no per-session evidence."
+        )
+    runs = {}
+    for side in ("candidate", "benchmark"):
+        record = prior["runs"][side]
+        runs[side] = {
+            "equity_curve": list(curves[side]),
+            "fills": list(record["fills"]),
+            "metrics": dict(record["metrics"]),
+        }
+    return runs
+
+
+def _formal_affected(
+    prior: Mapping[str, Any],
+    runs: Mapping[str, Any],
+    original_content: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    split = _formal_split(record)
+    trailing = split["trailing"]
+    return _affected(
+        _prior_formal_runs(prior),
+        runs,
+        snapshot.slice_content(
+            original_content, trailing["start"], trailing["end"]
+        ),
+        snapshot.slice_content(runs["data"], trailing["start"], trailing["end"]),
+        runs["expected_sessions"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Trusted validation copies and attempts
 # ---------------------------------------------------------------------------
 
@@ -1499,7 +2413,11 @@ def _validation_path(store: Path, validation_id: str) -> Path:
 
 
 def _published(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    published = {field: receipt[field] for field in _RECEIPT_FIELDS}
+    # Required legacy fields are published when present, so a formal receipt
+    # (which has no ``replay``) and a legacy receipt share one allowlist.
+    published = {
+        field: receipt[field] for field in _RECEIPT_FIELDS if field in receipt
+    }
     published.update(
         {field: receipt[field] for field in _OPTIONAL_RECEIPT_FIELDS if field in receipt}
     )
@@ -1599,21 +2517,398 @@ def _failpoint(name: str) -> None:
         raise OSError(f"synthetic test failpoint {name!r} reached")
 
 
+# ---------------------------------------------------------------------------
+# Automatic Validation allowance and its atomic reservation
+# ---------------------------------------------------------------------------
+
+
+def _validation_use(row: sqlite3.Row) -> dict[str, Any]:
+    return {field: row[field] for field in _VALIDATION_USE_FIELDS}
+
+
+def _validation_uses(
+    connection: sqlite3.Connection, round_id: str,
+) -> list[dict[str, Any]]:
+    return [
+        _validation_use(row)
+        for row in connection.execute(
+            "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
+            "validation_id, consumed_at FROM research_loop_validation_uses "
+            "WHERE round_id = ? ORDER BY sequence",
+            (round_id,),
+        )
+    ]
+
+
+def _validation_allowance(
+    connection: sqlite3.Connection, record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """The protocol-v2 counter view; a protocol-v1 round has no allowance."""
+    policy = record["kickoff"].get("validation_policy")
+    if not isinstance(policy, Mapping):
+        return None
+    uses = _validation_uses(connection, record["round_id"])
+    automatic = sum(1 for item in uses if item["kind"] == "automatic")
+    manual = sum(1 for item in uses if item["kind"] == "manual")
+    limit = policy["auto_validation_limit"]
+    return {
+        "auto_limit": limit,
+        "automatic_used": automatic,
+        "manual_used": manual,
+        "total_used": len(uses),
+        "remaining": max(0, limit - automatic),
+    }
+
+
+def _validation_allowance_status(
+    connection: sqlite3.Connection, record: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    allowance = _validation_allowance(connection, record)
+    if allowance is None:
+        return None
+    return {
+        **allowance,
+        "uses": _validation_uses(connection, record["round_id"]),
+    }
+
+
+def _reserved_validation_use(
+    connection: sqlite3.Connection, round_id: str, version_id: str,
+) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
+        "validation_id, consumed_at FROM research_loop_validation_uses "
+        "WHERE round_id = ? AND version_id = ?",
+        (round_id, version_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("The formal Validation use for this version is missing.")
+    return _validation_use(row)
+
+
+def _insert_validation_use(
+    connection: sqlite3.Connection,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    validation_id: str,
+    *,
+    kind: str,
+    admission_id: str | None,
+) -> dict[str, Any]:
+    """Insert the next immutable use row for this version's one counted read."""
+    sequence = connection.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM research_loop_validation_uses "
+        "WHERE round_id = ?",
+        (record["round_id"],),
+    ).fetchone()[0]
+    use = {
+        "use_id": "",
+        "round_id": record["round_id"],
+        "version_id": submission["version_id"],
+        "sequence": sequence,
+        "kind": kind,
+        "admission_id": admission_id,
+        "validation_id": validation_id,
+        "consumed_at": _now(),
+    }
+    use["use_id"] = _hash({field: use[field] for field in _VALIDATION_USE_FIELDS if field != "use_id"})
+    connection.execute(
+        "INSERT INTO research_loop_validation_uses "
+        "(use_id, round_id, version_id, sequence, kind, admission_id, validation_id, "
+        "consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            use["use_id"], use["round_id"], use["version_id"], use["sequence"],
+            use["kind"], use["admission_id"], use["validation_id"], use["consumed_at"],
+        ),
+    )
+    return use
+
+
+def _reserve_validation_use(
+    connection: sqlite3.Connection,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    validation_id: str,
+) -> dict[str, Any]:
+    """Reserve this version's one counted trailing read, atomically.
+
+    Caller holds the round lock and an open ``BEGIN IMMEDIATE`` transaction, so
+    the existence check, the admission check, the allowance check and the insert
+    are one serialized step: two processes racing the last slot or one manual
+    admission yield exactly one row and exactly one read.  Branch order:
+    reuse this version's row (resume / revalidation), then consume an unused
+    manual admission bound to this version, then take an automatic slot, then
+    reject before the read.  ``admit`` refuses a grant while automatic slots
+    remain, so a manual row can only be the researcher's post-limit extra read.
+    The manual branch still comes first defensively: a grant is explicit, so a
+    row recorded before this gate (or by a future caller) is honoured as manual
+    rather than silently consumed as an automatic slot.
+    """
+    existing = connection.execute(
+        "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
+        "validation_id, consumed_at FROM research_loop_validation_uses "
+        "WHERE round_id = ? AND version_id = ?",
+        (record["round_id"], submission["version_id"]),
+    ).fetchone()
+    if existing is not None:
+        return _validation_use(existing)
+    admission = _admission_for_version(
+        connection, record["round_id"], submission["version_id"]
+    )
+    if admission is not None:
+        consumed = _admission_use(connection, admission["admission_id"])
+        if consumed is not None:
+            # Defensive crash/retry path: an admission already reflected by a
+            # use row is reused, never consumed a second time.
+            if consumed["version_id"] != submission["version_id"]:
+                raise ValueError(
+                    "The Validation admission was consumed by another version."
+                )
+            return consumed
+        return _insert_validation_use(
+            connection,
+            record,
+            submission,
+            validation_id,
+            kind="manual",
+            admission_id=admission["admission_id"],
+        )
+    policy = record["kickoff"]["validation_policy"]
+    limit = policy["auto_validation_limit"]
+    automatic = connection.execute(
+        "SELECT count(*) FROM research_loop_validation_uses "
+        "WHERE round_id = ? AND kind = 'automatic'",
+        (record["round_id"],),
+    ).fetchone()[0]
+    if automatic >= limit:
+        raise _rejected(
+            "VALIDATION_ALLOWANCE_EXHAUSTED", "validation", "admit",
+            "This round has used every automatic trailing Validation slot; an "
+            "operator must admit this version before it can be read.",
+            allowance=_validation_allowance(connection, record),
+            round_state="awaiting_validation_admission",
+        )
+    return _insert_validation_use(
+        connection,
+        record,
+        submission,
+        validation_id,
+        kind="automatic",
+        admission_id=None,
+    )
+
+
+def _lifecycle(
+    connection: sqlite3.Connection,
+    record: Mapping[str, Any],
+    closure: Mapping[str, Any] | None,
+) -> str:
+    """The research-visible round lifecycle: converged / awaiting admission / research."""
+    if closure is not None:
+        return "converged"
+    allowance = _validation_allowance(connection, record)
+    if allowance is not None and allowance["automatic_used"] >= allowance["auto_limit"]:
+        return "awaiting_validation_admission"
+    return "research"
+
+
+# ---------------------------------------------------------------------------
+# Manual Validation admissions (the researcher's extra read after the limit)
+# ---------------------------------------------------------------------------
+
+_ADMISSION_IDENTITY_FIELDS = (
+    "schema_version", "round_id", "version_id", "reviewer", "reason",
+    "comparison", "selection_impact",
+)
+
+
+def _admission_path(store: Path, admission_id: str) -> Path:
+    return (
+        store
+        / ADMISSION_NAME
+        / f"{_require_hex(admission_id, 'admission')}.json"
+    )
+
+
+def _verify_admission(body: object) -> dict[str, Any]:
+    """Load and content-check one write-once admission record.
+
+    ``admission_id`` addresses the immutable decision body; ``granted_at`` is
+    stored alongside it and is deliberately outside the content address, so a
+    replay returns the originally recorded grant time.
+    """
+    if not isinstance(body, dict) or not set(_ADMISSION_IDENTITY_FIELDS) <= body.keys():
+        raise ValueError("Invalid Validation admission record.")
+    admission_id = body.get("admission_id")
+    _require_hex(admission_id, "admission")
+    if admission_id != _hash({field: body[field] for field in _ADMISSION_IDENTITY_FIELDS}):
+        raise ValueError("Validation admission fingerprint mismatch.")
+    _require_hex(body["round_id"], "research round")
+    _require_hex(body["version_id"], "version")
+    if not isinstance(body.get("granted_at"), str) or not body["granted_at"]:
+        raise ValueError("Invalid Validation admission timestamp.")
+    return body
+
+
+def _admissions(
+    connection: sqlite3.Connection, round_id: str,
+) -> list[dict[str, Any]]:
+    return [
+        _verify_admission(json.loads(row["admission_json"]))
+        for row in connection.execute(
+            "SELECT admission_json FROM research_loop_admissions "
+            "WHERE round_id = ? ORDER BY rowid",
+            (round_id,),
+        )
+    ]
+
+
+def _admission_for_version(
+    connection: sqlite3.Connection, round_id: str, version_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT admission_json FROM research_loop_admissions "
+        "WHERE round_id = ? AND version_id = ?",
+        (round_id, version_id),
+    ).fetchone()
+    return _verify_admission(json.loads(row["admission_json"])) if row is not None else None
+
+
+def _trusted_admission_for_version(
+    trusted: Path, round_id: str, version_id: str,
+) -> dict[str, Any] | None:
+    """Find a trusted admission a crashed grant wrote before its project row."""
+    directory = trusted / ADMISSION_NAME
+    if not directory.is_dir():
+        return None
+    for path in sorted(directory.glob("*.json")):
+        try:
+            body = _verify_admission(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if body["round_id"] == round_id and body["version_id"] == version_id:
+            return body
+    return None
+
+
+def _admission_use(
+    connection: sqlite3.Connection, admission_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
+        "validation_id, consumed_at FROM research_loop_validation_uses "
+        "WHERE admission_id = ?",
+        (admission_id,),
+    ).fetchone()
+    return _validation_use(row) if row is not None else None
+
+
+def _admission_view(
+    connection: sqlite3.Connection, body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The admission body plus its derived use state (never mutated in place)."""
+    use = _admission_use(connection, body["admission_id"])
+    return {
+        **{
+            field: body[field]
+            for field in (
+                "admission_id", "round_id", "version_id", "reviewer", "reason",
+                "comparison", "selection_impact", "granted_at",
+            )
+        },
+        "used": use is not None,
+        "consumed_validation_id": use["validation_id"] if use is not None else None,
+    }
+
+
+def _admission_status_view(
+    connection: sqlite3.Connection, body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The round-status projection: no human reviewer identity or reason (F8)."""
+    view = _admission_view(connection, body)
+    return {
+        field: view[field]
+        for field in (
+            "admission_id", "round_id", "version_id", "granted_at", "comparison",
+            "selection_impact", "used", "consumed_validation_id",
+        )
+    }
+
+
+def _publish_admission(
+    connection: sqlite3.Connection,
+    trusted: Path,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Write the write-once trusted record, then its project projection."""
+    from prajnatrade.protected_eval import write_trusted_record_once
+
+    path = _admission_path(trusted, body["admission_id"])
+    stored = dict(body)
+    if path.is_file():
+        existing = _verify_admission(json.loads(path.read_text(encoding="utf-8")))
+        if existing != stored:
+            raise ValueError("A Validation admission record is immutable and cannot change.")
+        stored = existing
+    else:
+        stored = write_trusted_record_once(path, stored)
+    connection.execute(
+        "INSERT OR IGNORE INTO research_loop_admissions "
+        "(admission_id, round_id, version_id, admission_json) VALUES (?, ?, ?, ?)",
+        (
+            stored["admission_id"],
+            stored["round_id"],
+            stored["version_id"],
+            _json(stored),
+        ),
+    )
+    return stored
+
+
+def _admission_result(
+    connection: sqlite3.Connection,
+    record: Mapping[str, Any],
+    body: Mapping[str, Any],
+    *,
+    reused: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "admitted",
+        "reused": reused,
+        "admission": _admission_view(connection, body),
+        "allowance": _validation_allowance(connection, record),
+    }
+
+
 def _validation_identity(
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
     campaign: Mapping[str, Any],
 ) -> str:
+    """Content-addressed Validation identity for the round's protocol.
+
+    Protocol v1 keeps its exact #43 body.  Protocol v2 additionally binds the
+    evidence source the receipt claims: the sealed snapshot ID and both frozen
+    slice hashes, so a changed development or trailing payload cannot replay an
+    old formal receipt.  (The protocol hash already covers ``split_hash``.)
+    """
     locked = submission["locked"]
-    return _hash(
-        {
-            "version_id": submission["version_id"],
-            "scoring_policy_hash": _scoring_policy_hash(record["kickoff"]),
-            "snapshot_hash": locked["snapshot_hash"],
-            "protocol_hash": locked["protocol_hash"],
-            "engine_runtime_identity": _current_runtime(campaign),
-        }
-    )
+    identity: dict[str, Any] = {
+        "version_id": submission["version_id"],
+        "scoring_policy_hash": _scoring_policy_hash(record["kickoff"]),
+        "snapshot_hash": locked["snapshot_hash"],
+        "protocol_hash": locked["protocol_hash"],
+        "engine_runtime_identity": _current_runtime(campaign),
+    }
+    split = record["kickoff"].get("research_partition")
+    if split is not None:
+        identity["validation_kind"] = VALIDATION_KIND_TRAILING
+        identity["snapshot_id"] = locked["snapshot_id"]
+        identity["split_hash"] = split["split_hash"]
+        identity["development_content_hash"] = split["development"]["content_hash"]
+        identity["trailing_content_hash"] = split["trailing"]["content_hash"]
+    return _hash(identity)
 
 
 def _submission(
@@ -1647,7 +2942,12 @@ def validate(
     round_id: str,
     version_id: str,
 ) -> dict[str, Any]:
-    """Replay a locked version over the frozen Discovery interval (no protected read)."""
+    """Validate a locked version under the round's recorded protocol.
+
+    Protocol v1 replays the frozen Discovery interval.  Protocol v2 scores the
+    frozen trailing segment only, after atomically reserving this version's one
+    counted read; every path after the reservation keeps that use.
+    """
     from prajnatrade.protected_eval import evaluation_store
 
     trusted = evaluation_store(store)
@@ -1669,7 +2969,7 @@ def validate(
             if state == "ended":
                 raise ProtocolError(
                     "VERSION_ENDED", "validation", "inspect",
-                    "An ended version cannot run another lightweight Validation.",
+                    "An ended version cannot run another Validation.",
                 )
             if state == "approved":
                 raise ProtocolError(
@@ -1691,6 +2991,11 @@ def validate(
                     "revalidate on the current evidence source instead of replaying "
                     "the superseded locked snapshot.",
                 )
+            formal = "research_partition" in record["kickoff"]
+            if formal:
+                # The reservation, the attempt row and every later state change
+                # are serialized by the round lock plus this write transaction.
+                connection.execute("BEGIN IMMEDIATE")
             validation_id = _validation_identity(record, submission, campaign)
             terminal = connection.execute(
                 "SELECT receipt_json FROM research_loop_validations WHERE validation_id = ?",
@@ -1699,12 +3004,26 @@ def validate(
             if terminal is not None:
                 receipt = _load_trusted_receipt(trusted, validation_id, terminal["receipt_json"])
                 stored_attempts = len(_attempt_rows(connection, validation_id))
-                return {
-                    **receipt,
+                result = {
+                    **_published(receipt),
                     "reused": True,
                     "attempts": stored_attempts,
                     "resumed": stored_attempts > 1,
                 }
+                if formal:
+                    result["allowance"] = _validation_allowance(connection, record)
+                return result
+            use: dict[str, Any] | None = None
+            if formal:
+                # Known gaps and a changed research interval block BEFORE the
+                # counted reservation: a rejected pre-check spends nothing.
+                _formal_manifest_gate(
+                    snapshot_store,
+                    record,
+                    campaign,
+                    _validation_allowance(connection, record),
+                )
+                use = _reserve_validation_use(connection, record, submission, validation_id)
             attempts = _attempt_rows(connection, validation_id)
             resumed = bool(attempts)
             attempt = len(attempts) + 1
@@ -1729,19 +3048,32 @@ def validate(
                             "attempt": attempt,
                             "started_at": _now(),
                             "engine_runtime_identity": _current_runtime(campaign),
+                            **({"validation_kind": VALIDATION_KIND_TRAILING} if formal else {}),
                         }
                     ),
                 ),
             )
         _write_running_marker(trusted, validation_id, record, submission, attempt)
         _failpoint(VALIDATION_FAILPOINT)
-        replay = _replay(project, snapshot_store, record, submission, campaign)
-        receipt = _receipt(
-            record,
-            submission,
-            validation_id=validation_id,
-            replay=replay,
-        )
+        if formal:
+            if use is None:
+                raise ValueError("The formal Validation use was not reserved.")
+            runs = _formal_runs(snapshot_store, record, submission, campaign)
+            receipt = _formal_receipt(
+                record,
+                submission,
+                validation_id=validation_id,
+                runs=runs,
+                use=use,
+            )
+        else:
+            replay = _replay(project, snapshot_store, record, submission, campaign)
+            receipt = _receipt(
+                record,
+                submission,
+                validation_id=validation_id,
+                replay=replay,
+            )
         # The trusted evidence is written before the research-visible copy is
         # published, so a crash between the two is recovered by re-running the
         # same identity and finding the identical terminal receipt (the receipt
@@ -1777,14 +3109,518 @@ def validate(
                 "(validation_id, version_id, receipt_json) VALUES (?, ?, ?)",
                 (validation_id, version_id, _json(_published(receipt))),
             )
-    return {
-        **receipt,
+            allowance = _validation_allowance(connection, record)
+    result = {
+        **_published(receipt),
         # A recovered terminal receipt means this invocation still completes the
         # attempt and publishes it, so it is resumed rather than a plain replay.
         "reused": False,
         "attempts": attempt,
         "resumed": resumed,
     }
+    if formal:
+        result["allowance"] = allowance
+    return result
+
+
+def admit(
+    project: Path,
+    store: Path,
+    round_id: str,
+    version_id: str,
+    reviewer: str,
+    reason: str,
+    source: object,
+) -> dict[str, Any]:
+    """Record one write-once manual Validation admission for a v2 round.
+
+    Granting is an operator decision and is not a read: it writes no use row and
+    leaves the allowance counters unchanged.  The admission is bound to exactly
+    one locked version, replays by identical request content, and consumes only
+    when (and if) that version is validated.
+    """
+    from prajnatrade.protected_eval import evaluation_store
+
+    payload = _object(source, {"comparison", "selection_impact"})
+    reviewer = _text(reviewer, "reviewer")
+    reason = _text(reason, "reason")
+    comparison = _text(payload["comparison"], "comparison")
+    selection_impact = _text(payload["selection_impact"], "selection_impact")
+    trusted = evaluation_store(store)
+    if trusted.is_relative_to(project.resolve()):
+        raise ValueError("Trusted evaluation store must be outside the research project.")
+    with _round_lock(project, round_id), _project(project) as connection:
+        record = _project_round(connection, round_id)
+        trusted_record = _load_round_file(_round_path(trusted, round_id), round_id)
+        if trusted_record != record:
+            raise ValueError("The research round copy does not match the trusted approval.")
+        submission = _submission(connection, round_id, version_id, phase="admission")
+        body = {
+            "schema_version": SCHEMA_VERSION,
+            "round_id": record["round_id"],
+            "version_id": submission["version_id"],
+            "reviewer": reviewer,
+            "reason": reason,
+            "comparison": comparison,
+            "selection_impact": selection_impact,
+        }
+        admission_id = _hash(body)
+        existing = _admission_for_version(connection, round_id, version_id)
+        if existing is not None and existing["admission_id"] == admission_id:
+            # An identical request replays the stored grant, including its
+            # original recorded time; a completed read still reports used.
+            return _admission_result(connection, record, existing, reused=True)
+        if _closure(connection, round_id) is not None:
+            raise _rejected(
+                "ROUND_CLOSED", "admission", "inspect",
+                "A closed research round cannot admit another version.",
+            )
+        if "research_partition" not in record["kickoff"]:
+            raise _rejected(
+                "VALIDATION_POLICY_REQUIRED", "admission", "inspect",
+                "A manual Validation admission applies only to a protocol-v2 round "
+                "with a frozen automatic Validation limit.",
+            )
+        state = _review_state(connection, version_id)
+        if state == "ended":
+            raise _rejected(
+                "VERSION_ENDED", "admission", "inspect",
+                "An ended version is terminal and cannot be admitted.",
+            )
+        if state == "approved":
+            raise _rejected(
+                "REVIEW_CONFLICT", "admission", "inspect",
+                "An approved version keeps its admitted receipt; a manual "
+                "Validation admission would be a second decision for it.",
+            )
+        if existing is not None:
+            raise _rejected(
+                "ADMISSION_CONFLICT", "admission", "inspect",
+                "This version already has a different manual Validation admission.",
+            )
+        counted = connection.execute(
+            "SELECT 1 FROM research_loop_validation_uses "
+            "WHERE round_id = ? AND version_id = ?",
+            (round_id, version_id),
+        ).fetchone()
+        completed = connection.execute(
+            "SELECT 1 FROM research_loop_validations WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if counted is not None or completed is not None:
+            raise _rejected(
+                "VALIDATION_ALREADY_COMPLETED", "admission", "inspect",
+                "This version already has a counted or completed trailing "
+                "Validation read; a manual admission would be stranded.",
+            )
+        # A manual admission is the researcher's extra read *after* the
+        # automatic allowance, never a way to bypass it: the round must have
+        # used every automatic slot first.  This is what makes the paused
+        # lifecycle (`awaiting_validation_admission`) meaningful, and it means a
+        # granted manual read can never be pre-empted by an unused automatic slot.
+        allowance = _validation_allowance(connection, record)
+        if allowance is None:
+            raise ValueError("The protocol-v2 round has no frozen Validation policy.")
+        if allowance["automatic_used"] < allowance["auto_limit"]:
+            raise _rejected(
+                "VALIDATION_ALLOWANCE_REMAINING", "admission", "validate",
+                "This round still has automatic trailing Validation slots; the "
+                "researcher must let those automatic reads be used before an "
+                "operator can admit an extra version.",
+                allowance=allowance,
+                round_state="research",
+            )
+        trusted_existing = _trusted_admission_for_version(trusted, round_id, version_id)
+        if (
+            trusted_existing is not None
+            and trusted_existing["admission_id"] != admission_id
+        ):
+            raise _rejected(
+                "ADMISSION_CONFLICT", "admission", "inspect",
+                "This version already has a different manual Validation admission.",
+            )
+        if trusted_existing is not None:
+            # A crash after the trusted write recovered on retry: publish the
+            # project projection only, keeping the recorded grant time.
+            stored = _publish_admission(connection, trusted, trusted_existing)
+            return _admission_result(connection, record, stored, reused=True)
+        stored = _publish_admission(
+            connection,
+            trusted,
+            {**body, "admission_id": admission_id, "granted_at": _now()},
+        )
+        return _admission_result(connection, record, stored, reused=False)
+
+
+# ---------------------------------------------------------------------------
+# Controlled Validation detail queries (protocol v2 and legacy receipts)
+# ---------------------------------------------------------------------------
+
+# The fixed allowlist projects the *published* project receipt only.  It never
+# names ``curves`` (trusted-only per-session evidence), a sealed payload, a
+# ledger row or a price, so a detail query cannot widen the agent boundary.
+_DETAIL_RECORD_NAMES = (
+    "summary", "metrics.candidate", "metrics.benchmark", "runs.candidate",
+    "runs.benchmark", "fills.candidate", "fills.benchmark", "observation",
+    "protocol", "provenance", "usage", "development", "trailing", "scoring",
+    "warmup", "replay",
+)
+_DETAIL_CHECK_GROUPS = (
+    "data_availability", "scoring_start", "coverage", "position", "costs",
+    "replay", "segment", "hard_conditions",
+)
+_DETAIL_MISSING = object()
+
+_FEEDBACK_IDENTITY_FIELDS = (
+    "schema_version", "round_id", "version_id", "validation_id", "receipt_hash",
+    "impact", "detail_access_id", "next_experiment_id",
+)
+
+
+def _detail_block(receipt: Mapping[str, Any], record: str) -> object:
+    """The published receipt block a record name projects (``_DETAIL_MISSING``)."""
+    if record == "summary":
+        return receipt.get("summary", _DETAIL_MISSING)
+    if record.startswith("metrics.") or record.startswith("runs."):
+        side = record.split(".", 1)[1]
+        block = receipt.get(record.split(".", 1)[0])
+        if isinstance(block, Mapping) and side in block:
+            return block[side]
+        return _DETAIL_MISSING
+    if record.startswith("fills."):
+        side = record.split(".", 1)[1]
+        runs = receipt.get("runs")
+        if isinstance(runs, Mapping) and isinstance(runs.get(side), Mapping):
+            return runs[side].get("fills", _DETAIL_MISSING)
+        return _DETAIL_MISSING
+    if record.startswith("checks."):
+        group = record.split(".", 1)[1]
+        checks = receipt.get("checks")
+        if isinstance(checks, Mapping) and group in checks:
+            return checks[group]
+        return _DETAIL_MISSING
+    return receipt.get(record, _DETAIL_MISSING)
+
+
+def _detail_request(round_id: str, version_id: str, receipt: Mapping[str, Any], source: object):
+    payload = _object(source, {"question", "records"})
+    question = _text(payload["question"], "question")
+    records = _texts(payload["records"], "records")
+    if not records:
+        raise ValueError("records must name at least one published receipt block.")
+    normalized = sorted(set(records))
+    unknown = [
+        record
+        for record in normalized
+        if record not in _DETAIL_RECORD_NAMES
+        and not (
+            record.startswith("checks.")
+            and record.split(".", 1)[1] in _DETAIL_CHECK_GROUPS
+        )
+    ]
+    if unknown:
+        raise _rejected(
+            "DETAIL_RECORD_UNKNOWN", "detail", "correct",
+            "The requested record is not in the published detail allowlist.",
+            records=unknown,
+        )
+    request = {
+        "schema_version": SCHEMA_VERSION,
+        "round_id": round_id,
+        "version_id": version_id,
+        "validation_id": receipt["validation_id"],
+        "receipt_hash": receipt["receipt_hash"],
+        "question": question,
+        "records": normalized,
+    }
+    details: dict[str, Any] = {}
+    unavailable: list[str] = []
+    for record in normalized:
+        value = _detail_block(receipt, record)
+        if value is _DETAIL_MISSING:
+            unavailable.append(record)
+        else:
+            details[record] = value
+    if unavailable:
+        raise _rejected(
+            "DETAIL_RECORD_UNAVAILABLE", "detail", "inspect",
+            "A requested record is not part of this published Validation receipt.",
+            records=unavailable,
+        )
+    return request, details
+
+
+def _verify_detail(row: sqlite3.Row) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load one content-addressed detail request and its stored resolution."""
+    request = json.loads(row["request_json"])
+    if not isinstance(request, dict) or request.get("detail_access_id") != row["detail_access_id"]:
+        raise ValueError("Validation detail request fingerprint mismatch.")
+    if _hash(
+        {key: value for key, value in request.items() if key != "detail_access_id"}
+    ) != row["detail_access_id"]:
+        raise ValueError("Validation detail request fingerprint mismatch.")
+    resolution = json.loads(row["resolution_json"])
+    if not isinstance(resolution, dict) or not isinstance(resolution.get("details"), dict):
+        raise ValueError("Invalid Validation detail resolution.")
+    return request, resolution
+
+
+def _detail_view(
+    request: Mapping[str, Any],
+    resolution: Mapping[str, Any],
+    *,
+    reused: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "completed",
+        "reused": reused,
+        **dict(request),
+        "details": resolution["details"],
+        "recorded_at": resolution["recorded_at"],
+    }
+
+
+def _detail_rows(
+    connection: sqlite3.Connection, version_id: str,
+) -> list[sqlite3.Row]:
+    return list(
+        connection.execute(
+            "SELECT detail_access_id, round_id, version_id, validation_id, "
+            "request_json, resolution_json FROM research_loop_details "
+            "WHERE version_id = ? ORDER BY rowid",
+            (version_id,),
+        )
+    )
+
+
+def _version_details(
+    connection: sqlite3.Connection, version_id: str,
+) -> list[dict[str, Any]]:
+    """The status projection: recorded questions without duplicating answers."""
+    listed: list[dict[str, Any]] = []
+    for row in _detail_rows(connection, version_id):
+        request, resolution = _verify_detail(row)
+        listed.append(
+            {
+                "detail_access_id": row["detail_access_id"],
+                "question": request["question"],
+                "records": list(request["records"]),
+                "recorded_at": resolution["recorded_at"],
+            }
+        )
+    return listed
+
+
+def detail(
+    project: Path, round_id: str, version_id: str, source: object,
+) -> dict[str, Any]:
+    """Answer one specific question from the version's *published* receipt.
+
+    Agent + operator command, project database only: the resolution is projected
+    from the project's published receipt and never re-reads the sealed snapshot,
+    the trusted per-session curves or a ledger.  A detail query is not a
+    Validation read: it writes no use row and never changes the allowance.
+    """
+    with _round_lock(project, round_id), _project(project) as connection:
+        _project_round(connection, round_id)
+        _submission(connection, round_id, version_id, phase="detail")
+        row = connection.execute(
+            "SELECT validation_id, receipt_json FROM research_loop_validations "
+            "WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if row is None:
+            raise _rejected(
+                "VALIDATION_NOT_PASSED", "detail", "validate",
+                "A detail question needs a terminal published Validation receipt.",
+            )
+        receipt = json.loads(row["receipt_json"])
+        if receipt.get("status") != "completed" or "receipt_hash" not in receipt:
+            raise _rejected(
+                "VALIDATION_NOT_PASSED", "detail", "validate",
+                "A detail question needs a terminal published Validation receipt.",
+            )
+        receipt = {**receipt, "validation_id": row["validation_id"]}
+        request, details = _detail_request(round_id, version_id, receipt, source)
+        detail_access_id = _hash(request)
+        stored_request = {**request, "detail_access_id": detail_access_id}
+        existing = connection.execute(
+            "SELECT detail_access_id, request_json, resolution_json "
+            "FROM research_loop_details WHERE detail_access_id = ?",
+            (detail_access_id,),
+        ).fetchone()
+        if existing is not None:
+            existing_request, existing_resolution = _verify_detail(existing)
+            return _detail_view(
+                existing_request, existing_resolution, reused=True
+            )
+        resolution = {
+            "status": "completed",
+            "details": details,
+            "recorded_at": _now(),
+        }
+        connection.execute(
+            "INSERT OR IGNORE INTO research_loop_details "
+            "(detail_access_id, round_id, version_id, validation_id, request_json, "
+            "resolution_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                detail_access_id,
+                round_id,
+                version_id,
+                receipt["validation_id"],
+                _json(stored_request),
+                _json(resolution),
+            ),
+        )
+        stored = connection.execute(
+            "SELECT detail_access_id, request_json, resolution_json "
+            "FROM research_loop_details WHERE detail_access_id = ?",
+            (detail_access_id,),
+        ).fetchone()
+        stored_request_json, stored_resolution = _verify_detail(stored)
+        return _detail_view(
+            stored_request_json,
+            stored_resolution,
+            reused=stored_resolution != resolution,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Validation feedback and the revision link
+# ---------------------------------------------------------------------------
+
+
+def _verify_feedback(body: object) -> dict[str, Any]:
+    if not isinstance(body, dict) or not set(_FEEDBACK_IDENTITY_FIELDS) <= body.keys():
+        raise ValueError("Invalid Validation feedback record.")
+    feedback_id = body.get("feedback_id")
+    _require_hex(feedback_id, "feedback")
+    if feedback_id != _hash(
+        {field: body[field] for field in _FEEDBACK_IDENTITY_FIELDS}
+    ):
+        raise ValueError("Validation feedback fingerprint mismatch.")
+    if not isinstance(body.get("recorded_at"), str) or not body["recorded_at"]:
+        raise ValueError("Invalid Validation feedback timestamp.")
+    return body
+
+
+def _version_feedback(
+    connection: sqlite3.Connection, version_id: str,
+) -> list[dict[str, Any]]:
+    return [
+        _verify_feedback(json.loads(row["feedback_json"]))
+        for row in connection.execute(
+            "SELECT feedback_json FROM research_loop_feedback "
+            "WHERE version_id = ? ORDER BY rowid",
+            (version_id,),
+        )
+    ]
+
+
+def _feedback_result(
+    body: Mapping[str, Any], *, reused: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "recorded",
+        "reused": reused,
+        "feedback": dict(body),
+    }
+
+
+def feedback(
+    project: Path, round_id: str, version_id: str, source: object,
+) -> dict[str, Any]:
+    """Link V1's Validation evidence (and one recorded detail) to what it changed."""
+    with _round_lock(project, round_id), _project(project) as connection:
+        record = _project_round(connection, round_id)
+        submission = _submission(connection, round_id, version_id, phase="feedback")
+        row = connection.execute(
+            "SELECT validation_id, receipt_json FROM research_loop_validations "
+            "WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if row is None:
+            raise _rejected(
+                "VALIDATION_NOT_PASSED", "feedback", "validate",
+                "Feedback needs a terminal published Validation receipt.",
+            )
+        receipt = json.loads(row["receipt_json"])
+        if receipt.get("status") != "completed" or "receipt_hash" not in receipt:
+            raise _rejected(
+                "VALIDATION_NOT_PASSED", "feedback", "validate",
+                "Feedback needs a terminal published Validation receipt.",
+            )
+        payload = _object(
+            source, {"impact", "detail_access_id", "next_experiment_id"}
+        )
+        impact = _text(payload["impact"], "impact")
+        detail_access_id = payload["detail_access_id"]
+        if detail_access_id is not None:
+            detail_access_id = _require_hex(detail_access_id, "detail access")
+            request_row = connection.execute(
+                "SELECT round_id, version_id, request_json FROM research_loop_details "
+                "WHERE detail_access_id = ?",
+                (detail_access_id,),
+            ).fetchone()
+            request = (
+                json.loads(request_row["request_json"])
+                if request_row is not None
+                else None
+            )
+            if (
+                request_row is None
+                or request_row["round_id"] != round_id
+                or request_row["version_id"] != version_id
+                or request["validation_id"] != row["validation_id"]
+                or request["receipt_hash"] != receipt["receipt_hash"]
+            ):
+                raise _rejected(
+                    "DETAIL_NOT_FOUND", "feedback", "detail",
+                    "The referenced detail access does not belong to this "
+                    "version's published Validation receipt.",
+                )
+        next_experiment_id = payload["next_experiment_id"]
+        if next_experiment_id is not None:
+            next_experiment_id = _text(next_experiment_id, "next_experiment_id")
+            attempts = campaign_experiment_history(project, record["campaign_id"])
+            known = any(
+                item["experiment_id"] == next_experiment_id for item in attempts
+            )
+            if not known or next_experiment_id == submission["experiment_id"]:
+                raise _rejected(
+                    "FEEDBACK_LINK_INVALID", "feedback", "correct",
+                    "Feedback must link another experiment in the same Campaign.",
+                )
+        identity = {
+            "schema_version": SCHEMA_VERSION,
+            "round_id": round_id,
+            "version_id": version_id,
+            "validation_id": row["validation_id"],
+            "receipt_hash": receipt["receipt_hash"],
+            "impact": impact,
+            "detail_access_id": detail_access_id,
+            "next_experiment_id": next_experiment_id,
+        }
+        feedback_id = _hash(identity)
+        existing = connection.execute(
+            "SELECT feedback_json FROM research_loop_feedback WHERE feedback_id = ?",
+            (feedback_id,),
+        ).fetchone()
+        if existing is not None:
+            return _feedback_result(_verify_feedback(json.loads(existing["feedback_json"])), reused=True)
+        body = {**identity, "feedback_id": feedback_id, "recorded_at": _now()}
+        connection.execute(
+            "INSERT OR IGNORE INTO research_loop_feedback "
+            "(feedback_id, round_id, version_id, feedback_json) VALUES (?, ?, ?, ?)",
+            (feedback_id, round_id, version_id, _json(body)),
+        )
+        stored = connection.execute(
+            "SELECT feedback_json FROM research_loop_feedback WHERE feedback_id = ?",
+            (feedback_id,),
+        ).fetchone()
+        return _feedback_result(_verify_feedback(json.loads(stored["feedback_json"])), reused=False)
 
 
 def load_tracking_receipt(store: str | Path, validation_id: str) -> dict[str, Any]:
@@ -2918,6 +4754,70 @@ def _corrected_evidence(
     return candidates[0] if candidates else None
 
 
+def _formal_revalidation_receipt(
+    snapshot_store: Path,
+    record: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read and verify the corrected successor for formal revalidation.
+
+    The successor must preserve the frozen development slice hash, data kind,
+    prior history, research interval/session dates and as-of.  Its trailing rows
+    may legitimately change (that is the correction this path recomputes).
+    """
+    split = _formal_split(record)
+    frozen = record["kickoff"]["scoring_policy"]["frozen"]
+    evaluation = campaign["evaluation"]
+    try:
+        receipt = snapshot.read_discovery(
+            Path(snapshot_store),
+            evidence["snapshot_id"],
+            "discovery",
+            evidence.get("as_of"),
+        )
+    except (OSError, ValueError) as error:
+        raise _rejected(
+            "EVIDENCE_INTEGRITY_VIOLATION", "revalidation", "inspect",
+            f"The corrected evidence payload cannot be read at its recorded "
+            f"as-of cutoff: {error}",
+        ) from error
+    if receipt["data_kind"] != evaluation["data_kind"]:
+        raise _rejected(
+            "EVIDENCE_DATA_KIND_MISMATCH", "revalidation", "inspect",
+            "The corrected evidence snapshot data kind differs from the Campaign.",
+        )
+    if receipt.get("prior_history_hash") != frozen.get("prior_history_hash"):
+        raise _rejected(
+            "EVIDENCE_PRIOR_HISTORY_MISMATCH", "revalidation", "inspect",
+            "The corrected evidence snapshot changed the frozen Discovery prior history.",
+        )
+    development = split["development"]
+    sliced = snapshot.partition_slice(
+        receipt["data"], development["start"], development["end"]
+    )
+    if sliced != development:
+        raise _rejected(
+            "EVIDENCE_DEVELOPMENT_MISMATCH", "revalidation", "inspect",
+            "The corrected evidence snapshot changed the frozen development slice.",
+            expected=dict(development),
+            actual=sliced,
+        )
+    trailing = snapshot.partition_slice(
+        receipt["data"], split["trailing"]["start"], split["trailing"]["end"]
+    )
+    if (
+        trailing["start"] != split["trailing"]["start"]
+        or trailing["end"] != split["trailing"]["end"]
+        or trailing["sessions"] != split["trailing"]["sessions"]
+    ):
+        raise _rejected(
+            "EVIDENCE_INTERVAL_MISMATCH", "revalidation", "inspect",
+            "The corrected evidence snapshot changed the frozen trailing session dates.",
+        )
+    return receipt
+
+
 def _revalidation_identity(
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
@@ -2972,7 +4872,12 @@ def _revalidation_body(
         "opened_protected_source": False,
         "query_debited": False,
     }
-    for field in ("original_discovery", "recomputed_discovery", "affected"):
+    if "validation_kind" in receipt:
+        body["validation_kind"] = receipt["validation_kind"]
+    for field in (
+        "original_discovery", "recomputed_discovery", "affected",
+        "original_validation", "recomputed_validation",
+    ):
         if field in receipt:
             body[field] = receipt[field]
     review_block: dict[str, Any] | None = None
@@ -3003,10 +4908,15 @@ def _revalidation_body(
         "reason": receipt["reason"],
         "evidence": dict(evidence),
     }
+    if "validation_kind" in receipt:
+        result["validation_kind"] = receipt["validation_kind"]
     if review_block is not None:
         body["review"] = review_block
         result["review"] = review_block
-    for field in ("original_discovery", "recomputed_discovery", "affected"):
+    for field in (
+        "original_discovery", "recomputed_discovery", "affected",
+        "original_validation", "recomputed_validation",
+    ):
         if field in receipt:
             result[field] = receipt[field]
     body["result"] = result
@@ -3074,6 +4984,15 @@ def revalidate(
             prior = _load_trusted_receipt(
                 trusted, row["validation_id"], row["receipt_json"]
             )
+            formal = "research_partition" in record["kickoff"]
+            if formal and prior.get("validation_kind") != VALIDATION_KIND_TRAILING:
+                raise ValueError(
+                    "This v2 round's stored receipt is not a formal trailing Validation."
+                )
+            use = (
+                _reserved_validation_use(connection, round_id, version_id)
+                if formal else None
+            )
             campaign = campaign_discovery(project, record["campaign_id"])
             locked_snapshot_id = submission["locked"]["snapshot_id"]
             corrected_evidence = _corrected_evidence(
@@ -3101,6 +5020,16 @@ def revalidate(
             )
             evidence["engine_runtime_identity"] = runtime
             evidence["replay_engine_identity"] = replay_engine_identity()
+            formal_source: dict[str, Any] | None = None
+            if formal:
+                formal_source = _formal_revalidation_receipt(
+                    snapshot_store, record, campaign, evidence
+                )
+                split = _formal_split(record)
+                evidence["validation_kind"] = VALIDATION_KIND_TRAILING
+                evidence["split_hash"] = split["split_hash"]
+                evidence["development"] = dict(split["development"])
+                evidence["trailing"] = dict(split["trailing"])
             # A repeated revalidation must key the same evidence epoch, so the
             # identity uses the base (non-revalidated) receipt as its anchor.
             base_validation_id = prior["validation_id"]
@@ -3170,7 +5099,49 @@ def revalidate(
             trusted, attempt_context[0], record, submission, attempt_context[1]
         )
         _failpoint(VALIDATION_FAILPOINT)
-        if corrected:
+        if formal:
+            if use is None or formal_source is None:
+                raise ValueError("The formal revalidation evidence was not prepared.")
+            recomputed = _formal_runs(
+                snapshot_store,
+                record,
+                submission,
+                campaign,
+                receipt=formal_source,
+                require_trailing=False,
+                phase="revalidation",
+                read_as_of=evidence.get("as_of"),
+                frozen_read=False,
+                snapshot_id=evidence["snapshot_id"],
+            )
+            receipt = _formal_receipt(
+                record,
+                submission,
+                validation_id=attempt_context[0],
+                runs=recomputed,
+                use=use,
+            )
+            original_view = snapshot.read_discovery(
+                Path(snapshot_store),
+                prior["provenance"]["snapshot_id"],
+                "discovery",
+                prior["provenance"]["as_of"],
+            )
+            receipt.update(
+                {
+                    "evidence": dict(evidence),
+                    "prior_validation_id": prior["validation_id"],
+                    "original_validation": _formal_validation_record(prior),
+                    "recomputed_validation": _formal_validation_record(receipt),
+                    "affected": _formal_affected(
+                        prior, recomputed, original_view["data"], record
+                    ),
+                }
+            )
+            receipt["receipt_hash"] = _hash(
+                {key: value for key, value in receipt.items() if key != "receipt_hash"}
+            )
+        elif corrected:
             recomputed = _evidence_runs(
                 snapshot_store, record, submission, campaign, evidence
             )
@@ -3345,8 +5316,24 @@ def _validation_summary(
             review_block = json.loads(revalidated["revalidation_json"]).get("review")
             if review_block is not None:
                 summary["review"] = review_block
+        # The protocol-v2 receipt fields are exposed when present; a legacy
+        # receipt keeps its exact summary shape.
+        for field, name in (
+            ("validation_kind", "kind"),
+            ("protocol", "protocol"),
+            ("development", "development"),
+            ("trailing", "trailing"),
+            ("scoring", "scoring"),
+            ("warmup", "warmup"),
+            ("provenance", "provenance"),
+            ("usage", "usage"),
+            ("summary", "summary"),
+        ):
+            if field in receipt:
+                summary[name] = receipt[field]
         for field in (
             "evidence", "original_discovery", "recomputed_discovery", "affected",
+            "original_validation", "recomputed_validation",
         ):
             if field in receipt:
                 summary[field] = receipt[field]
@@ -3481,25 +5468,33 @@ def _round_status_body(
         body = json.loads(row["submission_json"])
         version_id = body["version_id"]
         review_state = _review_state(connection, version_id)
-        submissions.append(
-            {
-                "version_id": version_id,
-                "submission_id": body["submission_id"],
-                "experiment_id": body["experiment_id"],
-                "change": body["change"],
-                "question": body["question"],
-                "expected_change": body["expected_change"],
-                "revisit_condition": body["revisit_condition"],
-                "risks": body["risks"],
-                "related_experiment_ids": body["related_experiment_ids"],
-                "strategy_fingerprint": body["strategy_fingerprint"],
-                "validation": _validation_summary(connection, version_id),
-                "review_state": review_state,
-                "review": _review_summary(connection, version_id),
-                "observation": _version_observation(connection, version_id),
-                "tracking": _latest_tracking(connection, version_id),
-            }
-        )
+        entry = {
+            "version_id": version_id,
+            "submission_id": body["submission_id"],
+            "experiment_id": body["experiment_id"],
+            "change": body["change"],
+            "question": body["question"],
+            "expected_change": body["expected_change"],
+            "revisit_condition": body["revisit_condition"],
+            "risks": body["risks"],
+            "related_experiment_ids": body["related_experiment_ids"],
+            "strategy_fingerprint": body["strategy_fingerprint"],
+            "validation": _validation_summary(connection, version_id),
+            "details": _version_details(connection, version_id),
+            "feedback": _version_feedback(connection, version_id),
+            "review_state": review_state,
+            "review": _review_summary(connection, version_id),
+            "observation": _version_observation(connection, version_id),
+            "tracking": _latest_tracking(connection, version_id),
+        }
+        for field in ("revision_of", "feedback_ids"):
+            if field in body:
+                entry[field] = body[field]
+        locked = body["locked"]
+        if "protocol" in locked:
+            entry["protocol"] = locked["protocol"]
+            entry["research_partition"] = locked["research_partition"]
+        submissions.append(entry)
     tracked = [
         {
             "version_id": item["version_id"],
@@ -3520,6 +5515,7 @@ def _round_status_body(
         "campaign_id": record["campaign_id"],
         "scope": record["scope"],
         "data_kind": record["data_kind"],
+        "protocol": dict(kickoff.get("protocol", VALIDATION_PROTOCOL_LEGACY)),
         "kickoff": {
             field: kickoff[field]
             for field in (
@@ -3541,6 +5537,19 @@ def _round_status_body(
             "versions": tracked,
         },
     }
+    if "research_partition" in kickoff:
+        result["research_partition"] = kickoff["research_partition"]
+        result["validation_policy"] = kickoff["validation_policy"]
+        if "reuse_disclosure" in record:
+            result["reuse_disclosure"] = record["reuse_disclosure"]
+        allowance = _validation_allowance_status(connection, record)
+        if allowance is not None:
+            result["validation_allowance"] = allowance
+        result["admissions"] = [
+            _admission_status_view(connection, body)
+            for body in _admissions(connection, round_id)
+        ]
+    result["lifecycle"] = _lifecycle(connection, record, closure)
     if closure is not None:
         result["closure"] = closure
     return result
@@ -4384,6 +6393,31 @@ def _version_approved(connection: sqlite3.Connection, version_id: str) -> bool:
     return _review_state(connection, version_id) == "approved"
 
 
+def _closure_validation(
+    connection: sqlite3.Connection, version_id: str,
+) -> dict[str, Any]:
+    """The published receipt an approved selected version is closed on."""
+    row = connection.execute(
+        "SELECT validation_id, receipt_json FROM research_loop_validations "
+        "WHERE version_id = ?",
+        (version_id,),
+    ).fetchone()
+    if row is None:
+        raise ProtocolError(
+            "VALIDATION_NOT_PASSED", "close", "review",
+            "The selected version has no published Validation receipt.",
+        )
+    receipt = json.loads(row["receipt_json"])
+    return {
+        "validation_id": receipt.get("validation_id", row["validation_id"]),
+        "receipt_hash": receipt["receipt_hash"],
+        "validation_kind": receipt.get(
+            "validation_kind", VALIDATION_PROTOCOL_LEGACY["validation_kind"]
+        ),
+        "protocol": dict(receipt.get("protocol", VALIDATION_PROTOCOL_LEGACY)),
+    }
+
+
 def close(
     project: Path, round_id: str, reviewer: str, reason: str, source: object,
 ) -> dict[str, Any]:
@@ -4425,15 +6459,15 @@ def close(
             "budget": dict(record["kickoff"]["budget"]),
             "versions_attempted": len(versions),
         }
-        closure_id = _hash(body)
-        closure = {**body, "closure_id": closure_id}
-        if previous is not None:
-            if previous.get("closure_id") == closure_id:
-                return {**previous, "status": "closed", "reused": True}
-            raise ProtocolError(
-                "ROUND_CLOSED", "close", "inspect",
-                "The research round already has a different closure.",
-            )
+        # Protocol-v2 closures also freeze the allowance at the stop, and a
+        # selected version records the receipt it was approved on.  A protocol-v1
+        # closure keeps the exact pre-#50 body -- even for a new closure -- so a
+        # v1 round's closure identity never gains v2-only fields.
+        protocol_v2 = "research_partition" in record["kickoff"]
+        if protocol_v2:
+            allowance = _validation_allowance(connection, record)
+            if allowance is not None:
+                body["validation_allowance"] = allowance
         if selected is not None:
             if selected not in versions:
                 raise ProtocolError(
@@ -4452,6 +6486,24 @@ def close(
                     "VALIDATION_NOT_PASSED", "close", "review",
                     "The selected version has no approving review decision.",
                 )
+            if protocol_v2:
+                body["selected_validation"] = _closure_validation(connection, selected)
+        closure_id = _hash(body)
+        closure = {**body, "closure_id": closure_id}
+        legacy_id = _hash(
+            {
+                key: value
+                for key, value in body.items()
+                if key not in {"validation_allowance", "selected_validation"}
+            }
+        )
+        if previous is not None:
+            if previous.get("closure_id") in {closure_id, legacy_id}:
+                return {**previous, "status": "closed", "reused": True}
+            raise ProtocolError(
+                "ROUND_CLOSED", "close", "inspect",
+                "The research round already has a different closure.",
+            )
         connection.execute(
             "INSERT INTO research_loop_closures (round_id, closure_json) VALUES (?, ?)",
             (round_id, _json(closure)),

@@ -26,7 +26,7 @@ PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
 The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
-CI run); at the time of writing this branch collects **429 tests**. CI
+CI run); at the time of writing this branch collects **483 tests**. CI
 (`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
 Python 3.12; `lint` runs `ruff check .`.
 
@@ -64,6 +64,90 @@ declarative strategies in the trusted controller, and the review/evidence tests
 build `manual_tracking` artifacts and ledger fixtures directly instead of
 running a protected evaluation. They are not marked `isolation`; see
 [`tests/README.md`](../../tests/README.md) for the rule if that changes.
+
+## Discovery split tests (#50-T1)
+
+`tests/test_discovery_split_cli.py` covers the opt-in 70/30 split of a
+Campaign's sealed Discovery interval. It drives `campaign create
+--discovery-split 70/30` and the v2 `round open/submit/status` protocol through
+the public CLI on synthetic snapshots, and recomputes the canonical slice
+hashes independently (the 15-session fixture seals Discovery=9 and gives
+development 6 / trailing 3, a session count not divisible by 10). It checks the
+development-only Campaign copy and its stored bytes, runs the same strategy on
+two snapshots whose development rows are identical but whose trailing rows
+differ and asserts identical signals, fills, equity and metrics, asserts the
+unchanged v1 kickoff/locked/receipt shape, and includes one direct unit test of
+`snapshot.verify_discovery_split` for tampered descriptors and payloads. The
+file is fast and not marked `isolation`.
+
+## Formal trailing Validation tests (#50-T2)
+
+`tests/test_formal_validation_cli.py` covers protocol-v2 `round validate` and
+`round revalidate`. It drives the public CLI on synthetic sealed snapshots with
+a 70/30 split Campaign (the 15-session fixture gives development 6 / trailing 3)
+and asserts: the receipt's candidate and benchmark are accounted on the trailing
+real dates only from the trailing first session with the frozen initial cash
+(the trusted receipt carries per-session curves; the published projection does
+not), a whole-interval v1 replay is distinguishable, a declared trailing gap
+blocks before the read with zero uses, the first read counts exactly once across
+a failpoint interruption, resume, terminal-receipt recovery, replay and
+failed/insufficient verdicts, an exhausted allowance refuses before the read,
+two subprocesses racing the last automatic slot yield exactly one read, a
+compliant prehistory scores every trailing session while a short one reports
+`SCORING_START_INSUFFICIENT` and keeps its use, later trailing data does not
+change the first decision, `round status` audits the allowance counters,
+lifecycle and per-version protocol/scoring/warmup/usage, and a trailing-only
+corrected successor produces a formal revalidation epoch with the prior receipt
+and affected diff while a changed development slice is refused with
+`EVIDENCE_DEVELOPMENT_MISMATCH`. The file is fast and not marked `isolation`.
+
+## Manual Validation admission tests (#50-T3)
+
+`tests/test_validation_admission_cli.py` covers the protocol-v2 pause after the
+automatic Validation limit and the researcher's manual admission. It drives the
+public CLI on the same synthetic 70/30 split Campaigns as #50-T2 (the 15-session
+fixture gives development 6 / trailing 3) and asserts: the exhausted limit
+refuses before the read while `lifecycle` is `awaiting_validation_admission` and
+Discovery experiments/`round submit` keep working, `round admit` records one
+write-once content-addressed admission (reviewer, reason, comparison,
+selection impact) with no counter change, replays identical content, converges
+a trusted-only crash leftover, and refuses conflicting/closed/ended/approved/
+unknown/already-counted versions plus v1 rounds, the admitted version's next
+validate inserts exactly one `manual` use reflected in the receipt `usage`,
+another version cannot consume it, two subprocesses consuming the same
+admission or racing the last slot yield one counted read, an interrupted manual
+read keeps its use and resume converges, close-at-limit records
+`selected_validation`/`validation_allowance`, early no-candidate close with
+Campaign budget remaining still works, and a protocol-v1 round keeps its legacy
+status/closure/receipt shapes. The file is fast and not marked `isolation`.
+
+## Validation feedback, detail and cross-round reuse tests (#50-T4)
+
+`tests/test_validation_feedback_cli.py` covers the T4 traceability surface. It
+drives the agent and operator CLI on the same synthetic 70/30 split Campaigns as
+#50-T2/T3 and imports the formal-validation, split, review, admission and
+research-loop builders. It asserts: the v2 receipt `summary` (return, drawdown,
+costs, fills, verdict reason) reaches `round status` and the agent view while
+`equity_curve`/`curves`, ledger/paths, `query_debited`/
+`opened_protected_source` internals and review reviewer/reason stay hidden, and
+a legacy summary keeps its v1 shape; `round detail` records the question and
+normalized records, returns only the requested published blocks, replays without
+a new row or Validation use, and rejects unknown/unavailable records and a
+version without a receipt; `round feedback` links a detail access and the next
+Campaign experiment, replays by content and never consumes a use, and
+`revision_of`/`feedback_ids` are validated provenance outside `version_id`, with
+V2 re-scored on the same protocol, trailing segment, benchmark cash, costs and
+thresholds; a returned V1 is re-approved on its stored formal receipt while a
+`failed` or `insufficient_evidence` formal receipt cannot be approved; a v2
+`round open` discloses the prior round's used interval, overlap and Validation
+use history plus its feedback on the same snapshot (or on a corrected successor
+with the same frozen development content hash) and reuses the stored disclosure
+across the trusted-write crash window while the old receipt keeps reading under
+`discovery-replay`; and a
+synthetic #35 chain links snapshot, round, version, experiment, real development
+and scoring dates, warmup source, allowance usage (including a manual admission
+read), feedback, review state and tracking. The file is fast and not marked
+`isolation`.
 
 ## Docker tests
 
