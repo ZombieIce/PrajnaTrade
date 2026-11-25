@@ -74,7 +74,7 @@ import math
 import operator
 import os
 import sqlite3
-from collections.abc import Generator, Mapping
+from collections.abc import Collection, Generator, Mapping
 from contextlib import closing, contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -1924,6 +1924,29 @@ def _execution_evidence_metadata(
     return evidence if isinstance(evidence, Mapping) else None
 
 
+def _trailing_gaps(
+    metadata: Mapping[str, Any],
+    start: str,
+    end: str,
+    explained: Collection[tuple[str, object]] = (),
+) -> dict[str, list[Any]]:
+    """The sealed manifest's per-kind gaps inside ``[start, end]``.
+
+    Metadata only: the evidence-classified gate and the legacy gaps-only gate
+    judge exactly this range-filtered projection, differing only in which
+    ``(date, symbol)`` pairs an execution-evidence row already explains.
+    """
+    return {
+        kind: [
+            entry for entry in metadata.get("gaps", {}).get(kind, [])
+            if isinstance(entry, Mapping)
+            and start <= str(entry.get("date")) <= end
+            and (str(entry.get("date")), entry.get("symbol")) not in explained
+        ]
+        for kind in _GAP_KINDS
+    }
+
+
 def _formal_execution_evidence_gate(
     metadata: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -1961,15 +1984,7 @@ def _formal_execution_evidence_gate(
     explained = {
         (str(row.get("date")), row.get("symbol")) for row in benign + blocking
     }
-    gaps = {
-        kind: [
-            entry for entry in metadata.get("gaps", {}).get(kind, [])
-            if isinstance(entry, Mapping)
-            and start <= str(entry.get("date")) <= end
-            and (str(entry.get("date")), entry.get("symbol")) not in explained
-        ]
-        for kind in _GAP_KINDS
-    }
+    gaps = _trailing_gaps(metadata, start, end, explained)
     unexplained = {kind: entries for kind, entries in gaps.items() if entries}
     if not blocking and not unexplained:
         return None
@@ -2058,14 +2073,7 @@ def _formal_manifest_gate(
         if rejection is not None:
             raise rejection
         return
-    gaps = {
-        kind: [
-            entry for entry in metadata.get("gaps", {}).get(kind, [])
-            if isinstance(entry, Mapping)
-            and trailing["start"] <= str(entry.get("date")) <= trailing["end"]
-        ]
-        for kind in _GAP_KINDS
-    }
+    gaps = _trailing_gaps(metadata, trailing["start"], trailing["end"])
     blocked = {kind: entries for kind, entries in gaps.items() if entries}
     if blocked:
         raise _rejected(
