@@ -26,9 +26,9 @@ PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
 The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
-CI run); at the time of writing this branch collects **483 tests**. CI
-(`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
-Python 3.12; `lint` runs `ruff check .`.
+CI run; **521 tests** collected after #56, of which 371 are fast and 150 are the
+`isolation`/Docker selections). CI (`.github/workflows/tests.yml`) runs the full
+suite on `macos-latest` with Python 3.12; `lint` runs `ruff check .`.
 
 ## Isolation tests
 
