@@ -175,6 +175,12 @@ _VALIDATION_USE_FIELDS = (
     "validation_id", "consumed_at",
 )
 _GAP_KINDS = ("raw_bars", "derived", "corporate_actions", "availability")
+#: #56 schema-3 execution-evidence classifications a counted trailing read may
+#: accept, versus the ones that must block before any read.
+_EXECUTION_EVIDENCE_BENIGN = ("actual_open_after_halt", "confirmed_no_trade")
+_EXECUTION_EVIDENCE_BLOCKING = (
+    "missing_required_open", "source_conflict", "unknown_status",
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS research_loop_rounds (
@@ -1297,6 +1303,9 @@ def _evidence_runs(
         "expected_sessions": expected,
         "scoring_start": scoring_start,
         "data": data,
+        # The #56 identity lives beside the snapshot block, never inside it:
+        # ``checks.data_availability.snapshot`` keeps its exact pre-#56 shape.
+        "snapshot_schema_version": receipt["schema_version"],
         "snapshot": {
             "verified": True,
             "snapshot_id": source["snapshot_id"],
@@ -1304,7 +1313,6 @@ def _evidence_runs(
             "prior_history_hash": receipt.get("prior_history_hash"),
             "scope": source["data_kind"],
             "data_kind": source["data_kind"],
-            "schema_version": receipt["schema_version"],
             "as_of": cutoff,
         },
     }
@@ -1853,7 +1861,7 @@ def _receipt(
     # Additive #56 identity, published only for the new protocol: a schema-3
     # snapshot or the actual-open execution rule.  A legacy schema-1/2 v1
     # receipt under a legacy rule keeps its exact old keys and receipt hash.
-    snapshot_schema_version = replay["snapshot"].get("schema_version")
+    snapshot_schema_version = replay["snapshot_schema_version"]
     execution_rule_version = submission["locked"]["execution_rules"].get(
         "version", NEXT_OPEN_RULES
     )
@@ -1897,6 +1905,104 @@ def _verdict(checks: Mapping[str, Any], comparison: Mapping[str, Any]) -> tuple[
 
 def _formal_split(record: Mapping[str, Any]) -> dict[str, Any]:
     return record["kickoff"]["research_partition"]
+
+
+def _execution_evidence_metadata(
+    metadata: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """The sealed schema-3 execution-evidence block, when this manifest has one.
+
+    Only a declared schema version of at least 3 with the additive block takes
+    the evidence-classified gate.  A schema-1/2 manifest, or a successor that
+    renamed ``gaps`` to ``base_gaps`` and carries no evidence, keeps the legacy
+    gap behaviour byte-for-byte.
+    """
+    schema_version = metadata.get("schema_version")
+    evidence = metadata.get("execution_evidence")
+    if type(schema_version) is not int or schema_version < 3:
+        return None
+    return evidence if isinstance(evidence, Mapping) else None
+
+
+def _formal_execution_evidence_gate(
+    metadata: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    trailing: Mapping[str, Any],
+    allowance: Mapping[str, Any] | None,
+) -> ProtocolError | None:
+    """Classify the trailing segment from sealed execution evidence only.
+
+    Metadata-only, like the legacy gap check: it never opens the Discovery
+    payload and runs before the counted reservation.  ``actual_open_after_halt``
+    and ``confirmed_no_trade`` rows explain their session/symbol; the three
+    blocking classifications reject with the sealed row itself.  A trailing gap
+    whose ``(date, symbol)`` no evidence row mentions is still unexplained and
+    blocks, so a v3 manifest cannot silently skip an unclassified hole.
+    """
+    start, end = trailing["start"], trailing["end"]
+    sealed_rows = evidence.get("rows")
+    rows = (
+        [
+            dict(row)
+            for row in sealed_rows
+            if isinstance(row, Mapping) and start <= str(row.get("date")) <= end
+        ]
+        if isinstance(sealed_rows, list)
+        else []
+    )
+    benign = [
+        row for row in rows
+        if row.get("classification") in _EXECUTION_EVIDENCE_BENIGN
+    ]
+    blocking = [
+        row for row in rows
+        if row.get("classification") in _EXECUTION_EVIDENCE_BLOCKING
+    ]
+    explained = {
+        (str(row.get("date")), row.get("symbol")) for row in benign + blocking
+    }
+    gaps = {
+        kind: [
+            entry for entry in metadata.get("gaps", {}).get(kind, [])
+            if isinstance(entry, Mapping)
+            and start <= str(entry.get("date")) <= end
+            and (str(entry.get("date")), entry.get("symbol")) not in explained
+        ]
+        for kind in _GAP_KINDS
+    }
+    unexplained = {kind: entries for kind, entries in gaps.items() if entries}
+    if not blocking and not unexplained:
+        return None
+    if blocking:
+        first = min(
+            blocking,
+            key=lambda row: (str(row.get("date")), str(row.get("symbol"))),
+        )
+        message = (
+            "The sealed execution evidence blocks the trailing segment: "
+            f"{first.get('date')} {first.get('symbol')} is "
+            f"{first.get('classification')}; a counted trailing read cannot be "
+            "honest until it is corrected."
+        )
+    else:
+        kind, entries = next(
+            (kind, entries) for kind, entries in unexplained.items() if entries
+        )
+        first = entries[0]
+        message = (
+            "The sealed manifest declares unexplained gaps inside the trailing "
+            f"segment: {kind} {first.get('date')} {first.get('symbol')}; a "
+            "counted trailing read cannot be honest until they are corrected."
+        )
+    return _rejected(
+        "VALIDATION_DATA_GAP", "validation", "inspect",
+        message,
+        counted=False,
+        allowance=dict(allowance) if allowance is not None else None,
+        execution_evidence=blocking,
+        gaps=unexplained,
+        trailing=dict(trailing),
+    )
 
 
 def _formal_manifest_gate(
@@ -1944,6 +2050,14 @@ def _formal_manifest_gate(
                       "sessions": descriptor["sessions"]},
             trailing=dict(trailing),
         )
+    evidence = _execution_evidence_metadata(metadata)
+    if evidence is not None:
+        rejection = _formal_execution_evidence_gate(
+            metadata, evidence, trailing, allowance
+        )
+        if rejection is not None:
+            raise rejection
+        return
     gaps = {
         kind: [
             entry for entry in metadata.get("gaps", {}).get(kind, [])
@@ -2034,6 +2148,9 @@ def _formal_snapshot_record(
         "prior_history_hash": receipt.get("prior_history_hash"),
         "data_kind": receipt["data_kind"],
         "scope": evaluation["data_kind"],
+        # #56 identity carried beside the branch evidence for the receipt's
+        # provenance; legacy stored receipts simply do not have it.
+        "schema_version": receipt["schema_version"],
     }
 
 
@@ -2337,6 +2454,13 @@ def _formal_receipt(
             "experiment_id": submission["experiment_id"],
             "development_content_hash": split["development"]["content_hash"],
             "trailing_content_hash": split["trailing"]["content_hash"],
+            # Additive #56 identity, flat like the merged v1 receipt: a reviewer
+            # can read which snapshot contract and execution rule scored this.
+            "snapshot_schema_version": runs["snapshot"]["schema_version"],
+            "execution_rule_version": submission["locked"]["execution_rules"].get(
+                "version", NEXT_OPEN_RULES
+            ),
+            "price_basis": EXECUTION_PRICE_BASIS,
         },
         "usage": _formal_usage(use),
         "summary": _formal_summary(
