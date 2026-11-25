@@ -269,6 +269,14 @@ def _price(day: pd.DataFrame, symbol: str, column: str) -> float | None:
     return float(value) if pd.notna(value) else None
 
 
+def _execution_price(value: float | None) -> float | None:
+    """A usable open: finite and positive, otherwise the symbol cannot match."""
+    if value is None:
+        return None
+    price = float(value)
+    return price if math.isfinite(price) and price > 0 else None
+
+
 def _rebalance_at_open(
     date: pd.Timestamp,
     open_prices: Mapping[str, float | None],
@@ -278,6 +286,12 @@ def _rebalance_at_open(
     fee_rate: float,
     slippage_rate: float,
 ) -> tuple[list[dict[str, Any]], float, dict[str, float], dict[str, float]]:
+    """Match sells then buys at the given opens, skipping symbols without one.
+
+    A symbol whose open is absent or not a positive price is left untouched: it
+    cannot trade, so its shares and cash stay in the account. Without a missing
+    price the result is the same as matching every symbol at its open.
+    """
     fills: list[dict[str, Any]] = []
     costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
 
@@ -285,7 +299,9 @@ def _rebalance_at_open(
         quantity = max(0.0, shares[symbol] - target_shares[symbol])
         if quantity <= 1e-12:
             continue
-        market_price = float(open_prices[symbol] or 0.0)
+        market_price = _execution_price(open_prices.get(symbol))
+        if market_price is None:
+            continue
         fill_price = market_price * (1.0 - slippage_rate)
         notional = quantity * market_price
         fee = quantity * fill_price * fee_rate
@@ -305,7 +321,9 @@ def _rebalance_at_open(
         quantity = max(0.0, target_shares[symbol] - shares[symbol])
         if quantity <= 1e-12:
             continue
-        market_price = float(open_prices[symbol] or 0.0)
+        market_price = _execution_price(open_prices.get(symbol))
+        if market_price is None:
+            continue
         fill_price = market_price * (1.0 + slippage_rate)
         fee = quantity * fill_price * fee_rate
         cost = quantity * fill_price + fee

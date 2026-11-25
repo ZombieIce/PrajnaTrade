@@ -173,6 +173,7 @@ def run_partition_strategy(
     ready_cash_sessions: list[str] = []
     fills: list[dict[str, Any]] = []
     order_attempts: list[dict[str, Any]] = []
+    positive_attempts: list[dict[str, Any]] = []
     valuation_gaps: list[dict[str, str]] = []
     equity_curve: list[dict[str, Any]] = []
     invested_sessions = 0
@@ -266,60 +267,67 @@ def run_partition_strategy(
                 for symbol in ETF_SYMBOLS
                 if (row := raw_bars.get((day, symbol))) is not None
             }
-            missing_opens = sorted(
-                symbol
-                for symbol in ETF_SYMBOLS
-                if (
-                    weights.get(symbol, 0.0) > _EPSILON or shares[symbol] > _EPSILON
-                ) and open_prices.get(symbol) is None
-            )
-            attempt = {
-                "signal_date": signal["date"],
-                "date": day,
-                "attempts": 1,
-                "status": "not_filled" if missing_opens else "filled",
-            }
-            if missing_opens:
-                attempt["reason"] = "missing_or_unconfirmed_open"
-                attempt["missing_symbols"] = missing_opens
-                if execution_rule_version == RETRY_INITIAL_RULES and not invested_sessions:
-                    pending = (signal, weights)
-            else:
-                open_equity = cash + math.fsum(
-                    shares[symbol] * float(open_prices.get(symbol) or 0.0)
-                    for symbol in ETF_SYMBOLS
+            if execution_rule_version == ACTUAL_OPEN_RULES:
+                # Every required symbol matches on its own: one missing open no
+                # longer aborts the basket, and no sell funds a buy unless it
+                # actually filled.
+                attempt, day_fills, cash, shares, costs = _match_actual_open_day(
+                    day, signal, weights, open_prices, raw_bars, cash, shares,
+                    fee_rate, slippage_rate,
                 )
-                target_shares = {
-                    symbol: (
-                        open_equity * weights.get(symbol, 0.0) / float(open_prices[symbol])
-                        if open_prices.get(symbol) is not None
-                        else 0.0
-                    )
-                    for symbol in ETF_SYMBOLS
-                }
-                day_fills, cash, shares, costs = _rebalance_at_open(
-                    pd.Timestamp(day),
-                    open_prices,
-                    target_shares,
-                    cash,
-                    shares,
-                    fee_rate,
-                    slippage_rate,
-                )
-                for fill in day_fills:
-                    fill["raw_open"] = open_prices[fill["symbol"]]
-                    fill["price_basis"] = EXECUTION_PRICE_BASIS
-                    if execution_rule_version == ACTUAL_OPEN_RULES:
-                        open_source = raw_bars[(day, fill["symbol"])].get("open_source")
-                        if isinstance(open_source, Mapping):
-                            fill["open_evidence"] = {
-                                "source": open_source["source"],
-                                "evidence_id": open_source["evidence_id"],
-                            }
                 fills.extend(day_fills)
                 fees_paid += costs["fees"]
                 slippage_paid += costs["slippage"]
+            else:
+                missing_opens = sorted(
+                    symbol
+                    for symbol in ETF_SYMBOLS
+                    if (
+                        weights.get(symbol, 0.0) > _EPSILON or shares[symbol] > _EPSILON
+                    ) and open_prices.get(symbol) is None
+                )
+                attempt = {
+                    "signal_date": signal["date"],
+                    "date": day,
+                    "attempts": 1,
+                    "status": "not_filled" if missing_opens else "filled",
+                }
+                if missing_opens:
+                    attempt["reason"] = "missing_or_unconfirmed_open"
+                    attempt["missing_symbols"] = missing_opens
+                    if execution_rule_version == RETRY_INITIAL_RULES and not invested_sessions:
+                        pending = (signal, weights)
+                else:
+                    open_equity = cash + math.fsum(
+                        shares[symbol] * float(open_prices.get(symbol) or 0.0)
+                        for symbol in ETF_SYMBOLS
+                    )
+                    target_shares = {
+                        symbol: (
+                            open_equity * weights.get(symbol, 0.0) / float(open_prices[symbol])
+                            if open_prices.get(symbol) is not None
+                            else 0.0
+                        )
+                        for symbol in ETF_SYMBOLS
+                    }
+                    day_fills, cash, shares, costs = _rebalance_at_open(
+                        pd.Timestamp(day),
+                        open_prices,
+                        target_shares,
+                        cash,
+                        shares,
+                        fee_rate,
+                        slippage_rate,
+                    )
+                    for fill in day_fills:
+                        fill["raw_open"] = open_prices[fill["symbol"]]
+                        fill["price_basis"] = EXECUTION_PRICE_BASIS
+                    fills.extend(day_fills)
+                    fees_paid += costs["fees"]
+                    slippage_paid += costs["slippage"]
             order_attempts.append(attempt)
+            if positive_order:
+                positive_attempts.append(attempt)
 
         invested = _has_position(shares)
         invested_sessions += invested
@@ -398,6 +406,7 @@ def run_partition_strategy(
         order_attempts=order_attempts,
         signal_gaps=signal_gaps,
         valuation_gaps=valuation_gaps,
+        execution_rule_version=execution_rule_version,
     )
     return {
         "snapshot_id": snapshot_id,
@@ -414,6 +423,8 @@ def run_partition_strategy(
         "equity_curve": equity_curve,
         "position_evidence": _position_evidence(
             signals, fills, invested_sessions, ready_cash=bool(ready_cash_sessions),
+            positive_attempts=positive_attempts,
+            execution_rule_version=execution_rule_version,
         ),
         **({
             "history_readiness": {
@@ -527,6 +538,8 @@ def _position_evidence(
     invested_sessions: int,
     *,
     ready_cash: bool = False,
+    positive_attempts: list[dict[str, Any]] | None = None,
+    execution_rule_version: str = NEXT_OPEN_RULES,
 ) -> dict[str, Any]:
     positive = [signal for signal in signals if _has_position(signal["target_weights"])]
     if invested_sessions:
@@ -537,7 +550,7 @@ def _position_evidence(
         state = "intentional_cash"
     else:
         state = "no_position_signal"
-    return {
+    evidence = {
         "state": state,
         "positive_target_signals": len(positive),
         "cash_target_signals": len(signals) - len(positive),
@@ -545,6 +558,17 @@ def _position_evidence(
         "first_position_signal_date": positive[0]["date"] if positive else None,
         "first_fill_date": fills[0]["date"] if fills else None,
     }
+    if execution_rule_version == ACTUAL_OPEN_RULES:
+        latest = positive_attempts[-1] if positive_attempts else None
+        evidence["basket_build_state"] = (
+            "none"
+            if latest is None
+            else "completed" if latest["basket_complete"] else "partial"
+        )
+        evidence["unfilled_basket_signals"] = sum(
+            1 for attempt in positive_attempts or [] if attempt["unfilled"]
+        )
+    return evidence
 
 
 def _metrics(
@@ -558,6 +582,7 @@ def _metrics(
     order_attempts: list[dict[str, Any]],
     signal_gaps: list[dict[str, Any]],
     valuation_gaps: list[dict[str, Any]],
+    execution_rule_version: str = NEXT_OPEN_RULES,
 ) -> dict[str, Any]:
     """Partition metrics; unavailable values are ``None`` rather than fabricated."""
     valued = [float(point["nav"]) for point in equity_curve if point["nav"] is not None]
@@ -576,7 +601,7 @@ def _metrics(
     if valued:
         drawdowns = np.asarray(valued) / np.maximum.accumulate(np.asarray(valued)) - 1.0
         max_drawdown = float(np.min(drawdowns))
-    return {
+    metrics = {
         "sessions": len(sessions),
         "valued_sessions": len(valued),
         "total_return": total_return,
@@ -595,6 +620,13 @@ def _metrics(
         "signal_gaps": len(signal_gaps),
         "valuation_gaps": len(valuation_gaps),
     }
+    if execution_rule_version == ACTUAL_OPEN_RULES:
+        # A partial attempt still counts as unfilled above; this additive count
+        # records the baskets that matched some symbols but not all of them.
+        metrics["orders_partially_filled"] = sum(
+            1 for attempt in order_attempts if attempt.get("status") == "partially_filled"
+        )
+    return metrics
 
 
 def run_discovery_equal_weight(
@@ -908,6 +940,116 @@ def _is_executable_open(
     if data_kind == "real":
         return _instant_by(row.get("open_available_at"), cutoff)
     return _available_by(row, cutoff)
+
+
+def _match_actual_open_day(
+    day: str,
+    signal: dict[str, Any],
+    weights: Mapping[str, float],
+    open_prices: Mapping[str, float | None],
+    raw_bars: Mapping[tuple[str, str], dict],
+    cash: float,
+    shares: dict[str, float],
+    fee_rate: float,
+    slippage_rate: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]], float, dict[str, float], dict[str, float]]:
+    """Match every required symbol at its own executable open, sells first.
+
+    A required symbol without an executable open is recorded unfilled and keeps
+    its cash or shares. Holdings without an executable open are left out of the
+    open equity that sizes the targets, so no stale price sizes an order.
+    """
+    required = [
+        symbol
+        for symbol in ETF_SYMBOLS
+        if weights.get(symbol, 0.0) > _EPSILON or shares[symbol] > _EPSILON
+    ]
+    unfilled = [
+        {"symbol": symbol, "reason": _unfilled_reason(raw_bars.get((day, symbol)))}
+        for symbol in required
+        if open_prices.get(symbol) is None
+    ]
+    open_equity = cash + math.fsum(
+        shares[symbol] * float(open_prices[symbol])
+        for symbol in ETF_SYMBOLS
+        if open_prices.get(symbol) is not None
+    )
+    target_shares = {
+        symbol: (
+            open_equity * weights.get(symbol, 0.0) / float(open_prices[symbol])
+            if open_prices.get(symbol) is not None
+            else 0.0
+        )
+        for symbol in ETF_SYMBOLS
+    }
+    day_fills, cash, shares, costs = _rebalance_at_open(
+        pd.Timestamp(day),
+        open_prices,
+        target_shares,
+        cash,
+        shares,
+        fee_rate,
+        slippage_rate,
+    )
+    for fill in day_fills:
+        fill["raw_open"] = open_prices[fill["symbol"]]
+        fill["price_basis"] = EXECUTION_PRICE_BASIS
+        open_source = raw_bars[(day, fill["symbol"])].get("open_source")
+        if isinstance(open_source, Mapping):
+            fill["open_evidence"] = {
+                "source": open_source["source"],
+                "evidence_id": open_source["evidence_id"],
+            }
+    traded = {fill["symbol"] for fill in day_fills}
+    attempt = {
+        "signal_date": signal["date"],
+        "date": day,
+        "attempts": 1,
+        "status": (
+            "filled" if not unfilled
+            else "partially_filled" if day_fills
+            else "not_filled"
+        ),
+        "filled_symbols": [
+            symbol for symbol in ETF_SYMBOLS if symbol in traded
+        ],
+        "unfilled": unfilled,
+        "basket_complete": not unfilled,
+    }
+    return attempt, day_fills, cash, shares, costs
+
+
+def _unfilled_reason(row: dict | None) -> str:
+    """Classify a required symbol the sealed row shows cannot match today."""
+    if row is None:
+        return "missing_bar"
+    status = row.get("trading_status")
+    if status == "unknown":
+        return "unknown_trading_status"
+    if status == "suspended" or (
+        status == "partial_halt"
+        and _halt_covers_session(row.get("halt"), row.get("date"))
+    ):
+        return "confirmed_no_trade"
+    return "missing_required_open"
+
+
+def _halt_covers_session(halt: object, day: object) -> bool:
+    """Whether a sealed halt window spans the session's 09:30-15:00 window."""
+    if not isinstance(halt, Mapping) or not isinstance(day, str):
+        return False
+    try:
+        start = datetime.fromisoformat(halt["start"])
+        end = datetime.fromisoformat(halt["end"])
+        session = datetime.fromisoformat(day).replace(tzinfo=_CN_TZ)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if start.tzinfo is None or end.tzinfo is None:
+        return False
+    return (
+        start <= session.replace(hour=9, minute=30)
+        and session.replace(hour=15, minute=0) <= end
+    )
 
 
 def _close_available(row: dict, cutoff: datetime, data_kind: str) -> bool:
