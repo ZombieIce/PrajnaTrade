@@ -210,13 +210,16 @@ receipt instead of assuming synthetic.
 Schema 3 is the new real contract for research snapshots: it is what a
 re-acquired snapshot must declare for actual-open execution. The checked-in
 acquisition script converts the probe artifacts into schema 3 through two pure,
-importable entries: `convert_raw_bars` keeps a halted-at-open session's vendor
-actual open (citing the price archive and the official halt notice as separate
-evidence roles) and turns a whole-day halt into `suspended` with null prices,
-and `build_snapshot_input` assembles the document `snapshot seal` accepts. The
-real re-acquisition and its 45-row verification are tracked by #35 (out of scope
-here), so no checked-in real snapshot changes. A schema-2 manifest and every
-receipt stored under it keep their exact historical bytes, shape and meaning.
+importable entries. `convert_raw_bars` keeps a resumed session's vendor actual
+open and cites the price archive and official halt notice separately. When the
+resumed session has no trusted open, conversion retains the notice so the seal
+can record `missing_required_open`. A confirmed whole-day halt is `suspended`
+with null prices. If the vendor reports positive trading volume against a
+whole-day halt notice, the row is `unknown` and the seal records
+`unknown_status`. `build_snapshot_input` uses the converted closes to derive
+total returns and assembles the document `snapshot seal` accepts. The real
+re-acquisition and its 45-row verification are tracked by #35. Schema-2 manifests
+and their receipts retain their historical format and interpretation.
 The test suite uses synthetic fixtures.
 The [ADR](docs/adr/0002-actual-daily-open-execution.md) records why the fill
 price is a matching base price and never a signal input.
