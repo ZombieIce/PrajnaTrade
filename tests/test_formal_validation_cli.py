@@ -49,6 +49,19 @@ from test_research_loop_cli import (
     version_input,
 )
 
+from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES
+from test_actual_open_cli import (
+    OPEN_SOURCE,
+    day_at,
+    make_actual_open_halt,
+    make_confirmed_suspension,
+    make_missing_required_open,
+    make_open_conflict,
+    raw_row,
+    schema_v3_fixture,
+)
+
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
 VALIDATION_TERMINAL_FAILPOINT = "round_validation_after_terminal_receipt"
 V2_PROTOCOL = {
@@ -110,11 +123,17 @@ def formal_scenario(
     requirements: list[dict] | None = None,
     hard_conditions: list[dict] | None = None,
     as_of: str | None = None,
+    execution_rules: str | None = None,
 ) -> dict:
     """A split Campaign with one locked version, before any formal Validation."""
     payload = payload if payload is not None else trending_snapshot(15)
     project, snapshots, campaign = split_campaign(
-        root, payload, warmup=warmup, name=name, as_of=as_of
+        root,
+        payload,
+        warmup=warmup,
+        name=name,
+        as_of=as_of,
+        execution_rules=execution_rules,
     )
     store = root / f"{name}-trusted"
     contract = v2_round_input(limit=limit)
@@ -449,6 +468,32 @@ def test_formal_validation_scores_only_the_trailing_segment(tmp_path: Path) -> N
     }
 
 
+def test_formal_receipt_names_the_snapshot_schema_and_execution_rule(
+    tmp_path: Path,
+) -> None:
+    """#59: the v2 receipt identifies the sealed schema and locked rule.
+
+    The identity mirrors the merged v1 receipt: three flat additive members
+    under the already-published ``provenance`` block.  They are the names a
+    reviewer needs to read the fills under the same rule as Discovery.
+    """
+    scenario = formal_scenario(
+        tmp_path,
+        payload=schema_v3_fixture(15),
+        name="provenance",
+        execution_rules=ACTUAL_OPEN_RULES,
+    )
+    validated = ok(validate_current(scenario))
+
+    assert validated["outcome"] == "passed", validated["checks"]
+    assert validated["provenance"]["snapshot_schema_version"] == 3
+    assert validated["provenance"]["execution_rule_version"] == ACTUAL_OPEN_RULES
+    assert validated["provenance"]["price_basis"] == "unadjusted_open"
+    # The legacy provenance members are unchanged beside the new identity.
+    assert validated["provenance"]["snapshot_id"] == scenario["campaign"]["snapshot_id"]
+    assert validated["provenance"]["as_of"] is None
+
+
 def test_formal_validation_is_distinguishable_from_the_v1_replay(tmp_path: Path) -> None:
     formal = formal_scenario(tmp_path, payload=drifting_snapshot(15), name="formal")
     formal_receipt = ok(validate_current(formal))
@@ -475,6 +520,34 @@ def test_formal_validation_is_distinguishable_from_the_v1_replay(tmp_path: Path)
     assert formal_receipt["summary"]["candidate"]["total_return"] == pytest.approx(
         formal_receipt["metrics"]["candidate"]["total_return"]
     )
+
+
+def test_legacy_v1_receipt_keeps_its_data_availability_snapshot_shape(
+    tmp_path: Path,
+) -> None:
+    """#59: a schema-1 next-open-v1 v1 receipt keeps its exact pre-#56 shape.
+
+    Ticket #57 stored ``schema_version`` inside the replay's ``snapshot`` block,
+    which leaked into ``checks.data_availability.snapshot`` of every recomputed
+    v1 receipt.  That block is the receipt's legacy availability evidence, not
+    the #56 identity; only schema-3/actual-open receipts get ``provenance``.
+    """
+    scenario = legacy_scenario(tmp_path, payload=drifting_snapshot(15))
+    receipt = ok(validate_current(scenario))
+    _, _, evaluation = stored_campaign(scenario["project"])
+
+    assert "provenance" not in receipt
+    snapshot = receipt["checks"]["data_availability"]["snapshot"]
+    assert snapshot == {
+        "verified": True,
+        "snapshot_id": evaluation["snapshot_id"],
+        "partition_content_hash": evaluation["partition_content_hash"],
+        "prior_history_hash": None,
+        "scope": "synthetic",
+        "data_kind": "synthetic",
+        "as_of": None,
+    }
+    assert "schema_version" not in snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +685,76 @@ def _payload_content(payload: dict) -> dict:
         kind: [row for row in payload[kind] if row["date"] in discovery]
         for kind in ("calendar", "raw_bars", "corporate_actions", "derived")
     }
+
+
+# ---------------------------------------------------------------------------
+# 3b. Schema-3 execution evidence: a benign halt is not a pre-read gap (#59)
+# ---------------------------------------------------------------------------
+
+
+def test_confirmed_no_trade_evidence_passes_the_pre_read_gate(tmp_path: Path) -> None:
+    """#59: sealed ``confirmed_no_trade`` evidence is a benign trailing halt.
+
+    The pre-read gate must classify the sealed execution evidence instead of
+    rejecting every gap.  This read proceeds and counts exactly one use.  The
+    suspended close is still unvaluable under the existing data-sufficiency
+    rules, so the counted verdict is ``insufficient_evidence``.
+    """
+    payload = schema_v3_fixture(15)
+    suspended_day = day_at(7)
+    make_confirmed_suspension(payload, suspended_day, ETF_SYMBOLS[0])
+    scenario = formal_scenario(
+        tmp_path, payload=payload, name="suspended", execution_rules=ACTUAL_OPEN_RULES
+    )
+    split = scenario["split"]
+    assert split["trailing"]["start"] < suspended_day <= split["trailing"]["end"]
+    assert suspended_day in scenario["trailing_dates"]
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "insufficient_evidence"
+    assert validated["reason"] == "COVERAGE_INSUFFICIENT"
+    assert validated["usage"]["kind"] == "automatic"
+    assert validated["usage"]["sequence"] == 1
+    assert validated["provenance"]["snapshot_schema_version"] == 3
+    assert len(round_uses(scenario)) == 1
+
+    # The benchmark entered before the halt and holds the unvaluable symbol.
+    benchmark = validated["runs"]["benchmark"]
+    assert benchmark["fills"][0]["date"] == split["trailing"]["start"]
+    assert split["trailing"]["start"] < suspended_day
+    valuation = validated["checks"]["data_availability"]["benchmark"]["valuation_gaps"]
+    assert suspended_day in valuation["dates"]
+    assert validated["checks"]["data_availability"]["ok"] is False
+
+
+def test_unexplained_trailing_gap_still_blocks_a_schema_v3_read(tmp_path: Path) -> None:
+    """#59: v3 evidence does not excuse an unclassified trailing hole.
+
+    Only the sealed benign/blocking classifications explain a gap.  A raw-bar
+    availability gap no execution-evidence row mentions is still unexplained,
+    so the read stays uncounted exactly like the legacy gate.
+    """
+    payload = schema_v3_fixture(15)
+    day = day_at(7)
+    raw_row(payload, day, ETF_SYMBOLS[0])["available_at"] = None
+    scenario = formal_scenario(
+        tmp_path, payload=payload, name="unexplained", execution_rules=ACTUAL_OPEN_RULES
+    )
+    split = scenario["split"]
+    assert split["trailing"]["start"] <= day <= split["trailing"]["end"]
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_DATA_GAP", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["allowance"]["automatic_used"] == 0
+    assert blocked["execution_evidence"] == []
+    assert [
+        (entry["date"], entry["symbol"])
+        for entry in blocked["gaps"]["availability"]
+    ] == [(day, ETF_SYMBOLS[0])]
+    assert day in blocked["error"]["message"]
+    assert not (scenario["store"] / "research-loop-validations").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1252,3 +1395,271 @@ def test_formal_validation_reads_at_the_campaigns_frozen_as_of(tmp_path: Path) -
     assert validated["metrics"]["candidate"]["sessions"] == 2
     receipt = trusted_receipt(scenario, validated["validation_id"])
     assert receipt["curves"]["candidate"][0]["date"] == split["trailing"]["start"]
+
+
+# ---------------------------------------------------------------------------
+# 9. Schema-3 actual-open formal Validation over the full trailing segment (#59)
+# ---------------------------------------------------------------------------
+
+#: 1824 sealed sessions -> 1094 Discovery -> 765 development -> 329 trailing.
+FULL_SESSIONS = 1824
+TRAILING_SESSIONS = 329
+HALTED_TRAILING_SESSIONS = 44
+HALTED_ROWS = 45
+
+
+def _drifting_v3_snapshot(session_count: int) -> dict:
+    """A schema-3 payload with a deterministic upward drift and no actions.
+
+    Climbing unadjusted prices give the momentum candidate a first
+    trailing-session buy, so both the candidate and the benchmark trade on the
+    session that also carries sealed halted-at-open evidence.
+    """
+    payload = schema_v3_fixture(session_count)
+    payload["corporate_actions"] = []
+    index = {row["date"]: position for position, row in enumerate(payload["calendar"])}
+    for row in payload["raw_bars"]:
+        factor = 1.0 + 0.005 * index[row["date"]]
+        for field in ("open", "high", "low", "close"):
+            row[field] = round(row[field] * factor, 6)
+    for row in payload["derived"]:
+        row["value"] = 10.0 * (1.0 + 0.005 * index[row["date"]])
+    return payload
+
+
+def _v3_trailing_dates(payload: dict) -> list[str]:
+    """The trailing session dates the seal and the 70/30 split will produce."""
+    dates = [row["date"] for row in payload["calendar"]]
+    discovery_end = len(dates) * 3 // 5
+    development = discovery_end * 70 // 100
+    return dates[development:discovery_end]
+
+
+def _apply_trailing_halts(payload: dict) -> list[tuple[str, str]]:
+    """Seal 45 halted-at-open rows on 44 trailing sessions.
+
+    The first trailing session (where both accounts trade) is included and
+    carries two halted symbols.  Each row keeps its own drifted actual open as
+    the sealed price source.
+    """
+    trailing = _v3_trailing_dates(payload)
+    positions = [
+        round(index * (len(trailing) - 1) / (HALTED_TRAILING_SESSIONS - 1))
+        for index in range(HALTED_TRAILING_SESSIONS)
+    ]
+    assert len(set(positions)) == HALTED_TRAILING_SESSIONS
+    # The momentum candidate buys the alphabetically first scored symbol on the
+    # first trailing session; halting it there evidences the candidate fill too.
+    candidate_symbol = min(ETF_SYMBOLS)
+    halted: list[tuple[str, str]] = []
+    for index, position in enumerate(positions):
+        day = trailing[position]
+        symbol = (
+            candidate_symbol
+            if index == 0
+            else ETF_SYMBOLS[index % len(ETF_SYMBOLS)]
+        )
+        halted.append((day, symbol))
+        if index == 0:
+            halted.append(
+                (day, next(item for item in ETF_SYMBOLS if item != symbol))
+            )
+    for day, symbol in halted:
+        make_actual_open_halt(
+            payload, day, symbol, open_price=float(raw_row(payload, day, symbol)["open"])
+        )
+    return halted
+
+
+def _validation_ledger_counts(scenario: dict) -> tuple[int, int]:
+    with sqlite3.connect(
+        scenario["project"] / ".prajnatrade" / "project.sqlite"
+    ) as connection:
+        attempts = connection.execute(
+            "SELECT count(*) FROM research_loop_validation_attempts"
+        ).fetchone()[0]
+        uses = connection.execute(
+            "SELECT count(*) FROM research_loop_validation_uses"
+        ).fetchone()[0]
+    return attempts, uses
+
+
+def test_schema_v3_trailing_validation_scores_329_trusted_halt_days(
+    tmp_path: Path,
+) -> None:
+    """#59: 45 evidenced halts on 44 trailing sessions do not cost a session.
+
+    Synthetic schema-3 real-shaped evidence through the public CLI only: no
+    real snapshot, no protected read, no query debit, no real allowance.
+    """
+    payload = _drifting_v3_snapshot(FULL_SESSIONS)
+    halted = _apply_trailing_halts(payload)
+    assert len(halted) == HALTED_ROWS
+    assert len({day for day, _ in halted}) == HALTED_TRAILING_SESSIONS
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        warmup=3,
+        limit=1,
+        name="gaps",
+        execution_rules=ACTUAL_OPEN_RULES,
+        parameters={"lookback": 2, "cash_if_negative": False},
+    )
+    split = scenario["split"]
+    assert split["trailing"]["sessions"] == TRAILING_SESSIONS
+    assert len(scenario["trailing_dates"]) == TRAILING_SESSIONS
+    assert scenario["campaign"]["execution_rules"]["version"] == ACTUAL_OPEN_RULES
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "passed", validated["checks"]
+    assert validated["reason"] is None
+    assert validated["scoring"] == {
+        "start": split["trailing"]["start"],
+        "end": split["trailing"]["end"],
+        "sessions": TRAILING_SESSIONS,
+        "valued_sessions": TRAILING_SESSIONS,
+    }
+    receipt = trusted_receipt(scenario, validated["validation_id"])
+    for side in ("candidate", "benchmark"):
+        run = validated["runs"][side]
+        assert run["sessions"] == TRAILING_SESSIONS
+        assert run["valued_sessions"] == TRAILING_SESSIONS
+        assert run["end_date"] == split["trailing"]["end"]
+        assert len(receipt["curves"][side]) == TRAILING_SESSIONS
+        assert receipt["curves"][side][-1]["date"] == split["trailing"]["end"]
+    assert validated["usage"]["kind"] == "automatic"
+    assert validated["usage"]["sequence"] == 1
+    assert len(round_uses(scenario)) == 1
+    assert _validation_ledger_counts(scenario) == (1, 1)
+
+    # Both accounts traded a halted session at its sealed actual open.
+    halted_days = {day for day, _ in halted}
+    first_day, first_symbol = halted[0]
+    sealed = raw_row(payload, first_day, first_symbol)
+    assert sealed["trading_status"] == "partial_halt"
+    assert sealed["open_source"] == OPEN_SOURCE
+    for side in ("candidate", "benchmark"):
+        fills = validated["runs"][side]["fills"]
+        halted_fills = [fill for fill in fills if fill["date"] in halted_days]
+        assert halted_fills, side
+        first = next(
+            fill
+            for fill in fills
+            if fill["date"] == first_day and fill["symbol"] == first_symbol
+        )
+        assert first["raw_open"] == sealed["open"]
+        assert first["open_evidence"] == sealed["open_source"]
+        assert first["price_basis"] == "unadjusted_open"
+    assert validated["provenance"]["snapshot_schema_version"] == 3
+    assert validated["provenance"]["execution_rule_version"] == ACTUAL_OPEN_RULES
+    assert validated["provenance"]["price_basis"] == "unadjusted_open"
+
+    # Replaying the same evaluation reuses the terminal receipt, never recounts.
+    replayed = ok(validate_current(scenario))
+    assert replayed["reused"] is True
+    assert replayed["validation_id"] == validated["validation_id"]
+    status = ok(
+        round_status(scenario["project"], scenario["opened"]["round_id"], agent=True)
+    )
+    assert status["validation_allowance"]["automatic_used"] == 1
+    assert len(status["validation_allowance"]["uses"]) == 1
+    assert _validation_ledger_counts(scenario) == (1, 1)
+
+
+def test_missing_required_open_blocks_the_329_day_read_with_zero_uses(
+    tmp_path: Path,
+) -> None:
+    """#59: one trailing halt without a trusted open costs zero uses.
+
+    The trailing payload is never read: the sealed manifest classifies the row
+    ``missing_required_open`` and the rejection names its date and symbol.
+    """
+    payload = _drifting_v3_snapshot(FULL_SESSIONS)
+    halted = _apply_trailing_halts(payload)
+    day, symbol = halted[2]
+    make_missing_required_open(payload, day, symbol)
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        warmup=3,
+        limit=1,
+        name="missing-open",
+        execution_rules=ACTUAL_OPEN_RULES,
+        parameters={"lookback": 2, "cash_if_negative": False},
+    )
+    assert scenario["split"]["trailing"]["sessions"] == TRAILING_SESSIONS
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_DATA_GAP", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["allowance"]["auto_limit"] == 1
+    assert blocked["allowance"]["automatic_used"] == 0
+    assert blocked["trailing"] == scenario["split"]["trailing"]
+    assert blocked["gaps"] == {}
+    rows = blocked["execution_evidence"]
+    assert len(rows) == 1
+    assert rows[0]["date"] == day
+    assert rows[0]["symbol"] == symbol
+    assert rows[0]["trading_status"] == "partial_halt"
+    assert rows[0]["classification"] == "missing_required_open"
+    assert rows[0]["reason"] == "partial_halt_without_actual_open"
+    assert day in blocked["error"]["message"]
+    assert symbol in blocked["error"]["message"]
+    assert "missing_required_open" in blocked["error"]["message"]
+    assert not (scenario["store"] / "research-loop-validations").exists()
+    assert _validation_ledger_counts(scenario) == (0, 0)
+
+    status = ok(
+        round_status(scenario["project"], scenario["opened"]["round_id"], agent=True)
+    )
+    assert status["lifecycle"] == "research"
+    assert status["validation_allowance"]["automatic_used"] == 0
+    assert status["validation_allowance"]["uses"] == []
+    assert version_entry(scenario)["validation"]["status"] == "not_run"
+
+
+def test_source_conflict_blocks_the_329_day_read_with_zero_uses(
+    tmp_path: Path,
+) -> None:
+    """#59: two disagreeing sealed opens are never silently resolved."""
+    payload = _drifting_v3_snapshot(FULL_SESSIONS)
+    halted = _apply_trailing_halts(payload)
+    day, symbol = halted[3]
+    conflict = make_open_conflict(payload, day, symbol)
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        warmup=3,
+        limit=1,
+        name="conflict",
+        execution_rules=ACTUAL_OPEN_RULES,
+        parameters={"lookback": 2, "cash_if_negative": False},
+    )
+    assert scenario["split"]["trailing"]["sessions"] == TRAILING_SESSIONS
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_DATA_GAP", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["allowance"]["auto_limit"] == 1
+    assert blocked["allowance"]["automatic_used"] == 0
+    assert blocked["gaps"] == {}
+    rows = blocked["execution_evidence"]
+    assert len(rows) == 1
+    assert rows[0]["date"] == day
+    assert rows[0]["symbol"] == symbol
+    assert rows[0]["classification"] == "source_conflict"
+    assert rows[0]["open_conflict"] == conflict["open_conflict"]
+    assert day in blocked["error"]["message"]
+    assert symbol in blocked["error"]["message"]
+    assert "source_conflict" in blocked["error"]["message"]
+    assert not (scenario["store"] / "research-loop-validations").exists()
+    assert _validation_ledger_counts(scenario) == (0, 0)
+
+    status = ok(
+        round_status(scenario["project"], scenario["opened"]["round_id"], agent=True)
+    )
+    assert status["lifecycle"] == "research"
+    assert status["validation_allowance"]["automatic_used"] == 0
+    assert version_entry(scenario)["validation"]["status"] == "not_run"

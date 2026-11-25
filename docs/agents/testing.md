@@ -159,6 +159,59 @@ corrected successor produces a formal revalidation epoch with the prior receipt
 and affected diff while a changed development slice is refused with
 `EVIDENCE_DEVELOPMENT_MISMATCH`. The file is fast and not marked `isolation`.
 
+## Formal Validation pre-read execution gate and 329-day receipt tests (#59)
+
+`tests/test_formal_validation_cli.py` also owns the end-to-end #56/#59 acceptance
+surface. It imports the schema-3 builders from `test_actual_open_cli.py`
+(`schema_v3_fixture`, `day_at`, `raw_row`, `make_actual_open_halt`,
+`make_confirmed_suspension`, `make_missing_required_open`, `make_open_conflict`,
+`OPEN_SOURCE`) and extends the shared builders without changing existing callers:
+`split_campaign` and `formal_scenario` take an optional
+`execution_rules: str | None = None` that appends `--execution-rules` only when
+given (the default keeps every existing record at `next-open-v1`).
+
+- **Pre-read gate.** A schema-3 `actual-open-v1` scenario with a
+  `confirmed_no_trade` suspension inside the trailing segment is not a
+  `VALIDATION_DATA_GAP`: the read proceeds, records exactly one automatic use,
+  and still ends `insufficient_evidence`/`COVERAGE_INSUFFICIENT` because the
+  held suspended close is a valuation gap. A trailing `availability` gap that no
+  `execution_evidence` row classifies is still unexplained and rejects with
+  `counted: false`, `execution_evidence: []` and the per-kind `gaps`.
+- **329-day positive.** The fixture is `schema_v3_fixture(1824)` with
+  `corporate_actions` cleared and a deterministic `1 + 0.005 * index` drift on
+  raw OHLC and derived values, so the momentum candidate buys the alphabetically
+  first symbol on the first trailing session. Before sealing, 45
+  `make_actual_open_halt` rows are placed on 44 distinct trailing sessions (the
+  first trailing session carries two halted symbols, including the candidate's
+  symbol) and each row keeps its own drifted actual open. 1824 sessions give a
+  1094-session sealed Discovery interval, development 765 and trailing 329.
+  `round validate` must return `passed` with `scoring` and both runs at 329
+  sessions/329 valued sessions ending on the trailing end, 329-point trusted
+  curves per side, `usage.kind: automatic`/`sequence: 1`, exactly one
+  `research_loop_validation_uses` row, a candidate and a benchmark fill on a
+  halted session whose `open_evidence` equals the sealed `open_source`, and the
+  receipt `provenance` carrying `snapshot_schema_version: 3`,
+  `execution_rule_version: "actual-open-v1"` and
+  `price_basis: "unadjusted_open"`. Replaying the same command returns the same
+  `validation_id` with `reused: true` and still one use row (and
+  `round status` shows one use).
+- **Zero-use negatives.** The same 1824-session recipe with one trailing halt
+  row replaced by `make_missing_required_open` (seal stays valid) or by
+  `make_open_conflict` rejects `VALIDATION_DATA_GAP` at the gate with
+  `counted: false`, `allowance.automatic_used == 0` of 1, the blocking
+  `execution_evidence` row naming the date/symbol/classification and reason in
+  the message, `gaps: {}`, no terminal receipt, no
+  `research-loop-validations` directory, zero use/attempt rows, and
+  `round status` still `research` with version validation `not_run`.
+- **Receipt identity and legacy readability.** The v2 `provenance` gains the
+  three flat keys; a legacy schema-1 `next-open-v1` v1 receipt has no
+  `provenance` and its `checks.data_availability.snapshot` keeps the exact
+  pre-#56 keys (no `schema_version` leak).
+
+The 329-day tests are subprocess-heavy (about 8-11 CLI calls each, a ~4.4 MB
+payload, ~10 s per test) but not marked `isolation`; the file is still fast
+compared with the full suite.
+
 ## Manual Validation admission tests (#50-T3)
 
 `tests/test_validation_admission_cli.py` covers the protocol-v2 pause after the
