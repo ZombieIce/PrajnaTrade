@@ -78,10 +78,24 @@ Two failure modes drove this decision:
 - Schema 2 remains the acquisition output until the real re-acquisition is done
   separately; no real Validation allowance is consumed by this change, and all
   acceptance tests remain synthetic.
-- Per-symbol partial fills, sell-then-buy funding and the formal allocation of
-  confirmed no-trade days are separate tickets; the current basket attempt stays
-  all-or-nothing, so a required symbol without an executable open still leaves
-  the whole attempt unfilled.
+- Under `actual-open-v1` a basket no longer fills all-or-nothing: every
+  required symbol (a buy with `weight > ε`, a sell with `shares > ε`) matches
+  separately at its own sealed executable open. Sells match before buys in
+  frozen symbol order; buys are funded by initial available cash plus realized
+  sell net, and a symbol without an executable open is recorded unfilled with a
+  reason derived from its sealed row (`confirmed_no_trade`,
+  `missing_required_open`, `unknown_trading_status`, `missing_bar`) while the
+  other required symbols still fill. A partially filled plan is recorded as
+  `partially_filled` with `basket_complete: false` and marked not yet built in
+  `position_evidence`; unfilled buy cash and unsold shares stay in the account,
+  and holdings without an executable open are left out of the open equity that
+  sizes targets. `actual-open-v1` never retries automatically: a later strategy
+  decision emits a new target, or the plan expires at the partition end.
+  `next-open-v1` and `retry-initial-v1` keep the all-or-nothing attempt, their
+  exact result keys and the legacy initial-entry retry.
+- The shared matching primitive skips a symbol whose open is absent or not a
+  positive price rather than trading at price 0, so an unfilled symbol cannot
+  corrupt the ledger. Without a missing price its result is unchanged.
 - A schema-3 successor of a schema-2 snapshot, protected Evaluation on schema 3,
   and dividend-correction successors of schema-3 snapshots are not supported by
   this decision.

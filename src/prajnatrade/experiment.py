@@ -177,12 +177,18 @@ def _execution_policy(version: str) -> dict[str, Any]:
             retry_scope="before_first_position_is_established",
         )
     elif version == ACTUAL_OPEN_RULES:
-        # Ticket #57 stage: the sealed actual daily open is a matching base
-        # price only. The basket attempt stays all-or-nothing until the
-        # per-symbol stage records each symbol separately.
+        # The sealed actual daily open is a matching base price only, never a
+        # signal input. Each required symbol matches separately, sells fund the
+        # same day's buys with their realized net, and an unfilled symbol keeps
+        # its cash or shares instead of blocking the whole basket (ADR 0002).
         rules["execution"].update(
             halted_open="actual_daily_open_when_evidenced",
             partial_halt_open_availability="not_gated_by_0930",
+            missing_required_open="symbol_not_filled",
+            partial_fill="recorded_per_symbol",
+            funding="initial_cash_plus_realized_sell_net",
+            order="sells_before_buys",
+            matching="per_symbol",
         )
     return rules
 

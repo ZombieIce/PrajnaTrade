@@ -413,11 +413,13 @@ def _complete_row(row: dict, kind: str, *, is_real: bool) -> bool:
 _SHANGHAI = timezone(timedelta(hours=8))
 
 
-def _halt_covers_session(halt: object, day: str) -> bool:
+def halt_covers_session(halt: object, day: str) -> bool:
     """Whether a halt window spans the whole session (09:30-15:00 Shanghai).
 
     A session the notice closes for the whole day is a confirmed no-trade day;
-    anything less leaves a required open the row does not store.
+    anything less leaves a required open the row does not store. Shared seam:
+    the manifest execution-evidence classification and the ``actual-open-v1``
+    engine's unfilled-symbol reason must agree on it.
     """
     if not isinstance(halt, dict):
         return False
@@ -457,7 +459,7 @@ def _execution_evidence_row(row: dict) -> dict | None:
                 open=row["open"],
                 open_source=row["open_source"],
             )
-        elif _halt_covers_session(row.get("halt"), row["date"]):
+        elif halt_covers_session(row.get("halt"), row["date"]):
             record["classification"] = "confirmed_no_trade"
         else:
             record.update(

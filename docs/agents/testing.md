@@ -105,6 +105,39 @@ valuation, and a `next-open-v1` control cannot fill the halted day. A v1
 `round validate` receipt on a schema-3 `actual-open-v1` Campaign asserts the
 additive provenance identity. The file is fast and not marked `isolation`.
 
+`tests/test_execution_rules_cli.py` owns the matching behaviour of the frozen
+execution rules and imports those schema-3 builders. For #58 it drives
+schema-3 Campaigns through the public CLI and asserts:
+
+- **Five-ETF basket.** On the entry day one symbol is a confirmed whole-day
+  suspension, one resumed with a trusted actual open and three trade normally.
+  Four symbols fill at their own actual opens, the suspended one is recorded
+  unfilled with `confirmed_no_trade`, and cash, fees, holdings and the reliable
+  close valuation are recomputed from the fill rows. The attempt is
+  `partially_filled` with `basket_complete: false`, `metrics.orders_partially_filled`
+  is one, and `position_evidence` reports the partial build. The equal-weight
+  candidate and the frozen benchmark agree on attempts, fills, equity, metrics
+  and position evidence. Changing only the suspended symbol's tradability makes
+  it fill and the account delta is recomputed from the new fill and the
+  proportional scale.
+- **Sell then buy.** A declarative `momentum` strategy (`lookback: 2`,
+  `top_k: 1`, `cash_if_negative: false`) over engineered per-symbol closes
+  starts fully invested in A, then targets B with no original cash. The fills
+  are sell A then buy B, B's debit equals A's realized sell net, and quantities,
+  fees, cash and the attempt terminal state are hand-recomputed. When A is a
+  confirmed whole-day suspension at the switch, B cannot use the expected
+  proceeds: B does not fill, A's shares are retained at the next confirmed mark,
+  fees and cash are unchanged, the attempt is `not_filled` and A's unfilled
+  reason is `confirmed_no_trade`.
+- **Unfilled accounting and no retry.** A day whose five required symbols are a
+  whole-day halt, a missing required open, an unknown status and two confirmed
+  suspensions records every sealed-row reason, keeps the 100000 cash, and is
+  never retried automatically under `actual-open-v1`: the next attempt comes
+  from a new strategy decision. The submit-once benchmark records only the
+  blocked attempt and never moves cash. The same payload under
+  `retry-initial-v1` reuses the blocked signal on the next open and keeps its
+  exact legacy attempt shape and legacy metrics/position-evidence key sets.
+
 ## Formal trailing Validation tests (#50-T2)
 
 `tests/test_formal_validation_cli.py` covers protocol-v2 `round validate` and
