@@ -273,7 +273,7 @@ def run_partition_strategy(
             open_prices = {
                 symbol: (
                     float(row["open"])
-                    if _is_executable_open(
+                    if is_executable_open(
                         row, open_cutoff, data_kind=data_kind,
                         execution_rule_version=execution_rule_version,
                     )
@@ -759,7 +759,7 @@ def run_discovery_baseline(
             )
             missing_opens = [
                 symbol for symbol in ETF_SYMBOLS
-                if not _is_executable_open(
+                if not is_executable_open(
                     raw_bars.get((day, symbol)), open_cutoff, data_kind=data_kind
                 )
             ]
@@ -947,7 +947,7 @@ def _instant_by(value: object, cutoff: datetime) -> bool:
     return available_at.tzinfo is not None and available_at <= cutoff
 
 
-def _is_executable_open(
+def is_executable_open(
     row: dict | None,
     cutoff: datetime,
     *,
@@ -961,12 +961,19 @@ def _is_executable_open(
     whose sealed bar carries the actual daily open and its price source: that
     daily open is only knowable after the close, and it is a matching base price
     for an order effective before the open, never a signal input (ADR 0002).
+    An actual open also has to be a real trade: the bar needs positive volume,
+    and its halt window cannot cover the whole session (that is a confirmed
+    no-trade day, which has no executable open).
     """
     if row is None or not _valid_price(row.get("open")):
         return False
     status = row.get("trading_status")
     if execution_rule_version == ACTUAL_OPEN_RULES and status == "partial_halt":
-        return isinstance(row.get("open_source"), Mapping)
+        return (
+            isinstance(row.get("open_source"), Mapping)
+            and _valid_price(row.get("volume"))
+            and not halt_covers_session(row.get("halt"), row.get("date"))
+        )
     if status != "trading" or not _valid_price(row.get("volume")):
         return False
     if data_kind == "real":
@@ -1017,7 +1024,7 @@ def _match_actual_open_day(
                     "reason": (
                         "equity_basis_unknown"
                         if open_prices.get(symbol) is not None
-                        else _unfilled_reason(raw_bars.get((day, symbol)))
+                        else unfilled_reason(raw_bars.get((day, symbol)))
                     ),
                 }
                 for symbol in required
@@ -1027,7 +1034,7 @@ def _match_actual_open_day(
         no_costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
         return attempt, [], cash, shares, no_costs
     unfilled = [
-        {"symbol": symbol, "reason": _unfilled_reason(raw_bars.get((day, symbol)))}
+        {"symbol": symbol, "reason": unfilled_reason(raw_bars.get((day, symbol)))}
         for symbol in unpriced
     ]
     open_equity = cash + math.fsum(
@@ -1071,7 +1078,7 @@ def _match_actual_open_day(
     return attempt, day_fills, cash, shares, costs
 
 
-def _unfilled_reason(row: dict | None) -> str:
+def unfilled_reason(row: dict | None) -> str:
     """Classify a required symbol the sealed row shows cannot match today."""
     if row is None:
         return "missing_bar"
@@ -1081,8 +1088,8 @@ def _unfilled_reason(row: dict | None) -> str:
     if status == "suspended":
         return "confirmed_no_trade"
     # A sealed source conflict is never resolved into a confirmed no-trade or a
-    # fill: the required open is missing.
-    if "open_conflict" in row:
+    # fill: the required open is missing.  An explicit null is not a conflict.
+    if row.get("open_conflict") is not None:
         return "missing_required_open"
     if status == "partial_halt" and halt_covers_session(row.get("halt"), row.get("date")):
         return "confirmed_no_trade"

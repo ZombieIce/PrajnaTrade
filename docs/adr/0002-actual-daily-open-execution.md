@@ -34,16 +34,29 @@ Two failure modes drove this decision:
    `status_evidence_id` and `open_conflict` to raw bars. An open is executable
    only with the price archive that produced it; the resumption notice is a
    separate evidence id that proves trading status only and must differ from the
-   open's price source. A `partial_halt` row may carry the day's actual
-   unadjusted daily open. Two sealed opens that disagree are stored as an
+   open's price source. Evidence has roles, and the seal checks them:
+   `open_source.evidence_id` must name a `price_archive` item, and
+   `status_evidence_id` must name a halt/suspension/resumption notice
+   (`halt`, `halt_notice`, `suspension_notice`, `resumption_notice`,
+   `trading_status_notice`). An announcement therefore cannot be used as a
+   price, nor a price archive as a status proof. A `partial_halt` row may carry
+   the day's actual unadjusted daily open, but an actual open is a real trade:
+   the row needs positive `volume` and a halt window that does not cover the
+   whole session, or the seal rejects it as a confirmed no-trade day with a
+   residual price. Two sealed opens that disagree are stored as an
    `open_conflict` with `open: null` and are never silently resolved; a
    `suspended` row cannot carry one, because a confirmed no-trade day has no
-   open to disagree about. The
-   manifest adds a schema-3-only `execution_evidence` block that classifies every
-   non-trading sealed session/symbol as `actual_open_after_halt`,
-   `confirmed_no_trade`, `missing_required_open`, `source_conflict` or
-   `unknown_status`; `gaps` keeps its historical shape so old consumers are
-   unchanged.
+   open to disagree about, and an explicit `open_conflict: null` is absent
+   rather than a conflict. The manifest adds a schema-3-only
+   `execution_evidence` block that classifies every non-trading sealed
+   session/symbol as `actual_open_after_halt`, `confirmed_no_trade`,
+   `missing_required_open`, `source_conflict` or `unknown_status`. That block is
+   a pre-read classification, not a price record: each row carries the
+   classification, date, symbol, status, halt/reason and evidence *references*
+   (`open_source`, `status_evidence_id`, `conflict_sources`) only. No actual
+   open and no conflict quote from any sealed partition appears in the manifest,
+   so inspecting it before the counted read cannot expose a price. `gaps` keeps
+   its historical shape so old consumers are unchanged.
 
 2. **`actual-open-v1` matches at the actual daily open.** Under the opt-in
    execution rule, an order effective before the open fills at the sealed actual
@@ -82,13 +95,18 @@ Two failure modes drove this decision:
   confirmed no-trade and from an unknown or conflicted price.
 - The formal trailing pre-read gate (#59) classifies the trailing segment from
   the sealed `execution_evidence` before it reads the payload. Trailing
-  `actual_open_after_halt` and `confirmed_no_trade` rows are benign and explain
-  their `(date, symbol)` gap; trailing `missing_required_open`, `source_conflict`
-  and `unknown_status` rows reject `VALIDATION_DATA_GAP` with zero uses, naming
-  the first date/symbol/classification, and so does a trailing gap that no
-  evidence row classifies. The gate is metadata-only and never turns a
-  confirmed no-trade day into a valuation input: a held symbol with no confirmed
-  close remains a valuation gap in the counted run. Schema-1/2 manifests, and
+  evidence explains only the gap kinds it proves: `actual_open_after_halt`
+  explains its `raw_bars` gap, `confirmed_no_trade` explains its `raw_bars` and
+  `derived` gaps, and `availability` or `corporate_actions` gaps are never
+  explained by execution evidence. This scoping matters: a trusted halted open
+  must not mask a same-day gap in another field, which would let a counted read
+  proceed on incomplete data. Trailing `missing_required_open`,
+  `source_conflict` and `unknown_status` rows reject `VALIDATION_DATA_GAP` with
+  zero uses, naming the first date/symbol/classification, and so does a trailing
+  gap that no evidence row explains for its kind; a blocking row suppresses only
+  its own entries so they are not reported twice. The gate is metadata-only and
+  never turns a confirmed no-trade day into a valuation input: a held symbol
+  with no confirmed close remains a valuation gap in the counted run. Schema-1/2 manifests, and
   successors without the block, keep the legacy gaps-only gate exactly.
 - Schema 2 remains the acquisition output of the checked-in script until the
   real re-acquisition (#35) is done separately; schema 3 is the new real

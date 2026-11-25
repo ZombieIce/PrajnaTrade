@@ -57,7 +57,9 @@ from prajnatrade.snapshot_baseline import (
 )
 from test_actual_open_cli import (
     OPEN_SOURCE,
+    conflict_references,
     day_at,
+    derived_row,
     make_actual_open_halt,
     make_confirmed_suspension,
     make_missing_required_open,
@@ -861,6 +863,86 @@ def test_unexplained_trailing_gap_still_blocks_a_schema_v3_read(tmp_path: Path) 
     ] == [(day, ETF_SYMBOLS[0])]
     assert day in blocked["error"]["message"]
     assert not (scenario["store"] / "research-loop-validations").exists()
+
+
+def test_actual_open_evidence_does_not_explain_a_same_day_availability_gap(
+    tmp_path: Path,
+) -> None:
+    """A3: a trusted actual open explains its raw bar, never ``availability``.
+
+    The reviewer kept one ETF's trusted resumed-halt open but removed that
+    ETF's derived ``available_at`` on the same day: the old gate explained every
+    gap kind for the benign ``(date, symbol)``, returned ``passed`` and spent a
+    use.  Execution evidence is scoped to the fields it actually covers, so the
+    ``availability`` gap stays unexplained, names the date/symbol and costs
+    zero uses.
+    """
+    payload = schema_v3_fixture(15)
+    halt_day = day_at(7)
+    make_actual_open_halt(payload, halt_day, ETF_SYMBOLS[0])
+    derived_row(payload, halt_day, ETF_SYMBOLS[0])["available_at"] = None
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="halt-availability",
+        limit=1,
+        execution_rules=ACTUAL_OPEN_RULES,
+    )
+    split = scenario["split"]
+    assert split["trailing"]["start"] <= halt_day <= split["trailing"]["end"]
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_DATA_GAP", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["allowance"]["auto_limit"] == 1
+    assert blocked["allowance"]["automatic_used"] == 0
+    # The benign actual-open row is not reported as blocking evidence.
+    assert blocked["execution_evidence"] == []
+    assert list(blocked["gaps"]) == ["availability"]
+    assert blocked["gaps"]["availability"] == [
+        {"kind": "derived", "date": halt_day, "symbol": ETF_SYMBOLS[0]}
+    ]
+    assert "availability" in blocked["error"]["message"]
+    assert halt_day in blocked["error"]["message"]
+    assert ETF_SYMBOLS[0] in blocked["error"]["message"]
+    assert not (scenario["store"] / "research-loop-validations").exists()
+    assert _validation_ledger_counts(scenario) == (0, 0)
+
+    status = ok(
+        round_status(scenario["project"], scenario["opened"]["round_id"], agent=True)
+    )
+    assert status["lifecycle"] == "research"
+    assert status["validation_allowance"]["automatic_used"] == 0
+    assert status["validation_allowance"]["uses"] == []
+    assert version_entry(scenario)["validation"]["status"] == "not_run"
+
+
+def test_a_null_open_conflict_passes_the_pre_read_gate(tmp_path: Path) -> None:
+    """A4: ``open_conflict: null`` on a valid trading row is not a conflict.
+
+    A manifest ``source_conflict`` row blocks the trailing read, so the old
+    classification of the bare key rejected a perfectly valid segment.  An
+    explicit null is absent in both the seal and the classifier: the gate sees
+    no evidence row, the read proceeds and counts exactly one use.
+    """
+    payload = schema_v3_fixture(15)
+    day = day_at(7)
+    raw_row(payload, day, ETF_SYMBOLS[0])["open_conflict"] = None
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="null-conflict",
+        execution_rules=ACTUAL_OPEN_RULES,
+    )
+    split = scenario["split"]
+    assert split["trailing"]["start"] <= day <= split["trailing"]["end"]
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "passed", validated["checks"]
+    assert validated["usage"]["kind"] == "automatic"
+    assert validated["usage"]["sequence"] == 1
+    assert len(round_uses(scenario)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1756,7 +1838,11 @@ def test_source_conflict_blocks_the_329_day_read_with_zero_uses(
     assert rows[0]["date"] == day
     assert rows[0]["symbol"] == symbol
     assert rows[0]["classification"] == "source_conflict"
-    assert rows[0]["open_conflict"] == conflict["open_conflict"]
+    assert rows[0]["conflict_sources"] == conflict_references()
+    # The sealed rejection names the references, never the disputed quotes.
+    serialized = json.dumps(rows[0])
+    for disputed_open in conflict["open_conflict"]["sources"]:
+        assert str(disputed_open["open"]) not in serialized
     assert day in blocked["error"]["message"]
     assert symbol in blocked["error"]["message"]
     assert "source_conflict" in blocked["error"]["message"]

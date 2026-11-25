@@ -24,6 +24,18 @@ DISCOVERY_PRIOR_HISTORY = "discovery_prior_history"
 #: The schema-3 raw-bar keys that bind an executable open and a trading-status
 #: notice to sealed evidence.  Schema 2 rejects them so its contract stays crisp.
 SCHEMA_3_ROW_KEYS = ("open_source", "status_evidence_id", "open_conflict")
+#: Evidence roles: an executable open may cite only a price archive, and a
+#: trading-status notice may cite only a halt/suspension/resumption notice.  A
+#: notice proves status, never a price; an archive proves the price, never the
+#: status (ADR 0002).
+PRICE_EVIDENCE_KINDS = ("price_archive",)
+STATUS_EVIDENCE_KINDS = (
+    "halt",
+    "halt_notice",
+    "suspension_notice",
+    "resumption_notice",
+    "trading_status_notice",
+)
 EXECUTION_EVIDENCE_POLICY = {
     "price_basis": "unadjusted_open",
     "price_source": "raw_bars[].open_source -> evidence.items",
@@ -202,12 +214,12 @@ def _reject_schema_3_row_keys(row: dict) -> None:
         )
 
 
-def _open_source_evidence(row: dict, evidence_ids: set[str]) -> dict | None:
+def _open_source_evidence(row: dict, evidence_kinds: dict[str, str]) -> dict | None:
     """Validate the sealed price source of an actual daily open (schema 3).
 
     An open is executable only with the price source that produced it, and a row
-    without an open cannot carry one.  A resumption notice is never a price
-    source: it is validated separately as ``status_evidence_id``.
+    without an open cannot carry one.  The cited item must be a price archive:
+    a resumption notice is never a price source, so it cannot stand in for one.
     """
     value = row.get("open_source")
     if row.get("open") is None:
@@ -222,13 +234,19 @@ def _open_source_evidence(row: dict, evidence_ids: set[str]) -> dict | None:
     source = value.get("source")
     if not isinstance(source, str) or not source.strip():
         raise ValueError("Invalid open_source source.")
-    if value.get("evidence_id") not in evidence_ids:
+    evidence_id = value.get("evidence_id")
+    if evidence_id not in evidence_kinds:
         raise ValueError("Unknown open_source evidence_id in raw_bars.")
+    if evidence_kinds[evidence_id] not in PRICE_EVIDENCE_KINDS:
+        raise ValueError(
+            "open_source evidence_id must name a price_archive evidence item; "
+            "a trading-status notice is not a price source."
+        )
     return value
 
 
 def _status_evidence(
-    row: dict, evidence_ids: set[str], open_source: dict | None
+    row: dict, evidence_kinds: dict[str, str], open_source: dict | None
 ) -> None:
     status = row.get("trading_status")
     value = row.get("status_evidence_id")
@@ -239,8 +257,13 @@ def _status_evidence(
                 "status_evidence_id."
             )
         return
-    if value not in evidence_ids:
+    if value not in evidence_kinds:
         raise ValueError("Unknown status_evidence_id in raw_bars.")
+    if evidence_kinds[value] not in STATUS_EVIDENCE_KINDS:
+        raise ValueError(
+            "status_evidence_id must name a trading-status evidence item "
+            "(a halt, suspension or resumption notice)."
+        )
     if open_source is not None and value == open_source["evidence_id"]:
         raise ValueError(
             "status_evidence_id must name the trading-status notice, not the "
@@ -248,7 +271,7 @@ def _status_evidence(
         )
 
 
-def _open_conflict(row: dict, evidence_ids: set[str]) -> None:
+def _open_conflict(row: dict, evidence_kinds: dict[str, str]) -> None:
     """Validate a sealed conflict; a disagreement is never silently resolved."""
     value = row.get("open_conflict")
     if value is None:
@@ -277,7 +300,7 @@ def _open_conflict(row: dict, evidence_ids: set[str]) -> None:
         name = entry["source"]
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Invalid open_conflict source name.")
-        if entry["evidence_id"] not in evidence_ids:
+        if entry["evidence_id"] not in evidence_kinds:
             raise ValueError("Unknown open_conflict evidence_id in raw_bars.")
         price = entry["open"]
         if (
@@ -319,16 +342,19 @@ def _real_raw_bar_v2(row: dict, status: str) -> None:
         raise ValueError("An unknown raw bar cannot declare a halt window.")
 
 
-def _real_raw_bar_v3(row: dict, status: str, evidence_ids: set[str]) -> None:
-    _open_conflict(row, evidence_ids)
-    open_source = _open_source_evidence(row, evidence_ids)
+def _real_raw_bar_v3(
+    row: dict, status: str, evidence_kinds: dict[str, str]
+) -> None:
+    _open_conflict(row, evidence_kinds)
+    open_source = _open_source_evidence(row, evidence_kinds)
+    conflict = row.get("open_conflict")
     if status == "trading":
         # A disputed open is stored once as open_conflict (with open: null), so a
         # trading row may also carry it; every other OHLCV field is still
         # required and no halt window is allowed.
         required = (
             tuple(field for field in RAW_FIELDS if field != "open")
-            if "open_conflict" in row
+            if conflict is not None
             else RAW_FIELDS
         )
         if any(row.get(field) is None for field in required):
@@ -338,7 +364,23 @@ def _real_raw_bar_v3(row: dict, status: str, evidence_ids: set[str]) -> None:
         if row.get("halt") is not None:
             raise ValueError("A trading raw bar cannot declare a halt window.")
     elif status == "partial_halt":
-        _halt(row.get("halt"), required=True)
+        halt = _halt(row.get("halt"), required=True)
+        if row.get("open") is not None:
+            # An actual open is the day's first print after a resume: it cannot
+            # coexist with a halt window covering the whole session, and a bar
+            # with no trade has no volume to support it.
+            if halt_covers_session(halt, row["date"]):
+                raise ValueError(
+                    "A partial_halt raw bar with an actual open cannot have a "
+                    "halt window covering the whole session: an actual open "
+                    "means a trade happened."
+                )
+            volume = row.get("volume")
+            if not isinstance(volume, (int, float)) or isinstance(volume, bool) or not volume > 0:
+                raise ValueError(
+                    "A partial_halt raw bar with an actual open requires "
+                    "positive volume."
+                )
     elif status == "suspended":
         if any(row.get(field) is not None for field in RAW_FIELDS):
             raise ValueError(
@@ -347,15 +389,17 @@ def _real_raw_bar_v3(row: dict, status: str, evidence_ids: set[str]) -> None:
         _halt(row.get("halt"), required=False)
     elif row.get("halt") is not None:
         raise ValueError("An unknown raw bar cannot declare a halt window.")
-    _status_evidence(row, evidence_ids, open_source)
+    _status_evidence(row, evidence_kinds, open_source)
 
 
-def _real_raw_bar(row: dict, *, schema_version: int, evidence_ids: set[str]) -> None:
+def _real_raw_bar(
+    row: dict, *, schema_version: int, evidence_kinds: dict[str, str]
+) -> None:
     status = row.get("trading_status")
     if status not in REAL_STATUSES:
         raise ValueError("Invalid or missing trading_status in raw_bars.")
     if schema_version >= 3:
-        _real_raw_bar_v3(row, status, evidence_ids)
+        _real_raw_bar_v3(row, status, evidence_kinds)
     else:
         _reject_schema_3_row_keys(row)
         _real_raw_bar_v2(row, status)
@@ -439,18 +483,30 @@ def halt_covers_session(halt: object, day: str) -> bool:
 
 
 def _execution_evidence_row(row: dict) -> dict | None:
-    """Classify one sealed session/symbol for the manifest execution evidence."""
+    """Classify one sealed session/symbol for the manifest execution evidence.
+
+    Metadata only, and deliberately quote-free: the manifest can be inspected
+    before any controlled partition read, so this row carries the
+    classification, date, symbol, trading status, halt window/reason and the
+    *references* to sealed evidence (``open_source``, ``status_evidence_id``,
+    ``conflict_sources``) -- never an actual open or a conflict's prices.
+    """
     status = row["trading_status"]
-    if status == "trading" and "open_conflict" not in row:
+    conflict = row.get("open_conflict")
+    if status == "trading" and conflict is None:
         return None
     record: dict = {
         "date": row["date"],
         "symbol": row["symbol"],
         "trading_status": status,
     }
-    if "open_conflict" in row:
+    if conflict is not None:
         record.update(
-            classification="source_conflict", open_conflict=row["open_conflict"],
+            classification="source_conflict",
+            conflict_sources=[
+                {"source": entry["source"], "evidence_id": entry["evidence_id"]}
+                for entry in conflict["sources"]
+            ],
         )
     elif status == "unknown":
         record["classification"] = "unknown_status"
@@ -460,7 +516,6 @@ def _execution_evidence_row(row: dict) -> dict | None:
         if row.get("open") is not None and row.get("open_source") is not None:
             record.update(
                 classification="actual_open_after_halt",
-                open=row["open"],
                 open_source=row["open_source"],
             )
         elif halt_covers_session(row.get("halt"), row["date"]):
@@ -542,11 +597,11 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
     if not isinstance(rule, str) or not rule.strip():
         raise ValueError("Missing derivation_rule_version.")
     evidence = derivation = None
-    evidence_ids: set[str] = set()
+    evidence_kinds: dict[str, str] = {}
     if is_real:
         evidence = _evidence_bundle(data)
         derivation = _derivation(data, rule)
-        evidence_ids = {item["id"] for item in evidence["items"]}
+        evidence_kinds = {item["id"]: item["kind"] for item in evidence["items"]}
         if schema_version >= 3:
             if data.get("raw_price_basis") != "unadjusted":
                 raise ValueError(
@@ -613,7 +668,8 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
                     raise ValueError("Invalid raw_bars OHLC values.")
                 if is_real:
                     _real_raw_bar(
-                        row, schema_version=schema_version, evidence_ids=evidence_ids,
+                        row, schema_version=schema_version,
+                        evidence_kinds=evidence_kinds,
                     )
                     real_raw_bars[(row["date"], row["symbol"])] = row
         records[kind] = sorted(rows, key=lambda row: (row["date"], row.get("symbol", ""), _bytes(row)))

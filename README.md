@@ -224,11 +224,15 @@ corporate-action rules, requires `raw_price_basis: "unadjusted"` to be
   `open` is not `null`, on a normal `trading` session and on a `partial_halt`
   session alike. It names the sealed price archive (a non-empty vendor/feed
   name) and its `evidence.items[].id`, binding every executable open to its
-  sealed price source. A row without an open cannot carry one.
+  sealed price source. The cited item's `kind` must be `price_archive`: an
+  archive proves the price, never the trading status. A row without an open
+  cannot carry one.
 - `status_evidence_id` is the `evidence.items[].id` of the official
   suspension/resumption notice. It is required for `partial_halt` and
   `suspended` rows and must differ from that row's `open_source.evidence_id`: a
-  resumption notice proves trading status, never a price.
+  resumption notice proves trading status, never a price. The cited item's
+  `kind` must be a trading-status notice: `halt`, `halt_notice`,
+  `suspension_notice`, `resumption_notice` or `trading_status_notice`.
 - `open_conflict: {"sources": [...]}` records two or more sealed vendor opens
   that disagree. It requires `open: null`, at least two entries with distinct
   non-empty `source` names, every `evidence_id` sealed, positive finite opens
@@ -237,13 +241,17 @@ corporate-action rules, requires `raw_price_basis: "unadjusted"` to be
   carries one stores `open: null`, keeps high/low/close/volume and carries no
   halt window, so a disputed opening print is never forced into an executable
   open. A `suspended` row cannot carry one — a confirmed no-trade day has no
-  open to disagree about.
+  open to disagree about. An explicit `open_conflict: null` is absent, not a
+  conflict: the field rules and the manifest classification both ignore it.
 
 A schema-3 `partial_halt` row **may** carry the day's actual unadjusted daily
 open — the first print after a resume on a halted-at-open day — together with
 its `open_source`. A halt window is still required, and a confirmed close still
-counts toward the common range. `trading`, `suspended` and `unknown` keep their
-schema-2 meaning, and schema 2 still rejects all three new keys and still
+counts toward the common range. An actual open is a real trade, so the same
+row must have positive `volume`, and its halt window must not cover the whole
+session: a halt that does would be a confirmed no-trade day, and the seal
+rejects both shapes (`halt`/`volume`). `trading`, `suspended` and `unknown` keep
+their schema-2 meaning, and schema 2 still rejects all three new keys and still
 forbids an `open` on `partial_halt`.
 
 The schema-3 manifest adds one additive, schema-3-only block,
@@ -257,15 +265,28 @@ The schema-3 manifest adds one additive, schema-3-only block,
  "rows": [{"date": "...", "symbol": "159612", "trading_status": "partial_halt",
            "classification": "actual_open_after_halt",
            "halt": {"start": "...", "end": "..."},
-           "status_evidence_id": "...", "open": 3.301,
-           "open_source": {"source": "...", "evidence_id": "..."}}],
+           "status_evidence_id": "...",
+           "open_source": {"source": "...", "evidence_id": "..."}},
+          {"date": "...", "symbol": "518880", "trading_status": "partial_halt",
+           "classification": "source_conflict",
+           "conflict_sources": [
+             {"source": "vendor-a", "evidence_id": "..."},
+             {"source": "vendor-b", "evidence_id": "..."}]}],
  "counts": {"actual_open_after_halt": 1, "confirmed_no_trade": 0,
-            "missing_required_open": 0, "source_conflict": 0, "unknown_status": 0}}
+            "missing_required_open": 0, "source_conflict": 1, "unknown_status": 0}}
 ```
 
+The block is a pre-read classification, not a price record: each row carries
+the classification, date, symbol, trading status, halt window/reason and
+evidence **references** only (`open_source`, `status_evidence_id`,
+`conflict_sources`). No actual open and no conflict quote from any sealed
+partition may appear in the manifest, so inspecting `snapshot manifest` never
+reveals a Final Holdout price without the controlled read. The sealed
+partition payload still keeps its prices for a counted read.
+
 It has one row per sealed session/symbol whose `trading_status` is not
-`trading` or that carries an `open_conflict`, sorted by date and symbol, with
-classification:
+`trading` or that carries a non-null `open_conflict`, sorted by date and
+symbol, with classification:
 
 - `actual_open_after_halt`: `partial_halt` with a valid `open` and
   `open_source`.
@@ -275,7 +296,9 @@ classification:
 - `missing_required_open`: `partial_halt` with `open: null`, no conflict and a
   halt that does not cover the session (`reason:
   "partial_halt_without_actual_open"`).
-- `source_conflict`: the row carries `open_conflict`.
+- `source_conflict`: the row carries a non-null `open_conflict`; the manifest
+  row exposes the two sources' references as `conflict_sources`, not their
+  quotes.
 - `unknown_status`: `trading_status: "unknown"`.
 
 `gaps` keeps its exact historical shape and population for every schema
@@ -284,11 +307,14 @@ declared as a raw-bar gap, while a confirmed no-trade day, a missing required
 open and a source conflict still are. The formal trailing pre-read gate reads
 `execution_evidence` when the sealed manifest claims schema 3 (see
 [the gate](#formal-trailing-validation-protocol-v2)): a trailing
-`actual_open_after_halt` or `confirmed_no_trade` row explains its gap, while
+`actual_open_after_halt` row explains only its `raw_bars` gap, a
+`confirmed_no_trade` row explains its `raw_bars` and `derived` gaps, while
 `missing_required_open`, `source_conflict` and `unknown_status` block the read
-with zero uses. A trailing gap no evidence row classifies is still unexplained
-and blocks. Schema-1/2 manifests, and successors without the block, keep the
-legacy gaps-only gate exactly.
+with zero uses. `availability` and `corporate_actions` gaps are never explained
+by execution evidence, so a trusted halt open cannot mask a same-day data
+availability gap. A trailing gap no evidence row classifies for its kind is
+still unexplained and blocks. Schema-1/2 manifests, and successors without the
+block, keep the legacy gaps-only gate exactly.
 
 ### Discovery snapshot equal-weight baseline (MVP-04)
 
@@ -1083,22 +1109,27 @@ The trusted read is counted once per locked version. `round validate`:
 1. **Pre-read gate (zero count).** Reads only the sealed `manifest.json`
    metadata, never the Discovery payload, and refuses before any count when the
    frozen research interval does not match the sealed Discovery descriptor.
-   - On a schema-3 manifest that carries the `execution_evidence` block, the
-     trailing `actual_open_after_halt` and `confirmed_no_trade` rows are benign
-     and explain their `(date, symbol)`: a trusted halted open and a proven
-     no-trade day do not block the read. A trailing `missing_required_open`,
-     `source_conflict` or `unknown_status` row blocks, and so does any trailing
-     `raw_bars`, `derived`, `corporate_actions` or `availability` gap whose
-     `(date, symbol)` no evidence row classifies (an unexplained gap).
+   - On a schema-3 manifest that carries the `execution_evidence` block,
+     trailing evidence explains only the gap kinds it proves: an
+     `actual_open_after_halt` row explains its `(date, symbol)` `raw_bars` gap,
+     and a `confirmed_no_trade` row explains its `raw_bars` and `derived` gaps.
+     A trusted halted open and a proven no-trade day therefore do not block the
+     read, while `availability` and `corporate_actions` gaps are never
+     explained by execution evidence (a trusted open cannot mask a same-day
+     availability gap). A trailing `missing_required_open`, `source_conflict`
+     or `unknown_status` row blocks, and so does any trailing gap whose
+     `(date, symbol)` no evidence row explains for that kind (an unexplained
+     gap). A blocking row suppresses only its own entries so they are not
+     reported twice; the row itself is the rejection evidence.
    - Otherwise (schema 1/2, or a successor manifest without the block) any gap
      in those four kinds inside the trailing date range blocks, exactly as
      before.
    The rejection is `VALIDATION_DATA_GAP` (exit 2, `counted: false`,
    `next_action: "inspect"`) with `trailing`, `allowance`, the blocking
    `execution_evidence` rows as sealed (date, symbol, trading status,
-   classification, reason, halt and evidence ids) and the per-kind `gaps` that
-   stayed unexplained; the message names the first blocking date, symbol and
-   classification. The ledger stays empty and the payload is not read. The gate
+   classification, reason, halt and evidence references only -- never a quote)
+   and the per-kind `gaps` that stayed unexplained; the message names the first
+   blocking date, symbol and classification. The ledger stays empty and the payload is not read. The gate
    is a read gate only: valuation still follows the confirmed-close rules, so a
    held `confirmed_no_trade` symbol with no close remains a valuation gap and
    the counted run can end `insufficient_evidence`/`COVERAGE_INSUFFICIENT`.
@@ -1730,8 +1761,11 @@ Validation. Strategies supply target weights to the shared accounting engine.
 
 Campaigns created before the version flag keep the `next-open-v1` behavior.
 `actual-open-v1` fills a halted-at-open session only from a schema-3 row that
-seals the actual daily open and its price source; a schema-2 row keeps the older
-behaviour. `campaign create` freezes the final policy block for this rule:
+seals the actual daily open with a `price_archive` source, a distinct
+trading-status notice, positive `volume` and a halt window that does not cover
+the whole session; a schema-2 row keeps the older behaviour, and a row failing
+those checks is recorded unfilled with its sealed-row reason. `campaign create`
+freezes the final policy block for this rule:
 `source: sealed_partition.raw_bars.open`, `basis: unadjusted`, `attempts: 1`,
 `halted_open: actual_daily_open_when_evidenced`,
 `partial_halt_open_availability: not_gated_by_0930`,

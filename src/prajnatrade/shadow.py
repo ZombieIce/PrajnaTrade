@@ -93,9 +93,9 @@ from prajnatrade.data import CASH, ETF_SYMBOLS
 from prajnatrade.experiment import runtime_matches
 from prajnatrade.isolation import IsolationError
 from prajnatrade.snapshot_baseline import (
-    _is_executable_open,
     _valid_price,
     available_by,
+    is_executable_open,
 )
 from prajnatrade.strategies import (
     STRATEGY_FAMILIES,
@@ -2561,7 +2561,7 @@ def _build_input(
                         "open_evidence_missing",
                         f"{symbol} has no evidence for the {session} opening auction.",
                     ))
-                elif order["side"] == "buy" and _is_executable_open(
+                elif order["side"] == "buy" and is_executable_open(
                     row, open_cutoff, data_kind=feed.data_kind
                 ):
                     buy_symbols.add(symbol)
@@ -3173,7 +3173,7 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
             orders.append(record)
             continue
         row = raw.get(symbol)
-        if not _is_executable_open(row, open_cutoff, data_kind=data_kind):
+        if not is_executable_open(row, open_cutoff, data_kind=data_kind):
             record["status"] = "missing_open"
             record["reason"] = (
                 "no confirmed unadjusted open is available for this symbol; this "
