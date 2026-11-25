@@ -50,7 +50,11 @@ from test_research_loop_cli import (
 )
 
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES
+from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_RULES,
+    EXECUTION_PRICE_BASIS,
+    NEXT_OPEN_RULES,
+)
 from test_actual_open_cli import (
     OPEN_SOURCE,
     day_at,
@@ -400,6 +404,22 @@ def test_formal_validation_scores_only_the_trailing_segment(tmp_path: Path) -> N
     assert validated["provenance"]["experiment_id"] == (
         scenario["experiment"]["experiment_id"]
     )
+    # The #56 identity lives beside the availability block, never inside it:
+    # ``checks.data_availability.snapshot`` keeps its exact pre-#56 shape.
+    availability = validated["checks"]["data_availability"]["snapshot"]
+    assert availability == {
+        "verified": True,
+        "snapshot_id": scenario["campaign"]["snapshot_id"],
+        "partition_content_hash": split["partition"]["content_hash"],
+        "prior_history_hash": None,
+        "scope": "synthetic",
+        "data_kind": "synthetic",
+        "as_of": None,
+    }
+    assert "schema_version" not in availability
+    assert validated["provenance"]["snapshot_schema_version"] == 1
+    assert validated["provenance"]["execution_rule_version"] == NEXT_OPEN_RULES
+    assert validated["provenance"]["price_basis"] == EXECUTION_PRICE_BASIS
     assert validated["usage"]["kind"] == "automatic"
     assert validated["usage"]["sequence"] == 1
     assert validated["usage"]["admission_id"] is None
@@ -488,10 +508,96 @@ def test_formal_receipt_names_the_snapshot_schema_and_execution_rule(
     assert validated["outcome"] == "passed", validated["checks"]
     assert validated["provenance"]["snapshot_schema_version"] == 3
     assert validated["provenance"]["execution_rule_version"] == ACTUAL_OPEN_RULES
-    assert validated["provenance"]["price_basis"] == "unadjusted_open"
+    assert validated["provenance"]["price_basis"] == EXECUTION_PRICE_BASIS
     # The legacy provenance members are unchanged beside the new identity.
     assert validated["provenance"]["snapshot_id"] == scenario["campaign"]["snapshot_id"]
     assert validated["provenance"]["as_of"] is None
+
+
+def test_discovery_and_formal_validation_score_one_frozen_actual_open_rule(
+    tmp_path: Path,
+) -> None:
+    """#56 US6/A4: Discovery, formal Validation and the benchmark share one rule.
+
+    One split schema-3 Campaign carries an evidenced halted-at-open row in the
+    development segment (where Discovery trades) and one in the trailing
+    segment (where formal Validation trades).  The frozen Campaign, the round
+    kickoff/locked version and the formal receipt must all identify the same
+    actual-open rule and sealed snapshot schema, and both candidates'
+    halted-day fills must carry the same sealed open evidence and the same
+    fee/slippage formula.
+    """
+    development_day, trailing_day = day_at(3), day_at(6)
+    symbol = min(ETF_SYMBOLS)
+    payload = schema_v3_fixture(15)
+    development_halt = make_actual_open_halt(payload, development_day, symbol)
+    trailing_halt = make_actual_open_halt(payload, trailing_day, symbol)
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="actual-open-identity",
+        execution_rules=ACTUAL_OPEN_RULES,
+    )
+    split = scenario["split"]
+    assert scenario["campaign"]["research_protocol"] == "trailing-70-30"
+    assert split["development"]["start"] <= development_day <= split["development"]["end"]
+    assert split["trailing"]["start"] == trailing_day
+
+    # The frozen Campaign evaluation names the rule and the sealed schema.
+    campaign = scenario["campaign"]
+    evaluation = stored_campaign(scenario["project"])[2]
+    assert evaluation["execution_rules"] == campaign["execution_rules"]
+    assert evaluation["execution_rules"]["version"] == ACTUAL_OPEN_RULES
+    assert evaluation["snapshot_schema_version"] == 3
+    assert evaluation["execution_rules"]["execution"]["basis"] == "unadjusted"
+
+    # The round kickoff froze the same rule for the locked version.
+    assert (
+        scenario["opened"]["kickoff"]["frozen_campaign"]["execution_rules"]["version"]
+        == ACTUAL_OPEN_RULES
+    )
+    locked = scenario["version"]["locked"]
+    assert locked["execution_rules"]["version"] == ACTUAL_OPEN_RULES
+    assert locked["execution_rules"] == evaluation["execution_rules"]
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "passed", validated["checks"]
+    provenance = validated["provenance"]
+    assert provenance["execution_rule_version"] == ACTUAL_OPEN_RULES
+    assert provenance["snapshot_schema_version"] == 3
+    assert provenance["price_basis"] == EXECUTION_PRICE_BASIS
+
+    # The Discovery candidate's development-segment fill and the formal
+    # candidate's trailing-segment fill use the same base price, sealed open
+    # evidence and fee/slippage formula.
+    fee_rate = 5 / 10_000
+    samples = {
+        "discovery": (
+            scenario["experiment"]["discovery"], development_day, development_halt
+        ),
+        "formal": (validated["runs"]["candidate"], trailing_day, trailing_halt),
+    }
+    fills = {}
+    for label, (run, day, sealed) in samples.items():
+        halted = [
+            fill
+            for fill in run["fills"]
+            if fill["date"] == day and fill["symbol"] == symbol
+        ]
+        assert len(halted) == 1, label
+        fill = halted[0]
+        assert fill["raw_open"] == sealed["open"] == 10.0
+        assert fill["price_basis"] == EXECUTION_PRICE_BASIS
+        assert fill["open_evidence"] == sealed["open_source"]
+        assert set(fill["open_evidence"]) == {"source", "evidence_id"}
+        assert fill["price"] == pytest.approx(fill["raw_open"])
+        assert fill["fee"] == pytest.approx(fill["quantity"] * fill["price"] * fee_rate)
+        assert fill["slippage"] == pytest.approx(
+            fill["quantity"] * (fill["price"] - fill["raw_open"])
+        )
+        fills[label] = fill
+    assert fills["discovery"]["side"] == fills["formal"]["side"] == "buy"
+    assert set(fills["discovery"]) == set(fills["formal"])
 
 
 def test_formal_validation_is_distinguishable_from_the_v1_replay(tmp_path: Path) -> None:
@@ -1549,10 +1655,10 @@ def test_schema_v3_trailing_validation_scores_329_trusted_halt_days(
         )
         assert first["raw_open"] == sealed["open"]
         assert first["open_evidence"] == sealed["open_source"]
-        assert first["price_basis"] == "unadjusted_open"
+        assert first["price_basis"] == EXECUTION_PRICE_BASIS
     assert validated["provenance"]["snapshot_schema_version"] == 3
     assert validated["provenance"]["execution_rule_version"] == ACTUAL_OPEN_RULES
-    assert validated["provenance"]["price_basis"] == "unadjusted_open"
+    assert validated["provenance"]["price_basis"] == EXECUTION_PRICE_BASIS
 
     # Replaying the same evaluation reuses the terminal receipt, never recounts.
     replayed = ok(validate_current(scenario))

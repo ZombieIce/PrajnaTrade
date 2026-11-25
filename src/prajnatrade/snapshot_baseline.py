@@ -1,3 +1,18 @@
+"""Point-in-time Discovery accounting shared by the candidate and benchmark.
+
+``next-open-v1`` (the default) and ``retry-initial-v1`` keep the legacy
+all-or-nothing basket attempt at the next session's open.  ``actual-open-v1``
+matches every required symbol separately at the sealed actual unadjusted daily
+open, including an evidenced halted-at-open session; a symbol without an
+executable open is recorded unfilled with its sealed-row reason.  Sells match
+before buys in frozen symbol order and buys are funded from initial cash plus
+realized sell net.  A held symbol without a trustworthy open makes that day's
+total equity basis unknowable, so the day fills nothing at all and records the
+priced required symbols as ``equity_basis_unknown`` (ADR 0002); only an entry
+basket with no holdings still fills its priced symbols per symbol.  The rule
+never retries automatically.
+"""
+
 from __future__ import annotations
 
 import math
@@ -275,9 +290,6 @@ def run_partition_strategy(
                     day, signal, weights, open_prices, raw_bars, cash, shares,
                     fee_rate, slippage_rate,
                 )
-                fills.extend(day_fills)
-                fees_paid += costs["fees"]
-                slippage_paid += costs["slippage"]
             else:
                 missing_opens = sorted(
                     symbol
@@ -292,6 +304,8 @@ def run_partition_strategy(
                     "attempts": 1,
                     "status": "not_filled" if missing_opens else "filled",
                 }
+                day_fills = []
+                costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
                 if missing_opens:
                     attempt["reason"] = "missing_or_unconfirmed_open"
                     attempt["missing_symbols"] = missing_opens
@@ -319,12 +333,22 @@ def run_partition_strategy(
                         fee_rate,
                         slippage_rate,
                     )
-                    for fill in day_fills:
-                        fill["raw_open"] = open_prices[fill["symbol"]]
-                        fill["price_basis"] = EXECUTION_PRICE_BASIS
-                    fills.extend(day_fills)
-                    fees_paid += costs["fees"]
-                    slippage_paid += costs["slippage"]
+            # One common tail for both rules: every fill echoes the sealed base
+            # price it matched at, and an actual-open fill also echoes the
+            # sealed price source that produced it.
+            for fill in day_fills:
+                fill["raw_open"] = open_prices[fill["symbol"]]
+                fill["price_basis"] = EXECUTION_PRICE_BASIS
+                if execution_rule_version == ACTUAL_OPEN_RULES:
+                    open_source = raw_bars[(day, fill["symbol"])].get("open_source")
+                    if isinstance(open_source, Mapping):
+                        fill["open_evidence"] = {
+                            "source": open_source["source"],
+                            "evidence_id": open_source["evidence_id"],
+                        }
+            fills.extend(day_fills)
+            fees_paid += costs["fees"]
+            slippage_paid += costs["slippage"]
             order_attempts.append(attempt)
             if positive_order:
                 positive_attempts.append(attempt)
@@ -560,11 +584,19 @@ def _position_evidence(
     }
     if execution_rule_version == ACTUAL_OPEN_RULES:
         latest = positive_attempts[-1] if positive_attempts else None
-        evidence["basket_build_state"] = (
-            "none"
-            if latest is None
-            else "completed" if latest["basket_complete"] else "partial"
-        )
+        # ``partial`` means the last positive target started building: at least
+        # one fill and at least one unfilled required symbol.  A target that
+        # produced no fill at all is ``unfilled``; a complete one is
+        # ``completed``; no positive target is ``none``.
+        if latest is None:
+            state = "none"
+        elif latest["basket_complete"]:
+            state = "completed"
+        elif latest["filled_symbols"]:
+            state = "partial"
+        else:
+            state = "unfilled"
+        evidence["basket_build_state"] = state
         evidence["unfilled_basket_signals"] = sum(
             1 for attempt in positive_attempts or [] if attempt["unfilled"]
         )
@@ -956,18 +988,47 @@ def _match_actual_open_day(
     """Match every required symbol at its own executable open, sells first.
 
     A required symbol without an executable open is recorded unfilled and keeps
-    its cash or shares. Holdings without an executable open are left out of the
-    open equity that sizes the targets, so no stale price sizes an order.
+    its cash or shares.  A *held* symbol without one makes the day's total
+    equity unknowable: retargeting the priced holdings against a partial open
+    equity would force sales the strategy never asked for.  The whole day is
+    then unfilled — cash, shares and costs stay untouched, the unpriced symbols
+    keep their sealed-row reason and every priced required symbol is recorded
+    as ``equity_basis_unknown``.  With no held symbol unpriced, matching stays
+    per symbol, so an entry basket still fills its priced symbols.
     """
     required = [
         symbol
         for symbol in ETF_SYMBOLS
         if weights.get(symbol, 0.0) > _EPSILON or shares[symbol] > _EPSILON
     ]
+    unpriced = [
+        symbol for symbol in required if open_prices.get(symbol) is None
+    ]
+    if any(shares[symbol] > _EPSILON for symbol in unpriced):
+        attempt = {
+            "signal_date": signal["date"],
+            "date": day,
+            "attempts": 1,
+            "status": "not_filled",
+            "filled_symbols": [],
+            "unfilled": [
+                {
+                    "symbol": symbol,
+                    "reason": (
+                        "equity_basis_unknown"
+                        if open_prices.get(symbol) is not None
+                        else _unfilled_reason(raw_bars.get((day, symbol)))
+                    ),
+                }
+                for symbol in required
+            ],
+            "basket_complete": False,
+        }
+        no_costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
+        return attempt, [], cash, shares, no_costs
     unfilled = [
         {"symbol": symbol, "reason": _unfilled_reason(raw_bars.get((day, symbol)))}
-        for symbol in required
-        if open_prices.get(symbol) is None
+        for symbol in unpriced
     ]
     open_equity = cash + math.fsum(
         shares[symbol] * float(open_prices[symbol])
@@ -991,15 +1052,6 @@ def _match_actual_open_day(
         fee_rate,
         slippage_rate,
     )
-    for fill in day_fills:
-        fill["raw_open"] = open_prices[fill["symbol"]]
-        fill["price_basis"] = EXECUTION_PRICE_BASIS
-        open_source = raw_bars[(day, fill["symbol"])].get("open_source")
-        if isinstance(open_source, Mapping):
-            fill["open_evidence"] = {
-                "source": open_source["source"],
-                "evidence_id": open_source["evidence_id"],
-            }
     traded = {fill["symbol"] for fill in day_fills}
     attempt = {
         "signal_date": signal["date"],

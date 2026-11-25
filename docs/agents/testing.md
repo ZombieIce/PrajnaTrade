@@ -90,20 +90,27 @@ schema-3 manifest and asserts the `execution_evidence` policy block, one row per
 non-trading sealed session/symbol, and the `actual_open_after_halt` /
 `confirmed_no_trade` / `missing_required_open` / `source_conflict` /
 `unknown_status` counts, plus that the historical `gaps` shape is unchanged and
-an evidenced actual open is no longer a raw-bar gap. Negative seal cases reject a
-missing or unsealed price source, a resumption-status notice reused as the price
-source, a missing `status_evidence_id`, an undeclared `raw_price_basis`, every
-malformed `open_conflict` (an executable open, fewer than two sources, duplicate
-sources, unsealed evidence, non-positive or identical opens, including on a
-`trading` row that keeps its other OHLCV fields) and a schema-2 row carrying any
-of the three schema-3 keys. The public-CLI price test runs the same
-target on a normal-open sample, a resumed-halt sample with the same daily open
-and a variant whose execution-day close differs: both the candidate and the
-benchmark must produce the same fill date, base price, quantity, fee, ending
-cash and sealed `open_evidence`, the close variant may change only that day's
-valuation, and a `next-open-v1` control cannot fill the halted day. A v1
-`round validate` receipt on a schema-3 `actual-open-v1` Campaign asserts the
-additive provenance identity. The file is fast and not marked `isolation`.
+an evidenced actual open is no longer a raw-bar gap. The `execution_evidence`
+block carries exactly `policy`, `rows` and `counts` (the manifest's own
+`schema_version` gates it; there is no unread inner copy). Negative seal cases
+reject a missing or unsealed price source, a resumption-status notice reused as
+the price source, a missing `status_evidence_id`, an undeclared
+`raw_price_basis`, every malformed `open_conflict` (an executable open, fewer
+than two sources, duplicate sources, unsealed evidence, non-positive or
+identical opens, including on a `trading` row that keeps its other OHLCV
+fields, and on a `suspended` row where a no-trade day has no open to dispute)
+and a schema-2 row carrying any of the three schema-3 keys. The public-CLI
+price test runs the same target on a normal-open sample, a resumed-halt sample
+with the same daily open and a variant whose execution-day close differs: both
+the candidate and the benchmark must produce the same fill date, base price,
+quantity, fee, ending cash and sealed `open_evidence`, the close variant may
+change only that day's valuation, and a `next-open-v1` control cannot fill the
+halted day. A non-zero `--slippage-bps` case repeats the normal-open/resumed-halt
+pair and recomputes every fill price as the sealed actual open moved by that
+rate, asserts the recorded slippage cost is identical and reconciles the
+post-fill cash against the same fee/slippage formulas. A v1 `round validate`
+receipt on a schema-3 `actual-open-v1` Campaign asserts the additive provenance
+identity. The file is fast and not marked `isolation`.
 
 `tests/test_execution_rules_cli.py` owns the matching behaviour of the frozen
 execution rules and imports those schema-3 builders. For #58 it drives
@@ -125,10 +132,22 @@ schema-3 Campaigns through the public CLI and asserts:
   starts fully invested in A, then targets B with no original cash. The fills
   are sell A then buy B, B's debit equals A's realized sell net, and quantities,
   fees, cash and the attempt terminal state are hand-recomputed. When A is a
-  confirmed whole-day suspension at the switch, B cannot use the expected
-  proceeds: B does not fill, A's shares are retained at the next confirmed mark,
-  fees and cash are unchanged, the attempt is `not_filled` and A's unfilled
-  reason is `confirmed_no_trade`.
+  confirmed whole-day suspension at the switch, the held symbol has no
+  trustworthy open: B does not fill, A's shares are retained at the next
+  confirmed mark, fees and cash are unchanged, the attempt is `not_filled`, A's
+  unfilled reason is `confirmed_no_trade` and the priced buyer is listed with
+  `equity_basis_unknown`.
+- **Held no-trade freeze.** With two holdings and a target that would sell one
+  of them, a confirmed whole-day halt on the other holding freezes the day: no
+  sell or buy fill, the priced required symbols are `equity_basis_unknown`, the
+  account (cash, both holdings, NAV) is unchanged, and the next priced decision
+  sizes and rebalances normally. This is the case that used to retarget the
+  priced holdings against a reduced open equity and sell them.
+- **Build state.** The last positive-target attempt drives
+  `position_evidence.basket_build_state`: the five-ETF entry basket is
+  `partial`, a completed target is `completed`, and a blocked attempt that
+  produced no fill at all is `unfilled` (the blocked switch and the submit-once
+  benchmark cover it); no positive target is `none`.
 - **Unfilled accounting and no retry.** A day whose five required symbols are a
   whole-day halt, a missing required open, an unknown status and two confirmed
   suspensions records every sealed-row reason, keeps the 100000 cash, and is
@@ -206,7 +225,18 @@ given (the default keeps every existing record at `next-open-v1`).
 - **Receipt identity and legacy readability.** The v2 `provenance` gains the
   three flat keys; a legacy schema-1 `next-open-v1` v1 receipt has no
   `provenance` and its `checks.data_availability.snapshot` keeps the exact
-  pre-#56 keys (no `schema_version` leak).
+  pre-#56 keys (no `schema_version` leak). A schema-1 formal trailing receipt
+  publishes the same pre-#56 availability `snapshot` block, while its
+  `provenance` carries `snapshot_schema_version: 1` and the legacy rule; the
+  formal identity is read from the sealed read receipt, never from the
+  availability block.
+- **Discovery/formal identity.** One split schema-3 `actual-open-v1` Campaign
+  carries an evidenced halt in the development segment and one in the trailing
+  segment. The Campaign evaluation, round kickoff/locked version and formal
+  receipt provenance name `actual-open-v1`, snapshot schema 3 and
+  `unadjusted_open`, and the Discovery candidate's development fill and the
+  formal candidate's trailing fill carry the same sealed `open_evidence` shape
+  and the same fee/slippage formula (`price == raw_open`, fee on that price).
 
 The 329-day tests are subprocess-heavy (about 8-11 CLI calls each, a ~4.4 MB
 payload, ~10 s per test) but not marked `isolation`; the file is still fast
