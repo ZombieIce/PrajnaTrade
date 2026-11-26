@@ -53,6 +53,7 @@ def _fingerprint(value: object) -> str:
 def _runtime_components(
     strategy_executor: dict[str, Any] | None = None,
     *,
+    execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     directory = Path(__file__).parent
@@ -60,6 +61,9 @@ def _runtime_components(
         "strategies.py", "backtest.py", "data.py", "snapshot.py", "snapshot_baseline.py",
         "container_executor.py",
     )
+    # Actual-open matching consults the shared full-session halt predicate.
+    if execution_rules is not None and execution_rules.get("version") == ACTUAL_OPEN_RULES:
+        files += ("trading_status.py",)
     if history_policy is not None:
         files += ("experiment.py",)
     executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}
@@ -95,11 +99,13 @@ def runtime_identity(
 ) -> str:
     """Fingerprint the accounting dependencies and optional strategy executor.
 
-    Passing the Campaign's ``history_policy`` binds the declared-history engine
-    (``experiment.py``) as well, matching the frozen Campaign runtime.  A source
-    fix therefore changes the identity and forces a fresh replay identity.
+    The Campaign's ``execution_rules`` select rule-specific dependencies.
+    Its ``history_policy`` also binds the declared-history engine
+    (``experiment.py``). A source fix changes the corresponding identity.
     """
-    dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
+    dependencies = _runtime_components(
+        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+    )
     if (
         history_policy is None
         and execution_rules is not None
@@ -118,10 +124,12 @@ def runtime_matches(
     history_policy: Mapping[str, Any] | None = None,
 ) -> bool:
     """Check the exact current runtime or a compatible legacy dependency set."""
-    dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
+    dependencies = _runtime_components(
+        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+    )
     if stored == _fingerprint(dependencies):
         return True
-    if history_policy is not None or any(
+    if history_policy is not None or "trading_status.py" in dependencies or any(
         dependencies[name] != digest for name, digest in _COMPATIBLE_RUNTIME_SOURCES.items()
     ):
         return False
@@ -208,7 +216,9 @@ def _campaign_evaluation(
     history_policy: Mapping[str, Any] | None = None,
     discovery_split: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    runtime_dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
+    runtime_dependencies = _runtime_components(
+        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+    )
     return {
         "engine": "sealed-discovery-v1",
         # The opt-in 70/30 protocol is the one new research Campaigns must use;

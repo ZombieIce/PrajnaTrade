@@ -6,7 +6,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 
-from cli_helpers import AGENT_COMMAND, cli, cli_env
+import pytest
+from cli_helpers import AGENT_COMMAND, cli, cli_env, ok
+
+from prajnatrade import trading_status
+from prajnatrade.experiment import campaign_discovery, runtime_identity, runtime_matches
 
 
 def sealed_snapshot_input(day_count: int = 15) -> dict:
@@ -119,6 +123,48 @@ def test_operator_creates_locked_synthetic_campaign(tmp_path: Path) -> None:
     assert campaign["fingerprints"]["snapshot"]
     assert campaign["fingerprints"]["evaluation"]
     assert campaign["budget"]["attempts_remaining"] == 2
+
+
+def test_actual_open_runtime_identity_binds_the_halt_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    actual_open = {"version": "actual-open-v1"}
+    legacy_rules = ({}, {"version": "next-open-v1"}, {"version": "retry-initial-v1"})
+    actual_identity = runtime_identity(execution_rules=actual_open)
+    legacy_identities = [runtime_identity(execution_rules=rules) for rules in legacy_rules]
+
+    halt_rules_path = Path(trading_status.__file__)
+    read_file = Path.read_bytes
+    original = read_file(halt_rules_path)
+    changed = original.replace(b"hour=15, minute=0", b"hour=14, minute=59")
+    assert changed != original
+
+    def read_with_earlier_close(path: Path) -> bytes:
+        return changed if path == halt_rules_path else read_file(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_with_earlier_close)
+    assert runtime_identity(execution_rules=actual_open) != actual_identity
+    assert not runtime_matches(actual_identity, execution_rules=actual_open)
+    for frozen, rules in zip(legacy_identities, legacy_rules, strict=True):
+        assert runtime_identity(execution_rules=rules) == frozen
+        assert runtime_matches(frozen, execution_rules=rules)
+
+
+def test_actual_open_campaign_freezes_the_matching_runtime(tmp_path: Path) -> None:
+    project = tmp_path / "research"
+    source = tmp_path / "snapshot.json"
+    snapshot_file(source)
+    ok(cli("project", "init", "--project", str(project)))
+    options = campaign_options(project, source)
+    actual = ok(cli(*options, "--execution-rules", "actual-open-v1"))
+    legacy = ok(cli(*options))
+    actual_evaluation = campaign_discovery(project, actual["campaign_id"])["evaluation"]
+    legacy_evaluation = campaign_discovery(project, legacy["campaign_id"])["evaluation"]
+
+    actual_rules = actual_evaluation["execution_rules"]
+    assert actual_evaluation["runtime"] == runtime_identity(execution_rules=actual_rules)
+    assert runtime_matches(actual_evaluation["runtime"], execution_rules=actual_rules)
+    # The previous fingerprint recipe gave actual-open and legacy Campaigns
+    # the same runtime because neither bound the halt predicate source.
+    assert not runtime_matches(legacy_evaluation["runtime"], execution_rules=actual_rules)
 
 
 def test_discovery_warmup_freezes_one_scoring_start_for_versions_and_benchmark(
