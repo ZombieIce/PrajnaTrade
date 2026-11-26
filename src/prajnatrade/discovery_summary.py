@@ -112,7 +112,22 @@ def _curve(run: Mapping[str, Any], label: str) -> list[dict[str, Any]]:
             nav = _finite_number(nav, f"{label} NAV for {raw_date}")
             if nav <= 0:
                 raise ValueError(f"{label} NAV for {raw_date} must be positive.")
-        curve.append({"date": raw_date, "nav": nav})
+        entry: dict[str, Any] = {"date": raw_date, "nav": nav}
+        if "valuation_basis" in point:
+            entry["valuation_basis"] = point["valuation_basis"]
+            carried: dict[str, Any] = {}
+            holdings = point.get("holdings")
+            if isinstance(holdings, Mapping):
+                for symbol in sorted(holdings):
+                    holding = holdings[symbol]
+                    if (
+                        isinstance(holding, Mapping)
+                        and holding.get("valuation_basis") == "carried_forward_prior_close"
+                        and isinstance(holding.get("carry_forward"), Mapping)
+                    ):
+                        carried[symbol] = dict(holding["carry_forward"])
+            entry["ending_carried_forward"] = carried
+        curve.append(entry)
         previous_date = raw_date
     metrics = run.get("metrics")
     if isinstance(metrics, Mapping):
@@ -190,6 +205,20 @@ def _quarter_side(
     )
     valued_sessions = sum(nav is not None for nav in navs)
     expected_sessions = len(points)
+    valuation = None
+    if any("valuation_basis" in point for point in points):
+        valuation = {
+            "actual_close_sessions": sum(
+                point["nav"] is not None and point.get("valuation_basis") == "actual_close"
+                for point in points
+            ),
+            "carried_forward_sessions": sum(
+                point["nav"] is not None and point.get("valuation_basis") == "carried_forward"
+                for point in points
+            ),
+            "missing_valuation_sessions": sum(point["nav"] is None for point in points),
+            "ending_carried_forward": dict(points[-1].get("ending_carried_forward", {})),
+        }
     return {
         "net_return": net_return,
         "max_drawdown": max_drawdown,
@@ -201,6 +230,7 @@ def _quarter_side(
             "fraction": valued_sessions / expected_sessions,
         },
         "daily_return_coverage": daily_return_coverage,
+        **({"valuation": valuation} if valuation is not None else {}),
         **({"missing_reasons": missing_reasons} if missing_reasons else {}),
     }
 

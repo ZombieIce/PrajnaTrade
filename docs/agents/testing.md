@@ -450,3 +450,22 @@ unmet scoring prerequisite or mismatched summary leaves the trailing payload
 unread and the Validation allowance unchanged; a missing disclosure-only metric
 and one-quarter performance disclosure may proceed. Counted Validation replay
 and interruption recovery keep #50's existing semantics.
+
+## Suspended holding carry-forward valuation (#69 / #68-A)
+
+`tests/test_suspended_valuation_cli.py` drives the public `snapshot seal`,
+`campaign create --valuation-policy carry-forward-suspended-v1`, `experiment submit`,
+`candidate freeze` and `evaluation plan` commands on synthetic schema-3 and
+schema-1 fixtures. It verifies the frozen valuation policy identity and Protected
+Evaluation rejection, the zero-cost 100@10 -> 1,000 suspended -> 900 resumed ->
+-10% drawdown arithmetic with source-close/evidence/carried-session audit trails
+and `strict-close-v1` legacy control, candidate/benchmark parity and differing
+holdings, staggered multi-ETF halts and unheld-symbol gap isolation, continuous
+multi-day suspensions across weekends, calendar quarters and `--full-history`
+authorized/scoring end boundaries (plus negative tail-unknown rejection) with
+quarterly summary reconciliation and end-of-period carry-forward disclosure,
+every failure and recovery path (missing authorized prior close, unknown gap,
+late notice after cutoff, conflicting status/trade evidence, mid-chain break,
+resumed open without close), 61-observation warmup and order-sizing independence
+from carried prices, no lookahead and account isolation, and fail-closed
+corporate actions during suspension. The file is fast and not marked `isolation`.

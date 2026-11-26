@@ -84,7 +84,10 @@ Two failure modes drove this decision:
    order would be lookahead. Orders remain generated from the declared history at
    the frozen decision cutoff (the prior session's open for the legacy path), and
    the daily open participates in no indicator, weight or valuation rule.
-   Valuation keeps using confirmed unadjusted closes.
+   Valuation keeps using confirmed unadjusted closes under the default
+   `strict-close-v1` policy (see [ADR 0003](0003-suspended-holding-carry-forward-valuation.md)
+   for the opt-in `carry-forward-suspended-v1` policy on confirmed full-day
+   no-trade holdings).
 
 4. **Legacy stays immutable and new behaviour is opt-in.** Schema 1 and 2
    manifests keep their exact bytes; schema 2 continues to forbid an `open` on
@@ -115,8 +118,10 @@ Two failure modes drove this decision:
   zero uses, naming the first date/symbol/classification, and so does a trailing
   gap that no evidence row explains for its kind; a blocking row suppresses only
   its own entries so they are not reported twice. The gate is metadata-only and
-  never turns a confirmed no-trade day into a valuation input: a held symbol
-  with no confirmed close remains a valuation gap in the counted run.
+  never turns a confirmed no-trade day into a valuation input: under the default
+  `strict-close-v1` policy, a held symbol with no confirmed close remains a
+  valuation gap in the counted run (for the opt-in carry-forward valuation
+  policy, see [ADR 0003](0003-suspended-holding-carry-forward-valuation.md)).
   A new schema-3 formal read requires the current execution classification
   policy. Reseal provisional schema-3 inputs before starting a new formal
   read. Schema 1 and 2 keep the legacy gaps-only gate. Existing receipts remain
