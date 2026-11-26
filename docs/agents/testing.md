@@ -451,21 +451,52 @@ unread and the Validation allowance unchanged; a missing disclosure-only metric
 and one-quarter performance disclosure may proceed. Counted Validation replay
 and interruption recovery keep #50's existing semantics.
 
-## Suspended holding carry-forward valuation (#69 / #68-A)
+## Suspended holding carry-forward valuation (#68: #69, #70, #71)
 
-`tests/test_suspended_valuation_cli.py` drives the public `snapshot seal`,
-`campaign create --valuation-policy carry-forward-suspended-v1`, `experiment submit`,
-`candidate freeze` and `evaluation plan` commands on synthetic schema-3 and
-schema-1 fixtures. It verifies the frozen valuation policy identity and Protected
-Evaluation rejection, the zero-cost 100@10 -> 1,000 suspended -> 900 resumed ->
--10% drawdown arithmetic with source-close/evidence/carried-session audit trails
-and `strict-close-v1` legacy control, candidate/benchmark parity and differing
-holdings, staggered multi-ETF halts and unheld-symbol gap isolation, continuous
-multi-day suspensions across weekends, calendar quarters and `--full-history`
-authorized/scoring end boundaries (plus negative tail-unknown rejection) with
-quarterly summary reconciliation and end-of-period carry-forward disclosure,
-every failure and recovery path (missing authorized prior close, unknown gap,
-late notice after cutoff, conflicting status/trade evidence, mid-chain break,
-resumed open without close), 61-observation warmup and order-sizing independence
-from carried prices, no lookahead and account isolation, and fail-closed
-corporate actions during suspension. The file is fast and not marked `isolation`.
+Three fast, non-`isolation` public-CLI suites cover Spec #68 (ADR 0003) on
+synthetic fixtures (including schema-3 `data_kind: "real"` fixtures used
+strictly for provenance and evidence semantics, plus schema-1/schema-2
+controls):
+
+- `tests/test_suspended_valuation_cli.py` (#69 / #68-A): drives `snapshot seal`,
+  `campaign create --valuation-policy carry-forward-suspended-v1`,
+  `experiment submit`, `candidate freeze` and `evaluation plan`. Verifies frozen
+  valuation policy identity and Protected Evaluation rejection, the zero-cost
+  100@10 -> 1,000 suspended -> 900 resumed -> -10% drawdown arithmetic with
+  source-close/evidence/carried-session audit trails and `strict-close-v1`
+  legacy control, candidate/benchmark parity and differing holdings, staggered
+  multi-ETF halts and unheld-symbol gap isolation, continuous multi-day
+  suspensions across weekends, calendar quarters and `--full-history`
+  authorized/scoring end boundaries (plus negative tail-unknown rejection and
+  schema-2 real suspended-tail boundary alignment) with quarterly summary
+  reconciliation and end-of-period carry-forward disclosure, every failure and
+  recovery path (missing authorized prior close, unknown gap, late notice after
+  cutoff, conflicting status/trade evidence including whole-session
+  `partial_halt` with zero/null volume and a contradictory close, mid-chain
+  break, resumed open without close), 61-observation warmup and order-sizing
+  independence from carried prices, no lookahead and account isolation, and
+  fail-closed unexplained corporate actions during suspension.
+- `tests/test_suspended_corporate_actions_cli.py` (#70 / #68-B): verifies
+  `snapshot seal` validation and canonical sorting of corporate-action
+  `sequence` numbers, evidenced ex-dividend adjustment (`valuation_price` minus
+  `cash_per_share`, dividend receivable on ex-date, cash transfer on pay-date
+  while still suspended) and share-split adjustment (`shares * ratio`,
+  `valuation_price / ratio`) with preserved `source_close_*` and `adjustments`
+  trails, same-day sequenced ordering (`div->split` vs `split->div`) and
+  resumption without double-adjustment, fail-closed atomic rejection on
+  ambiguous order, missing/late terms, `pay_date < ex_date`, and non-positive
+  adjusted carried prices, persistence of unresolved corporate-action gaps even
+  after exiting the position, per-account isolation, replay idempotency, and
+  `strict-close-v1` legacy controls.
+- `tests/test_formal_suspended_valuation_cli.py` (#71 / #68-C): drives the full
+  70/30 split Campaign -> Discovery -> `round open`/`submit`/`validate`/
+  `status`/`detail` flow under `carry-forward-suspended-v1`. Verifies frozen
+  policy identity across Campaign, Round, Locked Version, Discovery summary, and
+  formal/v1 receipt `provenance.valuation_policy_version`, additive
+  `runs.<side>.valuation_summary` (including `ending_carried_forward`) and
+  quarterly/trailing ledger reconciliation, distinct drawdown hard-condition
+  outcomes (pass within cap, fail violating cap, insufficient evidence),
+  zero-use Discovery precheck and sealed-manifest pre-read rejections vs
+  one-use post-read holdings-dependent trailing valuation gaps, replay without
+  double-debit, legacy `strict-close-v1` receipt readability, and research-side
+  agent visibility boundaries.

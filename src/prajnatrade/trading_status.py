@@ -65,6 +65,14 @@ def halt_covers_session(halt: object, day: str) -> bool:
     return start <= session_open and session_close <= end
 
 
+PRICE_FIELDS = ("open", "high", "low", "close")
+
+
+def has_status_evidence_id(value: object) -> bool:
+    """Return whether a raw bar carries a non-empty status_evidence_id."""
+    return isinstance(value, str) and bool(value.strip())
+
+
 def halt_conflicts_with_volume(halt: object, day: str, volume: object) -> bool:
     """Return whether reported trades contradict a whole-session halt."""
     return (
@@ -74,3 +82,57 @@ def halt_conflicts_with_volume(halt: object, day: str, volume: object) -> bool:
         and volume > 0
         and halt_covers_session(halt, day)
     )
+
+
+def halt_conflicts_with_trade(
+    halt: object, day: str, row: Mapping[str, Any]
+) -> bool:
+    """Return whether reported prices or positive volume contradict a whole-session halt."""
+    return halt_covers_session(halt, day) and (
+        any(row.get(field) is not None for field in PRICE_FIELDS)
+        or halt_conflicts_with_volume(halt, day, row.get("volume"))
+    )
+
+
+def confirmed_no_trade_shape(
+    row: Mapping[str, Any], *, data_kind: str
+) -> tuple[bool, str | None]:
+    """Classify whether a raw bar has a confirmed full-day no-trade row shape (ADR 0003).
+
+    Checks trading status, OHLCV/halt consistency, conflicts, and (for real
+    snapshots) presence of ``status_evidence_id``. Callers still verify
+    availability cutoff evidence as needed. Returns ``(True, None)`` when the
+    row shape confirms full-day no-trade, or ``(False, reason_or_none)``
+    otherwise.
+    """
+    if row.get("open_conflict") is not None or row.get("status_conflict") is not None:
+        return False, "conflicting_status_or_trade_evidence"
+    status = row.get("trading_status")
+    day = str(row.get("date"))
+    is_real = data_kind == "real"
+    if status == "unknown":
+        return False, "unknown_trading_status"
+    if status == "suspended":
+        has_price = any(row.get(field) is not None for field in PRICE_FIELDS)
+        volume = row.get("volume")
+        bad_volume = isinstance(volume, bool) or volume not in (None, 0)
+        halt = row.get("halt")
+        bad_halt = halt is not None and not halt_covers_session(halt, day)
+        if has_price or bad_volume or bad_halt:
+            return False, "conflicting_status_or_trade_evidence"
+        if is_real and not has_status_evidence_id(row.get("status_evidence_id")):
+            return False, "missing_status_evidence"
+        return True, None
+    if is_real and status == "partial_halt":
+        halt = row.get("halt")
+        volume = row.get("volume")
+        if halt_conflicts_with_trade(halt, day, row):
+            return False, "conflicting_status_or_trade_evidence"
+        all_prices_null = all(row.get(field) is None for field in PRICE_FIELDS)
+        no_volume = not isinstance(volume, bool) and volume in (None, 0)
+        if halt_covers_session(halt, day) and all_prices_null and no_volume:
+            if not has_status_evidence_id(row.get("status_evidence_id")):
+                return False, "missing_status_evidence"
+            return True, None
+        return False, "partial_halt_missing_close"
+    return False, None

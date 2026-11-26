@@ -28,6 +28,7 @@ from test_actual_open_cli import (
 )
 from test_full_history_cli import full_history, seal_full_history
 from test_protected_eval_cli import plan_input
+from test_real_snapshot import schema_v2_fixture
 
 from prajnatrade.data import ETF_SYMBOLS
 
@@ -68,6 +69,8 @@ def _init_campaign(
     valuation_policy: str | None = "carry-forward-suspended-v1",
     discovery_split: str | None = None,
     discovery_warmup_sessions: int | None = None,
+    attempts: int = 10,
+    max_seconds: int = 30,
     project_name: str = "project",
 ) -> tuple[Path, dict]:
     project = root / project_name
@@ -77,8 +80,8 @@ def _init_campaign(
         "--project", str(project),
         "--store", str(store),
         "--snapshot-id", snapshot_id,
-        "--attempts", "10",
-        "--max-seconds", "30",
+        "--attempts", str(attempts),
+        "--max-seconds", str(max_seconds),
         "--initial-cash", str(initial_cash),
         "--transaction-cost-bps", str(transaction_cost_bps),
         "--slippage-bps", str(slippage_bps),
@@ -516,6 +519,10 @@ def _schema_v3_on_dates(days: list[str]) -> dict:
         row["available_at"] = f"{new_day}T15:05:00+08:00"
         row["availability_evidence"] = f"synthetic:derivation:{new_day}"
     return payload
+
+
+weekday_dates = _weekday_dates
+schema_v3_on_dates = _schema_v3_on_dates
 
 
 def test_continuous_suspension_across_weekend_quarter_and_full_history_end(
@@ -1152,5 +1159,128 @@ def test_corporate_action_during_suspension_fails_closed_until_explained(
     assert rec_u["discovery"]["metrics"]["valuation_gaps"] == 0
     assert rec_u["discovery"]["metrics"]["valued_sessions"] == 9
     assert rec_u["discovery"]["metrics"]["max_drawdown"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("volume", [0, None])
+def test_whole_session_partial_halt_with_null_or_zero_volume_and_close_conflicts(
+    tmp_path: Path, volume: int | None,
+) -> None:
+    """Bug 2 regression: whole-session partial_halt with close != None and zero/null volume conflicts."""
+    # Day 3: buys 100 shares of TARGET @ 10.0, trusted close 10.0.
+    # Day 4: partial_halt with whole-session halt 09:30-15:00, open=None, volume=0/None,
+    #        yet contradictory close=10.0! Must NOT be accepted as a trusted close; must
+    #        report conflicting_status_or_trade_evidence, break carry chain, and leave nav=None.
+    # Day 5: confirmed suspension -> carry_forward_chain_broken (cannot cross day 4 conflict).
+    # Day 6..8: resumes trading @ 9.0 -> recovers actual close (nav=900.0).
+    payload = schema_v3_fixture(15)
+    _set_constant_prices(payload, raw_price=10.0)
+    conflict_day = day_at(4)
+    chain_day = day_at(5)
+    resume_day = day_at(6)
+
+    row = raw_row(payload, conflict_day, TARGET)
+    row.update(
+        trading_status="partial_halt",
+        halt={
+            "start": f"{conflict_day}T09:30:00+08:00",
+            "end": f"{conflict_day}T15:00:00+08:00",
+        },
+        open=None,
+        open_source=None,
+        open_available_at=f"{conflict_day}T09:30:00+08:00",
+        high=None,
+        low=None,
+        close=10.0,
+        close_available_at=f"{conflict_day}T15:05:00+08:00",
+        volume=volume,
+        status_evidence_id=STATUS_EVIDENCE,
+    )
+    derived_row(payload, conflict_day, TARGET)["value"] = None
+    make_confirmed_suspension(payload, chain_day, TARGET)
+    for idx in range(6, 9):
+        raw_row(payload, day_at(idx), TARGET).update(open=9.0, high=9.0, low=9.0, close=9.0)
+
+    tag = f"vol-{volume}"
+    sealed = seal_v3(tmp_path, payload, store=f"store-{tag}", name=tag)
+    project, created = _init_campaign(
+        tmp_path,
+        sealed["store"],
+        sealed["snapshot_id"],
+        initial_cash=1000.0,
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+        execution_rules="actual-open-v1",
+        valuation_policy="carry-forward-suspended-v1",
+        project_name=f"proj-{tag}",
+    )
+    receipt = _submit_strategy(tmp_path, project, created["campaign_id"], f"sub-{tag}")
+    disc = receipt["discovery"]
+    curve = {p["date"]: p for p in disc["equity_curve"]}
+    gaps_by_day = {g["date"]: g for g in disc["gaps"]["valuation"]}
+
+    assert curve[conflict_day]["nav"] is None
+    assert curve[conflict_day]["valuation_basis"] == "missing"
+    assert curve[conflict_day]["holdings"][TARGET]["valuation_basis"] == "missing"
+    assert (
+        curve[conflict_day]["holdings"][TARGET]["gap_reason"]
+        == "conflicting_status_or_trade_evidence"
+    )
+    assert (
+        gaps_by_day[conflict_day]["valuation_gap_reason"]
+        == "conflicting_status_or_trade_evidence"
+    )
+    assert curve[chain_day]["nav"] is None
+    assert curve[chain_day]["holdings"][TARGET]["gap_reason"] == "carry_forward_chain_broken"
+    assert curve[resume_day]["nav"] == pytest.approx(900.0)
+    assert curve[resume_day]["valuation_basis"] == "actual_close"
+    assert disc["metrics"]["max_drawdown"] is None
+
+
+def test_schema_v2_real_suspended_tail_not_accepted_as_confirmed_no_trade_boundary(
+    tmp_path: Path,
+) -> None:
+    """Bug 3 regression: schema-2 real snapshots (no status_evidence_id) are not schema-3 no-trade."""
+    payload = schema_v2_fixture(15)
+    days = [row["date"] for row in payload["calendar"]]
+    last_day = days[-1]
+    prev_day = days[-2]
+    row = raw_row(payload, last_day, TARGET)
+    row.update(
+        trading_status="suspended",
+        open=None,
+        high=None,
+        low=None,
+        close=None,
+        volume=None,
+        open_available_at=None,
+        close_available_at=None,
+        halt=None,
+    )
+    derived_row(payload, last_day, TARGET)["value"] = None
+
+    source = write_json(tmp_path / "v2-tail-susp.json", payload)
+    store = tmp_path / "store-v2-tail"
+    sealed = ok(cli("snapshot", "seal", "--input", str(source), "--store", str(store)))
+    manifest = ok(
+        cli("snapshot", "manifest", "--store", str(store), "--id", sealed["snapshot_id"])
+    )
+    # Schema-2 real snapshots cannot carry status_evidence_id, so a suspended tail
+    # must NOT be accepted as a complete schema-3 confirmed no-trade boundary.
+    assert manifest["common_range"] == {"start": days[0], "end": prev_day}
+
+    # --full-history requesting the schema-2 suspended tail as authorized_end must fail cleanly.
+    fh_store = tmp_path / "store-v2-fh"
+    fh_res = cli(
+        "snapshot", "seal",
+        "--input", str(source),
+        "--store", str(fh_store),
+        "--full-history",
+        "--authorization-id", "auth-v2-tail",
+        "--authorized-start", days[0],
+        "--authorized-end", last_day,
+    )
+    assert fh_res.returncode != 0
+    assert "complete common trading-session boundaries" in fh_res.stderr
+
 
 
