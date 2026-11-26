@@ -102,8 +102,10 @@ from prajnatrade.snapshot_baseline import (
     ACTUAL_OPEN_RULES,
     EXECUTION_PRICE_BASIS,
     NEXT_OPEN_RULES,
+    STRICT_CLOSE_VALUATION,
     run_discovery_equal_weight,
     run_partition_strategy,
+    valuation_policy_version,
 )
 from prajnatrade.strategies import make_strategy
 
@@ -1301,6 +1303,7 @@ def _evidence_runs(
     prior_history = (prior["sessions"], prior["derived"]) if prior is not None else None
     rules = locked["execution_rules"]
     rule_version = rules.get("version", NEXT_OPEN_RULES)
+    valuation_version = valuation_policy_version(rules)
     options = {
         "data_kind": source["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
@@ -1309,6 +1312,7 @@ def _evidence_runs(
         "transaction_cost_bps": locked["base_costs"]["transaction_cost_bps"],
         "slippage_bps": locked["base_costs"]["slippage_bps"],
         "execution_rule_version": rule_version,
+        "valuation_policy_version": valuation_version,
         "history_requirements": locked["history_requirements"],
         "scoring_start": scoring_start,
     }
@@ -1330,6 +1334,7 @@ def _evidence_runs(
         transaction_cost_bps=locked["base_costs"]["transaction_cost_bps"],
         slippage_bps=locked["base_costs"]["slippage_bps"],
         execution_rule_version=rule_version,
+        valuation_policy_version=valuation_version,
         history_requirements=[],
         scoring_start=scoring_start,
     )
@@ -1555,7 +1560,7 @@ def _run_record(run: Mapping[str, Any]) -> dict[str, Any]:
     """One recomputed/archival Discovery run with its metrics, fills and ending cash."""
     metrics = _metrics(run)
     curve = run["equity_curve"]
-    return {
+    record = {
         "start_date": run["start_date"],
         "end_date": run["end_date"],
         "sessions": metrics["sessions"],
@@ -1572,6 +1577,9 @@ def _run_record(run: Mapping[str, Any]) -> dict[str, Any]:
         "valuation_gaps": metrics["valuation_gaps"],
         "metrics": metrics,
     }
+    if "valuation_summary" in run:
+        record["valuation_summary"] = dict(run["valuation_summary"])
+    return record
 
 
 def _discovery_record(
@@ -1913,22 +1921,29 @@ def _receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
-    # Additive #56 identity, published only for the new protocol: a schema-3
-    # snapshot or the actual-open execution rule.  A legacy schema-1/2 v1
-    # receipt under a legacy rule keeps its exact old keys and receipt hash.
+    # Additive #56/#68 identity, published only for the opt-in protocols: a
+    # schema-3 snapshot, the actual-open execution rule, or a non-legacy
+    # valuation policy.  A legacy schema-1/2 v1 receipt under legacy rules
+    # keeps its exact old keys and receipt hash.
     snapshot_schema_version = replay["snapshot_schema_version"]
     execution_rule_version = submission["locked"]["execution_rules"].get(
         "version", NEXT_OPEN_RULES
     )
+    valuation_version = valuation_policy_version(submission["locked"]["execution_rules"])
     if (
-        type(snapshot_schema_version) is int and snapshot_schema_version >= 3
-    ) or execution_rule_version == ACTUAL_OPEN_RULES:
-        receipt["provenance"] = {
+        (type(snapshot_schema_version) is int and snapshot_schema_version >= 3)
+        or execution_rule_version == ACTUAL_OPEN_RULES
+        or valuation_version != STRICT_CLOSE_VALUATION
+    ):
+        provenance = {
             "snapshot_id": replay["snapshot"]["snapshot_id"],
             "snapshot_schema_version": snapshot_schema_version,
             "execution_rule_version": execution_rule_version,
             "price_basis": EXECUTION_PRICE_BASIS,
         }
+        if valuation_version != STRICT_CLOSE_VALUATION:
+            provenance["valuation_policy_version"] = valuation_version
+        receipt["provenance"] = provenance
     if corrected is not None:
         receipt.update(dict(corrected))
     receipt["receipt_hash"] = _hash(receipt)
@@ -2506,6 +2521,7 @@ def _formal_runs(
     prior_history = (prior["sessions"], prior["derived"]) if prior is not None else None
     rules = locked["execution_rules"]
     rule_version = rules.get("version", NEXT_OPEN_RULES)
+    valuation_version = valuation_policy_version(rules)
     options = {
         "data_kind": evaluation["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
@@ -2514,6 +2530,7 @@ def _formal_runs(
         "transaction_cost_bps": locked["base_costs"]["transaction_cost_bps"],
         "slippage_bps": locked["base_costs"]["slippage_bps"],
         "execution_rule_version": rule_version,
+        "valuation_policy_version": valuation_version,
         "history_requirements": list(locked["history_requirements"] or []),
         "scoring_start": scoring_start,
     }
@@ -2535,6 +2552,7 @@ def _formal_runs(
         transaction_cost_bps=locked["base_costs"]["transaction_cost_bps"],
         slippage_bps=locked["base_costs"]["slippage_bps"],
         execution_rule_version=rule_version,
+        valuation_policy_version=valuation_version,
         history_requirements=[],
         scoring_start=scoring_start,
     )
@@ -2687,6 +2705,32 @@ def _formal_receipt(
         "sessions": len(expected),
         "valued_sessions": candidate_metrics["valued_sessions"],
     }
+    valuation_version = valuation_policy_version(submission["locked"]["execution_rules"])
+    provenance = {
+        "snapshot_id": runs["snapshot"]["snapshot_id"],
+        "partition_content_hash": runs["snapshot"]["partition_content_hash"],
+        "frozen_partition_content_hash": evaluation["partition_content_hash"],
+        "as_of": runs["as_of"],
+        "round_id": record["round_id"],
+        "version_id": submission["version_id"],
+        "submission_id": submission["submission_id"],
+        "experiment_id": submission["experiment_id"],
+        "development_content_hash": split["development"]["content_hash"],
+        "trailing_content_hash": split["trailing"]["content_hash"],
+        # Additive #56/#68 identity, flat like the merged v1 receipt: a reviewer
+        # can read which snapshot contract, execution rule, and opt-in valuation
+        # policy scored this.
+        "snapshot_schema_version": runs["snapshot_schema_version"],
+        "execution_rule_version": submission["locked"]["execution_rules"].get(
+            "version", NEXT_OPEN_RULES
+        ),
+        "price_basis": EXECUTION_PRICE_BASIS,
+        **(
+            {"valuation_policy_version": valuation_version}
+            if valuation_version != STRICT_CLOSE_VALUATION
+            else {}
+        ),
+    }
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "round_id": record["round_id"],
@@ -2710,25 +2754,7 @@ def _formal_receipt(
         "trailing": dict(split["trailing"]),
         "scoring": scoring,
         "warmup": dict(runs["warmup"]),
-        "provenance": {
-            "snapshot_id": runs["snapshot"]["snapshot_id"],
-            "partition_content_hash": runs["snapshot"]["partition_content_hash"],
-            "frozen_partition_content_hash": evaluation["partition_content_hash"],
-            "as_of": runs["as_of"],
-            "round_id": record["round_id"],
-            "version_id": submission["version_id"],
-            "submission_id": submission["submission_id"],
-            "experiment_id": submission["experiment_id"],
-            "development_content_hash": split["development"]["content_hash"],
-            "trailing_content_hash": split["trailing"]["content_hash"],
-            # Additive #56 identity, flat like the merged v1 receipt: a reviewer
-            # can read which snapshot contract and execution rule scored this.
-            "snapshot_schema_version": runs["snapshot_schema_version"],
-            "execution_rule_version": submission["locked"]["execution_rules"].get(
-                "version", NEXT_OPEN_RULES
-            ),
-            "price_basis": EXECUTION_PRICE_BASIS,
-        },
+        "provenance": provenance,
         "usage": _formal_usage(use),
         "summary": _formal_summary(
             candidate_metrics, benchmark_metrics,

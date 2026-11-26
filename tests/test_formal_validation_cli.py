@@ -139,6 +139,7 @@ def formal_scenario(
     hard_conditions: list[dict] | None = None,
     as_of: str | None = None,
     execution_rules: str | None = None,
+    valuation_policy: str | None = None,
     frozen_campaign: tuple[Path, Path, dict] | None = None,
 ) -> dict:
     """A split Campaign with one locked version, before any formal Validation."""
@@ -150,6 +151,7 @@ def formal_scenario(
             name=name,
             as_of=as_of,
             execution_rules=execution_rules,
+            valuation_policy=valuation_policy,
         )
     project, snapshots, campaign = frozen_campaign
     store = root / f"{name}-trusted"
