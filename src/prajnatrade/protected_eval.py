@@ -52,8 +52,10 @@ from prajnatrade.snapshot_baseline import (
     CN_TZ,
     NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
+    STRICT_CLOSE_VALUATION,
     available_by,
     run_partition_strategy,
+    valuation_policy_version,
 )
 from prajnatrade.strategies import make_strategy
 from prajnatrade.validation import make_robustness_plan
@@ -68,6 +70,7 @@ HOLDOUT_STAGE = "final_holdout"
 STAGES = (VALIDATION_STAGE, HOLDOUT_STAGE)
 _PROTECTED_SNAPSHOT_SCHEMAS = {1: SCOPE, 2: "real"}
 _PROTECTED_EXECUTION_RULES = (NEXT_OPEN_RULES, RETRY_INITIAL_RULES)
+_PROTECTED_VALUATION_POLICIES = (STRICT_CLOSE_VALUATION,)
 
 THRESHOLD_METRICS = (
     "sessions",
@@ -755,6 +758,9 @@ def _protected_protocol_problem(
     rule = execution_rules.get("version", NEXT_OPEN_RULES)
     if rule not in _PROTECTED_EXECUTION_RULES:
         return f"Protected Evaluation does not support execution rule {rule}."
+    valuation = valuation_policy_version(execution_rules)
+    if valuation not in _PROTECTED_VALUATION_POLICIES:
+        return f"Protected Evaluation does not support valuation policy {valuation}."
     return None
 
 

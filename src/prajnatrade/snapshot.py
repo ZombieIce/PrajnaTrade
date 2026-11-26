@@ -514,6 +514,40 @@ def _complete_row(row: dict, kind: str, *, is_real: bool) -> bool:
     return False
 
 
+def _confirmed_no_trade_row(
+    row: dict, *, is_real: bool, schema_version: int,
+) -> bool:
+    """Whether a raw bar is a confirmed whole-day no-trade session (ADR 0003).
+
+    Such a session preserves frozen common/authorized range boundaries instead of
+    silently truncating them; missing, unknown, unexplained or conflicting rows
+    remain incomplete.
+    """
+    if row.get("open_conflict") is not None or row.get("status_conflict") is not None:
+        return False
+    status = row.get("trading_status")
+    if status == "suspended":
+        if any(row.get(field) is not None for field in RAW_FIELDS):
+            return False
+        if row.get("halt") is not None and not halt_covers_session(row["halt"], row["date"]):
+            return False
+        if is_real and schema_version >= 3 and not _valid_status_evidence_id(
+            row.get("status_evidence_id")
+        ):
+            return False
+        return True
+    if is_real and status == "partial_halt":
+        halt = row.get("halt")
+        volume = row.get("volume")
+        return (
+            halt_covers_session(halt, row["date"])
+            and volume in (None, 0)
+            and all(row.get(field) is None for field in ("open", "high", "low", "close"))
+            and (schema_version < 3 or _valid_status_evidence_id(row.get("status_evidence_id")))
+        )
+    return False
+
+
 def _execution_evidence_row(row: dict) -> dict | None:
     """Classify one sealed session/symbol for the manifest execution evidence.
 
@@ -767,9 +801,25 @@ def _prepare(
     )
     complete = [
         day for day in dates if start <= day <= source_end and all(
-            (day, symbol) in indexed[kind]
-            and _complete_row(indexed[kind][day, symbol], kind, is_real=is_real)
-            for kind in ("raw_bars", "derived")
+            (day, symbol) in indexed["raw_bars"]
+            and (day, symbol) in indexed["derived"]
+            and (
+                (
+                    _complete_row(indexed["raw_bars"][day, symbol], "raw_bars", is_real=is_real)
+                    and _complete_row(indexed["derived"][day, symbol], "derived", is_real=is_real)
+                )
+                or (
+                    _confirmed_no_trade_row(
+                        indexed["raw_bars"][day, symbol],
+                        is_real=is_real,
+                        schema_version=schema_version,
+                    )
+                    and (
+                        indexed["derived"][day, symbol].get("value") is None
+                        or not is_real
+                    )
+                )
+            )
             for symbol in ETF_SYMBOLS
         ) and day not in incomplete_days
     ]

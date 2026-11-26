@@ -38,9 +38,13 @@ from prajnatrade.snapshot import (
 )
 from prajnatrade.trading_status import (
     ACTUAL_OPEN_RULES,
+    CARRY_FORWARD_SUSPENDED_VALUATION,
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
+    STRICT_CLOSE_VALUATION,
+    VALUATION_POLICY_VERSIONS,
+    valuation_policy_version,
 )
 
 
@@ -60,8 +64,12 @@ def _runtime_components(
         "strategies.py", "backtest.py", "data.py", "snapshot.py", "snapshot_baseline.py",
         "container_executor.py",
     )
-    # Actual-open matching consults the shared full-session halt predicate.
-    if execution_rules is not None and execution_rules.get("version") == ACTUAL_OPEN_RULES:
+    valuation_version = valuation_policy_version(execution_rules)
+    # Actual-open matching and carry-forward valuation consult trading_status.py.
+    if (
+        (execution_rules is not None and execution_rules.get("version") == ACTUAL_OPEN_RULES)
+        or valuation_version != STRICT_CLOSE_VALUATION
+    ):
         files += ("trading_status.py",)
     if history_policy is not None:
         files += ("experiment.py",)
@@ -71,6 +79,7 @@ def _runtime_components(
             name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
             for name in files
         },
+        **({"valuation_policy": valuation_version} if valuation_version != STRICT_CLOSE_VALUATION else {}),
         "strategy_executor": _fingerprint(executor),
         "numpy": version("numpy"),
         "pandas": version("pandas"),
@@ -128,8 +137,13 @@ def runtime_matches(
     )
     if stored == _fingerprint(dependencies):
         return True
-    if history_policy is not None or "trading_status.py" in dependencies or any(
-        dependencies[name] != digest for name, digest in _COMPATIBLE_RUNTIME_SOURCES.items()
+    if (
+        history_policy is not None
+        or "trading_status.py" in dependencies
+        or "valuation_policy" in dependencies
+        or any(
+            dependencies[name] != digest for name, digest in _COMPATIBLE_RUNTIME_SOURCES.items()
+        )
     ):
         return False
     legacy = {
@@ -174,9 +188,13 @@ _NEXT_OPEN_EXECUTION = {
 }
 
 
-def _execution_policy(version: str) -> dict[str, Any]:
+def _execution_policy(
+    version: str, *, valuation_policy: str = STRICT_CLOSE_VALUATION,
+) -> dict[str, Any]:
     if version not in EXECUTION_RULE_VERSIONS:
         raise ValueError(f"Unknown execution rules version: {version!r}.")
+    if valuation_policy not in VALUATION_POLICY_VERSIONS:
+        raise ValueError(f"Unknown valuation policy version: {valuation_policy!r}.")
     rules = {"version": version, **deepcopy(_NEXT_OPEN_EXECUTION)}
     if version == RETRY_INITIAL_RULES:
         rules["execution"].update(
@@ -197,6 +215,16 @@ def _execution_policy(version: str) -> dict[str, Any]:
             order="sells_before_buys",
             matching="per_symbol",
         )
+    if valuation_policy == CARRY_FORWARD_SUSPENDED_VALUATION:
+        rules["valuation"] = {
+            "version": CARRY_FORWARD_SUSPENDED_VALUATION,
+            "source": "sealed_partition.raw_bars.close",
+            "basis": "unadjusted",
+            "includes": ["cash", "dividend_receivables"],
+            "confirmed_suspended_close": "carry_forward_prior_trusted_unadjusted_close",
+            "corporate_actions_during_suspension": "adjust_carried_basis_when_evidenced",
+            "missing_required_close": "nav_unavailable",
+        }
     return rules
 
 
@@ -219,6 +247,7 @@ def _campaign_evaluation(
     runtime_dependencies = _runtime_components(
         strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
     )
+    valuation_version = valuation_policy_version(execution_rules)
     return {
         "engine": "sealed-discovery-v1",
         # The opt-in 70/30 protocol is the one new research Campaigns must use;
@@ -236,6 +265,11 @@ def _campaign_evaluation(
         "transaction_cost_bps": transaction_cost_bps,
         "slippage_bps": slippage_bps,
         "execution_rules": execution_rules,
+        **(
+            {"valuation_policy": dict(execution_rules["valuation"])}
+            if valuation_version != STRICT_CLOSE_VALUATION
+            else {}
+        ),
         "strategy_executor": strategy_executor,
         "runtime_dependencies": runtime_dependencies,
         "runtime": _fingerprint(runtime_dependencies),
@@ -311,6 +345,7 @@ def campaign_create(
     initial_cash: float, transaction_cost_bps: float, slippage_bps: float,
     as_of: str | None = None, *,
     execution_rules: str = NEXT_OPEN_RULES,
+    valuation_policy: str = STRICT_CLOSE_VALUATION,
     strategy_executor: str = "none",
     strategy_image: str | None = None,
     executor: ContainerStrategyExecutor | None = None,
@@ -320,7 +355,7 @@ def campaign_create(
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("Attempts and execution seconds must be positive.")
-    execution_policy = _execution_policy(execution_rules)
+    execution_policy = _execution_policy(execution_rules, valuation_policy=valuation_policy)
     executor_config = _resolve_executor_config(
         strategy_executor, strategy_image, executor,
     )
@@ -437,6 +472,7 @@ def campaign_create(
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rules,
+        valuation_policy_version=valuation_policy,
         **baseline_options,
     )
     campaign_id = str(uuid.uuid4())
@@ -480,6 +516,11 @@ def campaign_create(
         },
         "budget": {"attempts_remaining": attempts, "execution_seconds_remaining": max_seconds},
         "execution_rules": execution_policy,
+        **(
+            {"valuation_policy": dict(execution_policy["valuation"])}
+            if valuation_policy != STRICT_CLOSE_VALUATION
+            else {}
+        ),
         "strategy_executor": executor_config,
         **({"history_policy": history_policy} if history_policy is not None else {}),
         **({"discovery_split": split_descriptor} if split_descriptor is not None else {}),
@@ -1030,6 +1071,7 @@ def _run_attempt(
             transaction_cost_bps=config["transaction_cost_bps"],
             slippage_bps=config["slippage_bps"],
             execution_rule_version=rules.get("version", NEXT_OPEN_RULES),
+            valuation_policy_version=valuation_policy_version(rules),
             **history_options,
         )
         benchmark = json.loads(campaign["baseline_json"])
