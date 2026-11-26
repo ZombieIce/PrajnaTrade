@@ -270,7 +270,8 @@ The schema-3 manifest adds one additive, schema-3-only block,
 `execution_evidence`:
 
 ```json
-{"policy": {"price_basis": "unadjusted_open",
+{"policy": {"classification_version": 2,
+            "price_basis": "unadjusted_open",
             "price_source": "raw_bars[].open_source -> evidence.items",
             "status_evidence": "raw_bars[].status_evidence_id -> evidence.items",
             "halted_open": "the day's actual unadjusted daily open for an order effective before the open"},
@@ -296,31 +297,30 @@ partition may appear in the manifest, so inspecting `snapshot manifest` never
 reveals a Final Holdout price without the controlled read. The sealed
 partition payload still keeps its prices for a counted read.
 
-It has one row per sealed session/symbol whose `trading_status` is not
-`trading` or that carries a non-null `open_conflict`, sorted by date and
-symbol, with classification:
+It has one row per sealed session and symbol with a non-trading status or
+a known execution gap, sorted by date and symbol.
 
 - `actual_open_after_halt`: `partial_halt` with a valid `open` and
   `open_source`.
 - `confirmed_no_trade`: `suspended`, or `partial_halt` with `open: null`, no
-  conflict, whose halt window covers the whole session (`start <= 09:30` and
-  `15:00 <= end`).
-- `missing_required_open`: `partial_halt` with `open: null`, no conflict and a
-  halt that does not cover the session (`reason:
-  "partial_halt_without_actual_open"`).
+  conflict or positive volume, whose halt window covers the whole session
+  (`start <= 09:30` and `15:00 <= end`).
+- `missing_required_open`: a partial halt without a trusted resume open or
+  a regular trading row with zero volume.
 - `source_conflict`: the row carries a non-null `open_conflict`; the manifest
   row exposes the two sources' references as `conflict_sources`, not their
   quotes.
-- `unknown_status`: `trading_status: "unknown"`. With `status_conflict`, the
-  manifest and preflight receipt include both evidence references and the
-  reason `positive_volume_during_whole_day_halt`.
+- `unknown_status`: an unknown trading status or a whole-day halt
+  contradicted by positive reported volume. With `status_conflict`, the
+  manifest and preflight receipt include both evidence references.
 
 `gaps` keeps its exact historical shape and population for every schema
 version, so old consumers are unchanged: an evidenced actual open is no longer
 declared as a raw-bar gap, while a confirmed no-trade day, a missing required
 open and a source conflict still are. The formal trailing pre-read gate reads
-`execution_evidence` when the sealed manifest claims schema 3 (see
-[the gate](#formal-trailing-validation-protocol-v2)): a trailing
+`execution_evidence` when the sealed manifest claims schema 3. Reseal snapshots
+built with the provisional schema-3 classification before a new formal read.
+Under [the formal gate](#formal-trailing-validation-protocol-v2), a trailing
 `actual_open_after_halt` row explains only its `raw_bars` gap, a
 `confirmed_no_trade` row explains its `raw_bars` and `derived` gaps, while
 `missing_required_open`, `source_conflict` and `unknown_status` block the read
@@ -1807,22 +1807,16 @@ the `unfilled` symbols with their sealed-row reason (`confirmed_no_trade`,
 trade was needed: a required symbol whose open is missing is recorded unfilled
 even if its target would have equalled its holding, while a required symbol that
 does have an executable open but needs no trade emits no fill row and stays out
-of both lists. A symbol whose row is `suspended` or whose `partial_halt` window
-covers the whole session is a confirmed no-trade day; a `partial_halt` without a
-trusted actual open or a conflicted/missing price is a missing required open.
+of both lists. A whole-session halt with no evidence of trading is confirmed
+no-trade. A contradictory status or a missing required open retains its
+specific reason in the attempt.
 
-A held symbol (`shares > ε`) without an executable open makes the day's total
-equity basis unknowable: sizing the priced holdings against a partial open
-equity would force retargeting the strategy never asked for. Every
-equity-dependent order (a required symbol with a target weight above zero) is
-then recorded unfilled with `equity_basis_unknown` and no buy is matched, while
-an *explicit exit* — target weight at or below the epsilon and shares above it —
-is sized independently of total equity and still sells in full at its own usable
-open. The unpriced symbols keep their sealed-row reason; any exit fill makes the
-attempt `partially_filled`, and `basket_complete` stays false while any required
-symbol is unfilled. Cash moves only by a realized sell net and unsold parcels
-stay in the account. An entry basket (no holdings yet) keeps per-symbol
-matching, so its priced symbols still fill.
+A held symbol without an executable open makes total equity unknown.
+Explicit exits still sell at their own usable opens. A sole 100% target
+with an executable open can use available cash after those sales, including
+fees and slippage. Orders that still depend on total equity remain unfilled
+with `equity_basis_unknown`. Unpriced symbols keep their sealed-row reasons
+and unsold shares. An entry basket still matches each priced symbol.
 
 A partially filled plan is recorded as it happened and marked not yet built:
 unfilled buy cash stays in cash and unsold shares stay in the account.

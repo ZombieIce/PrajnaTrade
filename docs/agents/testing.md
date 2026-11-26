@@ -1,11 +1,11 @@
 # Testing
 
-The suite needs no network and runs from the repository root.
+The suite uses synthetic fixtures and runs from the repository root. Provider integration tests use a local HTTP stub.
 
 ## Commands
 
 ```bash
-# Fast mode: skips tests marked "isolation" (safe in nested/agent sessions).
+# Fast mode skips tests marked "isolation".
 scripts/test.sh fast
 
 # Full mode: the entire suite, including real-sandbox tests.
@@ -25,10 +25,10 @@ A single test file, without the wrapper:
 PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
-The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
-CI run; **539 tests** collected after the #56 review rounds, of which 389 are
-fast and 150 are the `isolation`/Docker selections). CI (`.github/workflows/tests.yml`) runs the full
-suite on `macos-latest` with Python 3.12; `lint` runs `ruff check .`.
+[CI](../../.github/workflows/tests.yml) runs the full suite on macOS and Ruff on
+Linux. Run the relevant CLI tests first for local iteration. If a provider
+test raises `PermissionError` while binding a loopback HTTP server, run that
+test on the host or use the full CI result for the same commit.
 
 ## Isolation tests
 
@@ -48,6 +48,21 @@ In a nested/agent session use `scripts/test.sh fast`; run `full` on the host or
 let CI do it. A failure that names `sandbox_init`, `sandbox_install_failed`, or
 an unavailable sandbox runtime is usually this boundary, not a product bug —
 confirm on the host before changing code.
+
+## Snapshot schema and execution-rule changes
+
+For changes to the snapshot schema or matching rules, verify both the
+acquisition conversion and direct `snapshot seal` with synthetic inputs.
+Use the same cases to check the public manifest and the Formal Validation
+preflight. A known blocking gap names its session and symbol and leaves the
+allowance at zero before the trailing read. Use the matching tests to verify
+fills and cash, including the effect of realized sell proceeds.
+
+Check Protected Evaluation's supported versions at its public plan entry
+point and the frozen runtime fingerprints for changes to shared execution
+dependencies. Include these checks when the affected consumers are outside
+the diff. The module and test entry points are in
+[Architecture](architecture.md).
 
 ## Research Loop and Evidence Loop tests (#43)
 
