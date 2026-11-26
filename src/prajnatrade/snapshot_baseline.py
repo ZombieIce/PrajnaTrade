@@ -301,6 +301,9 @@ def run_partition_strategy(
             receivables,
             unresolved_actions,
             applied_actions=applied_actions_today,
+            enforce_action_order=(
+                valuation_policy_version == CARRY_FORWARD_SUSPENDED_VALUATION
+            ),
         )
         for item in receivables[:]:
             if item["pay_date"] <= day:
@@ -1292,6 +1295,41 @@ def _buy_target(
     return day_fills, cash, quantities, fees_paid, slippage_paid
 
 
+def _valid_action_sequence(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 1
+
+
+def _validate_action(day: str, action: dict, cutoff: datetime) -> str | None:
+    if (
+        not _available_by(action, cutoff)
+        or not isinstance(action.get("terms_evidence"), str)
+        or not action["terms_evidence"].strip()
+    ):
+        return "corporate_action_terms_or_availability_unknown"
+    action_type = action.get("type")
+    if action_type == "cash_dividend":
+        amount = action.get("cash_per_share")
+        pay_date = action.get("pay_date")
+        if (
+            not _valid_price(amount)
+            or not isinstance(pay_date, str)
+            or not pay_date
+        ):
+            return "cash_dividend_terms_unknown"
+        try:
+            datetime.fromisoformat(pay_date).date()
+        except ValueError:
+            return "cash_dividend_terms_unknown"
+        if pay_date < day:
+            return "cash_dividend_pay_date_precedes_ex_date"
+        return None
+    if action_type == "share_adjustment":
+        if not _valid_price(action.get("ratio")):
+            return "share_adjustment_ratio_unknown"
+        return None
+    return "corporate_action_type_unknown"
+
+
 def _apply_actions(
     day: str,
     actions: list[dict],
@@ -1301,65 +1339,96 @@ def _apply_actions(
     unresolved: dict[str, list[dict[str, str]]],
     *,
     applied_actions: dict[str, list[dict[str, Any]]] | None = None,
+    enforce_action_order: bool = False,
 ) -> float:
     cutoff = datetime.combine(
         datetime.fromisoformat(day).date(), time(9, 30), tzinfo=_CN_TZ
     )
+    if not enforce_action_order:
+        for action in actions:
+            symbol = action["symbol"]
+            quantity = shares[symbol]
+            if quantity <= _EPSILON:
+                continue
+            error = _validate_action(day, action, cutoff)
+            if error is not None:
+                unresolved[symbol].append({"date": day, "reason": error})
+                continue
+            if action["type"] == "cash_dividend":
+                amount = action["cash_per_share"]
+                pay_date = action["pay_date"]
+                receivables.append({
+                    "symbol": symbol,
+                    "ex_date": day,
+                    "pay_date": pay_date,
+                    "quantity": quantity,
+                    "cash_per_share": amount,
+                    "amount": quantity * amount,
+                })
+                if applied_actions is not None:
+                    applied_actions[symbol].append(dict(action))
+            elif action["type"] == "share_adjustment":
+                shares[symbol] *= action["ratio"]
+                if applied_actions is not None:
+                    applied_actions[symbol].append(dict(action))
+        return cash
+
+    by_symbol: dict[str, list[dict]] = {}
     for action in actions:
-        symbol = action["symbol"]
-        quantity = shares[symbol]
-        if quantity <= _EPSILON:
+        by_symbol.setdefault(action["symbol"], []).append(action)
+    for symbol, sym_actions in by_symbol.items():
+        if shares[symbol] <= _EPSILON:
             continue
-        if (
-            not _available_by(action, cutoff)
-            or not isinstance(action.get("terms_evidence"), str)
-            or not action["terms_evidence"].strip()
+        if len(sym_actions) > 1:
+            sequences = [action.get("sequence") for action in sym_actions]
+            if not all(
+                "sequence" in action and _valid_action_sequence(seq)
+                for action, seq in zip(sym_actions, sequences, strict=True)
+            ) or len(set(sequences)) != len(sequences):
+                unresolved[symbol].append({
+                    "date": day,
+                    "reason": "corporate_action_order_ambiguous",
+                })
+                continue
+            sym_actions = sorted(sym_actions, key=lambda item: item["sequence"])
+        elif "sequence" in sym_actions[0] and not _valid_action_sequence(
+            sym_actions[0]["sequence"]
         ):
             unresolved[symbol].append({
                 "date": day,
-                "reason": "corporate_action_terms_or_availability_unknown",
+                "reason": "corporate_action_order_ambiguous",
             })
             continue
-        if action["type"] == "cash_dividend":
-            amount = action.get("cash_per_share")
-            pay_date = action.get("pay_date")
-            if (
-                not _valid_price(amount)
-                or not isinstance(pay_date, str)
-                or not pay_date
-            ):
-                unresolved[symbol].append({
-                    "date": day,
-                    "reason": "cash_dividend_terms_unknown",
+
+        errors = [
+            error
+            for action in sym_actions
+            if (error := _validate_action(day, action, cutoff)) is not None
+        ]
+        if errors:
+            for error in errors:
+                unresolved[symbol].append({"date": day, "reason": error})
+            continue
+
+        for action in sym_actions:
+            if action["type"] == "cash_dividend":
+                quantity = shares[symbol]
+                amount = float(action["cash_per_share"])
+                pay_date = action["pay_date"]
+                receivables.append({
+                    "symbol": symbol,
+                    "ex_date": day,
+                    "pay_date": pay_date,
+                    "quantity": quantity,
+                    "cash_per_share": amount,
+                    "amount": quantity * amount,
                 })
-                continue
-            if pay_date < day:
-                unresolved[symbol].append({
-                    "date": day,
-                    "reason": "cash_dividend_pay_date_precedes_ex_date",
-                })
-                continue
-            receivables.append({
-                "symbol": symbol,
-                "ex_date": day,
-                "pay_date": pay_date,
-                "quantity": quantity,
-                "cash_per_share": amount,
-                "amount": quantity * amount,
-            })
-            if applied_actions is not None:
-                applied_actions[symbol].append(dict(action))
-        elif action["type"] == "share_adjustment":
-            ratio = action.get("ratio")
-            if not _valid_price(ratio):
-                unresolved[symbol].append({
-                    "date": day,
-                    "reason": "share_adjustment_ratio_unknown",
-                })
-                continue
-            shares[symbol] *= ratio
-            if applied_actions is not None:
-                applied_actions[symbol].append(dict(action))
+                if applied_actions is not None:
+                    applied_actions[symbol].append(dict(action))
+            elif action["type"] == "share_adjustment":
+                shares[symbol] *= float(action["ratio"])
+                if applied_actions is not None:
+                    applied_actions[symbol].append(dict(action))
     return cash
 
 
@@ -1473,14 +1542,59 @@ def _adjust_carried_basis_for_actions(
     anchor: dict[str, Any],
     applied_actions: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Adjust a carried-forward valuation anchor for corporate actions on ``day``.
-
-    Fail-closed seam for corporate actions affecting a suspended holding
-    (extended by #70 to apply evidenced cash dividends and share adjustments).
-    """
+    """Adjust a carried-forward valuation anchor for corporate actions on ``day``."""
+    del symbol
     if not applied_actions:
         return anchor, None
-    return None, "suspended_corporate_action_unadjusted"
+    price = float(anchor["valuation_price"])
+    adjustments = [dict(item) for item in anchor["adjustments"]]
+    for action in applied_actions:
+        action_type = action.get("type")
+        if action_type == "cash_dividend":
+            amount = float(action["cash_per_share"])
+            new_price = price - amount
+            if not _valid_price(new_price) or new_price <= _EPSILON:
+                return None, "carried_valuation_price_non_positive"
+            entry: dict[str, Any] = {
+                "date": day,
+                "type": "cash_dividend",
+                "cash_per_share": amount,
+                "pay_date": action["pay_date"],
+                "terms_evidence": action["terms_evidence"],
+                "available_at": action["available_at"],
+                "availability_evidence": action["availability_evidence"],
+                "valuation_price_before": price,
+                "valuation_price_after": new_price,
+            }
+            if "sequence" in action:
+                entry["sequence"] = action["sequence"]
+            adjustments.append(entry)
+            price = new_price
+        elif action_type == "share_adjustment":
+            ratio = float(action["ratio"])
+            new_price = price / ratio
+            if not _valid_price(new_price) or new_price <= _EPSILON:
+                return None, "carried_valuation_price_non_positive"
+            entry = {
+                "date": day,
+                "type": "share_adjustment",
+                "ratio": ratio,
+                "terms_evidence": action["terms_evidence"],
+                "available_at": action["available_at"],
+                "availability_evidence": action["availability_evidence"],
+                "valuation_price_before": price,
+                "valuation_price_after": new_price,
+            }
+            if "sequence" in action:
+                entry["sequence"] = action["sequence"]
+            adjustments.append(entry)
+            price = new_price
+        else:
+            return None, "suspended_corporate_action_unadjusted"
+    updated = dict(anchor)
+    updated["valuation_price"] = price
+    updated["adjustments"] = adjustments
+    return updated, None
 
 
 def _valuation_carry_forward(
