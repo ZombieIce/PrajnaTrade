@@ -1,5 +1,6 @@
 """Trading-session status rules shared by acquisition and snapshot consumers."""
 
+import math
 from datetime import datetime, timedelta, timezone
 
 _SHANGHAI = timezone(timedelta(hours=8))
@@ -23,3 +24,14 @@ def halt_covers_session(halt: object, day: str) -> bool:
     session_open = session.replace(hour=9, minute=30)
     session_close = session.replace(hour=15, minute=0)
     return start <= session_open and session_close <= end
+
+
+def halt_conflicts_with_volume(halt: object, day: str, volume: object) -> bool:
+    """Return whether reported trades contradict a whole-session halt."""
+    return (
+        isinstance(volume, (int, float))
+        and not isinstance(volume, bool)
+        and math.isfinite(volume)
+        and volume > 0
+        and halt_covers_session(halt, day)
+    )

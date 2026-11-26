@@ -8,11 +8,11 @@ was effective before the open.  A symbol without an executable open is recorded
 unfilled with its sealed-row reason.  Sells match before buys in frozen symbol
 order and buys are funded from initial cash plus realized sell net.  A held
 symbol without a trustworthy open makes that day's total equity basis
-unknowable, so every equity-dependent order is unfilled with
-``equity_basis_unknown`` and no buy is matched (ADR 0002); an explicit exit of
-another holding is still sized independently of equity and sells in full, and
-an entry basket with no holdings still fills its priced symbols per symbol.  The
-rule never retries automatically.
+unknowable, so equity-dependent orders are unfilled with
+``equity_basis_unknown`` (ADR 0002). Explicit exits still sell in full, and a
+single 100% target can buy with the cash available after those exits. An entry
+basket with no holdings still fills its priced symbols per symbol. The rule
+never retries automatically.
 """
 
 from __future__ import annotations
@@ -34,7 +34,8 @@ from prajnatrade.backtest import (
     equal_weight_buy_and_hold,
 )
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.snapshot import halt_covers_session, read_discovery
+from prajnatrade.snapshot import read_discovery
+from prajnatrade.trading_status import halt_conflicts_with_volume, halt_covers_session
 
 #: Asia/Shanghai is the trading-time anchor for both baselines and Shadow Live.
 CN_TZ = timezone(timedelta(hours=8))
@@ -314,22 +315,10 @@ def run_partition_strategy(
                     if execution_rule_version == RETRY_INITIAL_RULES and not invested_sessions:
                         pending = (signal, weights)
                 else:
-                    open_equity = cash + math.fsum(
-                        shares[symbol] * float(open_prices.get(symbol) or 0.0)
-                        for symbol in ETF_SYMBOLS
-                    )
-                    target_shares = {
-                        symbol: (
-                            open_equity * weights.get(symbol, 0.0) / float(open_prices[symbol])
-                            if open_prices.get(symbol) is not None
-                            else 0.0
-                        )
-                        for symbol in ETF_SYMBOLS
-                    }
                     day_fills, cash, shares, costs = _rebalance_at_open(
                         pd.Timestamp(day),
                         open_prices,
-                        target_shares,
+                        _target_shares_at_open(weights, open_prices, cash, shares),
                         cash,
                         shares,
                         fee_rate,
@@ -963,9 +952,8 @@ def is_executable_open(
     already effective before the open retrospectively, so no publication time
     gates the fill: a ``trading`` row needs a valid open and positive volume,
     and a ``partial_halt`` row also needs the sealed price source and a halt
-    window that does not cover the whole session (a covered session is a
-    confirmed no-trade day).  The daily open is a matching base price only,
-    never a signal input; signal inputs keep their own point-in-time cutoffs
+    window that leaves part of the session open for trading. The daily open is
+    a matching base price only. Signal inputs keep their own point-in-time cutoffs
     (ADR 0002).
     """
     if row is None or not _valid_price(row.get("open")):
@@ -987,6 +975,28 @@ def is_executable_open(
     return _available_by(row, cutoff)
 
 
+def _target_shares_at_open(
+    weights: Mapping[str, float],
+    open_prices: Mapping[str, float | None],
+    cash: float,
+    shares: Mapping[str, float],
+) -> dict[str, float]:
+    """Size targets when every held symbol has an executable open."""
+    open_equity = cash + math.fsum(
+        shares[symbol] * price
+        for symbol in ETF_SYMBOLS
+        if (price := open_prices.get(symbol)) is not None
+    )
+    return {
+        symbol: (
+            open_equity * weights.get(symbol, 0.0) / price
+            if (price := open_prices.get(symbol)) is not None
+            else 0.0
+        )
+        for symbol in ETF_SYMBOLS
+    }
+
+
 def _match_actual_open_day(
     day: str,
     signal: dict[str, Any],
@@ -1001,17 +1011,12 @@ def _match_actual_open_day(
     """Match every required symbol at its own executable open, sells first.
 
     A required symbol without an executable open is recorded unfilled and keeps
-    its cash or shares.  A *held* symbol without one makes the day's total
-    equity unknowable: retargeting the priced holdings against a partial open
-    equity would force sales the strategy never asked for, so every
-    equity-dependent order (a required symbol with a target weight above zero)
-    is recorded ``equity_basis_unknown`` and no buy is matched.  An explicit
-    exit -- target weight at or below the epsilon, shares above it -- is sized
-    independently of total equity, so it still sells in full at its own usable
-    open.  The unpriced symbols keep their sealed-row reason; any fill makes the
-    attempt ``partially_filled`` and ``basket_complete`` stays false while any
-    required symbol is unfilled.  With no held symbol unpriced, matching stays
-    per symbol, so an entry basket still fills its priced symbols.
+    its cash or shares. A held symbol without one makes the day's total equity
+    unknowable, leaving equity-dependent orders unfilled with
+    ``equity_basis_unknown``. Explicit exits still sell in full at their usable
+    opens, and the cash cap can size the only buy for a single 100% target.
+    The unpriced symbols keep their sealed-row reasons, and ``basket_complete``
+    stays false while any required symbol is unfilled.
     """
     required = [
         symbol
@@ -1023,9 +1028,8 @@ def _match_actual_open_day(
         for symbol in required
         if open_prices.get(symbol) is None
     }
+    cash_capped_buy = None
     if any(shares[symbol] > _EPSILON for symbol in unfilled_reasons):
-        # Only explicit exits are independent of the unknown equity basis: no
-        # other symbol may change, so every price-dependent order stays unfilled.
         exits = {
             symbol
             for symbol in required
@@ -1037,26 +1041,18 @@ def _match_actual_open_day(
             symbol: 0.0 if symbol in exits else shares[symbol]
             for symbol in ETF_SYMBOLS
         }
-        # Successful exits are removed from the unfilled list after matching.
-        unfilled_reasons.update(
-            (symbol, "equity_basis_unknown")
-            for symbol in required
-            if open_prices.get(symbol) is not None
-        )
+        positive_targets = [
+            symbol for symbol in required if weights.get(symbol, 0.0) > _EPSILON
+        ]
+        for symbol in positive_targets:
+            unfilled_reasons.setdefault(symbol, "equity_basis_unknown")
+        if len(positive_targets) == 1 and weights[positive_targets[0]] == 1.0:
+            # At 100%, the target's own market value cancels from its buy size.
+            # Cash and other holdings' open value bound demand from below. The
+            # realized sell net and buy costs only reduce what cash can buy.
+            cash_capped_buy = positive_targets[0]
     else:
-        open_equity = cash + math.fsum(
-            shares[symbol] * float(open_prices[symbol])
-            for symbol in ETF_SYMBOLS
-            if open_prices.get(symbol) is not None
-        )
-        target_shares = {
-            symbol: (
-                open_equity * weights.get(symbol, 0.0) / float(open_prices[symbol])
-                if open_prices.get(symbol) is not None
-                else 0.0
-            )
-            for symbol in ETF_SYMBOLS
-        }
+        target_shares = _target_shares_at_open(weights, open_prices, cash, shares)
 
     day_fills, cash, shares, costs = _rebalance_at_open(
         pd.Timestamp(day),
@@ -1066,6 +1062,7 @@ def _match_actual_open_day(
         shares,
         fee_rate,
         slippage_rate,
+        cash_capped_buy=cash_capped_buy,
     )
     traded = {fill["symbol"] for fill in day_fills}
     unfilled = [
@@ -1104,8 +1101,12 @@ def unfilled_reason(row: dict | None) -> str:
     # fill: the required open is missing.  An explicit null is not a conflict.
     if row.get("open_conflict") is not None:
         return "missing_required_open"
-    if status == "partial_halt" and halt_covers_session(row.get("halt"), row.get("date")):
-        return "confirmed_no_trade"
+    if status == "partial_halt":
+        halt, day = row.get("halt"), row.get("date")
+        if halt_conflicts_with_volume(halt, day, row.get("volume")):
+            return "unknown_trading_status"
+        if halt_covers_session(halt, day):
+            return "confirmed_no_trade"
     return "missing_required_open"
 
 
