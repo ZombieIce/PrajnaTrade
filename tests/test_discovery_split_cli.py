@@ -106,8 +106,14 @@ def split_campaign(
     attempts: int = 6,
     max_seconds: float = 180,
     as_of: str | None = None,
+    execution_rules: str | None = None,
 ) -> tuple[Path, Path, dict]:
-    """Initialize a project, seal the payload, and freeze a split Campaign."""
+    """Initialize a project, seal the payload, and freeze a split Campaign.
+
+    ``execution_rules`` is forwarded only when given, so every existing caller
+    keeps the Campaign's default ``next-open-v1`` and its frozen records
+    unchanged (#59).
+    """
     project = root / name
     source = write_json(root / f"{name}-snapshot.json", payload)
     ok(cli("project", "init", "--project", str(project)))
@@ -117,6 +123,8 @@ def split_campaign(
     arguments += ["--discovery-split", split]
     if as_of is not None:
         arguments += ["--as-of", as_of]
+    if execution_rules is not None:
+        arguments += ["--execution-rules", execution_rules]
     campaign = ok(cli(*arguments))
     snapshots = project.parent / f"{project.name}-snapshot-store"
     return project, snapshots, campaign

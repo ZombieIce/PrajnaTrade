@@ -26,9 +26,11 @@ Contract resolutions that the shared design contract leaves implicit:
 
 * ``round_id`` reuses :func:`research_direction.direction_id`, so a direction
   keeps its identity across renamed keys and new Campaigns.
-* ``validation_id`` includes the *current* accounting-engine fingerprint, so an
-  accounting-platform fix yields a new identity and re-runs the replay.  The
-  running attempt records the current runtime.
+* ``validation_id`` includes the accounting-engine fingerprint. For protocol v1,
+  an accounting-platform fix yields a new identity and re-runs the replay. For
+  protocol v2, the counted use binds the initial Validation identity; a completed
+  receipt replays from that identity across runtime changes. An unfinished read
+  can resume only under its original runtime.
 * Review decisions are immutable content-addressed epochs per version with
   exactly one current state.  Approval binds the stored terminal passed receipt,
   writes a write-once ``manual_tracking`` release artifact and appends one
@@ -74,7 +76,7 @@ import math
 import operator
 import os
 import sqlite3
-from collections.abc import Generator, Mapping
+from collections.abc import Collection, Generator, Mapping
 from contextlib import closing, contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -96,6 +98,8 @@ from prajnatrade.experiment import (
 )
 from prajnatrade.research_direction import direction_id
 from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_RULES,
+    EXECUTION_PRICE_BASIS,
     NEXT_OPEN_RULES,
     run_discovery_equal_weight,
     run_partition_strategy,
@@ -149,6 +153,9 @@ OPERATORS = {
     "==": operator.eq,
 }
 _POSITION_STATES = {"initial_position_established", "intentional_cash"}
+#: Basket-build states that leave a required basket unfinished; a formal
+#: position prerequisite is not satisfied while either side reports one.
+_UNFINISHED_BUILD_STATES = {"partial", "unfilled"}
 _OBSERVATION_FORMULA = (
     "ceil(sessions / max(1, opportunities)) * minimum_opportunities, "
     "clamped to [minimum_opportunities, 252]"
@@ -173,6 +180,20 @@ _VALIDATION_USE_FIELDS = (
     "validation_id", "consumed_at",
 )
 _GAP_KINDS = ("raw_bars", "derived", "corporate_actions", "availability")
+#: #56 schema-3 execution-evidence classifications a counted trailing read may
+#: accept, versus the ones that must block before any read.
+_EXECUTION_EVIDENCE_BENIGN = ("actual_open_after_halt", "confirmed_no_trade")
+_EXECUTION_EVIDENCE_BLOCKING = (
+    "missing_required_open", "source_conflict", "unknown_status",
+)
+#: Which manifest gap kinds a benign execution-evidence row actually explains.
+#: A trusted daily open proves the raw bar (and a confirmed no-trade day also
+#: proves its null derived value); neither says anything about availability or
+#: corporate-action terms, so those gaps are never explained by evidence.
+_EXECUTION_EVIDENCE_EXPLAINS = {
+    "actual_open_after_halt": ("raw_bars",),
+    "confirmed_no_trade": ("raw_bars", "derived"),
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS research_loop_rounds (
@@ -1295,6 +1316,9 @@ def _evidence_runs(
         "expected_sessions": expected,
         "scoring_start": scoring_start,
         "data": data,
+        # The #56 identity lives beside the snapshot block, never inside it:
+        # ``checks.data_availability.snapshot`` keeps its exact pre-#56 shape.
+        "snapshot_schema_version": receipt["schema_version"],
         "snapshot": {
             "verified": True,
             "snapshot_id": source["snapshot_id"],
@@ -1407,7 +1431,7 @@ def _gap_summary(gaps: list[dict[str, Any]]) -> dict[str, Any]:
 def _position_summary(run: Mapping[str, Any]) -> dict[str, Any]:
     evidence = run["position_evidence"]
     readiness = run.get("history_readiness") or {}
-    return {
+    summary = {
         "state": evidence["state"],
         "invested_sessions": evidence["invested_sessions"],
         "first_position_signal_date": evidence["first_position_signal_date"],
@@ -1416,6 +1440,12 @@ def _position_summary(run: Mapping[str, Any]) -> dict[str, Any]:
         "unfilled_orders": run["metrics"]["orders_unfilled"],
         "intentional_cash_sessions": list(readiness.get("ready_cash_sessions", [])),
     }
+    # Additive #56 basket-build disclosure, published only when the run carries
+    # it, so every legacy position-evidence shape stays byte-identical.
+    for key in ("basket_build_state", "unfilled_basket_signals"):
+        if key in evidence:
+            summary[key] = evidence[key]
+    return summary
 
 
 def observation_recommendation(
@@ -1739,11 +1769,24 @@ def _data_availability_check(
 def _position_check(
     candidate: Mapping[str, Any], benchmark: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """The formal position prerequisite for both sides of the frozen comparison.
+
+    A side satisfies it when its position evidence state targets a real
+    position or explicit cash *and* its latest basket build is not still
+    unfinished: a plan that required the whole basket and filled only part of it
+    (``partial``) or none of it (``unfilled``) leaves the scored premise unmet
+    even though shares were bought.  A run without a build state (the legacy
+    execution rules) is judged by its position state alone, exactly as before.
+    """
+    def satisfied(run: Mapping[str, Any]) -> bool:
+        evidence = run["position_evidence"]
+        if evidence["state"] not in _POSITION_STATES:
+            return False
+        build_state = evidence.get("basket_build_state")
+        return build_state is None or build_state not in _UNFINISHED_BUILD_STATES
+
     return {
-        "ok": (
-            candidate["position_evidence"]["state"] in _POSITION_STATES
-            and benchmark["position_evidence"]["state"] in _POSITION_STATES
-        ),
+        "ok": satisfied(candidate) and satisfied(benchmark),
         "candidate": _position_summary(candidate),
         "benchmark": _position_summary(benchmark),
     }
@@ -1847,6 +1890,22 @@ def _receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    # Additive #56 identity, published only for the new protocol: a schema-3
+    # snapshot or the actual-open execution rule.  A legacy schema-1/2 v1
+    # receipt under a legacy rule keeps its exact old keys and receipt hash.
+    snapshot_schema_version = replay["snapshot_schema_version"]
+    execution_rule_version = submission["locked"]["execution_rules"].get(
+        "version", NEXT_OPEN_RULES
+    )
+    if (
+        type(snapshot_schema_version) is int and snapshot_schema_version >= 3
+    ) or execution_rule_version == ACTUAL_OPEN_RULES:
+        receipt["provenance"] = {
+            "snapshot_id": replay["snapshot"]["snapshot_id"],
+            "snapshot_schema_version": snapshot_schema_version,
+            "execution_rule_version": execution_rule_version,
+            "price_basis": EXECUTION_PRICE_BASIS,
+        }
     if corrected is not None:
         receipt.update(dict(corrected))
     receipt["receipt_hash"] = _hash(receipt)
@@ -1878,6 +1937,118 @@ def _verdict(checks: Mapping[str, Any], comparison: Mapping[str, Any]) -> tuple[
 
 def _formal_split(record: Mapping[str, Any]) -> dict[str, Any]:
     return record["kickoff"]["research_partition"]
+
+
+def _trailing_gaps(
+    metadata: Mapping[str, Any],
+    start: str,
+    end: str,
+    explained: Mapping[str, Collection[tuple[str, object]]] | None = None,
+) -> dict[str, list[Any]]:
+    """The sealed manifest's per-kind gaps inside ``[start, end]``.
+
+    Metadata only: the evidence-classified gate and the legacy gaps-only gate
+    judge exactly this range-filtered projection.  ``explained`` maps each gap
+    kind to the ``(date, symbol)`` pairs that kind's evidence covers, so a
+    benign row explains only the fields it proves; without it every entry is
+    judged.
+    """
+    explained_by_kind = explained or {}
+    return {
+        kind: [
+            entry for entry in metadata.get("gaps", {}).get(kind, [])
+            if isinstance(entry, Mapping)
+            and start <= str(entry.get("date")) <= end
+            and (str(entry.get("date")), entry.get("symbol"))
+            not in explained_by_kind.get(kind, ())
+        ]
+        for kind in _GAP_KINDS
+    }
+
+
+def _formal_execution_evidence_gate(
+    metadata: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    trailing: Mapping[str, Any],
+    allowance: Mapping[str, Any] | None,
+) -> ProtocolError | None:
+    """Classify the trailing segment from sealed execution evidence only.
+
+    Metadata-only, like the legacy gap check: it never opens the Discovery
+    payload and runs before the counted reservation.  A benign row explains
+    only the gap kinds its evidence covers -- ``actual_open_after_halt`` the
+    ``raw_bars`` gap, ``confirmed_no_trade`` the ``raw_bars`` and ``derived``
+    gaps -- so a trusted halt open can never mask a same-day availability or
+    corporate-action gap.  The three blocking classifications reject with the
+    sealed row itself (their own gap entries are suppressed only so they are
+    not reported twice).  A trailing gap whose ``(date, symbol)`` no evidence
+    row mentions for that kind is still unexplained and blocks, so a v3
+    manifest cannot silently skip an unclassified hole.
+    """
+    start, end = trailing["start"], trailing["end"]
+    sealed_rows = evidence.get("rows")
+    rows = (
+        [
+            dict(row)
+            for row in sealed_rows
+            if isinstance(row, Mapping) and start <= str(row.get("date")) <= end
+        ]
+        if isinstance(sealed_rows, list)
+        else []
+    )
+    benign = [
+        row for row in rows
+        if row.get("classification") in _EXECUTION_EVIDENCE_BENIGN
+    ]
+    blocking = [
+        row for row in rows
+        if row.get("classification") in _EXECUTION_EVIDENCE_BLOCKING
+    ]
+    explained: dict[str, set[tuple[str, object]]] = {
+        kind: set() for kind in _GAP_KINDS
+    }
+    for row in benign:
+        pair = (str(row.get("date")), row.get("symbol"))
+        for kind in _EXECUTION_EVIDENCE_EXPLAINS.get(row.get("classification"), ()):
+            explained[kind].add(pair)
+    for row in blocking:
+        pair = (str(row.get("date")), row.get("symbol"))
+        for kind in _GAP_KINDS:
+            explained[kind].add(pair)
+    gaps = _trailing_gaps(metadata, start, end, explained)
+    unexplained = {kind: entries for kind, entries in gaps.items() if entries}
+    if not blocking and not unexplained:
+        return None
+    if blocking:
+        first = min(
+            blocking,
+            key=lambda row: (str(row.get("date")), str(row.get("symbol"))),
+        )
+        message = (
+            "The sealed execution evidence blocks the trailing segment: "
+            f"{first.get('date')} {first.get('symbol')} is "
+            f"{first.get('classification')}; a counted trailing read cannot be "
+            "honest until it is corrected."
+        )
+    else:
+        kind, entries = next(
+            (kind, entries) for kind, entries in unexplained.items() if entries
+        )
+        first = entries[0]
+        message = (
+            "The sealed manifest declares unexplained gaps inside the trailing "
+            f"segment: {kind} {first.get('date')} {first.get('symbol')}; a "
+            "counted trailing read cannot be honest until they are corrected."
+        )
+    return _rejected(
+        "VALIDATION_DATA_GAP", "validation", "inspect",
+        message,
+        counted=False,
+        allowance=dict(allowance) if allowance is not None else None,
+        execution_evidence=blocking,
+        gaps=unexplained,
+        trailing=dict(trailing),
+    )
 
 
 def _formal_manifest_gate(
@@ -1925,14 +2096,30 @@ def _formal_manifest_gate(
                       "sessions": descriptor["sessions"]},
             trailing=dict(trailing),
         )
-    gaps = {
-        kind: [
-            entry for entry in metadata.get("gaps", {}).get(kind, [])
-            if isinstance(entry, Mapping)
-            and trailing["start"] <= str(entry.get("date")) <= trailing["end"]
-        ]
-        for kind in _GAP_KINDS
-    }
+    schema_version = metadata.get("schema_version")
+    if type(schema_version) is int and schema_version >= 3:
+        evidence = metadata.get("execution_evidence")
+        policy = evidence.get("policy") if isinstance(evidence, Mapping) else None
+        version = policy.get("classification_version") if isinstance(policy, Mapping) else None
+        required_version = snapshot.EXECUTION_EVIDENCE_CLASSIFICATION_VERSION
+        if type(version) is not int or version != required_version:
+            raise _rejected(
+                "VALIDATION_DATA_GAP", "validation", "inspect",
+                "The sealed snapshot lacks the required execution evidence classification. "
+                "Re-seal the input and bind a Campaign to the new snapshot.",
+                counted=False,
+                allowance=dict(allowance) if allowance is not None else None,
+                snapshot_id=evaluation["snapshot_id"],
+                required_classification_version=required_version,
+                trailing=dict(trailing),
+            )
+        rejection = _formal_execution_evidence_gate(
+            metadata, evidence, trailing, allowance
+        )
+        if rejection is not None:
+            raise rejection
+        return
+    gaps = _trailing_gaps(metadata, trailing["start"], trailing["end"])
     blocked = {kind: entries for kind, entries in gaps.items() if entries}
     if blocked:
         raise _rejected(
@@ -2157,6 +2344,9 @@ def _formal_runs(
         "scoring_start": scoring_start,
         "data": data,
         "receipt": receipt,
+        # The #56 identity lives beside the snapshot block, never inside it:
+        # ``checks.data_availability.snapshot`` keeps its exact pre-#56 shape.
+        "snapshot_schema_version": receipt["schema_version"],
         "snapshot": _formal_snapshot_record(
             receipt,
             record,
@@ -2318,6 +2508,13 @@ def _formal_receipt(
             "experiment_id": submission["experiment_id"],
             "development_content_hash": split["development"]["content_hash"],
             "trailing_content_hash": split["trailing"]["content_hash"],
+            # Additive #56 identity, flat like the merged v1 receipt: a reviewer
+            # can read which snapshot contract and execution rule scored this.
+            "snapshot_schema_version": runs["snapshot_schema_version"],
+            "execution_rule_version": submission["locked"]["execution_rules"].get(
+                "version", NEXT_OPEN_RULES
+            ),
+            "price_basis": EXECUTION_PRICE_BASIS,
         },
         "usage": _formal_usage(use),
         "summary": _formal_summary(
@@ -2467,8 +2664,8 @@ def _write_terminal_receipt(
 ) -> bool:
     """Write the immutable receipt; a retry recovers an identical existing one.
 
-    Only the deterministic evidence content is stored, so a crash between the
-    trusted write and the project publication recomputes byte-identical content.
+    Only deterministic evidence is stored, so any recomputation must reproduce
+    the original content.
     Returns True when the receipt was already there (recovered, not rewritten).
     """
     path = _validation_path(store, validation_id)
@@ -2490,14 +2687,39 @@ def _load_trusted_receipt(
         receipt = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
         raise ValueError("The trusted research-loop Validation receipt is missing.") from error
+    receipt = _check_terminal_receipt(receipt, validation_id)
+    if _json(_published(receipt)) != published_json:
+        raise ValueError("The trusted Validation receipt differs from the project copy.")
+    return receipt
+
+
+def _check_terminal_receipt(receipt: object, validation_id: str) -> dict[str, Any]:
     if not isinstance(receipt, dict) or receipt.get("status") != "completed":
         raise ValueError("The trusted research-loop Validation receipt is not terminal.")
     expected = _hash({key: value for key, value in receipt.items() if key != "receipt_hash"})
     if receipt.get("receipt_hash") != expected or receipt.get("validation_id") != validation_id:
         raise ValueError("The trusted research-loop Validation receipt failed its integrity check.")
-    if _json(_published(receipt)) != published_json:
-        raise ValueError("The trusted Validation receipt differs from the project copy.")
-    return {**receipt, "status": "completed"}
+    return receipt
+
+
+def _recover_formal_terminal(store: Path, use: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Recover a trusted write that finished before the project publication."""
+    validation_id = use["validation_id"]
+    try:
+        receipt = json.loads(_validation_path(store, validation_id).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if isinstance(receipt, dict) and receipt.get("status") == "running":
+        return None
+    receipt = _check_terminal_receipt(receipt, validation_id)
+    if (
+        receipt.get("round_id") != use["round_id"]
+        or receipt.get("version_id") != use["version_id"]
+        or receipt.get("validation_kind") != VALIDATION_KIND_TRAILING
+        or receipt.get("usage") != _formal_usage(use)
+    ):
+        raise ValueError("The trusted Validation receipt differs from its reserved use.")
+    return receipt
 
 
 def _attempt_rows(
@@ -2572,18 +2794,16 @@ def _validation_allowance_status(
     }
 
 
-def _reserved_validation_use(
+def _validation_use_for_version(
     connection: sqlite3.Connection, round_id: str, version_id: str,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     row = connection.execute(
         "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
         "validation_id, consumed_at FROM research_loop_validation_uses "
         "WHERE round_id = ? AND version_id = ?",
         (round_id, version_id),
     ).fetchone()
-    if row is None:
-        raise ValueError("The formal Validation use for this version is missing.")
-    return _validation_use(row)
+    return _validation_use(row) if row is not None else None
 
 
 def _insert_validation_use(
@@ -2635,23 +2855,15 @@ def _reserve_validation_use(
     Caller holds the round lock and an open ``BEGIN IMMEDIATE`` transaction, so
     the existence check, the admission check, the allowance check and the insert
     are one serialized step: two processes racing the last slot or one manual
-    admission yield exactly one row and exactly one read.  Branch order:
-    reuse this version's row (resume / revalidation), then consume an unused
-    manual admission bound to this version, then take an automatic slot, then
-    reject before the read.  ``admit`` refuses a grant while automatic slots
-    remain, so a manual row can only be the researcher's post-limit extra read.
+    admission yield exactly one row and exactly one read. The caller has
+    already checked this version has no existing use. Consume an unused
+    manual admission, take an automatic slot, or reject before the read.
+    ``admit`` refuses a grant while automatic slots remain, so a manual row
+    can only be the researcher's post-limit extra read.
     The manual branch still comes first defensively: a grant is explicit, so a
     row recorded before this gate (or by a future caller) is honoured as manual
     rather than silently consumed as an automatic slot.
     """
-    existing = connection.execute(
-        "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
-        "validation_id, consumed_at FROM research_loop_validation_uses "
-        "WHERE round_id = ? AND version_id = ?",
-        (record["round_id"], submission["version_id"]),
-    ).fetchone()
-    if existing is not None:
-        return _validation_use(existing)
     admission = _admission_for_version(
         connection, record["round_id"], submission["version_id"]
     )
@@ -2884,7 +3096,7 @@ def _admission_result(
 def _validation_identity(
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
-    campaign: Mapping[str, Any],
+    runtime: str,
 ) -> str:
     """Content-addressed Validation identity for the round's protocol.
 
@@ -2899,7 +3111,7 @@ def _validation_identity(
         "scoring_policy_hash": _scoring_policy_hash(record["kickoff"]),
         "snapshot_hash": locked["snapshot_hash"],
         "protocol_hash": locked["protocol_hash"],
-        "engine_runtime_identity": _current_runtime(campaign),
+        "engine_runtime_identity": runtime,
     }
     split = record["kickoff"].get("research_partition")
     if split is not None:
@@ -2992,11 +3204,18 @@ def validate(
                     "the superseded locked snapshot.",
                 )
             formal = "research_partition" in record["kickoff"]
+            use: dict[str, Any] | None = None
             if formal:
                 # The reservation, the attempt row and every later state change
                 # are serialized by the round lock plus this write transaction.
                 connection.execute("BEGIN IMMEDIATE")
-            validation_id = _validation_identity(record, submission, campaign)
+                use = _validation_use_for_version(connection, round_id, version_id)
+            runtime: str | None = None
+            if use is None:
+                runtime = _current_runtime(campaign)
+                validation_id = _validation_identity(record, submission, runtime)
+            else:
+                validation_id = use["validation_id"]
             terminal = connection.execute(
                 "SELECT receipt_json FROM research_loop_validations WHERE validation_id = ?",
                 (validation_id,),
@@ -3013,8 +3232,18 @@ def validate(
                 if formal:
                     result["allowance"] = _validation_allowance(connection, record)
                 return result
-            use: dict[str, Any] | None = None
-            if formal:
+            recovered = _recover_formal_terminal(trusted, use) if use is not None else None
+            if runtime is None:
+                runtime = _current_runtime(campaign)
+            if use is not None and recovered is None and validation_id != _validation_identity(
+                record, submission, runtime,
+            ):
+                raise ProtocolError(
+                    "VALIDATION_RUNTIME_CHANGED", "validation", "inspect",
+                    "The interrupted formal Validation requires its original accounting "
+                    "runtime to resume.",
+                )
+            if formal and recovered is None:
                 # Known gaps and a changed research interval block BEFORE the
                 # counted reservation: a rejected pre-check spends nothing.
                 _formal_manifest_gate(
@@ -3023,7 +3252,8 @@ def validate(
                     campaign,
                     _validation_allowance(connection, record),
                 )
-                use = _reserve_validation_use(connection, record, submission, validation_id)
+                if use is None:
+                    use = _reserve_validation_use(connection, record, submission, validation_id)
             attempts = _attempt_rows(connection, validation_id)
             resumed = bool(attempts)
             attempt = len(attempts) + 1
@@ -3047,7 +3277,7 @@ def validate(
                             "validation_id": validation_id,
                             "attempt": attempt,
                             "started_at": _now(),
-                            "engine_runtime_identity": _current_runtime(campaign),
+                            "engine_runtime_identity": runtime,
                             **({"validation_kind": VALIDATION_KIND_TRAILING} if formal else {}),
                         }
                     ),
@@ -3055,7 +3285,9 @@ def validate(
             )
         _write_running_marker(trusted, validation_id, record, submission, attempt)
         _failpoint(VALIDATION_FAILPOINT)
-        if formal:
+        if recovered is not None:
+            receipt = recovered
+        elif formal:
             if use is None:
                 raise ValueError("The formal Validation use was not reserved.")
             runs = _formal_runs(snapshot_store, record, submission, campaign)
@@ -3074,10 +3306,9 @@ def validate(
                 validation_id=validation_id,
                 replay=replay,
             )
-        # The trusted evidence is written before the research-visible copy is
-        # published, so a crash between the two is recovered by re-running the
-        # same identity and finding the identical terminal receipt (the receipt
-        # content deliberately excludes mutable attempt provenance).
+        # The trusted evidence is written before the research-visible copy.
+        # For formal Validation, the reserved identity recovers an already
+        # completed trusted write without another sealed read.
         _write_terminal_receipt(trusted, validation_id, receipt)
         _failpoint(VALIDATION_TERMINAL_FAILPOINT)
         with _project(project) as connection:
@@ -4990,9 +5221,11 @@ def revalidate(
                     "This v2 round's stored receipt is not a formal trailing Validation."
                 )
             use = (
-                _reserved_validation_use(connection, round_id, version_id)
+                _validation_use_for_version(connection, round_id, version_id)
                 if formal else None
             )
+            if formal and use is None:
+                raise ValueError("The formal Validation use for this version is missing.")
             campaign = campaign_discovery(project, record["campaign_id"])
             locked_snapshot_id = submission["locked"]["snapshot_id"]
             corrected_evidence = _corrected_evidence(

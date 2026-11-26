@@ -346,7 +346,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     snapshots = commands.add_parser("snapshot", help="seal and inspect shared snapshots")
     snapshot_commands = snapshots.add_subparsers(dest="snapshot_command", required=True)
     seal = snapshot_commands.add_parser(
-        "seal", help="seal synthetic v1 or real v2 inputs in a trusted store"
+        "seal", help="seal synthetic v1 or real v2/v3 inputs in a trusted store"
     )
     seal.add_argument("--input", required=True, type=Path)
     seal.add_argument("--store", required=True, type=Path)

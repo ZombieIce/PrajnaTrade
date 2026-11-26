@@ -51,6 +51,7 @@ from prajnatrade.isolation import IsolationError, probe_isolation_evidence
 from prajnatrade.snapshot_baseline import (
     CN_TZ,
     NEXT_OPEN_RULES,
+    RETRY_INITIAL_RULES,
     available_by,
     run_partition_strategy,
 )
@@ -65,6 +66,8 @@ SCOPE = "synthetic"
 VALIDATION_STAGE = "validation"
 HOLDOUT_STAGE = "final_holdout"
 STAGES = (VALIDATION_STAGE, HOLDOUT_STAGE)
+_PROTECTED_SNAPSHOT_SCHEMAS = {1: SCOPE, 2: "real"}
+_PROTECTED_EXECUTION_RULES = (NEXT_OPEN_RULES, RETRY_INITIAL_RULES)
 
 THRESHOLD_METRICS = (
     "sessions",
@@ -744,6 +747,17 @@ def _plan_fingerprint(plan: dict[str, Any]) -> str:
     return _hash(body)
 
 
+def _protected_protocol_problem(
+    schema_version: object, execution_rules: dict[str, Any],
+) -> str | None:
+    if type(schema_version) is not int or schema_version not in _PROTECTED_SNAPSHOT_SCHEMAS:
+        return f"Protected Evaluation does not support snapshot schema {schema_version}."
+    rule = execution_rules.get("version", NEXT_OPEN_RULES)
+    if rule not in _PROTECTED_EXECUTION_RULES:
+        return f"Protected Evaluation does not support execution rule {rule}."
+    return None
+
+
 def _build_plan(
     project_id: str,
     candidate: dict[str, Any],
@@ -757,10 +771,13 @@ def _build_plan(
     evaluation = candidate.get("evaluation")
     if not isinstance(evaluation, dict) or evaluation.get("snapshot_id") != snapshot_id:
         raise ValueError("The frozen candidate snapshot reference is inconsistent.")
+    schema_version = metadata.get("schema_version")
+    problem = _protected_protocol_problem(schema_version, candidate["execution_rules"])
+    if problem is not None:
+        raise _invalid(problem)
     data_kind = metadata.get("data_kind")
     if (
-        data_kind not in (SCOPE, "real")
-        or snapshot.SCHEMA_VERSION.get(metadata.get("schema_version")) != data_kind
+        _PROTECTED_SNAPSHOT_SCHEMAS[schema_version] != data_kind
         or evaluation.get("data_kind", SCOPE) != data_kind
     ):
         raise _invalid("The frozen candidate and snapshot data kind must match.")
@@ -3067,13 +3084,6 @@ def run_evaluation(
             "The frozen candidate differs from the plan's frozen candidate.",
         )
     evaluation = candidate["evaluation"]
-    executor_config = evaluation.get("strategy_executor", {"kind": "none"})
-    runtime = runtime_identity(executor_config, execution_rules=evaluation["execution_rules"])
-    if plan.get("runtime") != runtime or evaluation.get("runtime") != runtime:
-        reject(
-            "FINGERPRINT_MISMATCH",
-            "The trusted accounting engine differs from the plan's frozen runtime.",
-        )
     try:
         metadata = snapshot.manifest(snapshot_store, plan["snapshot_id"])
         descriptors = {
@@ -3084,12 +3094,23 @@ def run_evaluation(
             "FINGERPRINT_MISMATCH",
             f"The frozen snapshot manifest could not be verified: {error}",
         )
+    schema_version = metadata.get("schema_version")
+    problem = _protected_protocol_problem(schema_version, plan["execution_rules"])
+    if problem is not None:
+        reject("UNSUPPORTED_PROTECTED_PROTOCOL", problem, next_action="stop")
     if (
         metadata.get("data_kind") != data_kind
-        or snapshot.SCHEMA_VERSION.get(metadata.get("schema_version")) != data_kind
+        or _PROTECTED_SNAPSHOT_SCHEMAS[schema_version] != data_kind
         or evaluation.get("data_kind", SCOPE) != data_kind
     ):
         reject("FINGERPRINT_MISMATCH", "The frozen candidate and snapshot data kind must match.")
+    executor_config = evaluation.get("strategy_executor", {"kind": "none"})
+    runtime = runtime_identity(executor_config, execution_rules=evaluation["execution_rules"])
+    if plan.get("runtime") != runtime or evaluation.get("runtime") != runtime:
+        reject(
+            "FINGERPRINT_MISMATCH",
+            "The trusted accounting engine differs from the plan's frozen runtime.",
+        )
     for name in STAGES:
         if descriptors[name] != plan["partitions"][name]:
             reject(
@@ -3460,6 +3481,11 @@ def _research_run_context(
     snapshot_store: Path, plan: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any], ContainerStrategyExecutor | None]:
     evaluation = plan["candidate"]["evaluation"]
+    metadata = snapshot.manifest(snapshot_store, plan["snapshot_id"])
+    schema_version = metadata.get("schema_version")
+    problem = _protected_protocol_problem(schema_version, plan["execution_rules"])
+    if problem is not None:
+        raise _reject("UNSUPPORTED_PROTECTED_PROTOCOL", "run", "stop", problem)
     runtime = runtime_identity(
         evaluation.get("strategy_executor"), execution_rules=evaluation["execution_rules"],
     )
@@ -3468,9 +3494,9 @@ def _research_run_context(
             "FINGERPRINT_MISMATCH", "run", "inspect",
             "The trusted accounting engine differs from the frozen runtime.",
         )
-    metadata = snapshot.manifest(snapshot_store, plan["snapshot_id"])
     if (
         metadata["data_kind"] != plan["data_kind"]
+        or _PROTECTED_SNAPSHOT_SCHEMAS[schema_version] != plan["data_kind"]
         or any(snapshot.partition_descriptor(metadata, stage) != plan["partitions"][stage]
                for stage in STAGES)
     ):

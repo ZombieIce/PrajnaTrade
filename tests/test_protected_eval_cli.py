@@ -1049,13 +1049,14 @@ def test_repackaged_snapshot_with_the_same_protected_content_cannot_buy_another_
 def build_scenario(
     root: Path, payload: dict, name: str, *,
     family: str = "equal_weight", parameters: dict | None = None,
+    campaign_options: tuple[str, ...] = (),
 ) -> dict:
     """Seal an alternative synthetic snapshot and freeze a candidate."""
     root.mkdir(parents=True, exist_ok=True)
     sealed = seal_snapshot(root, payload, f"snapshots-{name}")
     project = root / f"project-{name}"
     ok(cli("project", "init", "--project", str(project)))
-    campaign = create_campaign(project, sealed["store"], sealed["snapshot_id"])
+    campaign = create_campaign(project, sealed["store"], sealed["snapshot_id"], *campaign_options)
     source = root / f"submission-{name}.json"
     submit_experiment(
         project,

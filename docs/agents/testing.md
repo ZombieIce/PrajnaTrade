@@ -1,11 +1,11 @@
 # Testing
 
-The suite needs no network and runs from the repository root.
+The suite uses synthetic fixtures and runs from the repository root. Provider integration tests use a local HTTP stub.
 
 ## Commands
 
 ```bash
-# Fast mode: skips tests marked "isolation" (safe in nested/agent sessions).
+# Fast mode skips tests marked "isolation".
 scripts/test.sh fast
 
 # Full mode: the entire suite, including real-sandbox tests.
@@ -25,10 +25,10 @@ A single test file, without the wrapper:
 PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
-The full suite is the slow path (about 11 minutes on `macos-latest` in the #37
-CI run); at the time of writing this branch collects **483 tests**. CI
-(`.github/workflows/tests.yml`) runs the full suite on `macos-latest` with
-Python 3.12; `lint` runs `ruff check .`.
+[CI](../../.github/workflows/tests.yml) runs the full suite on macOS and Ruff on
+Linux. Run the relevant CLI tests first for local iteration. If a provider
+test raises `PermissionError` while binding a loopback HTTP server, run that
+test on the host or use the full CI result for the same commit.
 
 ## Isolation tests
 
@@ -48,6 +48,21 @@ In a nested/agent session use `scripts/test.sh fast`; run `full` on the host or
 let CI do it. A failure that names `sandbox_init`, `sandbox_install_failed`, or
 an unavailable sandbox runtime is usually this boundary, not a product bug —
 confirm on the host before changing code.
+
+## Snapshot schema and execution-rule changes
+
+For changes to the snapshot schema or matching rules, verify both the
+acquisition conversion and direct `snapshot seal` with synthetic inputs.
+Use the same cases to check the public manifest and the Formal Validation
+preflight. A known blocking gap names its session and symbol and leaves the
+allowance at zero before the trailing read. Use the matching tests to verify
+fills and cash, including the effect of realized sell proceeds.
+
+Check Protected Evaluation's supported versions at its public plan entry
+point and the frozen runtime fingerprints for changes to shared execution
+dependencies. Include these checks when the affected consumers are outside
+the diff. The module and test entry points are in
+[Architecture](architecture.md).
 
 ## Research Loop and Evidence Loop tests (#43)
 
@@ -80,6 +95,134 @@ unchanged v1 kickoff/locked/receipt shape, and includes one direct unit test of
 `snapshot.verify_discovery_split` for tampered descriptors and payloads. The
 file is fast and not marked `isolation`.
 
+## Actual daily open tests (#56)
+
+`tests/test_actual_open_cli.py` covers the schema-3 real contract and the
+`actual-open-v1` execution rule. It owns the reusable synthetic schema-3 fixture
+builders (`schema_v3_fixture`, `seal_v3`, `day_at` and the halt/suspension/
+conflict mutators); #58 and #59 import them instead of copying them. It seals a
+schema-3 manifest and asserts the `execution_evidence` policy block, one row per
+non-trading sealed session/symbol, and the `actual_open_after_halt` /
+`confirmed_no_trade` / `missing_required_open` / `source_conflict` /
+`unknown_status` counts, plus that the historical `gaps` shape is unchanged and
+an evidenced actual open is no longer a raw-bar gap. The `execution_evidence`
+block carries exactly `policy`, `rows` and `counts` (the manifest's own
+`schema_version` gates it; there is no unread inner copy) and it carries
+references only: a Final Holdout halted-at-open row (actual open `12.34`) and a
+source conflict (`12.34`/`12.39`) must not put either quote into
+`snapshot manifest`, no evidence row has an `open` or `open_conflict` key, a
+conflict exposes the two sources as `conflict_sources`, and the sealed
+Discovery payload still returns its prices. Negative seal cases reject a
+missing or unsealed price source, a resumption-status notice reused as the
+price source and a price archive reused as the status notice (the evidence role
+kinds), a missing `status_evidence_id`, an undeclared `raw_price_basis`, an
+actual open whose halt window covers the whole session or whose `volume` is
+zero (a hand-built row also checks `is_executable_open` and `unfilled_reason`
+directly), a null `open_conflict` that would otherwise hide a trading row's
+missing open, and every malformed `open_conflict` (an executable open, fewer
+than two sources, duplicate sources, unsealed evidence, non-positive or
+identical opens, including on a `trading` row that keeps its other OHLCV
+fields, and on a `suspended` row where a no-trade day has no open to dispute)
+and a schema-2 row carrying any of the three schema-3 keys. A valid trading row
+carrying `open_conflict: null` seals with no execution-evidence row (an explicit
+null is absent, not a conflict). The public-CLI
+price test runs the same target on a normal-open sample, a resumed-halt sample
+with the same daily open and a variant whose execution-day close differs: both
+the candidate and the benchmark must produce the same fill date, base price,
+quantity, fee, ending cash and sealed `open_evidence`, the close variant may
+change only that day's valuation, and a `next-open-v1` control cannot fill the
+halted day. A non-zero `--slippage-bps` case repeats the normal-open/resumed-halt
+pair and recomputes every fill price as the sealed actual open moved by that
+rate, asserts the recorded slippage cost is identical and reconciles the
+post-fill cash against the same fee/slippage formulas. A v1 `round validate`
+receipt on a schema-3 `actual-open-v1` Campaign asserts the additive provenance
+identity. A public-seam check fixes the retrospective rule: a `trading` row
+whose actual open is published at 15:05 is executable under `actual-open-v1`
+(positive volume still required) while `next-open-v1`/`retry-initial-v1` and
+the synthetic `available_at` seam keep their exact 09:30 gates. The file is
+fast and not marked `isolation`.
+
+`tests/test_execution_rules_cli.py` owns the matching behaviour of the frozen
+execution rules and imports those schema-3 builders. For #58 it drives
+schema-3 Campaigns through the public CLI and asserts:
+
+- **Five-ETF basket.** On the entry day one symbol is a confirmed whole-day
+  suspension, one resumed with a trusted actual open and three trade normally.
+  Four symbols fill at their own actual opens, the suspended one is recorded
+  unfilled with `confirmed_no_trade`, and cash, fees, holdings and the reliable
+  close valuation are recomputed from the fill rows. The attempt is
+  `partially_filled` with `basket_complete: false`, `metrics.orders_partially_filled`
+  is one, and `position_evidence` reports the partial build. The equal-weight
+  candidate and the frozen benchmark agree on attempts, fills, equity, metrics
+  and position evidence. Changing only the suspended symbol's tradability makes
+  it fill and the account delta is recomputed from the new fill and the
+  proportional scale.
+- **Retrospective matching.** The reviewer's repro: five ETFs are ordered
+  before the open and one symbol's actual open is 10 in both samples while its
+  quote is published only at 15:05. Marked normal and marked resumed-halt, both
+  samples fill 5/5 with the same fill date, base price, quantity, fee and cash
+  for the candidate and the benchmark; a `next-open-v1` control keeps the 09:30
+  gate and records the late symbol as a missing open.
+- **Sell then buy.** A declarative `momentum` strategy (`lookback: 2`,
+  `top_k: 1`, `cash_if_negative: false`) over engineered per-symbol closes
+  starts fully invested in A, then targets B with no original cash. The fills
+  are sell A then buy B, B's debit equals A's realized sell net, and quantities,
+  fees, cash and the attempt terminal state are hand-recomputed. When A is a
+  confirmed whole-day suspension at the switch, the held symbol has no
+  trustworthy open: B does not fill, A's shares are retained at the next
+  confirmed mark, fees and cash are unchanged, the attempt is `not_filled`, A's
+  unfilled reason is `confirmed_no_trade` and the priced buyer is listed with
+  `equity_basis_unknown`.
+- **Explicit exit vs unknown equity.** With two holdings whose target weights
+  are both zero, a confirmed suspension of A leaves the day's equity basis
+  unknown but B's exit is sized independently: B sells in full at its trusted
+  open, cash equals the realized sell net, A keeps every share and is recorded
+  `confirmed_no_trade`, and the attempt is `partially_filled` with
+  `filled_symbols: [B]`. The reviewer's suspended-seller sample and the
+  weight-positive freeze sample (`equity_basis_unknown` for every
+  equity-dependent order) are both covered.
+- **Held no-trade equity basis.** With two holdings and a target that asks for
+  a positive weight on one of them, a confirmed whole-day halt on the other
+  holding leaves equity unknown: no buy or retargeting fill, the priced
+  equity-dependent order is `equity_basis_unknown`, while the priced holding
+  whose target is zero is an explicit exit and sells in full for its realized
+  net. The halted holding keeps its parcel and confirmed-close mark, NAV drops
+  only by the exit fee, and the next priced decision sizes and rebalances
+  normally. This is the case that used to retarget the priced holdings against
+  a reduced open equity and sell them.
+- **Build state.** The last positive-target attempt drives
+  `position_evidence.basket_build_state`: the five-ETF entry basket is
+  `partial`, a completed target is `completed`, and a blocked attempt that
+  produced no fill at all is `unfilled` (the blocked switch and the submit-once
+  benchmark cover it); no positive target is `none`.
+- **Unfilled accounting and no retry.** A day whose five required symbols are a
+  whole-day halt, a missing required open, an unknown status and two confirmed
+  suspensions records every sealed-row reason, keeps the 100000 cash, and is
+  never retried automatically under `actual-open-v1`: the next attempt comes
+  from a new strategy decision. The submit-once benchmark records only the
+  blocked attempt and never moves cash. The same payload under
+  `retry-initial-v1` reuses the blocked signal on the next open and keeps its
+  exact legacy attempt shape and legacy metrics/position-evidence key sets.
+
+`tests/test_acquisition_conversion_cli.py` covers the #57 acquisition
+conversion without any network or real artifact. It imports the checked-in
+`scripts/acquire_real_etf_snapshot.py` by path (its `main` is guarded), feeds
+synthetic Tencent-shaped vendor bars and synthetic `open_halt` /
+`full_halt_until` notices with synthetic `price_archive`/`halt` evidence items,
+and calls the pure `build_snapshot_input` (which delegates to
+`convert_raw_bars`). It asserts schema 3, a normal row's vendor open and price
+source, the halted row's actual open `10.5` with the vendor `open_source` and a
+distinct halt-notice `status_evidence_id`, and the whole-day row's null prices
+with its halt notice. A `full_halt_until` notice with a same-day resume keeps
+its actual open (the real 2026-11-20 case), while one whose resume is on a later
+session covers the day and becomes `suspended`. The same converted document is sealed through the public
+CLI and scored under `actual-open-v1`: the `execution_evidence` classifications
+are `actual_open_after_halt` / `confirmed_no_trade`, the equal-weight Discovery
+fill on the halt day uses base price `10.5` and echoes the sealed
+`open_evidence`, and the confirmed no-trade symbol never fills (4/5). The real
+45-row verification stays with #35; the file is fast and not marked
+`isolation`.
+
 ## Formal trailing Validation tests (#50-T2)
 
 `tests/test_formal_validation_cli.py` covers protocol-v2 `round validate` and
@@ -100,6 +243,87 @@ lifecycle and per-version protocol/scoring/warmup/usage, and a trailing-only
 corrected successor produces a formal revalidation epoch with the prior receipt
 and affected diff while a changed development slice is refused with
 `EVIDENCE_DEVELOPMENT_MISMATCH`. The file is fast and not marked `isolation`.
+
+## Formal Validation pre-read execution gate and 329-day receipt tests (#59)
+
+`tests/test_formal_validation_cli.py` also owns the end-to-end #56/#59 acceptance
+surface. It imports the schema-3 builders from `test_actual_open_cli.py`
+(`schema_v3_fixture`, `day_at`, `raw_row`, `make_actual_open_halt`,
+`make_confirmed_suspension`, `make_missing_required_open`, `make_open_conflict`,
+`OPEN_SOURCE`) and extends the shared builders without changing existing callers:
+`split_campaign` and `formal_scenario` take an optional
+`execution_rules: str | None = None` that appends `--execution-rules` only when
+given (the default keeps every existing record at `next-open-v1`).
+
+- **Pre-read gate.** A schema-3 `actual-open-v1` scenario with a
+  `confirmed_no_trade` suspension inside the trailing segment is not a
+  `VALIDATION_DATA_GAP`: the read proceeds, records exactly one automatic use,
+  and still ends `insufficient_evidence`/`COVERAGE_INSUFFICIENT` because the
+  held suspended close is a valuation gap. Evidence explains only the gap kinds
+  it proves: keeping a trailing `actual_open_after_halt` row but removing that
+  ETF's derived `available_at` on the same day rejects `VALIDATION_DATA_GAP`
+  with `counted: false`, 0/1 uses, the `availability` gap naming the
+  date/symbol and no receipt/use (`actual_open_after_halt` explains `raw_bars`
+  only). A trailing `availability` gap that no `execution_evidence` row
+  explains is still unexplained and rejects with `counted: false`,
+  `execution_evidence: []` and the per-kind `gaps`. An explicit
+  `open_conflict: null` on a valid trailing trading row is not a conflict: the
+  manifest has no row for it and the read passes and counts one use.
+- **329-day positive.** The fixture is `schema_v3_fixture(1824)` with
+  `corporate_actions` cleared and a deterministic `1 + 0.005 * index` drift on
+  raw OHLC and derived values, so the momentum candidate buys the alphabetically
+  first symbol on the first trailing session. Before sealing, 45
+  `make_actual_open_halt` rows are placed on 44 distinct trailing sessions (the
+  first trailing session carries two halted symbols, including the candidate's
+  symbol) and each row keeps its own drifted actual open. 1824 sessions give a
+  1094-session sealed Discovery interval, development 765 and trailing 329.
+  `round validate` must return `passed` with `scoring` and both runs at 329
+  sessions/329 valued sessions ending on the trailing end, 329-point trusted
+  curves per side, `usage.kind: automatic`/`sequence: 1`, exactly one
+  `research_loop_validation_uses` row, a candidate and a benchmark fill on a
+  halted session whose `open_evidence` equals the sealed `open_source`, and the
+  receipt `provenance` carrying `snapshot_schema_version: 3`,
+  `execution_rule_version: "actual-open-v1"` and
+  `price_basis: "unadjusted_open"`. Replaying the same command returns the same
+  `validation_id` with `reused: true` and still one use row (and
+  `round status` shows one use).
+- **Zero-use negatives.** The same 1824-session recipe with one trailing halt
+  row replaced by `make_missing_required_open` (seal stays valid) or by
+  `make_open_conflict` rejects `VALIDATION_DATA_GAP` at the gate with
+  `counted: false`, `allowance.automatic_used == 0` of 1, the blocking
+  `execution_evidence` row naming the date/symbol/classification and reason in
+  the message, `gaps: {}`, no terminal receipt, no
+  `research-loop-validations` directory, zero use/attempt rows, and
+  `round status` still `research` with version validation `not_run`.
+- **Receipt identity and legacy readability.** The v2 `provenance` gains the
+  three flat keys; a legacy schema-1 `next-open-v1` v1 receipt has no
+  `provenance` and its `checks.data_availability.snapshot` keeps the exact
+  pre-#56 keys (no `schema_version` leak). A schema-1 formal trailing receipt
+  publishes the same pre-#56 availability `snapshot` block, while its
+  `provenance` carries `snapshot_schema_version: 1` and the legacy rule; the
+  formal identity is read from the sealed read receipt, never from the
+  availability block.
+- **Discovery/formal identity.** One split schema-3 `actual-open-v1` Campaign
+  carries an evidenced halt in the development segment and one in the trailing
+  segment. The Campaign evaluation, round kickoff/locked version and formal
+  receipt provenance name `actual-open-v1`, snapshot schema 3 and
+  `unadjusted_open`, and the Discovery candidate's development fill and the
+  formal candidate's trailing fill carry the same sealed `open_evidence` shape
+  and the same fee/slippage formula (`price == raw_open`, fee on that price).
+- **Formal position prerequisite.** One split schema-3 `actual-open-v1`
+  Campaign carries a confirmed suspended symbol on the benchmark's entry day
+  (the first trailing session); the pre-read gate accepts it as benign. The run
+  proceeds and consumes exactly one counted use, but the benchmark filled only
+  4/5 required symbols, so the receipt is
+  `insufficient_evidence`/`POSITION_EVIDENCE_INSUFFICIENT` with
+  `checks.position.ok` false, both sides' `basket_build_state` published
+  (`partial` for the benchmark, `completed` for the candidate), the benchmark's
+  four fills and `fill_count` recorded, and the #56 `provenance` identity
+  intact.
+
+The 329-day tests are subprocess-heavy (about 8-11 CLI calls each, a ~4.4 MB
+payload, ~10 s per test) but not marked `isolation`; the file is still fast
+compared with the full suite.
 
 ## Manual Validation admission tests (#50-T3)
 

@@ -30,6 +30,7 @@ from prajnatrade.snapshot import (
     slice_content,
 )
 from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_RULES,
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
@@ -52,6 +53,7 @@ def _fingerprint(value: object) -> str:
 def _runtime_components(
     strategy_executor: dict[str, Any] | None = None,
     *,
+    execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     directory = Path(__file__).parent
@@ -59,6 +61,9 @@ def _runtime_components(
         "strategies.py", "backtest.py", "data.py", "snapshot.py", "snapshot_baseline.py",
         "container_executor.py",
     )
+    # Actual-open matching consults the shared full-session halt predicate.
+    if execution_rules is not None and execution_rules.get("version") == ACTUAL_OPEN_RULES:
+        files += ("trading_status.py",)
     if history_policy is not None:
         files += ("experiment.py",)
     executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}
@@ -94,11 +99,13 @@ def runtime_identity(
 ) -> str:
     """Fingerprint the accounting dependencies and optional strategy executor.
 
-    Passing the Campaign's ``history_policy`` binds the declared-history engine
-    (``experiment.py``) as well, matching the frozen Campaign runtime.  A source
-    fix therefore changes the identity and forces a fresh replay identity.
+    The Campaign's ``execution_rules`` select rule-specific dependencies.
+    Its ``history_policy`` also binds the declared-history engine
+    (``experiment.py``). A source fix changes the corresponding identity.
     """
-    dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
+    dependencies = _runtime_components(
+        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+    )
     if (
         history_policy is None
         and execution_rules is not None
@@ -117,10 +124,12 @@ def runtime_matches(
     history_policy: Mapping[str, Any] | None = None,
 ) -> bool:
     """Check the exact current runtime or a compatible legacy dependency set."""
-    dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
+    dependencies = _runtime_components(
+        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+    )
     if stored == _fingerprint(dependencies):
         return True
-    if history_policy is not None or any(
+    if history_policy is not None or "trading_status.py" in dependencies or any(
         dependencies[name] != digest for name, digest in _COMPATIBLE_RUNTIME_SOURCES.items()
     ):
         return False
@@ -175,12 +184,27 @@ def _execution_policy(version: str) -> dict[str, Any]:
             initial_entry_retry="next_open_until_filled_or_superseded",
             retry_scope="before_first_position_is_established",
         )
+    elif version == ACTUAL_OPEN_RULES:
+        # The sealed actual daily open is a matching base price only, never a
+        # signal input. Each required symbol matches separately, sells fund the
+        # same day's buys with their realized net, and an unfilled symbol keeps
+        # its cash or shares instead of blocking the whole basket (ADR 0002).
+        rules["execution"].update(
+            halted_open="actual_daily_open_when_evidenced",
+            partial_halt_open_availability="not_gated_by_0930",
+            missing_required_open="symbol_not_filled",
+            partial_fill="recorded_per_symbol",
+            funding="initial_cash_plus_realized_sell_net",
+            order="sells_before_buys",
+            matching="per_symbol",
+        )
     return rules
 
 
 def _campaign_evaluation(
     *,
     data_kind: str,
+    snapshot_schema_version: int,
     snapshot_id: str,
     partition_content_hash: str,
     as_of: str | None,
@@ -192,7 +216,9 @@ def _campaign_evaluation(
     history_policy: Mapping[str, Any] | None = None,
     discovery_split: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    runtime_dependencies = _runtime_components(strategy_executor, history_policy=history_policy)
+    runtime_dependencies = _runtime_components(
+        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+    )
     return {
         "engine": "sealed-discovery-v1",
         # The opt-in 70/30 protocol is the one new research Campaigns must use;
@@ -205,6 +231,7 @@ def _campaign_evaluation(
         "partition_content_hash": partition_content_hash,
         "as_of": as_of,
         "data_kind": data_kind,
+        "snapshot_schema_version": snapshot_schema_version,
         "initial_cash": initial_cash,
         "transaction_cost_bps": transaction_cost_bps,
         "slippage_bps": slippage_bps,
@@ -331,6 +358,7 @@ def campaign_create(
         baseline_options = {"history_requirements": [], "scoring_start": history_policy["scoring_start"]}
     evaluation = _campaign_evaluation(
         data_kind=data_kind,
+        snapshot_schema_version=receipt["schema_version"],
         snapshot_id=snapshot_id,
         partition_content_hash=partition_hash,
         as_of=as_of,
@@ -984,6 +1012,10 @@ def _run_attempt(
         if family == "python":
             result["strategy"] = dict(request["strategy"])
             result["executor"] = _executor_evidence(executor_config, executor_evidence)
+        # Additive identity echo: the sealed snapshot protocol this result was
+        # computed under (a Campaign stored before #56 lacks the evaluation key).
+        if "snapshot_schema_version" in config:
+            result["snapshot_schema_version"] = config["snapshot_schema_version"]
         if time.monotonic() - started >= remaining:
             raise _TimeExpired()
     except _TimeExpired:
