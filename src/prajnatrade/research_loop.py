@@ -1937,23 +1937,6 @@ def _formal_split(record: Mapping[str, Any]) -> dict[str, Any]:
     return record["kickoff"]["research_partition"]
 
 
-def _execution_evidence_metadata(
-    metadata: Mapping[str, Any],
-) -> Mapping[str, Any] | None:
-    """The sealed schema-3 execution-evidence block, when this manifest has one.
-
-    Only a declared schema version of at least 3 with the additive block takes
-    the evidence-classified gate.  A schema-1/2 manifest, or a successor that
-    renamed ``gaps`` to ``base_gaps`` and carries no evidence, keeps the legacy
-    gap behaviour byte-for-byte.
-    """
-    schema_version = metadata.get("schema_version")
-    evidence = metadata.get("execution_evidence")
-    if type(schema_version) is not int or schema_version < 3:
-        return None
-    return evidence if isinstance(evidence, Mapping) else None
-
-
 def _trailing_gaps(
     metadata: Mapping[str, Any],
     start: str,
@@ -2111,8 +2094,23 @@ def _formal_manifest_gate(
                       "sessions": descriptor["sessions"]},
             trailing=dict(trailing),
         )
-    evidence = _execution_evidence_metadata(metadata)
-    if evidence is not None:
+    schema_version = metadata.get("schema_version")
+    if type(schema_version) is int and schema_version >= 3:
+        evidence = metadata.get("execution_evidence")
+        policy = evidence.get("policy") if isinstance(evidence, Mapping) else None
+        version = policy.get("classification_version") if isinstance(policy, Mapping) else None
+        required_version = snapshot.EXECUTION_EVIDENCE_CLASSIFICATION_VERSION
+        if type(version) is not int or version != required_version:
+            raise _rejected(
+                "VALIDATION_DATA_GAP", "validation", "inspect",
+                "The sealed snapshot lacks the required execution evidence classification. "
+                "Re-seal the input and bind a Campaign to the new snapshot.",
+                counted=False,
+                allowance=dict(allowance) if allowance is not None else None,
+                snapshot_id=evaluation["snapshot_id"],
+                required_classification_version=required_version,
+                trailing=dict(trailing),
+            )
         rejection = _formal_execution_evidence_gate(
             metadata, evidence, trailing, allowance
         )

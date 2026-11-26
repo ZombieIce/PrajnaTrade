@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.trading_status import halt_conflicts_with_volume
 from prajnatrade.trading_status import halt_covers_session as halt_covers_session
 
 KINDS = ("calendar", "raw_bars", "corporate_actions", "derived")
@@ -37,7 +38,9 @@ STATUS_EVIDENCE_KINDS = (
     "resumption_notice",
     "trading_status_notice",
 )
+EXECUTION_EVIDENCE_CLASSIFICATION_VERSION = 2
 EXECUTION_EVIDENCE_POLICY = {
+    "classification_version": EXECUTION_EVIDENCE_CLASSIFICATION_VERSION,
     "price_basis": "unadjusted_open",
     "price_source": "raw_bars[].open_source -> evidence.items",
     "status_evidence": "raw_bars[].status_evidence_id -> evidence.items",
@@ -246,12 +249,16 @@ def _open_source_evidence(row: dict, evidence_kinds: dict[str, str]) -> dict | N
     return value
 
 
+def _valid_status_evidence_id(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _status_evidence(
     row: dict, evidence_kinds: dict[str, str], open_source: dict | None
 ) -> None:
     status = row.get("trading_status")
     value = row.get("status_evidence_id")
-    if not isinstance(value, str) or not value.strip():
+    if value is None:
         if row.get("status_conflict") is not None:
             raise ValueError("status_conflict requires status_evidence_id.")
         if status in ("partial_halt", "suspended"):
@@ -260,6 +267,8 @@ def _status_evidence(
                 "status_evidence_id."
             )
         return
+    if not _valid_status_evidence_id(value):
+        raise ValueError("status_evidence_id must be a nonempty string when provided.")
     if value not in evidence_kinds:
         raise ValueError("Unknown status_evidence_id in raw_bars.")
     if evidence_kinds[value] not in STATUS_EVIDENCE_KINDS:
@@ -303,8 +312,11 @@ def _open_conflict(row: dict, evidence_kinds: dict[str, str]) -> None:
         name = entry["source"]
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Invalid open_conflict source name.")
-        if entry["evidence_id"] not in evidence_kinds:
+        evidence_id = entry["evidence_id"]
+        if not isinstance(evidence_id, str) or evidence_id not in evidence_kinds:
             raise ValueError("Unknown open_conflict evidence_id in raw_bars.")
+        if evidence_kinds[evidence_id] not in PRICE_EVIDENCE_KINDS:
+            raise ValueError("open_conflict evidence_id must name a price_archive evidence item.")
         price = entry["open"]
         if (
             isinstance(price, bool)
@@ -498,7 +510,7 @@ def _execution_evidence_row(row: dict) -> dict | None:
     """
     status = row["trading_status"]
     conflict = row.get("open_conflict")
-    if status == "trading" and conflict is None:
+    if status == "trading" and conflict is None and row["volume"] > 0:
         return None
     record: dict = {
         "date": row["date"],
@@ -513,6 +525,11 @@ def _execution_evidence_row(row: dict) -> dict | None:
                 for entry in conflict["sources"]
             ],
         )
+    elif status == "trading":
+        record.update(
+            classification="missing_required_open",
+            reason="trading_without_positive_volume",
+        )
     elif status == "unknown":
         record["classification"] = "unknown_status"
         if row.get("status_conflict") is not None:
@@ -526,6 +543,11 @@ def _execution_evidence_row(row: dict) -> dict | None:
                 classification="actual_open_after_halt",
                 open_source=row["open_source"],
             )
+        elif halt_conflicts_with_volume(row.get("halt"), row["date"], row["volume"]):
+            record.update(
+                classification="unknown_status",
+                reason="positive_volume_during_whole_day_halt",
+            )
         elif halt_covers_session(row.get("halt"), row["date"]):
             record["classification"] = "confirmed_no_trade"
         else:
@@ -535,17 +557,16 @@ def _execution_evidence_row(row: dict) -> dict | None:
             )
     if row.get("halt") is not None:
         record["halt"] = row["halt"]
-    if row.get("status_evidence_id") is not None:
-        record["status_evidence_id"] = row["status_evidence_id"]
+    status_evidence_id = row.get("status_evidence_id")
+    if _valid_status_evidence_id(status_evidence_id):
+        record["status_evidence_id"] = status_evidence_id
     return record
 
 
 def _execution_evidence(index: dict[tuple[str, str], dict], sessions: list[str]) -> dict:
-    """Bind every non-trading sealed session to its execution classification.
+    """Bind every halted, unknown or otherwise unexecutable sealed session.
 
-    One row per sealed session/symbol whose ``trading_status`` is not
-    ``trading`` or that carries an ``open_conflict``, sorted by date and symbol.
-    This is metadata only: the pre-read gate can classify a known gap without
+    The date/symbol rows let the pre-read gate classify known gaps without
     opening the Discovery payload.
     """
     rows = []
@@ -826,6 +847,14 @@ def _manifest(store: Path, snapshot_id: str) -> dict:
     value = _read_json(store / snapshot_id / "manifest.json")
     if not isinstance(value, dict) or _hash(value) != snapshot_id:
         raise ValueError("Snapshot manifest integrity check failed.")
+    evidence = value.get("execution_evidence")
+    if isinstance(evidence, dict):
+        # Earlier schema-3 seals could put structured data in this reference.
+        # Verify the original content address, then refuse it without echoing it.
+        for row in evidence.get("rows", []):
+            reference = row.get("status_evidence_id")
+            if reference is not None and not _valid_status_evidence_id(reference):
+                raise ValueError("Invalid status_evidence_id in the sealed snapshot manifest.")
     return value
 
 
