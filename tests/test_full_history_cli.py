@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import date, timedelta
 from pathlib import Path
 
+import pytest
 from cli_helpers import cli, ok, rejected, write_json
+from test_actual_open_cli import schema_v3_fixture
+from test_real_snapshot import schema_v2_fixture
 from test_research_loop_cli import (
     lock_version,
     open_round,
@@ -101,6 +104,77 @@ def full_history(day_count: int) -> dict:
             for symbol in SYMBOLS
         ],
     }
+
+
+@pytest.mark.parametrize("fixture", [schema_v2_fixture, schema_v3_fixture])
+def test_authorized_real_schema_history_keeps_real_provenance(
+    tmp_path: Path, fixture,
+) -> None:
+    # These schema-real inputs contain only synthetic test data.
+    payload = fixture()
+    dates = [row["date"] for row in payload["calendar"]]
+    store = tmp_path / "snapshots"
+    source = write_json(tmp_path / "input.json", payload)
+    unauthorized = cli(
+        "snapshot", "seal", "--input", str(source), "--store", str(store), "--full-history"
+    )
+    assert unauthorized.returncode != 0
+    assert "authorization-id" in unauthorized.stderr
+    sealed = seal_full_history(tmp_path, store, payload, "test-authorization")
+    manifest = ok(cli("snapshot", "manifest", "--store", str(store), "--id", sealed["snapshot_id"]))
+    provenance = manifest["authorized_history"]["source"]
+    assert provenance == {"kind": "real_input", "snapshot_id": None, "data_kind": "real"}
+    assert manifest["data_kind"] == "real"
+    assert manifest["authorized_history"]["range"]["sessions"] == len(dates)
+    assert [part["name"] for part in manifest["partitions"]] == ["discovery"]
+    assert cli(
+        "snapshot", "read", "--store", str(store), "--id", sealed["snapshot_id"],
+        "--partition", "validation",
+    ).returncode != 0
+
+    successor = seal_full_history(
+        tmp_path, store, payload, "successor-authorization",
+        source_snapshot_id=sealed["snapshot_id"],
+    )
+    successor_manifest = ok(
+        cli("snapshot", "manifest", "--store", str(store), "--id", successor["snapshot_id"])
+    )
+    assert successor_manifest["authorized_history"]["source"] == {
+        "kind": "sealed_real_snapshot",
+        "snapshot_id": sealed["snapshot_id"],
+        "data_kind": "real",
+        "range": manifest["authorized_history"]["range"],
+    }
+    synthetic = full_history(15)
+    synthetic_source = write_json(tmp_path / "synthetic.json", synthetic)
+    mismatch = cli(
+        "snapshot", "seal", "--input", str(synthetic_source), "--store", str(store),
+        "--full-history", "--authorization-id", "test-authorization",
+        "--authorized-start", synthetic["calendar"][0]["date"],
+        "--authorized-end", synthetic["calendar"][-1]["date"],
+        "--source-snapshot-id", sealed["snapshot_id"],
+    )
+    assert mismatch.returncode != 0
+    assert "same data kind" in mismatch.stderr
+
+    project = tmp_path / "project"
+    ok(cli("project", "init", "--project", str(project)))
+    campaign = ok(cli(
+        "campaign", "create", "--project", str(project), "--store", str(store),
+        "--snapshot-id", successor["snapshot_id"], "--attempts", "2", "--max-seconds", "30",
+        "--discovery-split", "70/30", "--discovery-warmup-sessions", "2",
+    ))
+    receipt = campaign["full_history"]
+    assert receipt["source"] == successor_manifest["authorized_history"]["source"]
+    assert (receipt["discovery"]["sessions"], receipt["validation"]["sessions"]) == (10, 5)
+    round_source = write_json(
+        tmp_path / "round.json", round_input(validation_policy={"auto_validation_limit": 1})
+    )
+    opened = ok(open_round(
+        project, tmp_path / "trusted", campaign["campaign_id"], round_source,
+        authorization_id="successor-authorization",
+    ))
+    assert opened["kickoff"]["full_history"] == receipt
 
 
 def test_public_cli_seals_and_opens_one_authorized_full_history(tmp_path: Path) -> None:

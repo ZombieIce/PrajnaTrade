@@ -793,8 +793,6 @@ def _prepare(
         start = discovery_start
         sessions = [day for day in sessions if day >= start]
     if authorized_history is not None:
-        if data_kind != "synthetic":
-            raise ValueError("Authorized full-history snapshots are limited to synthetic data.")
         authorized_start = _date(authorized_history["start"])
         authorized_end = _date(authorized_history["end"])
         if authorized_start > authorized_end:
@@ -931,15 +929,17 @@ def seal(
             raise ValueError(
                 "--full-history requires --authorized-start and --authorized-end."
             )
+        data = _read_json(source)
+        _, data_kind = _input_kind(data)
         source_metadata: dict[str, object] = {
-            "kind": "synthetic_input",
+            "kind": f"{data_kind}_input",
             "snapshot_id": source_snapshot_id,
-            "data_kind": "synthetic",
+            "data_kind": data_kind,
         }
         if source_snapshot_id is not None:
             source_manifest = _manifest(store, source_snapshot_id)
-            if source_manifest.get("data_kind") != "synthetic":
-                raise ValueError("--source-snapshot-id must identify a synthetic snapshot.")
+            if source_manifest.get("data_kind") != data_kind:
+                raise ValueError("--source-snapshot-id must have the same data kind as the input.")
             previous_authorization = source_manifest.get("authorized_history")
             if not isinstance(previous_authorization, dict):
                 raise ValueError(
@@ -962,9 +962,9 @@ def seal(
             ):
                 raise ValueError("The new authorized range does not overlap its source snapshot.")
             source_metadata = {
-                "kind": "sealed_synthetic_snapshot",
+                "kind": f"sealed_{data_kind}_snapshot",
                 "snapshot_id": source_snapshot_id,
-                "data_kind": "synthetic",
+                "data_kind": data_kind,
                 "range": {
                     key: source_range[key]
                     for key in ("start", "end", "sessions", "content_hash")
@@ -983,8 +983,10 @@ def seal(
         raise ValueError(
             "Full-history authorization options require --full-history."
         )
+    else:
+        data = _read_json(source)
     manifest, partitions = _prepare(
-        _read_json(source), authorized_history=authorized_history,
+        data, authorized_history=authorized_history,
     )
     return _publish(store, manifest, partitions)
 

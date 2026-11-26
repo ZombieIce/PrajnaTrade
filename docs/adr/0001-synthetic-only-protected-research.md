@@ -255,8 +255,8 @@ Discovery after research has stopped changing it.
 
 ## Authorized full-history rounds (issue #61)
 
-The #61 opt-in `snapshot seal --full-history` workflow accepts synthetic data
-only, records an explicit authorization ID and complete date range, and seals
+The #61 opt-in `snapshot seal --full-history` workflow accepts synthetic or
+real schema-2/3 data, records an explicit authorization ID and complete date range, and seals
 that range as one Discovery payload. A Campaign then freezes the existing
 floor-based 70/30 split over the full authorized range; its receipt separately
 records the Discovery/Validation lengths, warm-up source, and actual scoring
@@ -264,11 +264,13 @@ dates and session count. `round open` must repeat the snapshot authorization ID.
 This mode does not create or grant access to protected Validation or Final
 Holdout partitions, and standard snapshot partitions are unchanged.
 
-A full-history snapshot may identify a previously sealed synthetic source
-snapshot. A later round opening discloses prior receipts and feedback for
+A full-history snapshot may identify a previously sealed authorized source
+snapshot of the same data kind; provenance identifies real and synthetic sources
+separately. A later round opening discloses prior receipts and feedback for
 overlapping authorized intervals. These fields are additive: existing
 snapshots, round permissions and receipts continue to be interpreted under
-their original protocols. Acceptance remains synthetic-only.
+their original protocols. Acceptance remains synthetic-only; real data and
+production allowances are used only for actual research.
 
 ## Discovery evidence precheck (issue #63)
 

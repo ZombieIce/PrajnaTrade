@@ -97,14 +97,16 @@ untrusted agents; this ticket does not verify that boundary.
 
 #### Authorized full-history rounds (#61)
 
-For a synthetic research round whose denominator is the complete authorized
+For a research round whose denominator is the complete authorized
 history, `snapshot seal --full-history` records the authorization ID and exact
 date bounds and seals that interval as one Discovery payload. This opt-in form
 does not create the usual protected Validation or Final Holdout partitions;
-the existing 60/20/20 snapshots and their permissions are unchanged. Only
-synthetic snapshots are accepted. To base a new authorization on a previously
-sealed synthetic interval, pass `--source-snapshot-id`; the source and date
-overlap are frozen in the manifest.
+the existing 60/20/20 snapshots and their permissions are unchanged. Synthetic
+schema-1 and real schema-2/3 inputs are supported; real data and production
+allowances are for actual research only, not development or acceptance. To
+base a new authorization on a previously sealed authorized interval of the
+same data kind, pass `--source-snapshot-id`; its kind, identity and range are
+recorded in the manifest so the overlap can be traced.
 
 ```sh
 prajnatrade snapshot seal --input authorized-synthetic.json \

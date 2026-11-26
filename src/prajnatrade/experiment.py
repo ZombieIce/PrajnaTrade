@@ -346,9 +346,9 @@ def campaign_create(
     if authorized_history is not None:
         if as_of is not None:
             raise ValueError("An authorized full-history Campaign cannot use --as-of.")
-        if data_kind != "synthetic" or split_ratio != (70, 30):
+        if split_ratio != (70, 30):
             raise ValueError(
-                "Authorized full-history Campaigns require synthetic data and --discovery-split 70/30."
+                "Authorized full-history Campaigns require --discovery-split 70/30."
             )
         if discovery_warmup_sessions is None:
             raise ValueError(

@@ -99,7 +99,8 @@ file is fast and not marked `isolation`.
 
 `tests/test_full_history_cli.py` drives the public `snapshot seal --full-history`,
 `campaign create --discovery-split 70/30` and `round open` commands using
-synthetic-only inputs. It asserts the 1,094-session 765/329 split, content
+synthetic-only fixtures, including schema-2/3 inputs marked as real to exercise
+real provenance without using market data. It asserts the 1,094-session 765/329 split, content
 fingerprints, warm-up versus actual scoring days, authorization binding, and
 disclosure of prior feedback for a successor snapshot with overlapping dates.
 The test also confirms that this mode does not turn its research Validation
