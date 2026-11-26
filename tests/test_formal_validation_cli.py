@@ -24,6 +24,7 @@ from cli_helpers import (
     assert_hex,
     cli,
     cli_env,
+    digest,
     ok,
     rejected,
     round_validate_argv,
@@ -32,6 +33,7 @@ from cli_helpers import (
 from test_corrected_evidence_cli import remove_protected_payloads
 from test_discovery_split_cli import (
     discovery_read,
+    manifest as snapshot_manifest,
     split_campaign,
     stored_campaign,
     v2_round_input,
@@ -64,8 +66,10 @@ from test_actual_open_cli import (
     make_confirmed_suspension,
     make_missing_required_open,
     make_open_conflict,
+    make_whole_day_halt,
     raw_row,
     schema_v3_fixture,
+    seal_v3,
 )
 
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
@@ -130,17 +134,19 @@ def formal_scenario(
     hard_conditions: list[dict] | None = None,
     as_of: str | None = None,
     execution_rules: str | None = None,
+    frozen_campaign: tuple[Path, Path, dict] | None = None,
 ) -> dict:
     """A split Campaign with one locked version, before any formal Validation."""
-    payload = payload if payload is not None else trending_snapshot(15)
-    project, snapshots, campaign = split_campaign(
-        root,
-        payload,
-        warmup=warmup,
-        name=name,
-        as_of=as_of,
-        execution_rules=execution_rules,
-    )
+    if frozen_campaign is None:
+        frozen_campaign = split_campaign(
+            root,
+            payload if payload is not None else trending_snapshot(15),
+            warmup=warmup,
+            name=name,
+            as_of=as_of,
+            execution_rules=execution_rules,
+        )
+    project, snapshots, campaign = frozen_campaign
     store = root / f"{name}-trusted"
     contract = v2_round_input(limit=limit)
     if hard_conditions is not None:
@@ -890,6 +896,92 @@ def test_confirmed_no_trade_evidence_passes_the_pre_read_gate(tmp_path: Path) ->
     valuation = validated["checks"]["data_availability"]["benchmark"]["valuation_gaps"]
     assert suspended_day in valuation["dates"]
     assert validated["checks"]["data_availability"]["ok"] is False
+
+
+@pytest.mark.parametrize(
+    ("trading_status", "classification", "reason"),
+    [
+        ("trading", "missing_required_open", "trading_without_positive_volume"),
+        ("partial_halt", "unknown_status", "positive_volume_during_whole_day_halt"),
+    ],
+)
+def test_sealed_volume_inconsistency_blocks_the_trailing_read_without_a_use(
+    tmp_path: Path, trading_status: str, classification: str, reason: str
+) -> None:
+    payload = schema_v3_fixture(15)
+    day, symbol = day_at(7), ETF_SYMBOLS[0]
+    if trading_status == "partial_halt":
+        make_whole_day_halt(payload, day, symbol, volume=1200)
+    else:
+        raw_row(payload, day, symbol)["volume"] = 0
+    scenario = formal_scenario(
+        tmp_path, payload=payload, limit=1, execution_rules=ACTUAL_OPEN_RULES
+    )
+    assert day in scenario["trailing_dates"]
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_DATA_GAP", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["allowance"]["auto_limit"] == 1
+    assert blocked["allowance"]["automatic_used"] == 0
+    assert blocked["gaps"] == {}
+    [evidence] = blocked["execution_evidence"]
+    assert evidence["date"] == day
+    assert evidence["symbol"] == symbol
+    assert evidence["trading_status"] == trading_status
+    assert evidence["classification"] == classification
+    assert evidence["reason"] == reason
+    assert "open" not in evidence
+    assert "volume" not in evidence
+    assert day in blocked["error"]["message"]
+    assert symbol in blocked["error"]["message"]
+    assert classification in blocked["error"]["message"]
+
+    manifest = snapshot_manifest(scenario["snapshots"], scenario["campaign"]["snapshot_id"])
+    assert manifest["execution_evidence"]["rows"] == [evidence]
+    assert round_uses(scenario) == []
+    assert version_entry(scenario)["validation"]["status"] == "not_run"
+    assert not (scenario["store"] / "research-loop-validations").exists()
+
+
+def test_older_schema_v3_seal_requires_resealing_before_a_new_formal_read(
+    tmp_path: Path,
+) -> None:
+    sealed = seal_v3(tmp_path, schema_v3_fixture())
+    body = sealed["manifest"]
+    body.pop("snapshot_id")
+    body["execution_evidence"]["policy"].pop("classification_version")
+    old_id = digest(body)
+    snapshots = sealed["store"]
+    old_manifest = write_json(snapshots / old_id / "manifest.json", body)
+    old_discovery = old_manifest.with_name("discovery.json")
+    old_discovery.hardlink_to(snapshots / sealed["snapshot_id"] / old_discovery.name)
+    assert snapshot_manifest(snapshots, old_id)["snapshot_id"] == old_id
+
+    project = tmp_path / "project"
+    ok(cli("project", "init", "--project", str(project)))
+    campaign = ok(cli(
+        "campaign", "create", "--project", str(project), "--store", str(snapshots),
+        "--snapshot-id", old_id, "--attempts", "2", "--max-seconds", "30",
+        "--discovery-split", "70/30", "--discovery-warmup-sessions", "3",
+        "--execution-rules", ACTUAL_OPEN_RULES,
+    ))
+    scenario = formal_scenario(
+        tmp_path, limit=1, frozen_campaign=(project, snapshots, campaign)
+    )
+    old_discovery.unlink()
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_DATA_GAP", phase="validation"
+    )
+    assert blocked["snapshot_id"] == old_id
+    assert blocked["required_classification_version"] == 2
+    assert "Re-seal" in blocked["error"]["message"]
+    assert blocked["counted"] is False
+    assert blocked["allowance"]["automatic_used"] == 0
+    assert round_uses(scenario) == []
+    assert version_entry(scenario)["validation"]["status"] == "not_run"
 
 
 def test_unexplained_trailing_gap_still_blocks_a_schema_v3_read(tmp_path: Path) -> None:

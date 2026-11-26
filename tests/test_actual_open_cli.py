@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from cli_helpers import cli, ok, write_json
+from cli_helpers import cli, digest, ok, write_json
 from test_experiment_cli import campaign_options
 from test_protected_eval_cli import submit_experiment
 from test_real_snapshot import schema_v2_fixture
@@ -63,6 +63,7 @@ CONFLICT_SOURCES = ("synthetic-vendor-a", "synthetic-vendor-b")
 #: The per-row open price source echoed onto an ``actual-open-v1`` fill.
 OPEN_SOURCE = {"source": "synthetic-tdx-unadjusted", "evidence_id": PRICE_EVIDENCE}
 EXECUTION_EVIDENCE_POLICY = {
+    "classification_version": 2,
     "price_basis": EXECUTION_PRICE_BASIS,
     "price_source": "raw_bars[].open_source -> evidence.items",
     "status_evidence": "raw_bars[].status_evidence_id -> evidence.items",
@@ -285,13 +286,14 @@ def make_confirmed_suspension(payload: dict, day: str, symbol: str) -> dict:
     return row
 
 
-def make_whole_day_halt(payload: dict, day: str, symbol: str) -> dict:
-    """A partial_halt row whose window covers the session: confirmed no trade."""
+def make_whole_day_halt(payload: dict, day: str, symbol: str, *, volume: int = 0) -> dict:
+    """A partial_halt row whose window covers the session, with a vendor close."""
     row = raw_row(payload, day, symbol)
     row.pop("open_source", None)
     row.update(
         trading_status="partial_halt",
         open=None,
+        volume=volume,
         open_available_at=_at(day, 15, 0),
         close_available_at=_at(day, 15, 5),
         status_evidence_id=STATUS_EVIDENCE,
@@ -410,7 +412,7 @@ def test_schema_v3_seal_classifies_execution_evidence(tmp_path: Path) -> None:
     conflict_day = day_at(6)
     make_open_conflict(payload, conflict_day, SYMBOLS[4])
     unknown_day = day_at(7)
-    make_unknown_status(payload, unknown_day, SYMBOLS[0])
+    make_unknown_status(payload, unknown_day, SYMBOLS[0])["status_evidence_id"] = None
     # A disputed opening print may also be declared on a trading-status row: it
     # keeps every other OHLCV field and open: null, and carries no halt.
     trading_conflict_day = day_at(8)
@@ -605,6 +607,64 @@ def test_schema_v3_manifest_keeps_execution_evidence_references_only(
     assert discovery_row["open_source"] == OPEN_SOURCE
 
 
+@pytest.mark.parametrize(
+    ("status", "value"),
+    [
+        ("unknown", {"open": 12.34}),
+        ("unknown", [12.34]),
+        ("unknown", 12.34),
+        ("unknown", False),
+        ("unknown", ""),
+        ("unknown", "  "),
+        ("trading", {"open": 12.34}),
+        ("partial_halt", {"open": 12.34}),
+        ("suspended", {"open": 12.34}),
+    ],
+)
+def test_all_schema_v3_statuses_reject_malformed_status_evidence(
+    tmp_path: Path, status: str, value: object
+) -> None:
+    payload = schema_v3_fixture()
+    day, symbol = day_at(13), SYMBOLS[0]
+    if status == "unknown":
+        row = make_unknown_status(payload, day, symbol)
+    elif status == "partial_halt":
+        row = make_actual_open_halt(payload, day, symbol)
+    elif status == "suspended":
+        row = make_confirmed_suspension(payload, day, symbol)
+    else:
+        row = raw_row(payload, day, symbol)
+    row["status_evidence_id"] = value
+
+    result = _seal_rejected(tmp_path, payload)
+    assert result.returncode != 0
+    assert not result.stdout
+    assert "status_evidence_id must be a nonempty string" in result.stderr
+    assert "12.34" not in result.stderr
+
+
+def test_manifest_rejects_an_already_sealed_malformed_status_reference(
+    tmp_path: Path,
+) -> None:
+    payload = schema_v3_fixture()
+    make_unknown_status(payload, day_at(13), SYMBOLS[0])
+    sealed = seal_v3(tmp_path, payload)
+    body = sealed["manifest"]
+    body.pop("snapshot_id")
+    body["execution_evidence"]["policy"].pop("classification_version")
+    [row] = body["execution_evidence"]["rows"]
+    row["status_evidence_id"] = {"open": 12.34}
+    old_id = digest(body)
+    write_json(sealed["store"] / old_id / "manifest.json", body)
+
+    result = cli("snapshot", "manifest", "--store", str(sealed["store"]), "--id", old_id)
+
+    assert result.returncode != 0
+    assert not result.stdout
+    assert "Invalid status_evidence_id in the sealed snapshot manifest" in result.stderr
+    assert "12.34" not in result.stderr
+
+
 def test_a_null_open_conflict_is_absent_not_a_source_conflict(tmp_path: Path) -> None:
     """A4: an explicit null ``open_conflict`` is not a disagreement.
 
@@ -702,6 +762,11 @@ def _conflict_with_unknown_evidence(payload: dict) -> None:
     row["open_conflict"]["sources"][0]["evidence_id"] = "missing"
 
 
+def _conflict_cites_a_status_notice(payload: dict) -> None:
+    row = make_open_conflict(payload, day_at(0), SYMBOLS[0])
+    row["open_conflict"]["sources"][0]["evidence_id"] = STATUS_EVIDENCE
+
+
 def _conflict_with_negative_open(payload: dict) -> None:
     row = make_open_conflict(payload, day_at(0), SYMBOLS[0])
     row["open_conflict"]["sources"][0]["open"] = -1.0
@@ -786,6 +851,7 @@ def _null_conflict_hides_a_missing_open(payload: dict) -> None:
         (_conflict_with_one_source, "open_conflict"),
         (_conflict_with_duplicate_sources, "open_conflict"),
         (_conflict_with_unknown_evidence, "open_conflict evidence_id"),
+        (_conflict_cites_a_status_notice, "open_conflict evidence_id must name a price_archive"),
         (_conflict_with_negative_open, "open_conflict open"),
         (_conflict_with_identical_opens, "open_conflict"),
         (_partial_halt_without_a_halt, "halt"),
@@ -832,7 +898,7 @@ def test_a_hand_built_whole_day_halt_open_is_never_executable() -> None:
     assert not is_executable_open(
         row, cutoff, data_kind="real", execution_rule_version=ACTUAL_OPEN_RULES
     )
-    assert unfilled_reason(row) == "confirmed_no_trade"
+    assert unfilled_reason(row) == "unknown_trading_status"
 
     # A zero-volume row with a partial halt window is not a fill either: an
     # actual open means a trade happened.
@@ -991,6 +1057,30 @@ def _fill_signature(run: dict) -> list[tuple]:
         )
         for fill in run["fills"]
     ]
+
+
+def test_discovery_uses_the_sealed_volume_evidence_for_unfilled_orders(tmp_path: Path) -> None:
+    payload = schema_v3_fixture(8)
+    day = day_at(1)
+    zero_volume, contradicted_halt = SYMBOLS[:2]
+    raw_row(payload, day, zero_volume)["volume"] = 0
+    make_whole_day_halt(payload, day, contradicted_halt, volume=1200)
+
+    run = campaign_run(tmp_path, "unexecutable", payload)
+
+    manifest_evidence = run["sealed"]["manifest"]["execution_evidence"]
+    assert {row["symbol"]: row["classification"] for row in manifest_evidence["rows"]} == {
+        zero_volume: "missing_required_open",
+        contradicted_halt: "unknown_status",
+    }
+    for side in _runs(run["experiment"]):
+        attempt = side["order_attempts"][0]
+        assert attempt["date"] == day
+        assert attempt["status"] == "partially_filled"
+        assert {row["symbol"]: row["reason"] for row in attempt["unfilled"]} == {
+            zero_volume: "missing_required_open",
+            contradicted_halt: "unknown_trading_status",
+        }
 
 
 def test_normal_open_and_resumed_halt_fill_identically_at_the_actual_open(
