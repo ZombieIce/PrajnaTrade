@@ -95,6 +95,17 @@ unchanged v1 kickoff/locked/receipt shape, and includes one direct unit test of
 `snapshot.verify_discovery_split` for tampered descriptors and payloads. The
 file is fast and not marked `isolation`.
 
+## Authorized full-history tests (#61)
+
+`tests/test_full_history_cli.py` drives the public `snapshot seal --full-history`,
+`campaign create --discovery-split 70/30` and `round open` commands using
+synthetic-only fixtures, including schema-2/3 inputs marked as real to exercise
+real provenance without using market data. It asserts the 1,094-session 765/329 split, content
+fingerprints, warm-up versus actual scoring days, authorization binding, and
+disclosure of prior feedback for a successor snapshot with overlapping dates.
+The test also confirms that this mode does not turn its research Validation
+segment into protected-partition access.
+
 ## Actual daily open tests (#56)
 
 `tests/test_actual_open_cli.py` covers the schema-3 real contract and the
@@ -416,3 +427,22 @@ experiment receipts, fixtures) must not contain machine-specific paths. Use
 repository-relative paths or placeholders such as `$PYTHON`, never absolute
 home-directory or venv paths. A leaked absolute path makes the artifact
 unreproducible on another machine and has had to be fixed before.
+
+## Discovery quarterly summaries (#62)
+
+`tests/test_discovery_summary.py` checks synthetic continuous-ledger quarter
+arithmetic, including a next-quarter first-day loss, drawdown from the previous
+quarter close, missing end/prior NAV boundaries, and retained actual dates.
+`tests/test_experiment_cli.py` verifies that a completed experiment's receipt
+and later `experiment status` expose the same identity-bound summary, and that
+daily-return coverage counts only truly adjacent valued trading sessions.
+
+## Discovery evidence precheck (#63)
+
+`tests/test_formal_validation_cli.py` drives the public `round validate` seam
+with synthetic receipts to verify identity binding and pre-read hard-condition
+and common-scoring checks. A failed hard condition, unavailable required metric,
+unmet scoring prerequisite or mismatched summary leaves the trailing payload
+unread and the Validation allowance unchanged; a missing disclosure-only metric
+and one-quarter performance disclosure may proceed. Counted Validation replay
+and interruption recovery keep #50's existing semantics.

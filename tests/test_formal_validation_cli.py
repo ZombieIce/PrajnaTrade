@@ -796,7 +796,7 @@ def test_round_status_audits_the_formal_receipt_and_allowance(tmp_path: Path) ->
 
 def test_known_trailing_gap_blocks_before_the_read(tmp_path: Path) -> None:
     payload = trending_snapshot(15)
-    split_preview = _split_for_payload(payload)
+    split_preview = split_for_payload(payload)
     suspended = suspend_derived(
         payload,
         next(
@@ -846,7 +846,7 @@ def test_known_trailing_gap_blocks_before_the_read(tmp_path: Path) -> None:
         ).fetchone()[0] == 0
 
 
-def _split_for_payload(payload: dict) -> dict:
+def split_for_payload(payload: dict) -> dict:
     from prajnatrade.snapshot import discovery_split
 
     return discovery_split(_payload_content(payload))
@@ -1207,27 +1207,167 @@ def test_formal_use_stays_bound_to_its_validation_across_a_runtime_upgrade(
     ]
 
 
-def test_failed_verdict_keeps_the_counted_use(tmp_path: Path) -> None:
+def test_failed_discovery_hard_condition_is_rejected_without_counted_use(
+    tmp_path: Path,
+) -> None:
     scenario = formal_scenario(
         tmp_path,
         hard_conditions=[
             {"id": "impossible", "metric": "net_return", "operator": ">=", "value": 10}
         ],
     )
-    failed = ok(validate_current(scenario))
-    assert failed["status"] == "completed"
-    assert failed["outcome"] == "failed"
-    assert failed["reason"] == "HARD_CONDITION_NOT_MET"
-    assert len(round_uses(scenario)) == 1
-    replay = ok(validate_current(scenario))
-    assert replay["reused"] is True
-    assert replay["outcome"] == "failed"
-    assert len(round_uses(scenario)) == 1
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_PRECHECK_REJECTED", phase="validation"
+    )
+    assert blocked["outcome"] == "rejected"
+    assert blocked["reason"] == "HARD_CONDITION_NOT_MET"
+    assert blocked["counted"] is False
+    assert blocked["precheck"]["hard_conditions"][0]["status"] == "failed"
+    assert round_uses(scenario) == []
 
 
-def test_insufficient_history_verdict_keeps_the_counted_use(tmp_path: Path) -> None:
+def _flat_market() -> dict:
     payload = trending_snapshot(15)
-    split_preview = _split_for_payload(payload)
+    payload["corporate_actions"] = []
+    for row in payload["raw_bars"]:
+        row.update({"open": 10, "high": 10, "low": 10, "close": 10})
+    for row in payload["derived"]:
+        row["value"] = 10
+    return payload
+
+
+def test_missing_disclosure_metric_does_not_block_trailing_validation(tmp_path: Path) -> None:
+    scenario = formal_scenario(
+        tmp_path, payload=_flat_market(), family="equal_weight", parameters={},
+    )
+    assert scenario["experiment"]["discovery"]["metrics"]["sharpe"] is None
+
+    receipt = ok(validate_current(scenario))
+    assert receipt["outcome"] == "passed"
+    assert all(
+        condition["metric"] != "sharpe"
+        for condition in receipt["discovery_precheck"]["hard_conditions"]
+    )
+    assert "sharpe" in receipt["discovery_precheck"]["disclosure_only_metrics_unavailable"]
+    assert len(round_uses(scenario)) == 1
+
+
+def test_missing_required_hard_condition_metric_is_free_insufficient_evidence(
+    tmp_path: Path,
+) -> None:
+    scenario = formal_scenario(
+        tmp_path,
+        payload=_flat_market(),
+        family="equal_weight",
+        parameters={},
+        hard_conditions=[
+            {"id": "sharpe", "metric": "sharpe", "operator": ">=", "value": 0}
+        ],
+    )
+    assert scenario["experiment"]["discovery"]["metrics"]["sharpe"] is None
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_PRECHECK_INSUFFICIENT", phase="validation"
+    )
+    assert blocked["outcome"] == "insufficient_evidence"
+    assert blocked["reason"] == "METRICS_NOT_READY"
+    assert blocked["counted"] is False
+    assert blocked["precheck"]["hard_conditions"][0]["status"] == "unavailable"
+    assert round_uses(scenario) == []
+    assert not (scenario["store"] / "research-loop-validations").exists()
+
+
+def test_unmet_common_scoring_prerequisite_is_free_insufficient_evidence(
+    tmp_path: Path,
+) -> None:
+    payload = trending_snapshot(15)
+    split = split_for_payload(payload)
+    index = {row["date"]: position for position, row in enumerate(payload["calendar"])}
+    development_end = index[split["development"]["end"]]
+    suspend_derived(payload, development_end - 1)
+    suspend_derived(payload, development_end)
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        family="momentum",
+        parameters={"lookback": 2, "cash_if_negative": False},
+        requirements=[
+            {"id": "strategy_lookback", "observations": 3, "mode": "consecutive_sessions"}
+        ],
+    )
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_PRECHECK_INSUFFICIENT", phase="validation"
+    )
+    assert blocked["outcome"] == "insufficient_evidence"
+    assert blocked["reason"] == "SCORING_PREREQUISITES_NOT_MET"
+    assert blocked["counted"] is False
+    assert any(
+        not check["ok"]
+        for check in blocked["precheck"]["scoring_prerequisites"].values()
+    )
+    assert round_uses(scenario) == []
+
+
+@pytest.mark.parametrize(
+    "binding",
+    ["strategy", "snapshot", "development_interval", "execution_rules", "evaluation_policy"],
+)
+def test_mismatched_discovery_summary_binding_cannot_read_trailing_segment(
+    tmp_path: Path, binding: str,
+) -> None:
+    scenario = formal_scenario(tmp_path)
+    database = scenario["project"] / ".prajnatrade" / "project.sqlite"
+    with sqlite3.connect(database) as connection:
+        raw = connection.execute(
+            "SELECT result_json FROM experiments WHERE experiment_id = ?",
+            (scenario["experiment"]["experiment_id"],),
+        ).fetchone()[0]
+        result = json.loads(raw)
+        identity = result["quarterly_summary"]["identity"]
+        if binding == "strategy":
+            identity["strategy"]["parameters"]["lookback"] += 1
+        elif binding == "snapshot":
+            identity["snapshot_id"] = "wrong-snapshot"
+        elif binding == "development_interval":
+            identity["interval"]["end_date"] = "2024-12-31"
+        elif binding == "execution_rules":
+            identity["execution_rules"]["version"] = "wrong-rule"
+        else:
+            identity["evaluation_protocol"] = "wrong-policy"
+        connection.execute(
+            "UPDATE experiments SET result_json = ? WHERE experiment_id = ?",
+            (json.dumps(result), scenario["experiment"]["experiment_id"]),
+        )
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_EVIDENCE_MISMATCH", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["outcome"] == "rejected"
+    assert round_uses(scenario) == []
+    assert not (scenario["store"] / "research-loop-validations").exists()
+
+
+def test_single_quarter_performance_stays_disclosure_without_a_hard_condition(
+    tmp_path: Path,
+) -> None:
+    scenario = formal_scenario(
+        tmp_path, payload=trending_snapshot(15), family="equal_weight", parameters={},
+    )
+    [quarter] = scenario["experiment"]["quarterly_summary"]["quarters"]
+    assert quarter["candidate"]["net_return"] is not None
+
+    receipt = ok(validate_current(scenario))
+    assert receipt["outcome"] == "passed"
+    assert receipt["discovery_precheck"]["status"] == "eligible"
+    assert len(round_uses(scenario)) == 1
+
+
+def test_insufficient_development_history_is_recorded_before_counted_use(
+    tmp_path: Path,
+) -> None:
+    payload = trending_snapshot(15)
+    split_preview = split_for_payload(payload)
     index = {row["date"]: position for position, row in enumerate(payload["calendar"])}
     dev_end = index[split_preview["development"]["end"]]
     for day_index in (dev_end - 1, dev_end):
@@ -1240,12 +1380,17 @@ def test_insufficient_history_verdict_keeps_the_counted_use(tmp_path: Path) -> N
             {"id": "strategy_lookback", "observations": 3, "mode": "consecutive_sessions"}
         ],
     )
-    short = ok(validate_current(scenario))
+    short = rejected(
+        validate_current(scenario), "VALIDATION_PRECHECK_INSUFFICIENT", phase="validation"
+    )
     assert short["outcome"] == "insufficient_evidence"
-    assert short["reason"] == "SCORING_START_INSUFFICIENT"
-    assert short["checks"]["scoring_start"]["ok"] is False
-    assert short["checks"]["coverage"]["ok"] is True
-    assert len(round_uses(scenario)) == 1
+    assert short["reason"] == "SCORING_PREREQUISITES_NOT_MET"
+    assert short["counted"] is False
+    assert any(
+        not check["ok"]
+        for check in short["precheck"]["scoring_prerequisites"].values()
+    )
+    assert round_uses(scenario) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1355,7 +1500,7 @@ def test_compliant_prehistory_scores_every_trailing_session(tmp_path: Path) -> N
 
 def test_later_trailing_data_does_not_change_the_first_decision(tmp_path: Path) -> None:
     base = drifting_snapshot(15)
-    preview = _split_for_payload(base)
+    preview = split_for_payload(base)
     first_trailing = preview["trailing"]["start"]
     variant = deepcopy(base)
     for row in variant["raw_bars"]:
@@ -1410,7 +1555,7 @@ def test_trailing_only_data_changes_the_formal_receipt_not_the_development(
     tmp_path: Path,
 ) -> None:
     base = drifting_snapshot(15)
-    preview = _split_for_payload(base)
+    preview = split_for_payload(base)
     first_trailing = preview["trailing"]["start"]
     variant = deepcopy(base)
     for row in variant["raw_bars"]:

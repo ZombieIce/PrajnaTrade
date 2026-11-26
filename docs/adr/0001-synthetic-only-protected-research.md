@@ -253,6 +253,45 @@ Discovery after research has stopped changing it.
     synthetic sealed snapshots; they do not establish real forward evidence and
     do not change the #17 acceptance verdict.
 
+## Authorized full-history rounds (issue #61)
+
+The #61 opt-in `snapshot seal --full-history` workflow accepts synthetic or
+real schema-2/3 data, records an explicit authorization ID and complete date range, and seals
+that range as one Discovery payload. A Campaign then freezes the existing
+floor-based 70/30 split over the full authorized range; its receipt separately
+records the Discovery/Validation lengths, warm-up source, and actual scoring
+dates and session count. `round open` must repeat the snapshot authorization ID.
+This mode does not create or grant access to protected Validation or Final
+Holdout partitions, and standard snapshot partitions are unchanged.
+
+A full-history snapshot may identify a previously sealed authorized source
+snapshot of the same data kind; provenance identifies real and synthetic sources
+separately. A later round opening discloses prior receipts and feedback for
+overlapping authorized intervals. These fields are additive: existing
+snapshots, round permissions and receipts continue to be interpreted under
+their original protocols. Acceptance remains synthetic-only; real data and
+production allowances are used only for actual research.
+
+## Discovery evidence precheck (issue #63)
+
+Before protocol-v2 `round validate` reads or reserves a trailing Validation
+use, it verifies the trusted experiment receipt's quarterly-summary binding to
+the locked strategy version, snapshot and development interval, execution
+rules, and frozen evaluation policy. It recomputes the summary from the
+Discovery ledger receipt so a stale or mismatched summary cannot authorize a
+read. Frozen hard conditions and common-scoring prerequisites are checked
+against that summary first.
+
+A failed hard condition rejects the attempt; an unavailable required
+hard-condition metric or failed common-scoring prerequisite records
+insufficient evidence. Both outcomes have zero Validation uses and do not read
+the trailing partition. Metrics declared for disclosure only may be
+unavailable without blocking the read, and quarterly concentration remains
+disclosure unless the frozen policy explicitly makes it a hard condition.
+Successful prechecks are recorded with the formal receipt and first attempt
+metadata so recovery preserves #50's pre-read, counting and retry semantics.
+All acceptance evidence remains synthetic.
+
 ## Original decision (issue #17)
 
 1. **Synthetic only.** Every sealed snapshot, evaluation, release, forward

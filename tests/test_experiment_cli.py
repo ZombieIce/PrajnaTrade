@@ -320,6 +320,17 @@ def test_submit_and_status_report_same_discovery_experiment(tmp_path: Path) -> N
     assert result["fingerprints"]["evaluation"] == campaign["fingerprints"]["evaluation"]
     assert result["fingerprints"]["strategy_and_parameters"]
     assert result["discovery"]["return_delta"] == 0
+    quarterly_summary = result["quarterly_summary"]
+    assert quarterly_summary["identity"]["interval"] == {
+        "start_date": result["discovery"]["start_date"],
+        "end_date": result["discovery"]["end_date"],
+    }
+    assert quarterly_summary["identity"]["fingerprints"] == result["fingerprints"]
+    assert quarterly_summary["identity"]["snapshot_id"] == campaign["snapshot_id"]
+    assert quarterly_summary["identity"]["execution_rules"] == campaign["execution_rules"]
+    assert quarterly_summary["quarters"][0]["expected_trading_sessions"] == len(
+        result["discovery"]["equity_curve"]
+    )
     assert isinstance(result["diagnostics"], list)
     assert "holdout" not in submitted.stdout.lower()
     assert "validation" not in submitted.stdout.lower()
@@ -333,6 +344,40 @@ def test_submit_and_status_report_same_discovery_experiment(tmp_path: Path) -> N
     assert json.loads(status.stdout)["experiment_id"] == result["experiment_id"]
     assert json.loads(status.stdout)["project_id"] == project_id
     assert json.loads(status.stdout)["discovery"] == result["discovery"]
+    assert json.loads(status.stdout)["quarterly_summary"] == quarterly_summary
+
+
+def test_quarterly_summary_uses_the_frozen_development_interval(tmp_path: Path) -> None:
+    project = tmp_path / "strategy-a"
+    source = tmp_path / "snapshot.json"
+    snapshot_file(source, day_count=15)
+    assert cli("project", "init", "--project", str(project)).returncode == 0
+    campaign = json.loads(cli(
+        *campaign_options(project, source), "--discovery-split", "70/30",
+    ).stdout)
+    request = tmp_path / "equal-weight.json"
+    request.write_text(json.dumps({
+        "schema_version": 1,
+        "campaign_id": campaign["campaign_id"],
+        "submission_id": "development-only",
+        "hypothesis": "Summarize only the frozen synthetic development account.",
+        "strategy": {"family": "equal_weight"},
+        "parameters": {},
+    }), encoding="utf-8")
+
+    submitted = cli("experiment", "submit", "--project", str(project), "--input", str(request))
+    assert submitted.returncode == 0, submitted.stderr
+    result = json.loads(submitted.stdout)
+    development = campaign["discovery_split"]["development"]
+    summary = result["quarterly_summary"]
+    assert result["data_kind"] == "synthetic"
+    assert result["discovery"]["start_date"] == development["start"]
+    assert result["discovery"]["end_date"] == development["end"]
+    assert summary["identity"]["interval"] == {
+        "start_date": development["start"],
+        "end_date": development["end"],
+    }
+    assert summary["quarters"][0]["expected_trading_sessions"] == development["sessions"]
 
 
 def test_experiment_uses_sealed_discovery_accounting_and_same_interval_baseline(
@@ -482,9 +527,14 @@ def test_experiment_does_not_substitute_missing_open_or_close_prices(tmp_path: P
             row["volume"] = 0
         if row["date"] == "2024-01-04" and row["symbol"] == "511260":
             row["close"] = None
+        if row["date"] >= "2024-01-05":
+            row["high"] = 11
+            row["close"] = 11
     source.write_text(json.dumps(payload), encoding="utf-8")
     assert cli("project", "init", "--project", str(project)).returncode == 0
-    campaign = json.loads(cli(*campaign_options(project, source, attempts=1)).stdout)
+    campaign = json.loads(cli(
+        *campaign_options(project, source, attempts=1), "--transaction-cost-bps", "0",
+    ).stdout)
     request = tmp_path / "first.json"
     request.write_text(json.dumps({
         "schema_version": 1,
@@ -514,6 +564,19 @@ def test_experiment_does_not_substitute_missing_open_or_close_prices(tmp_path: P
         and gap["reason"] == "missing_or_unconfirmed_unadjusted_close"
         for gap in discovery["gaps"]["valuation"]
     )
+    curve = discovery["equity_curve"]
+    expected_adjacent_observations = sum(
+        left["nav"] is not None and right["nav"] is not None
+        for left, right in zip(curve, curve[1:], strict=False)
+    )
+    assert discovery["metrics"]["sharpe"] is None
+    quarterly_metrics = result["quarterly_summary"]["quarters"][0]["candidate"]
+    assert quarterly_metrics["daily_return_coverage"] == {
+        "observed_adjacent_returns": expected_adjacent_observations,
+        "expected_adjacent_returns": len(curve) - 1,
+        "fraction": expected_adjacent_observations / (len(curve) - 1),
+    }
+    assert quarterly_metrics["missing_reasons"]["daily_returns"] == "missing_adjacent_nav_pair"
 
 
 def test_concurrent_replay_conflict_and_invalid_submissions_do_not_double_charge(tmp_path: Path) -> None:

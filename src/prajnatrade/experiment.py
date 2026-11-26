@@ -21,8 +21,15 @@ from prajnatrade.container_executor import (
     ContainerStrategyExecutor,
     executor_from_config,
 )
+from prajnatrade.discovery_summary import summarize_discovery_quarters
 from prajnatrade.snapshot import (
     discovery_split as snapshot_discovery_split,
+)
+from prajnatrade.snapshot import (
+    manifest as snapshot_manifest,
+)
+from prajnatrade.snapshot import (
+    partition_descriptor as snapshot_partition_descriptor,
 )
 from prajnatrade.snapshot import (
     partition_slice,
@@ -215,6 +222,7 @@ def _campaign_evaluation(
     execution_rules: dict[str, Any],
     history_policy: Mapping[str, Any] | None = None,
     discovery_split: Mapping[str, Any] | None = None,
+    full_history: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_dependencies = _runtime_components(
         strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
@@ -241,6 +249,7 @@ def _campaign_evaluation(
         "runtime": _fingerprint(runtime_dependencies),
         **({"history_policy": dict(history_policy)} if history_policy is not None else {}),
         **({"discovery_split": dict(discovery_split)} if discovery_split is not None else {}),
+        **({"full_history": dict(full_history)} if full_history is not None else {}),
     }
 
 
@@ -329,9 +338,37 @@ def campaign_create(
     # Read the sealed Discovery payload exactly once; an opt-in split then
     # restricts the Campaign copy and every later Discovery read to its
     # development slice.
-    receipt = read_discovery(store, snapshot_id, "discovery", as_of)
+    receipt = read_discovery(
+        store,
+        snapshot_id,
+        "discovery",
+        as_of,
+        include_trailing=True,
+    )
     data = receipt["data"]
     data_kind = receipt["data_kind"]
+    metadata = snapshot_manifest(store, snapshot_id)
+    authorized_history = metadata.get("authorized_history")
+    if authorized_history is not None:
+        if as_of is not None:
+            raise ValueError("An authorized full-history Campaign cannot use --as-of.")
+        if split_ratio != (70, 30):
+            raise ValueError(
+                "Authorized full-history Campaigns require --discovery-split 70/30."
+            )
+        if discovery_warmup_sessions is None:
+            raise ValueError(
+                "Authorized full-history Campaigns require --discovery-warmup-sessions."
+            )
+        authorized_range = authorized_history.get("range")
+        sealed_partition = snapshot_partition_descriptor(metadata, "discovery")
+        if not isinstance(authorized_range, dict) or (
+            sealed_partition["content_hash"] != authorized_range.get("content_hash")
+            or sealed_partition["start"] != authorized_range.get("start")
+            or sealed_partition["end"] != authorized_range.get("end")
+            or sealed_partition["sessions"] != authorized_range.get("sessions")
+        ):
+            raise ValueError("The sealed Discovery partition does not match its authorized range.")
     split_descriptor = (
         snapshot_discovery_split(
             data, development=split_ratio[0], as_of=receipt.get("as_of")
@@ -356,6 +393,32 @@ def campaign_create(
         history_policy = _discovery_history_policy(data, receipt, discovery_warmup_sessions)
         prior_history = receipt.get("prior_history")
         baseline_options = {"history_requirements": [], "scoring_start": history_policy["scoring_start"]}
+    full_history = None
+    if authorized_history is not None:
+        if split_descriptor is None or history_policy is None:
+            raise ValueError("The authorized full-history split and scoring policy are required.")
+        development_sessions = sorted({row["date"] for row in data["calendar"]})
+        warmup = history_policy["warmup_sessions"]
+        warmup_dates = development_sessions[:warmup]
+        scoring_dates = development_sessions[warmup:]
+        full_history = {
+            "authorization_id": authorized_history["authorization_id"],
+            "authorized_range": dict(authorized_history["range"]),
+            "source": dict(authorized_history["source"]),
+            "discovery": dict(split_descriptor["development"]),
+            "validation": dict(split_descriptor["trailing"]),
+            "warmup": {
+                "source": "authorized_history",
+                "start": warmup_dates[0] if warmup_dates else None,
+                "end": warmup_dates[-1] if warmup_dates else None,
+                "sessions": len(warmup_dates),
+            },
+            "scoring": {
+                "start": scoring_dates[0],
+                "end": scoring_dates[-1],
+                "sessions": len(scoring_dates),
+            },
+        }
     evaluation = _campaign_evaluation(
         data_kind=data_kind,
         snapshot_schema_version=receipt["schema_version"],
@@ -369,6 +432,7 @@ def campaign_create(
         execution_rules=execution_policy,
         history_policy=history_policy,
         discovery_split=split_descriptor,
+        full_history=full_history,
     )
     baseline = run_discovery_equal_weight(
         data,
@@ -425,6 +489,7 @@ def campaign_create(
         "strategy_executor": executor_config,
         **({"history_policy": history_policy} if history_policy is not None else {}),
         **({"discovery_split": split_descriptor} if split_descriptor is not None else {}),
+        **({"full_history": full_history} if full_history is not None else {}),
     }
 
 
@@ -1016,6 +1081,27 @@ def _run_attempt(
         # computed under (a Campaign stored before #56 lacks the evaluation key).
         if "snapshot_schema_version" in config:
             result["snapshot_schema_version"] = config["snapshot_schema_version"]
+        result["quarterly_summary"] = summarize_discovery_quarters(
+            discovery,
+            benchmark,
+            identity={
+                "experiment_id": experiment_id,
+                "submission_id": request["submission_id"],
+                "campaign_id": campaign_id,
+                "strategy": {
+                    "family": family,
+                    "parameters": request["parameters"],
+                },
+                "snapshot_id": config["snapshot_id"],
+                "fingerprints": result["fingerprints"],
+                "interval": {
+                    "start_date": discovery["start_date"],
+                    "end_date": discovery["end_date"],
+                },
+                "execution_rules": rules,
+                "evaluation_protocol": campaign["evaluation_hash"],
+            },
+        )
         if time.monotonic() - started >= remaining:
             raise _TimeExpired()
     except _TimeExpired:

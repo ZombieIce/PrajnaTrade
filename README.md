@@ -95,6 +95,43 @@ any process with the trusted operator's filesystem permissions can bypass them.
 Protect the store with a separately enforced deployment boundary before using
 untrusted agents; this ticket does not verify that boundary.
 
+#### Authorized full-history rounds (#61)
+
+For a research round whose denominator is the complete authorized
+history, `snapshot seal --full-history` records the authorization ID and exact
+date bounds and seals that interval as one Discovery payload. This opt-in form
+does not create the usual protected Validation or Final Holdout partitions;
+the existing 60/20/20 snapshots and their permissions are unchanged. Synthetic
+schema-1 and real schema-2/3 inputs are supported; real data and production
+allowances are for actual research only, not development or acceptance. To
+base a new authorization on a previously sealed authorized interval of the
+same data kind, pass `--source-snapshot-id`; its kind, identity and range are
+recorded in the manifest so the overlap can be traced.
+
+```sh
+prajnatrade snapshot seal --input authorized-synthetic.json \
+  --store /trusted/snapshots --full-history \
+  --authorization-id "$HISTORY_APPROVAL" \
+  --authorized-start 2020-01-01 --authorized-end 2024-12-31 \
+  --source-snapshot-id "$PRIOR_SNAPSHOT"
+prajnatrade campaign create --project ./strategy-A --store /trusted/snapshots \
+  --snapshot-id "$SNAPSHOT" --attempts 20 --max-seconds 3600 \
+  --discovery-split 70/30 --discovery-warmup-sessions 40
+prajnatrade round open --project ./strategy-A --store /trusted/evaluations \
+  --campaign-id "$CAMPAIGN" --direction-key "etf-relative-strength" \
+  --name "ETF relative strength" --authorization-id "$HISTORY_APPROVAL" \
+  --input round.json
+```
+
+The Campaign and round receipts bind the same authorization ID, full interval,
+source, and content fingerprint. With 1,094 trading sessions, the split is
+Discovery=765 and Validation=329 (`floor(N * 70 / 100)`); a 40-session warm-up
+leaves 725 actual scoring sessions, with the scoring dates reported separately.
+Opening a later round on overlapping authorized dates also discloses prior
+round receipts and feedback when available. This research Validation remains
+within the sealed Discovery payload and does not grant protected-partition
+access.
+
 Set `discovery_start` in the seal input to reserve earlier common sessions for
 indicator input. Use a trading date in the declared common range. The usual
 partition split applies from that date. Discovery reads return the earlier

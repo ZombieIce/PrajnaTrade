@@ -627,7 +627,9 @@ def _read_json(path: Path) -> object:
         return json.load(file)
 
 
-def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
+def _prepare(
+    data: object, *, authorized_history: dict[str, object] | None = None,
+) -> tuple[dict, dict[str, dict]]:
     schema_version, data_kind = _input_kind(data)
     is_real = data_kind == "real"
     sources = data.get("sources")
@@ -790,6 +792,19 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
             }
         start = discovery_start
         sessions = [day for day in sessions if day >= start]
+    if authorized_history is not None:
+        authorized_start = _date(authorized_history["start"])
+        authorized_end = _date(authorized_history["end"])
+        if authorized_start > authorized_end:
+            raise ValueError("The authorized history ends before it starts.")
+        if authorized_start not in sessions or authorized_end not in sessions:
+            raise ValueError(
+                "The authorized range must use complete common trading-session boundaries."
+            )
+        first = sessions.index(authorized_start)
+        last = sessions.index(authorized_end)
+        sessions = sessions[first:last + 1]
+        start, end = authorized_start, authorized_end
     if len(sessions) < 5:
         raise ValueError("At least five common trading sessions are required.")
     gaps = {
@@ -804,12 +819,21 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
     }
     gaps["corporate_actions"] = [gap for gap in action_gaps if start <= gap["date"] <= end]
     gaps["availability"] = [gap for gap in availability_gaps if start <= gap["date"] <= end]
-    discovery_end = len(sessions) * 3 // 5
-    validation_end = discovery_end + len(sessions) // 5
-    groups = (sessions[:discovery_end], sessions[discovery_end:validation_end], sessions[validation_end:])
+    if authorized_history is not None:
+        groups = (sessions,)
+        partition_names = ("discovery",)
+    else:
+        discovery_end = len(sessions) * 3 // 5
+        validation_end = discovery_end + len(sessions) // 5
+        groups = (
+            sessions[:discovery_end],
+            sessions[discovery_end:validation_end],
+            sessions[validation_end:],
+        )
+        partition_names = ("discovery", "validation", "final_holdout")
     partitions = {}
     descriptions = []
-    for name, days in zip(("discovery", "validation", "final_holdout"), groups, strict=True):
+    for name, days in zip(partition_names, groups, strict=True):
         day_set = set(days)
         content = {kind: [row for row in records[kind] if row["date"] in day_set] for kind in KINDS}
         partitions[name] = content
@@ -855,6 +879,19 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
             "content_hash": _hash(prior_history),
         }
         partitions[DISCOVERY_PRIOR_HISTORY] = prior_history
+    if authorized_history is not None:
+        history_content = partitions["discovery"]
+        manifest["authorized_history"] = {
+            "schema_version": 1,
+            "authorization_id": authorized_history["authorization_id"],
+            "range": {
+                "start": start,
+                "end": end,
+                "sessions": len(sessions),
+                "content_hash": _hash(history_content),
+            },
+            "source": authorized_history["source"],
+        }
     return manifest, partitions
 
 
@@ -875,9 +912,82 @@ def _manifest(store: Path, snapshot_id: str) -> dict:
     return value
 
 
-def seal(source: Path, store: Path) -> dict:
+def seal(
+    source: Path, store: Path, *,
+    full_history: bool = False,
+    authorization_id: str | None = None,
+    authorized_start: str | None = None,
+    authorized_end: str | None = None,
+    source_snapshot_id: str | None = None,
+) -> dict:
     store = _store_path(store)
-    manifest, partitions = _prepare(_read_json(source))
+    authorized_history = None
+    if full_history:
+        if not isinstance(authorization_id, str) or not authorization_id.strip():
+            raise ValueError("--full-history requires a non-empty --authorization-id.")
+        if authorized_start is None or authorized_end is None:
+            raise ValueError(
+                "--full-history requires --authorized-start and --authorized-end."
+            )
+        data = _read_json(source)
+        _, data_kind = _input_kind(data)
+        source_metadata: dict[str, object] = {
+            "kind": f"{data_kind}_input",
+            "snapshot_id": source_snapshot_id,
+            "data_kind": data_kind,
+        }
+        if source_snapshot_id is not None:
+            source_manifest = _manifest(store, source_snapshot_id)
+            if source_manifest.get("data_kind") != data_kind:
+                raise ValueError("--source-snapshot-id must have the same data kind as the input.")
+            previous_authorization = source_manifest.get("authorized_history")
+            if not isinstance(previous_authorization, dict):
+                raise ValueError(
+                    "--source-snapshot-id must identify an authorized full-history snapshot."
+                )
+            source_range = previous_authorization.get("range")
+            if not isinstance(source_range, dict):
+                raise ValueError("The source snapshot has no verifiable authorized range.")
+            source_start = _date(source_range.get("start"))
+            source_end = _date(source_range.get("end"))
+            source_partition = partition_descriptor(source_manifest, "discovery")
+            if any(
+                source_partition.get(key) != source_range.get(key)
+                for key in ("start", "end", "sessions", "content_hash")
+            ):
+                raise ValueError("The source snapshot's authorized range is not its sealed Discovery.")
+            read_discovery(store, source_snapshot_id, "discovery")
+            if max(source_start, _date(authorized_start)) > min(
+                source_end, _date(authorized_end)
+            ):
+                raise ValueError("The new authorized range does not overlap its source snapshot.")
+            source_metadata = {
+                "kind": f"sealed_{data_kind}_snapshot",
+                "snapshot_id": source_snapshot_id,
+                "data_kind": data_kind,
+                "range": {
+                    key: source_range[key]
+                    for key in ("start", "end", "sessions", "content_hash")
+                    if key in source_range
+                },
+            }
+        authorized_history = {
+            "authorization_id": authorization_id.strip(),
+            "start": authorized_start,
+            "end": authorized_end,
+            "source": source_metadata,
+        }
+    elif any(value is not None for value in (
+        authorization_id, authorized_start, authorized_end, source_snapshot_id,
+    )):
+        raise ValueError(
+            "Full-history authorization options require --full-history."
+        )
+    else:
+        data = _read_json(source)
+    manifest, partitions = _prepare(
+        data, authorized_history=authorized_history,
+    )
     return _publish(store, manifest, partitions)
 
 
@@ -1101,7 +1211,14 @@ def read_protected(store: Path, snapshot_id: str, partition: str) -> dict:
     }
 
 
-def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | None = None) -> dict:
+def read_discovery(
+    store: Path,
+    snapshot_id: str,
+    partition: str,
+    as_of: str | None = None,
+    *,
+    include_trailing: bool = False,
+) -> dict:
     if partition != "discovery":
         raise ValueError("Research access is limited to Discovery.")
     store = _store_path(store)
@@ -1116,6 +1233,14 @@ def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | N
         raise ValueError("Discovery partition integrity check failed.")
     content = latest if cutoff is None else _discovery_view(base, revisions, cutoff)
     prior = _discovery_prior_history(store, snapshot_id, metadata, cutoff)
+    if "authorized_history" in metadata and not include_trailing:
+        split = discovery_split(content)
+        development = split["development"]
+        content = slice_content(
+            content,
+            development["start"],
+            development["end"],
+        )
     return {
         "schema_version": metadata["schema_version"],
         "data_kind": metadata["data_kind"],

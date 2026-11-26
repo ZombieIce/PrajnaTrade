@@ -608,25 +608,32 @@ def _metrics(
     execution_rule_version: str = NEXT_OPEN_RULES,
 ) -> dict[str, Any]:
     """Partition metrics; unavailable values are ``None`` rather than fabricated."""
-    valued = [float(point["nav"]) for point in equity_curve if point["nav"] is not None]
     ending_equity = equity_curve[-1]["nav"] if equity_curve else None
     total_return = ending_equity / initial_cash - 1.0 if ending_equity is not None else None
     max_drawdown = None
     sharpe = None
-    if len(valued) >= 2:
-        returns = np.asarray(
-            [right / left - 1.0 for left, right in zip(valued, valued[1:], strict=False)],
-            dtype=float,
-        )
-        std = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+    nav_by_date = {point["date"]: point["nav"] for point in equity_curve}
+    adjacent_returns = [
+        float(nav_by_date[right]) / float(nav_by_date[left]) - 1.0
+        for left, right in zip(sessions, sessions[1:], strict=False)
+        if nav_by_date.get(left) is not None and nav_by_date.get(right) is not None
+    ]
+    if len(adjacent_returns) >= 2:
+        returns = np.asarray(adjacent_returns, dtype=float)
+        std = float(np.std(returns, ddof=1))
         if std > 0:
             sharpe = float(np.mean(returns) / std * math.sqrt(252.0))
-    if valued:
+    complete_curve = (
+        len(equity_curve) == len(sessions)
+        and all(point["nav"] is not None for point in equity_curve)
+    )
+    if complete_curve:
+        valued = [initial_cash, *(float(point["nav"]) for point in equity_curve)]
         drawdowns = np.asarray(valued) / np.maximum.accumulate(np.asarray(valued)) - 1.0
         max_drawdown = float(np.min(drawdowns))
     metrics = {
         "sessions": len(sessions),
-        "valued_sessions": len(valued),
+        "valued_sessions": sum(point["nav"] is not None for point in equity_curve),
         "total_return": total_return,
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
