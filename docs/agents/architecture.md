@@ -138,9 +138,8 @@ actual-daily-open execution semantics and its `execution_evidence` metadata.
 The checked-in acquisition script now converts the probe artifacts into schema
 3 through its pure `convert_raw_bars`/`build_snapshot_input` entries (a
 halted-at-open session keeps the vendor's actual open with price and status
-evidence; a whole-day halt becomes `suspended`); the real re-acquisition and
-its 45-row verification remain #35, so no real Validation allowance is consumed
-by the mechanism. Issue #24 verified the real five-ETF baseline. Issue #26
+evidence; a whole-day halt becomes `suspended`). Re-acquisition and 45-row
+verification belong to actual use. Issue #24 verified the real five-ETF baseline. Issue #26
 verified the bounded Mock campaign, including OS isolation for the actual
 research run and a reconciled interruption and resume.
 Protected evaluation, release and Shadow Live remain synthetic or replay.
