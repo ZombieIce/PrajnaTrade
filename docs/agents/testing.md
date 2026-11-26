@@ -95,6 +95,16 @@ unchanged v1 kickoff/locked/receipt shape, and includes one direct unit test of
 `snapshot.verify_discovery_split` for tampered descriptors and payloads. The
 file is fast and not marked `isolation`.
 
+## Authorized full-history tests (#61)
+
+`tests/test_full_history_cli.py` drives the public `snapshot seal --full-history`,
+`campaign create --discovery-split 70/30` and `round open` commands using
+synthetic-only inputs. It asserts the 1,094-session 765/329 split, content
+fingerprints, warm-up versus actual scoring days, authorization binding, and
+disclosure of prior feedback for a successor snapshot with overlapping dates.
+The test also confirms that this mode does not turn its research Validation
+segment into protected-partition access.
+
 ## Actual daily open tests (#56)
 
 `tests/test_actual_open_cli.py` covers the schema-3 real contract and the

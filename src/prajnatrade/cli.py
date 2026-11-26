@@ -350,6 +350,18 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     )
     seal.add_argument("--input", required=True, type=Path)
     seal.add_argument("--store", required=True, type=Path)
+    seal.add_argument(
+        "--full-history",
+        action="store_true",
+        help="seal one explicitly authorized synthetic interval for a research 70/30 split",
+    )
+    seal.add_argument("--authorization-id")
+    seal.add_argument("--authorized-start")
+    seal.add_argument("--authorized-end")
+    seal.add_argument(
+        "--source-snapshot-id",
+        help="previous synthetic snapshot used to derive this authorized interval",
+    )
     manifest = snapshot_commands.add_parser("manifest", help="inspect a snapshot manifest")
     manifest.add_argument("--store", required=True, type=Path)
     manifest.add_argument("--id", required=True)
@@ -775,7 +787,15 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
     try:
         if args.command == "snapshot":
             if args.snapshot_command == "seal":
-                result = snapshot.seal(args.input, args.store)
+                result = snapshot.seal(
+                    args.input,
+                    args.store,
+                    full_history=args.full_history,
+                    authorization_id=args.authorization_id,
+                    authorized_start=args.authorized_start,
+                    authorized_end=args.authorized_end,
+                    source_snapshot_id=args.source_snapshot_id,
+                )
             elif args.snapshot_command == "manifest":
                 result = snapshot.manifest(args.store, args.id)
             elif args.snapshot_command == "correction":

@@ -664,6 +664,14 @@ def prepare_round(
         kickoff["validation_policy"] = _validation_policy(
             contract.pop("validation_policy", None)
         )
+    full_history = evaluation.get("full_history")
+    if full_history is not None:
+        if authorization_id != full_history["authorization_id"]:
+            raise ProtocolError(
+                "AUTHORIZATION_MISMATCH", "round", "correct",
+                "The round authorization must match the full-history authorization.",
+            )
+        kickoff["full_history"] = dict(full_history)
     body = {
         "schema_version": SCHEMA_VERSION,
         "round_id": round_id,
@@ -781,6 +789,7 @@ def _reuse_disclosure(
     snapshot_id = kickoff["frozen_campaign"]["snapshot_id"]
     development_hash = kickoff["research_partition"]["development"]["content_hash"]
     trailing = kickoff["research_partition"]["trailing"]
+    authorized_range = kickoff.get("full_history", {}).get("authorized_range")
     previous_rounds: list[dict[str, Any]] = []
     disclosed_feedback: list[dict[str, Any]] = []
     for row in connection.execute(
@@ -803,7 +812,20 @@ def _reuse_disclosure(
         elif prior_development == development_hash:
             match = "same_development"
         else:
-            continue
+            prior_full_history = evaluation.get("full_history")
+            prior_range = (
+                prior_full_history.get("authorized_range")
+                if isinstance(prior_full_history, Mapping) else None
+            )
+            if (
+                isinstance(authorized_range, Mapping)
+                and isinstance(prior_range, Mapping)
+                and max(authorized_range["start"], prior_range["start"])
+                <= min(authorized_range["end"], prior_range["end"])
+            ):
+                match = "overlapping_authorized_interval"
+            else:
+                continue
         receipt_row = connection.execute(
             "SELECT v.receipt_json FROM research_loop_validations v "
             "JOIN research_loop_submissions s USING (version_id) "
@@ -5773,6 +5795,8 @@ def _round_status_body(
     if "research_partition" in kickoff:
         result["research_partition"] = kickoff["research_partition"]
         result["validation_policy"] = kickoff["validation_policy"]
+        if "full_history" in kickoff:
+            result["full_history"] = kickoff["full_history"]
         if "reuse_disclosure" in record:
             result["reuse_disclosure"] = record["reuse_disclosure"]
         allowance = _validation_allowance_status(connection, record)
