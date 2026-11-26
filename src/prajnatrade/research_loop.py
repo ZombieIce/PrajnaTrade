@@ -2463,6 +2463,7 @@ def _formal_runs(
                 source_id,
                 "discovery",
                 split["as_of"] if frozen_read else read_as_of,
+                include_trailing=True,
             )
         except (OSError, ValueError) as error:
             raise _rejected(

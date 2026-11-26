@@ -195,6 +195,21 @@ def test_public_cli_seals_and_opens_one_authorized_full_history(tmp_path: Path) 
     )
     assert [item["name"] for item in manifest["partitions"]] == ["discovery"]
     assert manifest["partitions"][0]["sessions"] == 1094
+    development_read = ok(
+        cli(
+            "snapshot",
+            "read",
+            "--store",
+            str(store),
+            "--id",
+            sealed["snapshot_id"],
+            "--partition",
+            "discovery",
+        )
+    )
+    assert development_read["partition"] == "discovery"
+    assert development_read["data"]["calendar"][-1]["date"] == dates[764]
+    assert len(development_read["data"]["calendar"]) == 765
     protected_read = cli(
         "snapshot",
         "read",

@@ -1211,7 +1211,14 @@ def read_protected(store: Path, snapshot_id: str, partition: str) -> dict:
     }
 
 
-def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | None = None) -> dict:
+def read_discovery(
+    store: Path,
+    snapshot_id: str,
+    partition: str,
+    as_of: str | None = None,
+    *,
+    include_trailing: bool = False,
+) -> dict:
     if partition != "discovery":
         raise ValueError("Research access is limited to Discovery.")
     store = _store_path(store)
@@ -1226,6 +1233,14 @@ def read_discovery(store: Path, snapshot_id: str, partition: str, as_of: str | N
         raise ValueError("Discovery partition integrity check failed.")
     content = latest if cutoff is None else _discovery_view(base, revisions, cutoff)
     prior = _discovery_prior_history(store, snapshot_id, metadata, cutoff)
+    if "authorized_history" in metadata and not include_trailing:
+        split = discovery_split(content)
+        development = split["development"]
+        content = slice_content(
+            content,
+            development["start"],
+            development["end"],
+        )
     return {
         "schema_version": metadata["schema_version"],
         "data_kind": metadata["data_kind"],

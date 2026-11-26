@@ -338,7 +338,13 @@ def campaign_create(
     # Read the sealed Discovery payload exactly once; an opt-in split then
     # restricts the Campaign copy and every later Discovery read to its
     # development slice.
-    receipt = read_discovery(store, snapshot_id, "discovery", as_of)
+    receipt = read_discovery(
+        store,
+        snapshot_id,
+        "discovery",
+        as_of,
+        include_trailing=True,
+    )
     data = receipt["data"]
     data_kind = receipt["data_kind"]
     metadata = snapshot_manifest(store, snapshot_id)
