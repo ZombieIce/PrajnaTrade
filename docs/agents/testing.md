@@ -435,3 +435,13 @@ quarter close, missing end/prior NAV boundaries, and retained actual dates.
 `tests/test_experiment_cli.py` verifies that a completed experiment's receipt
 and later `experiment status` expose the same identity-bound summary, and that
 daily-return coverage counts only truly adjacent valued trading sessions.
+
+## Discovery evidence precheck (#63)
+
+`tests/test_formal_validation_cli.py` drives the public `round validate` seam
+with synthetic receipts to verify identity binding and pre-read hard-condition
+and common-scoring checks. A failed hard condition, unavailable required metric,
+unmet scoring prerequisite or mismatched summary leaves the trailing payload
+unread and the Validation allowance unchanged; a missing disclosure-only metric
+and one-quarter performance disclosure may proceed. Counted Validation replay
+and interruption recovery keep #50's existing semantics.

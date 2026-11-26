@@ -270,6 +270,26 @@ overlapping authorized intervals. These fields are additive: existing
 snapshots, round permissions and receipts continue to be interpreted under
 their original protocols. Acceptance remains synthetic-only.
 
+## Discovery evidence precheck (issue #63)
+
+Before protocol-v2 `round validate` reads or reserves a trailing Validation
+use, it verifies the trusted experiment receipt's quarterly-summary binding to
+the locked strategy version, snapshot and development interval, execution
+rules, and frozen evaluation policy. It recomputes the summary from the
+Discovery ledger receipt so a stale or mismatched summary cannot authorize a
+read. Frozen hard conditions and common-scoring prerequisites are checked
+against that summary first.
+
+A failed hard condition rejects the attempt; an unavailable required
+hard-condition metric or failed common-scoring prerequisite records
+insufficient evidence. Both outcomes have zero Validation uses and do not read
+the trailing partition. Metrics declared for disclosure only may be
+unavailable without blocking the read, and quarterly concentration remains
+disclosure unless the frozen policy explicitly makes it a hard condition.
+Successful prechecks are recorded with the formal receipt and first attempt
+metadata so recovery preserves #50's pre-read, counting and retry semantics.
+All acceptance evidence remains synthetic.
+
 ## Original decision (issue #17)
 
 1. **Synthetic only.** Every sealed snapshot, evaluation, release, forward

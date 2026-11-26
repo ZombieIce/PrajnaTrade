@@ -86,6 +86,7 @@ from zoneinfo import ZoneInfo
 from prajnatrade import release, shadow_calendar, snapshot
 from prajnatrade.container_executor import executor_from_config
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.discovery_summary import summarize_discovery_quarters
 from prajnatrade.experiment import (
     ProtocolError,
     campaign_discovery,
@@ -172,7 +173,7 @@ _OPTIONAL_RECEIPT_FIELDS = (
     "evidence", "original_discovery", "recomputed_discovery", "affected",
     "prior_validation_id", "validation_kind", "protocol", "development", "trailing",
     "scoring", "warmup", "provenance", "usage", "summary", "runs",
-    "original_validation", "recomputed_validation",
+    "original_validation", "recomputed_validation", "discovery_precheck",
 )
 VALIDATION_KIND_TRAILING = "trailing_validation"
 _VALIDATION_USE_FIELDS = (
@@ -2073,6 +2074,194 @@ def _formal_execution_evidence_gate(
     )
 
 
+def _formal_discovery_precheck(
+    project: Path,
+    record: Mapping[str, Any],
+    submission: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    allowance: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Verify the locked Discovery receipt and frozen scoring premises before use."""
+    def reject_binding(message: str) -> None:
+        raise _rejected(
+            "VALIDATION_EVIDENCE_MISMATCH", "validation", "inspect", message,
+            counted=False,
+            allowance=dict(allowance) if allowance is not None else None,
+            outcome="rejected",
+            reason="VALIDATION_EVIDENCE_MISMATCH",
+            precheck={"status": "rejected", "reason": "EVIDENCE_MISMATCH"},
+        )
+
+    experiment = next(
+        (
+            item
+            for item in campaign_experiment_history(project, record["campaign_id"])
+            if item["experiment_id"] == submission["experiment_id"]
+        ),
+        None,
+    )
+    if experiment is None or experiment.get("status") != "succeeded":
+        reject_binding("The locked version has no successful Discovery receipt.")
+    assert experiment is not None
+
+    kickoff = record["kickoff"]
+    locked = submission["locked"]
+    frozen_campaign = kickoff["frozen_campaign"]
+    split = _formal_split(record)
+    development = split["development"]
+    scoring_policy = kickoff["scoring_policy"]["frozen"]
+    discovery = experiment.get("discovery")
+    quarterly = experiment.get("quarterly_summary")
+    if not isinstance(discovery, Mapping) or not isinstance(quarterly, Mapping):
+        reject_binding("The locked Discovery receipt lacks its quarterly summary.")
+    baseline_comparison = discovery.get("baseline_comparison")
+    baseline = (
+        baseline_comparison.get("baseline")
+        if isinstance(baseline_comparison, Mapping) else None
+    )
+    identity = quarterly.get("identity")
+    fingerprints = experiment.get("fingerprints")
+    if (
+        not isinstance(baseline, Mapping)
+        or not isinstance(identity, Mapping)
+        or not isinstance(fingerprints, Mapping)
+    ):
+        reject_binding("The locked Discovery receipt is incomplete.")
+
+    expected_end = development["end"]
+    as_of = split.get("as_of")
+    if isinstance(as_of, str):
+        expected_end = min(expected_end, as_of)
+    expected_identity = {
+        "experiment_id": submission["experiment_id"],
+        "submission_id": submission["experiment_submission_id"],
+        "campaign_id": record["campaign_id"],
+        "strategy": {
+            "family": locked["strategy"]["family"],
+            "parameters": locked["strategy"]["parameters"],
+        },
+        "snapshot_id": locked["snapshot_id"],
+        "fingerprints": dict(fingerprints),
+        "interval": {
+            "start_date": scoring_policy["scoring_start"],
+            "end_date": expected_end,
+        },
+        "execution_rules": locked["execution_rules"],
+        "evaluation_protocol": locked["evaluation_hash"],
+    }
+    expected_protocol_hash = _protocol_hash(kickoff)
+    expected_base_costs = {
+        key: frozen_campaign[key]
+        for key in ("initial_cash", "transaction_cost_bps", "slippage_bps")
+    }
+    if (
+        experiment.get("campaign_id") != record["campaign_id"]
+        or experiment.get("submission_id") != submission["experiment_submission_id"]
+        or identity != expected_identity
+        or fingerprints.get("strategy_and_parameters") != submission["strategy_fingerprint"]
+        or fingerprints.get("snapshot") != locked["snapshot_hash"]
+        or fingerprints.get("partition") != frozen_campaign["partition_content_hash"]
+        or fingerprints.get("evaluation") != frozen_campaign["campaign_evaluation_hash"]
+        or locked["snapshot_id"] != frozen_campaign["snapshot_id"]
+        or locked["snapshot_hash"] != development["content_hash"]
+        or locked["evaluation_hash"] != frozen_campaign["campaign_evaluation_hash"]
+        or locked["execution_rules"] != frozen_campaign["execution_rules"]
+        or locked["base_costs"] != expected_base_costs
+        or locked["history_policy"] != scoring_policy
+        or locked["protocol_hash"] != expected_protocol_hash
+        or locked.get("protocol") != kickoff.get("protocol")
+        or locked.get("research_partition") != split
+        or campaign["snapshot_id"] != frozen_campaign["snapshot_id"]
+        or campaign["campaign_evaluation_hash"] != frozen_campaign["campaign_evaluation_hash"]
+        or campaign["evaluation"]["execution_rules"] != frozen_campaign["execution_rules"]
+    ):
+        reject_binding("The Discovery summary does not match the locked version and round.")
+
+    try:
+        expected_quarterly = summarize_discovery_quarters(
+            discovery, baseline, identity=identity,
+        )
+    except (KeyError, TypeError, ValueError):
+        reject_binding("The Discovery quarterly summary cannot be verified.")
+    if expected_quarterly != quarterly:
+        reject_binding("The Discovery quarterly summary does not match its ledger receipt.")
+
+    candidate_metrics = _metrics(discovery)
+    hard_conditions = [
+        _hard_condition(condition, candidate_metrics)
+        for condition in kickoff["hard_conditions"]
+    ]
+    expected_start = scoring_policy["scoring_start"]
+    expected_sessions = max(
+        0, development["sessions"] - scoring_policy["warmup_sessions"],
+    )
+    expected_dates = [expected_end] * expected_sessions
+    scoring_start = _scoring_start_check(discovery, baseline, expected_start)
+    coverage = _coverage_check(
+        discovery, baseline, expected_start, expected_dates,
+    )
+    snapshot_evidence = {
+        "verified": True,
+        "snapshot_id": locked["snapshot_id"],
+        "partition_content_hash": frozen_campaign["partition_content_hash"],
+        "prior_history_hash": scoring_policy.get("prior_history_hash"),
+        "data_kind": frozen_campaign["data_kind"],
+        "scope": frozen_campaign["data_kind"],
+        "as_of": as_of,
+    }
+    data_availability = _data_availability_check(
+        discovery, baseline, snapshot_evidence,
+    )
+    position = _position_check(discovery, baseline)
+    prerequisites = {
+        "scoring_start": scoring_start,
+        "coverage": coverage,
+        "data_availability": data_availability,
+        "position": position,
+    }
+    hard_failed = any(item["status"] == "failed" for item in hard_conditions)
+    hard_unavailable = any(item["status"] == "unavailable" for item in hard_conditions)
+    hard_metric_names = {
+        condition["metric"] for condition in kickoff["hard_conditions"]
+    }
+    unavailable_disclosures = [
+        metric
+        for metric, field in METRIC_REGISTRY.items()
+        if metric not in hard_metric_names and candidate_metrics.get(field) is None
+    ]
+    precheck = {
+        "status": "eligible",
+        "quarterly_summary_hash": _hash(quarterly),
+        "hard_conditions": hard_conditions,
+        "scoring_prerequisites": prerequisites,
+        "disclosure_only_metrics_unavailable": unavailable_disclosures,
+    }
+    if hard_failed:
+        precheck["status"] = "rejected"
+        raise _rejected(
+            "VALIDATION_PRECHECK_REJECTED", "validation", "inspect",
+            "A frozen hard condition already fails on the trusted Discovery evidence.",
+            counted=False,
+            allowance=dict(allowance) if allowance is not None else None,
+            outcome="rejected",
+            reason="HARD_CONDITION_NOT_MET",
+            precheck=precheck,
+        )
+    if hard_unavailable or any(not item["ok"] for item in prerequisites.values()):
+        precheck["status"] = "insufficient_evidence"
+        reason = "METRICS_NOT_READY" if hard_unavailable else "SCORING_PREREQUISITES_NOT_MET"
+        raise _rejected(
+            "VALIDATION_PRECHECK_INSUFFICIENT", "validation", "inspect",
+            "The trusted Discovery evidence cannot satisfy the frozen scoring premises.",
+            counted=False,
+            allowance=dict(allowance) if allowance is not None else None,
+            outcome="insufficient_evidence",
+            reason=reason,
+            precheck=precheck,
+        )
+    return precheck
+
+
 def _formal_manifest_gate(
     snapshot_store: Path,
     record: Mapping[str, Any],
@@ -2458,6 +2647,7 @@ def _formal_receipt(
     validation_id: str,
     runs: Mapping[str, Any],
     use: Mapping[str, Any],
+    discovery_precheck: Mapping[str, Any] | None = None,
     corrected: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     kickoff = record["kickoff"]
@@ -2559,6 +2749,8 @@ def _formal_receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    if discovery_precheck is not None:
+        receipt["discovery_precheck"] = dict(discovery_precheck)
     if corrected is not None:
         receipt.update(dict(corrected))
     receipt["receipt_hash"] = _hash(
@@ -3265,9 +3457,24 @@ def validate(
                     "The interrupted formal Validation requires its original accounting "
                     "runtime to resume.",
                 )
+            attempts = _attempt_rows(connection, validation_id)
+            discovery_precheck: dict[str, Any] | None = None
             if formal and recovered is None:
-                # Known gaps and a changed research interval block BEFORE the
-                # counted reservation: a rejected pre-check spends nothing.
+                # The summary and frozen scoring premises are checked before
+                # either metadata admission or the counted reservation.
+                if use is None:
+                    discovery_precheck = _formal_discovery_precheck(
+                        project,
+                        record,
+                        submission,
+                        campaign,
+                        _validation_allowance(connection, record),
+                    )
+                elif attempts:
+                    first_attempt = json.loads(attempts[0]["attempt_json"])
+                    stored_precheck = first_attempt.get("discovery_precheck")
+                    if isinstance(stored_precheck, dict):
+                        discovery_precheck = stored_precheck
                 _formal_manifest_gate(
                     snapshot_store,
                     record,
@@ -3276,7 +3483,6 @@ def validate(
                 )
                 if use is None:
                     use = _reserve_validation_use(connection, record, submission, validation_id)
-            attempts = _attempt_rows(connection, validation_id)
             resumed = bool(attempts)
             attempt = len(attempts) + 1
             for row in attempts:
@@ -3301,6 +3507,10 @@ def validate(
                             "started_at": _now(),
                             "engine_runtime_identity": runtime,
                             **({"validation_kind": VALIDATION_KIND_TRAILING} if formal else {}),
+                            **(
+                                {"discovery_precheck": discovery_precheck}
+                                if discovery_precheck is not None else {}
+                            ),
                         }
                     ),
                 ),
@@ -3319,6 +3529,7 @@ def validate(
                 validation_id=validation_id,
                 runs=runs,
                 use=use,
+                discovery_precheck=discovery_precheck,
             )
         else:
             replay = _replay(project, snapshot_store, record, submission, campaign)
@@ -5375,6 +5586,7 @@ def revalidate(
                 validation_id=attempt_context[0],
                 runs=recomputed,
                 use=use,
+                discovery_precheck=prior.get("discovery_precheck"),
             )
             original_view = snapshot.read_discovery(
                 Path(snapshot_store),
