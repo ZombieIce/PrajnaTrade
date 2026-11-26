@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from prajnatrade import snapshot
-from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.trading_status import ETF_SYMBOLS
 
 
 class RevisionError(ValueError):

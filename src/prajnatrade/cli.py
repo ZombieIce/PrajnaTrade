@@ -7,50 +7,12 @@ import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from prajnatrade import dividend, release, shadow, snapshot
-from prajnatrade.acceptance import (
-    AcceptanceRejection,
-    write_acceptance_report,
-)
-from prajnatrade.backtest import (
-    benchmark_relative_returns,
-    equal_weight_buy_and_hold,
-    run_backtest,
-)
-from prajnatrade.data import CASH, DataValidationError, load_bars, validate_calendar
-from prajnatrade.evaluation_report import write_evaluation_report
-from prajnatrade.experiment import (
-    ProtocolError,
-    campaign_create,
-    candidate_status,
-    error_context,
-    experiment_resume,
-    experiment_status,
-    experiment_submit,
-    freeze_experiment_candidate,
-    project_init,
-    project_status,
-)
-from prajnatrade.isolation import probe_isolation
-from prajnatrade.protected_eval import (
-    EvaluationRejection,
-    agent_evaluation_status,
-    authorize,
-    create_plan,
-    evaluation_status,
-    run_evaluation,
-)
-from prajnatrade.providers import MockProvider, OpenAICompatibleProvider, ResearchProvider
-from prajnatrade.report import write_campaign_report
-from prajnatrade.research import campaign_status, resume_campaign, start_campaign
-from prajnatrade.snapshot_baseline import (
-    EXECUTION_RULE_VERSIONS,
-    NEXT_OPEN_RULES,
-    run_discovery_baseline,
-)
-from prajnatrade.store import SQLiteStore
-from prajnatrade.validation import freeze_candidate, run_holdout, validate_candidate
+from prajnatrade.trading_status import EXECUTION_RULE_VERSIONS, NEXT_OPEN_RULES
+
+if TYPE_CHECKING:
+    from prajnatrade.providers import ResearchProvider
 
 
 def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
@@ -751,6 +713,14 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
     if args.command == "acceptance":
         return _acceptance_command(args)
     if args.command == "experiment":
+        from prajnatrade.experiment import (
+            ProtocolError,
+            error_context,
+            experiment_resume,
+            experiment_status,
+            experiment_submit,
+        )
+
         request = None
         try:
             if args.experiment_command == "submit":
@@ -786,19 +756,9 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
         return 2 if result["status"] in {"failed", "rejected"} else 0
     try:
         if args.command == "snapshot":
-            if args.snapshot_command == "seal":
-                result = snapshot.seal(
-                    args.input,
-                    args.store,
-                    full_history=args.full_history,
-                    authorization_id=args.authorization_id,
-                    authorized_start=args.authorized_start,
-                    authorized_end=args.authorized_end,
-                    source_snapshot_id=args.source_snapshot_id,
-                )
-            elif args.snapshot_command == "manifest":
-                result = snapshot.manifest(args.store, args.id)
-            elif args.snapshot_command == "correction":
+            if args.snapshot_command == "correction":
+                from prajnatrade import dividend
+
                 if args.correction_command == "register":
                     result = dividend.register(args.input, args.store)
                 elif args.correction_command == "verify":
@@ -806,10 +766,27 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 else:
                     result = dividend.successor(args.store, args.proposal_id, args.revision_id)
             else:
-                result = snapshot.read_discovery(args.store, args.id, args.partition, args.as_of)
+                from prajnatrade import snapshot
+
+                if args.snapshot_command == "seal":
+                    result = snapshot.seal(
+                        args.input,
+                        args.store,
+                        full_history=args.full_history,
+                        authorization_id=args.authorization_id,
+                        authorized_start=args.authorized_start,
+                        authorized_end=args.authorized_end,
+                        source_snapshot_id=args.source_snapshot_id,
+                    )
+                elif args.snapshot_command == "manifest":
+                    result = snapshot.manifest(args.store, args.id)
+                else:
+                    result = snapshot.read_discovery(args.store, args.id, args.partition, args.as_of)
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 0
         if args.command == "project":
+            from prajnatrade.experiment import project_init, project_status
+
             result = (
                 project_init(args.project) if args.project_command == "init"
                 else project_status(args.project)
@@ -817,6 +794,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
             print(json.dumps(result, sort_keys=True))
             return 0
         if args.command == "campaign":
+            from prajnatrade.experiment import campaign_create
+
             result = campaign_create(
                 args.project, args.store, args.snapshot_id, args.attempts,
                 args.max_seconds, args.initial_cash, args.transaction_cost_bps,
@@ -830,6 +809,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
             print(json.dumps(result, sort_keys=True, allow_nan=False))
             return 0
         if args.command == "candidate":
+            from prajnatrade.experiment import candidate_status, freeze_experiment_candidate
+
             result = (
                 freeze_experiment_candidate(
                     args.project, args.campaign_id, args.submission_id,
@@ -848,8 +829,13 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     "can be kept outside the research CLI."
                 )
             if isolated_python and args.research_command in {"run", "resume"}:
+                from prajnatrade.isolation import probe_isolation
+
                 probe_isolation()
             if args.research_command == "run":
+                from prajnatrade.data import load_bars
+                from prajnatrade.research import start_campaign
+
                 if args.budget_mode == "best-effort" and args.accept_budget_overrun_risk:
                     print(
                         "warning: best-effort provider calls may exceed the configured budget.",
@@ -880,6 +866,9 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     max_drawdown_limit=args.max_drawdown_limit,
                 )
             elif args.research_command == "resume":
+                from prajnatrade.research import resume_campaign
+                from prajnatrade.store import SQLiteStore
+
                 campaign = SQLiteStore(args.db).get_campaign(args.campaign_id)
                 provider = _resume_provider(
                     campaign,
@@ -899,14 +888,20 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     isolated_python=isolated_python,
                 )
             elif args.research_command == "status":
+                from prajnatrade.research import campaign_status
+
                 result = campaign_status(args.db, args.campaign_id)
             elif args.research_command == "reconcile-request":
+                from prajnatrade.store import SQLiteStore
+
                 result = SQLiteStore(args.db).reconcile_provider_request(
                     args.campaign_id, args.request_id, prompt_tokens=args.prompt_tokens,
                     completion_tokens=args.completion_tokens,
                     actual_cost_usd=args.actual_cost_usd, evidence=args.evidence,
                 )
             elif args.research_command == "freeze":
+                from prajnatrade.validation import freeze_candidate
+
                 result = freeze_candidate(
                     args.db,
                     args.campaign_id,
@@ -915,6 +910,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     args.conclusion,
                 )
             elif args.research_command == "validate":
+                from prajnatrade.validation import validate_candidate
+
                 result = validate_candidate(
                     args.db,
                     args.candidate_id,
@@ -924,6 +921,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     isolated_python=isolated_python,
                 )
             elif args.research_command == "holdout":
+                from prajnatrade.validation import run_holdout
+
                 result = run_holdout(
                     args.db,
                     args.candidate_id,
@@ -934,6 +933,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     isolated_python=isolated_python,
                 )
             else:
+                from prajnatrade.report import write_campaign_report
+
                 result = write_campaign_report(
                     args.db, args.campaign_id, args.output
                 )
@@ -946,6 +947,8 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     raise ValueError(
                         "Snapshot baseline requires --store and --snapshot-id, and cannot use --data."
                     )
+                from prajnatrade.snapshot_baseline import run_discovery_baseline
+
                 result = run_discovery_baseline(
                     args.store,
                     args.snapshot_id,
@@ -959,6 +962,13 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                         "CSV/Parquet baseline requires --data, --price-basis, and --data-kind; "
                         "use --store and --snapshot-id for a sealed Discovery snapshot."
                     )
+                from prajnatrade.backtest import (
+                    benchmark_relative_returns,
+                    equal_weight_buy_and_hold,
+                    run_backtest,
+                )
+                from prajnatrade.data import CASH, load_bars
+
                 dataset = load_bars(args.data, args.price_basis)
                 backtest = run_backtest(
                     dataset,
@@ -994,8 +1004,10 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
             ))
             return 0
 
-        dataset = load_bars(args.data, args.price_basis)
         if args.command == "data":
+            from prajnatrade.data import load_bars, validate_calendar
+
+            dataset = load_bars(args.data, args.price_basis)
             result = {
                 "valid": True,
                 "data_kind": args.data_kind,
@@ -1006,7 +1018,7 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
             return 0
 
         parser.error(f"unsupported command {args.command!r}")
-    except (DataValidationError, OSError, sqlite3.Error, ValueError) as error:
+    except (OSError, sqlite3.Error, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
@@ -1022,7 +1034,9 @@ def _rejection_result(error: Exception, *, schema_version: int) -> dict:
 
 
 def _direction_workflow_command(args: argparse.Namespace) -> int:
-    from prajnatrade import research_direction
+    from prajnatrade import release, research_direction
+    from prajnatrade.experiment import ProtocolError
+    from prajnatrade.protected_eval import EvaluationRejection
 
     try:
         if args.command == "direction":
@@ -1041,7 +1055,8 @@ def _direction_workflow_command(args: argparse.Namespace) -> int:
 
 
 def _research_loop_command(args: argparse.Namespace) -> int:
-    from prajnatrade import research_loop
+    from prajnatrade import release, research_loop
+    from prajnatrade.experiment import ProtocolError
 
     try:
         if args.round_action == "open":
@@ -1209,6 +1224,9 @@ def _validation_action(args: argparse.Namespace, direction) -> dict:
 
 
 def _service_validation(args: argparse.Namespace, direction, evaluator) -> dict:
+    from prajnatrade.experiment import ProtocolError
+    from prajnatrade.protected_eval import EvaluationRejection
+
     round_status = evaluator.research_validation_status(args.store, args.round_id)
     benchmark_failed = round_status["status"] == "paused"
     queued = direction.pending_validation_work(
@@ -1257,6 +1275,15 @@ def _holdout_action(args: argparse.Namespace) -> dict:
 
 
 def _evaluation_command(args: argparse.Namespace, *, agent_only: bool) -> int:
+    from prajnatrade.protected_eval import (
+        EvaluationRejection,
+        agent_evaluation_status,
+        authorize,
+        create_plan,
+        evaluation_status,
+        run_evaluation,
+    )
+
     try:
         if args.evaluation_command == "status":
             if agent_only:
@@ -1273,6 +1300,8 @@ def _evaluation_command(args: argparse.Namespace, *, agent_only: bool) -> int:
                 args.store, args.plan_id, args.stage, args.reviewer, args.reason
             )
         elif args.evaluation_command == "report":
+            from prajnatrade.evaluation_report import write_evaluation_report
+
             result = write_evaluation_report(
                 args.store, args.plan_id, args.output
             )
@@ -1298,6 +1327,8 @@ def _evaluation_command(args: argparse.Namespace, *, agent_only: bool) -> int:
 
 
 def _release_command(args: argparse.Namespace) -> int:
+    from prajnatrade import release
+
     try:
         if args.release_command == "approve":
             result = release.approve(
@@ -1355,6 +1386,8 @@ def _release_command(args: argparse.Namespace) -> int:
 
 
 def _shadow_command(args: argparse.Namespace) -> int:
+    from prajnatrade import shadow
+
     try:
         if args.shadow_command in {"tick", "alerts"}:
             from prajnatrade import shadow_schedule
@@ -1403,6 +1436,8 @@ def _shadow_command(args: argparse.Namespace) -> int:
 
 
 def _acceptance_command(args: argparse.Namespace) -> int:
+    from prajnatrade.acceptance import AcceptanceRejection, write_acceptance_report
+
     try:
         result = write_acceptance_report(args.input, args.output)
     except AcceptanceRejection as error:
@@ -1422,6 +1457,8 @@ def _acceptance_command(args: argparse.Namespace) -> int:
 
 
 def _make_provider(args: argparse.Namespace) -> tuple[ResearchProvider, dict[str, object]]:
+    from prajnatrade.providers import MockProvider, OpenAICompatibleProvider
+
     if args.provider == "mock":
         return MockProvider(args.seed), {}
     if not args.endpoint or not args.model:
@@ -1482,6 +1519,8 @@ def _resume_provider(
         raise ValueError(
             f"Provider API key is missing from environment variable {api_key_env!r}."
         )
+    from prajnatrade.providers import OpenAICompatibleProvider
+
     return OpenAICompatibleProvider(
         endpoint=str(config["endpoint"]),
         model=str(campaign["provider_model"]),

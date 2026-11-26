@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pandas as pd
 
-ETF_SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
-CASH = "CASH"
+from prajnatrade.trading_status import CASH as CASH
+from prajnatrade.trading_status import ETF_SYMBOLS as ETF_SYMBOLS
+
 PRICE_BASIS = "total_return"
 REQUIRED_COLUMNS = (
     "date",

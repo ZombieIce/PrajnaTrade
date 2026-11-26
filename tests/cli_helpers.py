@@ -24,12 +24,16 @@ Test-writing rules this module exists to support:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
+import traceback
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -79,32 +83,104 @@ def cli_env(
     return env
 
 
+def _run_in_process(
+    *args: str,
+    agent: bool,
+    env: dict[str, str] | None,
+    cwd: Path | None,
+) -> subprocess.CompletedProcess[str]:
+    if str(SRC_PATH) not in sys.path:
+        sys.path.insert(0, str(SRC_PATH))
+    from prajnatrade.cli import agent_main, main
+
+    argv = [os.fspath(arg) for arg in args]
+    command = AGENT_COMMAND if agent else (sys.executable, "-m", "prajnatrade")
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    saved_env = os.environ.copy() if env is not None else None
+    saved_cwd = os.getcwd() if cwd is not None else None
+    try:
+        if env is not None:
+            os.environ.clear()
+            os.environ.update(env)
+        if cwd is not None:
+            os.chdir(cwd)
+        entry = agent_main if agent else main
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            try:
+                raw_code = entry(argv)
+                returncode = 0 if raw_code is None else int(raw_code)
+            except SystemExit as exc:
+                if exc.code is None:
+                    returncode = 0
+                elif isinstance(exc.code, int):
+                    returncode = exc.code
+                else:
+                    print(exc.code, file=stderr_buf)
+                    returncode = 1
+            except Exception:
+                traceback.print_exc(file=stderr_buf)
+                returncode = 1
+    finally:
+        if saved_cwd is not None:
+            os.chdir(saved_cwd)
+        if saved_env is not None:
+            os.environ.clear()
+            os.environ.update(saved_env)
+    return subprocess.CompletedProcess(
+        args=[*command, *argv],
+        returncode=returncode,
+        stdout=stdout_buf.getvalue(),
+        stderr=stderr_buf.getvalue(),
+    )
+
+
+def _requires_subprocess(
+    *, use_subprocess: bool, env: dict[str, str] | None
+) -> bool:
+    if use_subprocess or os.environ.get("PRAJNATRADE_TEST_CLI_SUBPROCESS") == "1":
+        return True
+    if threading.current_thread() is not threading.main_thread():
+        return True
+    if env is not None and env.get("PYTHONPATH") != cli_env()["PYTHONPATH"]:
+        return True
+    return False
+
+
 def cli(
     *args: str,
     agent: bool = False,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
+    use_subprocess: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the public CLI in a subprocess and capture text output.
+    """Run the public CLI and capture text output.
 
     ``agent=True`` runs the research/agent entry point
     (``prajnatrade-agent`` equivalent) instead of ``python -m prajnatrade``.
 
-    The default timeout is 60 seconds, long enough for every current CLI test
-    and short enough to fail a hung subprocess quickly.  A test that
-    intentionally waits on a longer budget must pass ``timeout=`` explicitly.
+    By default this invokes ``prajnatrade.cli.main`` / ``agent_main`` in
+    process to avoid thousands of cold interpreter startups across the test
+    suite, while returning an equivalent ``subprocess.CompletedProcess``.
+    Calls automatically fall back to a real child Python process when
+    ``use_subprocess=True``, when ``PRAJNATRADE_TEST_CLI_SUBPROCESS=1`` is set,
+    when called from a non-main thread (e.g. concurrent ``ThreadPoolExecutor``
+    tests), or when ``env`` overrides ``PYTHONPATH`` (e.g. runtime-upgrade
+    fingerprint tests).  ``timeout`` applies in subprocess mode (default 60s).
     """
-    command = AGENT_COMMAND if agent else (sys.executable, "-m", "prajnatrade")
-    return subprocess.run(
-        [*command, *args],
-        capture_output=True,
-        text=True,
-        env=env or cli_env(),
-        cwd=cwd,
-        timeout=timeout,
-        check=False,
-    )
+    if _requires_subprocess(use_subprocess=use_subprocess, env=env):
+        command = AGENT_COMMAND if agent else (sys.executable, "-m", "prajnatrade")
+        return subprocess.run(
+            [*command, *args],
+            capture_output=True,
+            text=True,
+            env=env or cli_env(),
+            cwd=cwd,
+            timeout=timeout,
+            check=False,
+        )
+    return _run_in_process(*args, agent=agent, env=env, cwd=cwd)
 
 
 def agent_cli(
@@ -112,9 +188,17 @@ def agent_cli(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
+    use_subprocess: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run the agent entry point; shorthand for ``cli(..., agent=True)``."""
-    return cli(*args, agent=True, timeout=timeout, env=env, cwd=cwd)
+    return cli(
+        *args,
+        agent=True,
+        timeout=timeout,
+        env=env,
+        cwd=cwd,
+        use_subprocess=use_subprocess,
+    )
 
 
 def ok(result: subprocess.CompletedProcess[str]) -> dict:

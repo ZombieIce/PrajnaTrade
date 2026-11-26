@@ -16,10 +16,14 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src <venv>/python -m pytest -q -p no:cachep
 - `cli_env(extra=None, **env_extra)` copies the parent environment, prepends
   this checkout's `src` to `PYTHONPATH`, and merges `extra`/`env_extra`
   (failpoints, provider variables).
-- `cli(*args, agent=False, timeout=60, env=None, cwd=None)` runs
-  `python -m prajnatrade`; `agent=True` (or `agent_cli`) runs the agent entry
-  point.  The documented default timeout is **60 seconds**; a test that
-  intentionally waits on a longer budget passes `timeout=` explicitly.
+- `cli(*args, agent=False, timeout=60, env=None, cwd=None, use_subprocess=False)`
+  runs `prajnatrade.cli.main` (`agent=True` or `agent_cli` runs `agent_main`)
+  in process by default and returns an equivalent `CompletedProcess`, avoiding
+  repeated interpreter startups across the suite.  Pass `use_subprocess=True`
+  (or set `PRAJNATRADE_TEST_CLI_SUBPROCESS=1`) for a real child process; the
+  documented default timeout is **60 seconds** and a test that intentionally
+  waits on a longer budget passes `timeout=` explicitly.  `tests/test_cli_startup.py`
+  keeps real-subprocess smoke and lazy-import checks in the fast suite.
 - `ok()`, `rejected()` and `write_json()` are the shared JSON assertions and
   fixture writer.
 - `AGENT_COMMAND` is the agent entry-point command tuple, for tests that need

@@ -33,9 +33,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from prajnatrade.backtest import _validate_weights
-from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.isolation import IsolationError
+from prajnatrade.trading_status import ETF_SYMBOLS
 
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{12,64}$")
@@ -862,6 +861,8 @@ def _validate_container_weights(raw: Any) -> dict[str, float]:
             raise ValueError(f"weight for {key} must be numeric")
         if not math.isfinite(float(value)):
             raise ValueError(f"weight for {key} must be finite")
+    from prajnatrade.backtest import _validate_weights
+
     return _validate_weights(raw)
 
 

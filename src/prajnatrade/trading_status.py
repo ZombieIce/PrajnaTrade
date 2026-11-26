@@ -1,9 +1,24 @@
-"""Trading-session status rules shared by acquisition and snapshot consumers."""
+"""Trading-session status rules and stdlib constants shared across modules."""
 
 import math
 from datetime import datetime, timedelta, timezone
 
-_SHANGHAI = timezone(timedelta(hours=8))
+#: Fixed five-ETF universe and cash symbol.
+ETF_SYMBOLS = ("511260", "518880", "515080", "513300", "159612")
+CASH = "CASH"
+
+#: Asia/Shanghai is the trading-time anchor for both baselines and Shadow Live.
+CN_TZ = timezone(timedelta(hours=8))
+_SHANGHAI = CN_TZ
+
+NEXT_OPEN_RULES = "next-open-v1"
+RETRY_INITIAL_RULES = "retry-initial-v1"
+#: Fill an order effective before the open at the sealed, evidenced actual daily
+#: open, including a halted-at-open session whose bar carries that open (ADR 0002).
+ACTUAL_OPEN_RULES = "actual-open-v1"
+EXECUTION_RULE_VERSIONS = (NEXT_OPEN_RULES, RETRY_INITIAL_RULES, ACTUAL_OPEN_RULES)
+#: The sealed execution basis echoed by every fill and by a round receipt.
+EXECUTION_PRICE_BASIS = "unadjusted_open"
 
 
 def halt_covers_session(halt: object, day: str) -> bool:
