@@ -416,3 +416,12 @@ experiment receipts, fixtures) must not contain machine-specific paths. Use
 repository-relative paths or placeholders such as `$PYTHON`, never absolute
 home-directory or venv paths. A leaked absolute path makes the artifact
 unreproducible on another machine and has had to be fixed before.
+
+## Discovery quarterly summaries (#62)
+
+`tests/test_discovery_summary.py` checks synthetic continuous-ledger quarter
+arithmetic, including a next-quarter first-day loss, drawdown from the previous
+quarter close, missing end/prior NAV boundaries, and retained actual dates.
+`tests/test_experiment_cli.py` verifies that a completed experiment's receipt
+and later `experiment status` expose the same identity-bound summary, and that
+daily-return coverage counts only truly adjacent valued trading sessions.

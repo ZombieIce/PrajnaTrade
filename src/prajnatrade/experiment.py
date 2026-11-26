@@ -21,6 +21,7 @@ from prajnatrade.container_executor import (
     ContainerStrategyExecutor,
     executor_from_config,
 )
+from prajnatrade.discovery_summary import summarize_discovery_quarters
 from prajnatrade.snapshot import (
     discovery_split as snapshot_discovery_split,
 )
@@ -1016,6 +1017,27 @@ def _run_attempt(
         # computed under (a Campaign stored before #56 lacks the evaluation key).
         if "snapshot_schema_version" in config:
             result["snapshot_schema_version"] = config["snapshot_schema_version"]
+        result["quarterly_summary"] = summarize_discovery_quarters(
+            discovery,
+            benchmark,
+            identity={
+                "experiment_id": experiment_id,
+                "submission_id": request["submission_id"],
+                "campaign_id": campaign_id,
+                "strategy": {
+                    "family": family,
+                    "parameters": request["parameters"],
+                },
+                "snapshot_id": config["snapshot_id"],
+                "fingerprints": result["fingerprints"],
+                "interval": {
+                    "start_date": discovery["start_date"],
+                    "end_date": discovery["end_date"],
+                },
+                "execution_rules": rules,
+                "evaluation_protocol": campaign["evaluation_hash"],
+            },
+        )
         if time.monotonic() - started >= remaining:
             raise _TimeExpired()
     except _TimeExpired:
