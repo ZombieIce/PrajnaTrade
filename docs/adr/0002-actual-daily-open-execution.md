@@ -31,29 +31,32 @@ Two failure modes drove this decision:
 
 1. **Schema 3 binds every executable open to sealed evidence.** A real schema-3
    snapshot declares `raw_price_basis: "unadjusted"` and adds `open_source`,
-   `status_evidence_id` and `open_conflict` to raw bars. An open is executable
+   `status_evidence_id`, `open_conflict` and `status_conflict` to raw bars. An open is executable
    only with the price archive that produced it; the resumption notice is a
    separate evidence id that proves trading status only and must differ from the
    open's price source. Evidence has roles, and the seal checks them:
-   `open_source.evidence_id` must name a `price_archive` item, and
-   `status_evidence_id` must name a halt/suspension/resumption notice
+   the evidence ID for an open or a conflicting quote must name a
+   `price_archive` item, and `status_evidence_id` must be a string naming a
+   halt/suspension/resumption notice
    (`halt`, `halt_notice`, `suspension_notice`, `resumption_notice`,
    `trading_status_notice`). An announcement therefore cannot be used as a
    price, nor a price archive as a status proof. A `partial_halt` row may carry
    the day's actual unadjusted daily open, but an actual open is a real trade:
    the row needs positive `volume` and a halt window that does not cover the
-   whole session, or the seal rejects it as a confirmed no-trade day with a
-   residual price. Two sealed opens that disagree are stored as an
+   whole session. The seal rejects incompatible quoted rows. A whole-day halt
+   with positive reported volume is a status conflict even with a null open.
+   A normal trading row with zero volume has no executable open. Two sealed
+   opens that disagree are stored as an
    `open_conflict` with `open: null` and are never silently resolved; a
    `suspended` row cannot carry one, because a confirmed no-trade day has no
    open to disagree about, and an explicit `open_conflict: null` is absent
    rather than a conflict. The manifest adds a schema-3-only
-   `execution_evidence` block that classifies every non-trading sealed
-   session/symbol as `actual_open_after_halt`, `confirmed_no_trade`,
+   `execution_evidence` block that classifies non-trading rows and rows with
+   a known execution gap as `actual_open_after_halt`, `confirmed_no_trade`,
    `missing_required_open`, `source_conflict` or `unknown_status`. That block is
    a pre-read classification, not a price record: each row carries the
    classification, date, symbol, status, halt/reason and evidence *references*
-   (`open_source`, `status_evidence_id`, `conflict_sources`) only. No actual
+   (`open_source`, `status_evidence_id`, `conflict_sources`, `status_conflict`) only. No actual
    open and no conflict quote from any sealed partition appears in the manifest,
    so inspecting it before the counted read cannot expose a price. `gaps` keeps
    its historical shape so old consumers are unchanged.
@@ -111,8 +114,12 @@ Two failure modes drove this decision:
   gap that no evidence row explains for its kind; a blocking row suppresses only
   its own entries so they are not reported twice. The gate is metadata-only and
   never turns a confirmed no-trade day into a valuation input: a held symbol
-  with no confirmed close remains a valuation gap in the counted run. Schema-1/2 manifests, and
-  successors without the block, keep the legacy gaps-only gate exactly.
+  with no confirmed close remains a valuation gap in the counted run.
+  A new schema-3 formal read requires the current execution classification
+  policy. Reseal provisional schema-3 inputs before starting a new formal
+  read. Schema 1 and 2 keep the legacy gaps-only gate. Existing receipts remain
+  available for inspection, and replay of the same frozen identity keeps its
+  original count.
 - The acquisition script emits schema 3. `convert_raw_bars` keeps a resumed
   session's evidenced actual open when there is a usable vendor price and
   positive volume. A missing resume open remains `missing_required_open` at
@@ -130,17 +137,15 @@ Two failure modes drove this decision:
   reason derived from its sealed row (`confirmed_no_trade`,
   `missing_required_open`, `unknown_trading_status`, `missing_bar`) while the
   other required symbols still fill.
-- A *held* symbol without an executable open makes the day's total equity
-  unknowable: its open would size the other holdings' targets, and excluding it
-  would force retargeting of priced holdings the strategy never asked for.
-  Every equity-dependent order (a required symbol with a target weight above
-  zero) is then recorded as `equity_basis_unknown` with no buy matched, while an
-  explicit exit (target weight at or below the epsilon, shares above it) is
-  sized independently of total equity and still sells in full at its own usable
-  open. The unpriced symbols keep their sealed-row reason; any exit fill makes
-  the attempt `partially_filled`, and `basket_complete` stays false while any
-  required symbol is unfilled. An entry basket (no holdings) keeps filling its
-  priced symbols per symbol.
+- A held symbol without an executable open makes total equity unknown.
+  Match explicit exits at their own usable opens. For a sole 100% target
+  with an executable open, the available cash after those sales determines
+  the buy quantity, including fees and slippage. The unknown holding adds
+  nonnegative value to the target equity, so the cash cap determines the
+  affordable quantity. Leave orders whose quantities still depend on
+  total equity unfilled with `equity_basis_unknown`. Unpriced symbols keep
+  their sealed-row reason, and the basket stays incomplete while any
+  required symbol is unfilled.
 - A partially filled plan is recorded as `partially_filled` with
   `basket_complete: false` and marked not yet built in `position_evidence`;
   unfilled buy cash and unsold shares stay in the account. The attempt states
