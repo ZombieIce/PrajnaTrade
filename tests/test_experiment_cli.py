@@ -11,6 +11,7 @@ from cli_helpers import AGENT_COMMAND, cli, cli_env, ok
 
 from prajnatrade import trading_status
 from prajnatrade.experiment import campaign_discovery, runtime_identity, runtime_matches
+from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES, NEXT_OPEN_RULES, RETRY_INITIAL_RULES
 
 
 def sealed_snapshot_input(day_count: int = 15) -> dict:
@@ -126,8 +127,8 @@ def test_operator_creates_locked_synthetic_campaign(tmp_path: Path) -> None:
 
 
 def test_actual_open_runtime_identity_binds_the_halt_rules(monkeypatch: pytest.MonkeyPatch) -> None:
-    actual_open = {"version": "actual-open-v1"}
-    legacy_rules = ({}, {"version": "next-open-v1"}, {"version": "retry-initial-v1"})
+    actual_open = {"version": ACTUAL_OPEN_RULES}
+    legacy_rules = ({}, {"version": NEXT_OPEN_RULES}, {"version": RETRY_INITIAL_RULES})
     actual_identity = runtime_identity(execution_rules=actual_open)
     legacy_identities = [runtime_identity(execution_rules=rules) for rules in legacy_rules]
 
@@ -154,7 +155,7 @@ def test_actual_open_campaign_freezes_the_matching_runtime(tmp_path: Path) -> No
     snapshot_file(source)
     ok(cli("project", "init", "--project", str(project)))
     options = campaign_options(project, source)
-    actual = ok(cli(*options, "--execution-rules", "actual-open-v1"))
+    actual = ok(cli(*options, "--execution-rules", ACTUAL_OPEN_RULES))
     legacy = ok(cli(*options))
     actual_evaluation = campaign_discovery(project, actual["campaign_id"])["evaluation"]
     legacy_evaluation = campaign_discovery(project, legacy["campaign_id"])["evaluation"]

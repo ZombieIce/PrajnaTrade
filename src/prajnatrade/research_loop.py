@@ -26,9 +26,11 @@ Contract resolutions that the shared design contract leaves implicit:
 
 * ``round_id`` reuses :func:`research_direction.direction_id`, so a direction
   keeps its identity across renamed keys and new Campaigns.
-* ``validation_id`` includes the *current* accounting-engine fingerprint, so an
-  accounting-platform fix yields a new identity and re-runs the replay.  The
-  running attempt records the current runtime.
+* ``validation_id`` includes the accounting-engine fingerprint. For protocol v1,
+  an accounting-platform fix yields a new identity and re-runs the replay. For
+  protocol v2, the counted use binds the initial Validation identity; a completed
+  receipt replays from that identity across runtime changes. An unfinished read
+  can resume only under its original runtime.
 * Review decisions are immutable content-addressed epochs per version with
   exactly one current state.  Approval binds the stored terminal passed receipt,
   writes a write-once ``manual_tracking`` release artifact and appends one
@@ -2662,8 +2664,8 @@ def _write_terminal_receipt(
 ) -> bool:
     """Write the immutable receipt; a retry recovers an identical existing one.
 
-    Only the deterministic evidence content is stored, so a crash between the
-    trusted write and the project publication recomputes byte-identical content.
+    Only deterministic evidence is stored, so any recomputation must reproduce
+    the original content.
     Returns True when the receipt was already there (recovered, not rewritten).
     """
     path = _validation_path(store, validation_id)
@@ -2685,14 +2687,39 @@ def _load_trusted_receipt(
         receipt = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
         raise ValueError("The trusted research-loop Validation receipt is missing.") from error
+    receipt = _check_terminal_receipt(receipt, validation_id)
+    if _json(_published(receipt)) != published_json:
+        raise ValueError("The trusted Validation receipt differs from the project copy.")
+    return receipt
+
+
+def _check_terminal_receipt(receipt: object, validation_id: str) -> dict[str, Any]:
     if not isinstance(receipt, dict) or receipt.get("status") != "completed":
         raise ValueError("The trusted research-loop Validation receipt is not terminal.")
     expected = _hash({key: value for key, value in receipt.items() if key != "receipt_hash"})
     if receipt.get("receipt_hash") != expected or receipt.get("validation_id") != validation_id:
         raise ValueError("The trusted research-loop Validation receipt failed its integrity check.")
-    if _json(_published(receipt)) != published_json:
-        raise ValueError("The trusted Validation receipt differs from the project copy.")
-    return {**receipt, "status": "completed"}
+    return receipt
+
+
+def _recover_formal_terminal(store: Path, use: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Recover a trusted write that finished before the project publication."""
+    validation_id = use["validation_id"]
+    try:
+        receipt = json.loads(_validation_path(store, validation_id).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if isinstance(receipt, dict) and receipt.get("status") == "running":
+        return None
+    receipt = _check_terminal_receipt(receipt, validation_id)
+    if (
+        receipt.get("round_id") != use["round_id"]
+        or receipt.get("version_id") != use["version_id"]
+        or receipt.get("validation_kind") != VALIDATION_KIND_TRAILING
+        or receipt.get("usage") != _formal_usage(use)
+    ):
+        raise ValueError("The trusted Validation receipt differs from its reserved use.")
+    return receipt
 
 
 def _attempt_rows(
@@ -2767,18 +2794,16 @@ def _validation_allowance_status(
     }
 
 
-def _reserved_validation_use(
+def _validation_use_for_version(
     connection: sqlite3.Connection, round_id: str, version_id: str,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     row = connection.execute(
         "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
         "validation_id, consumed_at FROM research_loop_validation_uses "
         "WHERE round_id = ? AND version_id = ?",
         (round_id, version_id),
     ).fetchone()
-    if row is None:
-        raise ValueError("The formal Validation use for this version is missing.")
-    return _validation_use(row)
+    return _validation_use(row) if row is not None else None
 
 
 def _insert_validation_use(
@@ -2830,23 +2855,15 @@ def _reserve_validation_use(
     Caller holds the round lock and an open ``BEGIN IMMEDIATE`` transaction, so
     the existence check, the admission check, the allowance check and the insert
     are one serialized step: two processes racing the last slot or one manual
-    admission yield exactly one row and exactly one read.  Branch order:
-    reuse this version's row (resume / revalidation), then consume an unused
-    manual admission bound to this version, then take an automatic slot, then
-    reject before the read.  ``admit`` refuses a grant while automatic slots
-    remain, so a manual row can only be the researcher's post-limit extra read.
+    admission yield exactly one row and exactly one read. The caller has
+    already checked this version has no existing use. Consume an unused
+    manual admission, take an automatic slot, or reject before the read.
+    ``admit`` refuses a grant while automatic slots remain, so a manual row
+    can only be the researcher's post-limit extra read.
     The manual branch still comes first defensively: a grant is explicit, so a
     row recorded before this gate (or by a future caller) is honoured as manual
     rather than silently consumed as an automatic slot.
     """
-    existing = connection.execute(
-        "SELECT use_id, round_id, version_id, sequence, kind, admission_id, "
-        "validation_id, consumed_at FROM research_loop_validation_uses "
-        "WHERE round_id = ? AND version_id = ?",
-        (record["round_id"], submission["version_id"]),
-    ).fetchone()
-    if existing is not None:
-        return _validation_use(existing)
     admission = _admission_for_version(
         connection, record["round_id"], submission["version_id"]
     )
@@ -3079,7 +3096,7 @@ def _admission_result(
 def _validation_identity(
     record: Mapping[str, Any],
     submission: Mapping[str, Any],
-    campaign: Mapping[str, Any],
+    runtime: str,
 ) -> str:
     """Content-addressed Validation identity for the round's protocol.
 
@@ -3094,7 +3111,7 @@ def _validation_identity(
         "scoring_policy_hash": _scoring_policy_hash(record["kickoff"]),
         "snapshot_hash": locked["snapshot_hash"],
         "protocol_hash": locked["protocol_hash"],
-        "engine_runtime_identity": _current_runtime(campaign),
+        "engine_runtime_identity": runtime,
     }
     split = record["kickoff"].get("research_partition")
     if split is not None:
@@ -3187,11 +3204,18 @@ def validate(
                     "the superseded locked snapshot.",
                 )
             formal = "research_partition" in record["kickoff"]
+            use: dict[str, Any] | None = None
             if formal:
                 # The reservation, the attempt row and every later state change
                 # are serialized by the round lock plus this write transaction.
                 connection.execute("BEGIN IMMEDIATE")
-            validation_id = _validation_identity(record, submission, campaign)
+                use = _validation_use_for_version(connection, round_id, version_id)
+            runtime: str | None = None
+            if use is None:
+                runtime = _current_runtime(campaign)
+                validation_id = _validation_identity(record, submission, runtime)
+            else:
+                validation_id = use["validation_id"]
             terminal = connection.execute(
                 "SELECT receipt_json FROM research_loop_validations WHERE validation_id = ?",
                 (validation_id,),
@@ -3208,8 +3232,18 @@ def validate(
                 if formal:
                     result["allowance"] = _validation_allowance(connection, record)
                 return result
-            use: dict[str, Any] | None = None
-            if formal:
+            recovered = _recover_formal_terminal(trusted, use) if use is not None else None
+            if runtime is None:
+                runtime = _current_runtime(campaign)
+            if use is not None and recovered is None and validation_id != _validation_identity(
+                record, submission, runtime,
+            ):
+                raise ProtocolError(
+                    "VALIDATION_RUNTIME_CHANGED", "validation", "inspect",
+                    "The interrupted formal Validation requires its original accounting "
+                    "runtime to resume.",
+                )
+            if formal and recovered is None:
                 # Known gaps and a changed research interval block BEFORE the
                 # counted reservation: a rejected pre-check spends nothing.
                 _formal_manifest_gate(
@@ -3218,7 +3252,8 @@ def validate(
                     campaign,
                     _validation_allowance(connection, record),
                 )
-                use = _reserve_validation_use(connection, record, submission, validation_id)
+                if use is None:
+                    use = _reserve_validation_use(connection, record, submission, validation_id)
             attempts = _attempt_rows(connection, validation_id)
             resumed = bool(attempts)
             attempt = len(attempts) + 1
@@ -3242,7 +3277,7 @@ def validate(
                             "validation_id": validation_id,
                             "attempt": attempt,
                             "started_at": _now(),
-                            "engine_runtime_identity": _current_runtime(campaign),
+                            "engine_runtime_identity": runtime,
                             **({"validation_kind": VALIDATION_KIND_TRAILING} if formal else {}),
                         }
                     ),
@@ -3250,7 +3285,9 @@ def validate(
             )
         _write_running_marker(trusted, validation_id, record, submission, attempt)
         _failpoint(VALIDATION_FAILPOINT)
-        if formal:
+        if recovered is not None:
+            receipt = recovered
+        elif formal:
             if use is None:
                 raise ValueError("The formal Validation use was not reserved.")
             runs = _formal_runs(snapshot_store, record, submission, campaign)
@@ -3269,10 +3306,9 @@ def validate(
                 validation_id=validation_id,
                 replay=replay,
             )
-        # The trusted evidence is written before the research-visible copy is
-        # published, so a crash between the two is recovered by re-running the
-        # same identity and finding the identical terminal receipt (the receipt
-        # content deliberately excludes mutable attempt provenance).
+        # The trusted evidence is written before the research-visible copy.
+        # For formal Validation, the reserved identity recovers an already
+        # completed trusted write without another sealed read.
         _write_terminal_receipt(trusted, validation_id, receipt)
         _failpoint(VALIDATION_TERMINAL_FAILPOINT)
         with _project(project) as connection:
@@ -5185,9 +5221,11 @@ def revalidate(
                     "This v2 round's stored receipt is not a formal trailing Validation."
                 )
             use = (
-                _reserved_validation_use(connection, round_id, version_id)
+                _validation_use_for_version(connection, round_id, version_id)
                 if formal else None
             )
+            if formal and use is None:
+                raise ValueError("The formal Validation use for this version is missing.")
             campaign = campaign_discovery(project, record["campaign_id"])
             locked_snapshot_id = submission["locked"]["snapshot_id"]
             corrected_evidence = _corrected_evidence(

@@ -43,8 +43,10 @@ Two failure modes drove this decision:
    price, nor a price archive as a status proof. A `partial_halt` row may carry
    the day's actual unadjusted daily open, but an actual open is a real trade:
    the row needs positive `volume` and a halt window that does not cover the
-   whole session. The seal rejects incompatible quoted rows. A whole-day halt
-   with positive reported volume is a status conflict even with a null open.
+   whole session. A whole-day halt with positive reported volume is a status
+   conflict even when the open is null. A direct seal may retain the reported
+   volume with null OHLC and derived values, and the manifest classifies that
+   row as `unknown_status`.
    A normal trading row with zero volume has no executable open. Two sealed
    opens that disagree are stored as an
    `open_conflict` with `open: null` and are never silently resolved; a

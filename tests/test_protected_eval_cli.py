@@ -1211,40 +1211,6 @@ def test_abort_after_protected_read_keeps_the_debit_and_never_retries(base: dict
     assert len(evaluation_rows(store)) == 1
 
 
-@pytest.mark.parametrize(("schema_version", "execution_rule", "reason"), [
-    (3, "actual-open-v1", "snapshot schema 3"),
-    (3, "next-open-v1", "snapshot schema 3"),
-    (2, "actual-open-v1", "execution rule actual-open-v1"),
-])
-def test_unsupported_protected_evaluation_plan_does_not_claim_a_partition(
-    tmp_path: Path, schema_version: int, execution_rule: str, reason: str,
-) -> None:
-    from test_actual_open_cli import schema_v3_fixture
-
-    fixture = schema_v3_fixture if schema_version == 3 else schema_v2_fixture
-    base = build_scenario(
-        tmp_path, fixture(), "unsupported-protocol",
-        campaign_options=("--execution-rules", execution_rule),
-    )
-    store = eval_store(base, "unsupported-protocol")
-    sealed = base["snapshot_store"] / base["snapshot_id"]
-    sealed.chmod(0o755)
-    for partition in ("discovery", "validation", "final_holdout"):
-        (sealed / f"{partition}.json").rename(sealed / f"{partition}.withheld")
-    source = write_json(tmp_path / "unsupported-protocol-plan.json", plan_input())
-
-    denial = rejected(cli(
-        "evaluation", "plan", "--store", str(store),
-        "--snapshot-store", str(base["snapshot_store"]),
-        "--project", str(base["project"]), "--candidate-id", base["candidate"]["candidate_id"],
-        "--input", str(source),
-    ), "INVALID_PLAN_INPUT", phase="plan")
-
-    assert reason in denial["error"]["message"]
-    assert not list((store / "plans").glob("*.json"))
-    assert consumed_rows(store) == evaluation_rows(store) == []
-
-
 def test_schema_v2_validation_checks_authorization_and_commits_before_first_read(
     tmp_path: Path,
 ) -> None:

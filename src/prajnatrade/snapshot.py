@@ -417,6 +417,13 @@ def _real_raw_bar_v3(
                     "A partial_halt raw bar with an actual open requires "
                     "positive volume."
                 )
+        if halt_conflicts_with_volume(halt, row["date"], row["volume"]) and any(
+            row[field] is not None for field in ("high", "low", "close")
+        ):
+            raise ValueError(
+                "A partial_halt raw bar requires null high, low and close when "
+                "positive volume contradicts a whole-session halt."
+            )
     elif status == "suspended":
         if any(row.get(field) is not None for field in RAW_FIELDS):
             raise ValueError(
@@ -465,7 +472,9 @@ def _real_corporate_action(row: dict) -> None:
         )
 
 
-def _real_derived(rows: list[dict], raw_bars: dict[tuple[str, str], dict]) -> None:
+def _real_derived(
+    rows: list[dict], raw_bars: dict[tuple[str, str], dict], *, schema_version: int,
+) -> None:
     for row in rows:
         raw = raw_bars.get((row["date"], row["symbol"]))
         if raw is None:
@@ -482,6 +491,14 @@ def _real_derived(rows: list[dict], raw_bars: dict[tuple[str, str], dict]) -> No
 
         if raw.get("status_conflict") is not None and row.get("value") is not None:
             raise ValueError("A real derived value must be null on a status_conflict session.")
+        if (
+            schema_version >= 3 and status == "partial_halt" and row.get("value") is not None
+            and halt_conflicts_with_volume(raw.get("halt"), raw["date"], raw["volume"])
+        ):
+            raise ValueError(
+                "A real derived value must be null when positive volume contradicts "
+                "a whole-session halt."
+            )
 
 
 def _complete_row(row: dict, kind: str, *, is_real: bool) -> bool:
@@ -703,7 +720,7 @@ def _prepare(data: object) -> tuple[dict, dict[str, dict]]:
                     real_raw_bars[(row["date"], row["symbol"])] = row
         records[kind] = sorted(rows, key=lambda row: (row["date"], row.get("symbol", ""), _bytes(row)))
     if is_real:
-        _real_derived(records["derived"], real_raw_bars)
+        _real_derived(records["derived"], real_raw_bars, schema_version=schema_version)
 
     dates = [row["date"] for row in records["calendar"]]
     date_set = set(dates)

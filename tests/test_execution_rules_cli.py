@@ -15,11 +15,16 @@ from test_actual_open_cli import (
     schema_v3_fixture,
     seal_v3,
 )
-from test_protected_eval_cli import create_campaign, seal_snapshot, submit_experiment, synthetic_snapshot
+from test_protected_eval_cli import (
+    create_campaign,
+    seal_snapshot,
+    submit_experiment,
+    synthetic_snapshot,
+)
 from test_research_direction_cli import approve_round, kickoff_input, propose, run_validation
 
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES, EXECUTION_PRICE_BASIS
+from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES, EXECUTION_PRICE_BASIS, NEXT_OPEN_RULES
 
 FEE_RATE = 5 / 10_000
 #: The frozen ``experiment._execution_policy`` block of ``actual-open-v1``.
@@ -95,7 +100,7 @@ def _halted_open_snapshot():
 
 
 @pytest.mark.parametrize(("version", "first_fill_date"), [
-    ("next-open-v1", None),
+    (NEXT_OPEN_RULES, None),
     ("retry-initial-v1", "2024-01-03"),
 ])
 def test_campaign_freezes_platform_retry_for_discovery(tmp_path, version, first_fill_date):
@@ -257,7 +262,7 @@ def test_actual_open_ignores_the_published_time_of_a_pre_open_order(tmp_path):
     # Control: the legacy rule keeps its 09:30 publication gate exactly, so the
     # late quote still leaves the attempt unfilled.
     control = _v3_run(
-        tmp_path, "late-control", normal_payload, execution_rules="next-open-v1",
+        tmp_path, "late-control", normal_payload, execution_rules=NEXT_OPEN_RULES,
     )
     for run in _sides(control["experiment"]):
         assert run["order_attempts"][0] == {

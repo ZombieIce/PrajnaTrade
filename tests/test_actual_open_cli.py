@@ -19,9 +19,16 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from cli_helpers import cli, digest, ok, write_json
+from cli_helpers import cli, digest, ok, rejected, write_json
 from test_experiment_cli import campaign_options
-from test_protected_eval_cli import submit_experiment
+from test_protected_eval_cli import (
+    build_scenario,
+    consumed_rows,
+    eval_store,
+    evaluation_rows,
+    plan_input,
+    submit_experiment,
+)
 from test_real_snapshot import schema_v2_fixture
 from test_research_loop_cli import (
     open_round,
@@ -35,6 +42,7 @@ from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot_baseline import (
     ACTUAL_OPEN_RULES,
     EXECUTION_PRICE_BASIS,
+    NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
     is_executable_open,
     unfilled_reason,
@@ -287,7 +295,7 @@ def make_confirmed_suspension(payload: dict, day: str, symbol: str) -> dict:
 
 
 def make_whole_day_halt(payload: dict, day: str, symbol: str, *, volume: int = 0) -> dict:
-    """A partial_halt row whose window covers the session, with a vendor close."""
+    """A whole-session halt with a vendor close or a disputed volume report."""
     row = raw_row(payload, day, symbol)
     row.pop("open_source", None)
     row.update(
@@ -299,6 +307,9 @@ def make_whole_day_halt(payload: dict, day: str, symbol: str, *, volume: int = 0
         status_evidence_id=STATUS_EVIDENCE,
         halt={"start": _at(day, 9, 30), "end": _at(day, 15, 0)},
     )
+    if volume > 0:
+        row.update(high=None, low=None, close=None, close_available_at=None)
+        derived_row(payload, day, symbol)["value"] = None
     return row
 
 
@@ -873,6 +884,60 @@ def test_schema_v3_seal_rejects_invalid_execution_evidence(
     assert message in result.stderr
 
 
+@pytest.mark.parametrize("field", ["high", "low", "close", "derived"])
+def test_schema_v3_seal_rejects_prices_in_a_contradictory_whole_day_halt(
+    tmp_path: Path, field: str,
+) -> None:
+    payload = schema_v3_fixture()
+    day, symbol = day_at(2), SYMBOLS[0]
+    original = raw_row(payload, day, symbol).copy()
+    original_derived = derived_row(payload, day, symbol)["value"]
+    row = make_whole_day_halt(payload, day, symbol, volume=1200)
+    if field == "derived":
+        derived_row(payload, day, symbol)["value"] = original_derived
+    else:
+        row[field] = original[field]
+        if field == "close":
+            row["close_available_at"] = original["close_available_at"]
+
+    result = _seal_rejected(tmp_path, payload)
+    assert result.returncode != 0
+    assert not result.stdout
+    assert "positive volume contradicts a whole-session halt" in result.stderr
+
+
+@pytest.mark.parametrize(("schema_version", "execution_rule", "reason"), [
+    (3, ACTUAL_OPEN_RULES, "snapshot schema 3"),
+    (3, NEXT_OPEN_RULES, "snapshot schema 3"),
+    (2, ACTUAL_OPEN_RULES, f"execution rule {ACTUAL_OPEN_RULES}"),
+])
+def test_unsupported_protected_evaluation_plan_does_not_claim_a_partition(
+    tmp_path: Path, schema_version: int, execution_rule: str, reason: str,
+) -> None:
+    fixture = schema_v3_fixture if schema_version == 3 else schema_v2_fixture
+    base = build_scenario(
+        tmp_path, fixture(), "unsupported-protocol",
+        campaign_options=("--execution-rules", execution_rule),
+    )
+    store = eval_store(base, "unsupported-protocol")
+    sealed = base["snapshot_store"] / base["snapshot_id"]
+    sealed.chmod(0o755)
+    for partition in ("discovery", "validation", "final_holdout"):
+        (sealed / f"{partition}.json").rename(sealed / f"{partition}.withheld")
+    source = write_json(tmp_path / "unsupported-protocol-plan.json", plan_input())
+
+    denial = rejected(cli(
+        "evaluation", "plan", "--store", str(store),
+        "--snapshot-store", str(base["snapshot_store"]),
+        "--project", str(base["project"]), "--candidate-id", base["candidate"]["candidate_id"],
+        "--input", str(source),
+    ), "INVALID_PLAN_INPUT", phase="plan")
+
+    assert reason in denial["error"]["message"]
+    assert not list((store / "plans").glob("*.json"))
+    assert consumed_rows(store) == evaluation_rows(store) == []
+
+
 def test_a_hand_built_whole_day_halt_open_is_never_executable() -> None:
     """A2: the engine re-checks volume and the halt window, not just the seal.
 
@@ -1164,7 +1229,7 @@ def test_normal_open_and_resumed_halt_fill_identically_at_the_actual_open(
     # Control: the same halted row is not executable under the legacy rule, so
     # the identical result above is the new rule's doing.
     legacy = campaign_run(
-        tmp_path, "legacy", resumed_payload, execution_rules="next-open-v1"
+        tmp_path, "legacy", resumed_payload, execution_rules=NEXT_OPEN_RULES
     )
     legacy_fills = []
     for side in _runs(legacy["experiment"]):

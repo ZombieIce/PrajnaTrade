@@ -14,6 +14,8 @@ snapshots.  Fixture builders are imported from the modules that own them.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 from copy import deepcopy
@@ -28,15 +30,32 @@ from cli_helpers import (
     ok,
     rejected,
     round_validate_argv,
+    src_path,
     write_json,
+)
+from test_actual_open_cli import (
+    OPEN_SOURCE,
+    conflict_references,
+    day_at,
+    derived_row,
+    make_actual_open_halt,
+    make_confirmed_suspension,
+    make_missing_required_open,
+    make_open_conflict,
+    make_whole_day_halt,
+    raw_row,
+    schema_v3_fixture,
+    seal_v3,
 )
 from test_corrected_evidence_cli import remove_protected_payloads
 from test_discovery_split_cli import (
     discovery_read,
-    manifest as snapshot_manifest,
     split_campaign,
     stored_campaign,
     v2_round_input,
+)
+from test_discovery_split_cli import (
+    manifest as snapshot_manifest,
 )
 from test_experiment_cli import sealed_snapshot_input
 from test_protected_eval_cli import submit_experiment
@@ -56,20 +75,6 @@ from prajnatrade.snapshot_baseline import (
     ACTUAL_OPEN_RULES,
     EXECUTION_PRICE_BASIS,
     NEXT_OPEN_RULES,
-)
-from test_actual_open_cli import (
-    OPEN_SOURCE,
-    conflict_references,
-    day_at,
-    derived_row,
-    make_actual_open_halt,
-    make_confirmed_suspension,
-    make_missing_required_open,
-    make_open_conflict,
-    make_whole_day_halt,
-    raw_row,
-    schema_v3_fixture,
-    seal_v3,
 )
 
 VALIDATION_FAILPOINT = "round_validation_after_attempt"
@@ -1153,6 +1158,53 @@ def test_terminal_receipt_interruption_recovers_one_use(tmp_path: Path) -> None:
     assert replay["reused"] is True
     assert replay["receipt_hash"] == recovered["receipt_hash"]
     assert len(round_uses(scenario)) == 1
+
+
+@pytest.mark.parametrize("interruption", [None, VALIDATION_TERMINAL_FAILPOINT, VALIDATION_FAILPOINT])
+def test_formal_use_stays_bound_to_its_validation_across_a_runtime_upgrade(
+    tmp_path: Path, interruption: str | None,
+) -> None:
+    scenario = formal_scenario(tmp_path)
+    initial = validate_current(
+        scenario, env=cli_env(PRAJNATRADE_TEST_FAILPOINT=interruption) if interruption else None,
+    )
+    if interruption:
+        assert initial.returncode == 2
+        assert interruption in initial.stderr
+    else:
+        ok(initial)
+    [reserved] = round_uses(scenario)
+    original_id = reserved["validation_id"]
+    original = trusted_receipt(scenario, original_id)
+    original_status = version_entry(scenario)["validation"]
+
+    updated_src = tmp_path / "updated-src"
+    shutil.copytree(src_path() / "prajnatrade", updated_src / "prajnatrade")
+    accounting = updated_src / "prajnatrade" / "snapshot.py"
+    with accounting.open("a", encoding="utf-8") as source:
+        source.write("\n# Accounting source revision used to exercise the runtime fingerprint.\n")
+    env = cli_env()
+    env["PYTHONPATH"] = os.pathsep.join((str(updated_src), env["PYTHONPATH"]))
+    sealed = scenario["snapshots"] / scenario["campaign"]["snapshot_id"]
+    sealed.chmod(0o755)
+    (sealed / "discovery.json").unlink()
+
+    retry = validate_current(scenario, env=env)
+    if interruption == VALIDATION_FAILPOINT:
+        rejected(retry, "VALIDATION_RUNTIME_CHANGED", phase="validation")
+        assert version_entry(scenario)["validation"] == original_status
+        assert trusted_receipt(scenario, original_id) == original
+    else:
+        receipt = ok(retry)
+        assert receipt["validation_id"] == original_id
+        assert receipt["receipt_hash"] == original["receipt_hash"]
+        assert receipt["reused"] is (interruption is None)
+        assert receipt["allowance"]["total_used"] == 1
+        assert version_entry(scenario)["validation"]["validation_id"] == original_id
+    assert round_uses(scenario) == [reserved]
+    assert list((scenario["store"] / "research-loop-validations").glob("*.json")) == [
+        scenario["store"] / "research-loop-validations" / f"{original_id}.json"
+    ]
 
 
 def test_failed_verdict_keeps_the_counted_use(tmp_path: Path) -> None:
