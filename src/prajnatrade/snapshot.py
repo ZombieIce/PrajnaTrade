@@ -11,7 +11,13 @@ import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from prajnatrade.trading_status import ETF_SYMBOLS, halt_conflicts_with_volume
+from prajnatrade.trading_status import (
+    ETF_SYMBOLS,
+    confirmed_no_trade_shape,
+    halt_conflicts_with_trade,
+    halt_conflicts_with_volume,
+    has_status_evidence_id,
+)
 from prajnatrade.trading_status import halt_covers_session as halt_covers_session
 
 KINDS = ("calendar", "raw_bars", "corporate_actions", "derived")
@@ -249,7 +255,7 @@ def _open_source_evidence(row: dict, evidence_kinds: dict[str, str]) -> dict | N
 
 
 def _valid_status_evidence_id(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+    return has_status_evidence_id(value)
 
 
 def _status_evidence(
@@ -510,8 +516,24 @@ def _complete_row(row: dict, kind: str, *, is_real: bool) -> bool:
     if status == "trading":
         return all(row.get(field) is not None for field in RAW_FIELDS)
     if status == "partial_halt":
-        return row.get("close") is not None
+        return row.get("close") is not None and not halt_conflicts_with_trade(
+            row.get("halt"), row["date"], row
+        )
     return False
+
+
+def _confirmed_no_trade_row(row: dict, *, is_real: bool) -> bool:
+    """Whether a raw bar is a confirmed whole-day no-trade session (ADR 0003).
+
+    Such a session preserves frozen common/authorized range boundaries instead of
+    silently truncating them; missing, unknown, unexplained or conflicting rows
+    remain incomplete. Real snapshots require ``status_evidence_id`` (schema 3+)
+    so schema-2 real snapshots match carry-forward valuation rules.
+    """
+    confirmed, _ = confirmed_no_trade_shape(
+        row, data_kind="real" if is_real else "synthetic"
+    )
+    return confirmed
 
 
 def _execution_evidence_row(row: dict) -> dict | None:
@@ -660,6 +682,7 @@ def _prepare(
 
     records: dict[str, list[dict]] = {}
     real_raw_bars: dict[tuple[str, str], dict] = {}
+    action_sequences: dict[tuple[str, str], set[int]] = {}
     for kind in KINDS:
         rows = data.get(kind)
         if not isinstance(rows, list) or (kind != "corporate_actions" and not rows):
@@ -689,6 +712,17 @@ def _prepare(
                     raise ValueError("Invalid corporate action terms evidence.")
                 if action_type == "cash_dividend" and row["pay_date"] is not None:
                     _date(row["pay_date"])
+                if "sequence" in row:
+                    sequence = row["sequence"]
+                    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+                        raise ValueError("Invalid corporate action sequence.")
+                    seq_key = (row["date"], row["symbol"])
+                    seen = action_sequences.setdefault(seq_key, set())
+                    if sequence in seen:
+                        raise ValueError(
+                            "Duplicate corporate action sequence for date and symbol."
+                        )
+                    seen.add(sequence)
                 if is_real:
                     _real_corporate_action(row)
             if kind in ("raw_bars", "derived"):
@@ -719,7 +753,20 @@ def _prepare(
                         evidence_kinds=evidence_kinds,
                     )
                     real_raw_bars[(row["date"], row["symbol"])] = row
-        records[kind] = sorted(rows, key=lambda row: (row["date"], row.get("symbol", ""), _bytes(row)))
+        if kind == "corporate_actions":
+            records[kind] = sorted(
+                rows,
+                key=lambda row: (
+                    row["date"],
+                    row.get("symbol", ""),
+                    (0, row["sequence"]) if "sequence" in row else (1, 0),
+                    _bytes(row),
+                ),
+            )
+        else:
+            records[kind] = sorted(
+                rows, key=lambda row: (row["date"], row.get("symbol", ""), _bytes(row))
+            )
     if is_real:
         _real_derived(records["derived"], real_raw_bars, schema_version=schema_version)
 
@@ -767,9 +814,24 @@ def _prepare(
     )
     complete = [
         day for day in dates if start <= day <= source_end and all(
-            (day, symbol) in indexed[kind]
-            and _complete_row(indexed[kind][day, symbol], kind, is_real=is_real)
-            for kind in ("raw_bars", "derived")
+            (day, symbol) in indexed["raw_bars"]
+            and (day, symbol) in indexed["derived"]
+            and (
+                (
+                    _complete_row(indexed["raw_bars"][day, symbol], "raw_bars", is_real=is_real)
+                    and _complete_row(indexed["derived"][day, symbol], "derived", is_real=is_real)
+                )
+                or (
+                    _confirmed_no_trade_row(
+                        indexed["raw_bars"][day, symbol],
+                        is_real=is_real,
+                    )
+                    and (
+                        indexed["derived"][day, symbol].get("value") is None
+                        or not is_real
+                    )
+                )
+            )
             for symbol in ETF_SYMBOLS
         ) and day not in incomplete_days
     ]

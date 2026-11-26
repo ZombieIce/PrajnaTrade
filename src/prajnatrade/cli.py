@@ -9,7 +9,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from prajnatrade.trading_status import EXECUTION_RULE_VERSIONS, NEXT_OPEN_RULES
+from prajnatrade.trading_status import (
+    EXECUTION_RULE_VERSIONS,
+    NEXT_OPEN_RULES,
+    STRICT_CLOSE_VALUATION,
+    VALUATION_POLICY_VERSIONS,
+)
 
 if TYPE_CHECKING:
     from prajnatrade.providers import ResearchProvider
@@ -277,6 +282,10 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     create.add_argument(
         "--execution-rules", choices=EXECUTION_RULE_VERSIONS, default=NEXT_OPEN_RULES,
         help="freeze platform matching rules for Discovery and protected evaluation",
+    )
+    create.add_argument(
+        "--valuation-policy", choices=VALUATION_POLICY_VERSIONS, default=STRICT_CLOSE_VALUATION,
+        help="freeze close valuation policy for held symbols (default: strict-close-v1)",
     )
     create.add_argument(
         "--strategy-executor", choices=["none", "container"], default="none",
@@ -801,6 +810,7 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 args.max_seconds, args.initial_cash, args.transaction_cost_bps,
                 args.slippage_bps, args.as_of,
                 execution_rules=args.execution_rules,
+                valuation_policy=args.valuation_policy,
                 strategy_executor=args.strategy_executor,
                 strategy_image=args.strategy_image,
                 discovery_warmup_sessions=args.discovery_warmup_sessions,

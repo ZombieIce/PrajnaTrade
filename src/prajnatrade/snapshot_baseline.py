@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_left
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,9 @@ from prajnatrade.trading_status import (
     ACTUAL_OPEN_RULES as ACTUAL_OPEN_RULES,
 )
 from prajnatrade.trading_status import (
+    CARRY_FORWARD_SUSPENDED_VALUATION as CARRY_FORWARD_SUSPENDED_VALUATION,
+)
+from prajnatrade.trading_status import (
     CN_TZ as CN_TZ,
 )
 from prajnatrade.trading_status import (
@@ -54,8 +58,19 @@ from prajnatrade.trading_status import (
     RETRY_INITIAL_RULES as RETRY_INITIAL_RULES,
 )
 from prajnatrade.trading_status import (
+    STRICT_CLOSE_VALUATION as STRICT_CLOSE_VALUATION,
+)
+from prajnatrade.trading_status import (
+    VALUATION_POLICY_VERSIONS as VALUATION_POLICY_VERSIONS,
+)
+from prajnatrade.trading_status import (
+    confirmed_no_trade_shape,
+    halt_conflicts_with_trade,
     halt_conflicts_with_volume,
     halt_covers_session,
+)
+from prajnatrade.trading_status import (
+    valuation_policy_version as valuation_policy_version,
 )
 
 _CN_TZ = CN_TZ  # backward-compatible private alias
@@ -75,6 +90,7 @@ def run_discovery_strategy(
     transaction_cost_bps: float = 5.0,
     slippage_bps: float = 0.0,
     execution_rule_version: str = NEXT_OPEN_RULES,
+    valuation_policy_version: str = STRICT_CLOSE_VALUATION,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
@@ -93,6 +109,7 @@ def run_discovery_strategy(
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rule_version,
+        valuation_policy_version=valuation_policy_version,
         history_requirements=history_requirements,
         scoring_start=scoring_start,
     )
@@ -144,6 +161,7 @@ def run_partition_strategy(
     transaction_cost_bps: float = 5.0,
     slippage_bps: float = 0.0,
     execution_rule_version: str = NEXT_OPEN_RULES,
+    valuation_policy_version: str = STRICT_CLOSE_VALUATION,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
 ) -> dict[str, Any]:
@@ -159,6 +177,8 @@ def run_partition_strategy(
     _validate_parameters(initial_cash, transaction_cost_bps, slippage_bps)
     if execution_rule_version not in EXECUTION_RULE_VERSIONS:
         raise ValueError(f"Unknown execution rules version: {execution_rule_version!r}.")
+    if valuation_policy_version not in VALUATION_POLICY_VERSIONS:
+        raise ValueError(f"Unknown valuation policy version: {valuation_policy_version!r}.")
     if signal_window_sessions <= 0:
         raise ValueError("signal_window_sessions must be positive.")
     if not isinstance(partition_name, str) or not partition_name.strip():
@@ -193,6 +213,9 @@ def run_partition_strategy(
     receivables: list[dict[str, Any]] = []
     unresolved_actions: dict[str, list[dict[str, str]]] = {
         symbol: [] for symbol in ETF_SYMBOLS
+    }
+    carry_states: dict[str, _CarryState] = {
+        symbol: _CarryState() for symbol in ETF_SYMBOLS
     }
     signals: list[dict[str, Any]] = []
     signal_gaps: list[dict[str, Any]] = []
@@ -269,8 +292,20 @@ def run_partition_strategy(
                     "requirements": readiness["requirements"],
                 })
 
+        applied_actions_today: dict[str, list[dict[str, Any]]] = {
+            symbol: [] for symbol in ETF_SYMBOLS
+        }
         _apply_actions(
-            day, actions.get(day, []), shares, cash, receivables, unresolved_actions
+            day,
+            actions.get(day, []),
+            shares,
+            cash,
+            receivables,
+            unresolved_actions,
+            applied_actions=applied_actions_today,
+            enforce_action_order=(
+                valuation_policy_version == CARRY_FORWARD_SUSPENDED_VALUATION
+            ),
         )
         for item in receivables[:]:
             if item["pay_date"] <= day:
@@ -359,9 +394,28 @@ def run_partition_strategy(
         invested_sessions += invested
         if ready and not invested and not positive_order:
             ready_cash_sessions.append(day)
-        nav_point, gaps = _valuation(
-            day, raw_bars, shares, cash, receivables, unresolved_actions, data_kind=data_kind,
-        )
+        if valuation_policy_version == CARRY_FORWARD_SUSPENDED_VALUATION:
+            nav_point, gaps = _valuation_carry_forward(
+                day,
+                raw_bars,
+                shares,
+                cash,
+                receivables,
+                unresolved_actions,
+                carry_states,
+                applied_actions_today,
+                data_kind=data_kind,
+            )
+        else:
+            nav_point, gaps = _valuation(
+                day,
+                raw_bars,
+                shares,
+                cash,
+                receivables,
+                unresolved_actions,
+                data_kind=data_kind,
+            )
         equity_curve.append(nav_point)
         valuation_gaps.extend(gaps)
 
@@ -433,6 +487,7 @@ def run_partition_strategy(
         signal_gaps=signal_gaps,
         valuation_gaps=valuation_gaps,
         execution_rule_version=execution_rule_version,
+        valuation_policy_version=valuation_policy_version,
     )
     return {
         "snapshot_id": snapshot_id,
@@ -460,6 +515,18 @@ def run_partition_strategy(
                 "ready_cash_sessions": ready_cash_sessions,
             },
         } if history_requirements is not None else {}),
+        **(
+            {
+                "valuation_summary": _valuation_summary(
+                    sessions,
+                    equity_curve,
+                    metrics,
+                    policy_version=valuation_policy_version,
+                ),
+            }
+            if valuation_policy_version == CARRY_FORWARD_SUSPENDED_VALUATION
+            else {}
+        ),
         "metrics": metrics,
         "gaps": {
             "raw_bars": _data_gaps(sessions, raw_bars, "raw_bars", data_kind=data_kind),
@@ -617,6 +684,7 @@ def _metrics(
     signal_gaps: list[dict[str, Any]],
     valuation_gaps: list[dict[str, Any]],
     execution_rule_version: str = NEXT_OPEN_RULES,
+    valuation_policy_version: str = STRICT_CLOSE_VALUATION,
 ) -> dict[str, Any]:
     """Partition metrics; unavailable values are ``None`` rather than fabricated."""
     ending_equity = equity_curve[-1]["nav"] if equity_curve else None
@@ -667,7 +735,45 @@ def _metrics(
         metrics["orders_partially_filled"] = sum(
             1 for attempt in order_attempts if attempt.get("status") == "partially_filled"
         )
+    if valuation_policy_version == CARRY_FORWARD_SUSPENDED_VALUATION:
+        metrics["actual_close_sessions"] = sum(
+            point["nav"] is not None and point.get("valuation_basis") == "actual_close"
+            for point in equity_curve
+        )
+        metrics["carried_forward_sessions"] = sum(
+            point["nav"] is not None and point.get("valuation_basis") == "carried_forward"
+            for point in equity_curve
+        )
+        metrics["missing_valuation_sessions"] = sum(
+            point["nav"] is None for point in equity_curve
+        )
     return metrics
+
+
+def _valuation_summary(
+    sessions: list[str],
+    equity_curve: list[dict[str, Any]],
+    metrics: Mapping[str, Any],
+    *,
+    policy_version: str,
+) -> dict[str, Any]:
+    """Summarize actual-close vs carried-forward valuation across scoring sessions."""
+    ending_carried: dict[str, Any] = {}
+    if equity_curve:
+        last_holdings = equity_curve[-1].get("holdings", {})
+        for symbol in ETF_SYMBOLS:
+            holding = last_holdings.get(symbol, {})
+            if holding.get("valuation_basis") == "carried_forward_prior_close":
+                ending_carried[symbol] = dict(holding["carry_forward"])
+    return {
+        "policy_version": policy_version,
+        "sessions": len(sessions),
+        "valued_sessions": metrics["valued_sessions"],
+        "actual_close_sessions": metrics["actual_close_sessions"],
+        "carried_forward_sessions": metrics["carried_forward_sessions"],
+        "missing_valuation_sessions": metrics["missing_valuation_sessions"],
+        "ending_carried_forward": ending_carried,
+    }
 
 
 def run_discovery_equal_weight(
@@ -680,6 +786,7 @@ def run_discovery_equal_weight(
     transaction_cost_bps: float,
     slippage_bps: float,
     execution_rule_version: str = NEXT_OPEN_RULES,
+    valuation_policy_version: str = STRICT_CLOSE_VALUATION,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
@@ -706,6 +813,7 @@ def run_discovery_equal_weight(
         transaction_cost_bps=transaction_cost_bps,
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rule_version,
+        valuation_policy_version=valuation_policy_version,
         history_requirements=history_requirements,
         scoring_start=scoring_start,
         prior_history=prior_history,
@@ -1188,6 +1296,69 @@ def _buy_target(
     return day_fills, cash, quantities, fees_paid, slippage_paid
 
 
+def _valid_action_sequence(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 1
+
+
+def _validate_action(day: str, action: dict, cutoff: datetime) -> str | None:
+    if (
+        not _available_by(action, cutoff)
+        or not isinstance(action.get("terms_evidence"), str)
+        or not action["terms_evidence"].strip()
+    ):
+        return "corporate_action_terms_or_availability_unknown"
+    action_type = action.get("type")
+    if action_type == "cash_dividend":
+        amount = action.get("cash_per_share")
+        pay_date = action.get("pay_date")
+        if (
+            not _valid_price(amount)
+            or not isinstance(pay_date, str)
+            or not pay_date
+        ):
+            return "cash_dividend_terms_unknown"
+        try:
+            datetime.fromisoformat(pay_date).date()
+        except ValueError:
+            return "cash_dividend_terms_unknown"
+        if pay_date < day:
+            return "cash_dividend_pay_date_precedes_ex_date"
+        return None
+    if action_type == "share_adjustment":
+        if not _valid_price(action.get("ratio")):
+            return "share_adjustment_ratio_unknown"
+        return None
+    return "corporate_action_type_unknown"
+
+
+def _apply_single_action(
+    day: str,
+    symbol: str,
+    action: dict,
+    shares: dict[str, float],
+    receivables: list[dict[str, Any]],
+    applied_actions: dict[str, list[dict[str, Any]]] | None,
+) -> None:
+    action_type = action["type"]
+    if action_type == "cash_dividend":
+        quantity = shares[symbol]
+        amount = action["cash_per_share"]
+        receivables.append({
+            "symbol": symbol,
+            "ex_date": day,
+            "pay_date": action["pay_date"],
+            "quantity": quantity,
+            "cash_per_share": amount,
+            "amount": quantity * amount,
+        })
+        if applied_actions is not None:
+            applied_actions[symbol].append(dict(action))
+    elif action_type == "share_adjustment":
+        shares[symbol] *= action["ratio"]
+        if applied_actions is not None:
+            applied_actions[symbol].append(dict(action))
+
+
 def _apply_actions(
     day: str,
     actions: list[dict],
@@ -1195,62 +1366,425 @@ def _apply_actions(
     cash: float,
     receivables: list[dict[str, Any]],
     unresolved: dict[str, list[dict[str, str]]],
+    *,
+    applied_actions: dict[str, list[dict[str, Any]]] | None = None,
+    enforce_action_order: bool = False,
 ) -> float:
     cutoff = datetime.combine(
         datetime.fromisoformat(day).date(), time(9, 30), tzinfo=_CN_TZ
     )
+    if not enforce_action_order:
+        for action in actions:
+            symbol = action["symbol"]
+            if shares[symbol] <= _EPSILON:
+                continue
+            error = _validate_action(day, action, cutoff)
+            if error is not None:
+                unresolved[symbol].append({"date": day, "reason": error})
+                continue
+            _apply_single_action(day, symbol, action, shares, receivables, applied_actions)
+        return cash
+
+    by_symbol: dict[str, list[dict]] = {}
     for action in actions:
-        symbol = action["symbol"]
-        quantity = shares[symbol]
-        if quantity <= _EPSILON:
+        by_symbol.setdefault(action["symbol"], []).append(action)
+    for symbol, sym_actions in by_symbol.items():
+        if shares[symbol] <= _EPSILON:
             continue
-        if (
-            not _available_by(action, cutoff)
-            or not isinstance(action.get("terms_evidence"), str)
-            or not action["terms_evidence"].strip()
+        if len(sym_actions) > 1:
+            sequences = [action.get("sequence") for action in sym_actions]
+            if not all(
+                "sequence" in action and _valid_action_sequence(seq)
+                for action, seq in zip(sym_actions, sequences, strict=True)
+            ) or len(set(sequences)) != len(sequences):
+                unresolved[symbol].append({
+                    "date": day,
+                    "reason": "corporate_action_order_ambiguous",
+                })
+                continue
+            sym_actions = sorted(sym_actions, key=lambda item: item["sequence"])
+        elif "sequence" in sym_actions[0] and not _valid_action_sequence(
+            sym_actions[0]["sequence"]
         ):
             unresolved[symbol].append({
                 "date": day,
-                "reason": "corporate_action_terms_or_availability_unknown",
+                "reason": "corporate_action_order_ambiguous",
             })
             continue
-        if action["type"] == "cash_dividend":
-            amount = action.get("cash_per_share")
-            pay_date = action.get("pay_date")
-            if (
-                not _valid_price(amount)
-                or not isinstance(pay_date, str)
-                or not pay_date
-            ):
-                unresolved[symbol].append({
-                    "date": day,
-                    "reason": "cash_dividend_terms_unknown",
-                })
-                continue
-            if pay_date < day:
-                unresolved[symbol].append({
-                    "date": day,
-                    "reason": "cash_dividend_pay_date_precedes_ex_date",
-                })
-                continue
-            receivables.append({
-                "symbol": symbol,
-                "ex_date": day,
-                "pay_date": pay_date,
-                "quantity": quantity,
-                "cash_per_share": amount,
-                "amount": quantity * amount,
-            })
-        elif action["type"] == "share_adjustment":
-            ratio = action.get("ratio")
-            if not _valid_price(ratio):
-                unresolved[symbol].append({
-                    "date": day,
-                    "reason": "share_adjustment_ratio_unknown",
-                })
-                continue
-            shares[symbol] *= ratio
+
+        errors = [
+            error
+            for action in sym_actions
+            if (error := _validate_action(day, action, cutoff)) is not None
+        ]
+        if errors:
+            for error in errors:
+                unresolved[symbol].append({"date": day, "reason": error})
+            continue
+
+        for action in sym_actions:
+            _apply_single_action(day, symbol, action, shares, receivables, applied_actions)
     return cash
+
+
+def _parse_instant(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _close_source_evidence(row: Mapping[str, Any], *, data_kind: str) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "availability_evidence": row.get("availability_evidence"),
+        "available_at": (
+            row.get("close_available_at") if data_kind == "real" else row.get("available_at")
+        ),
+    }
+    open_source = row.get("open_source")
+    if isinstance(open_source, Mapping):
+        evidence["source"] = open_source.get("source")
+        evidence["evidence_id"] = open_source.get("evidence_id")
+    return evidence
+
+
+def _status_source_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "trading_status": row.get("trading_status"),
+        "availability_evidence": row.get("availability_evidence"),
+        "available_at": row.get("available_at"),
+    }
+    status_id = row.get("status_evidence_id")
+    if isinstance(status_id, str) and status_id.strip():
+        evidence["status_evidence_id"] = status_id
+    halt = row.get("halt")
+    if isinstance(halt, Mapping):
+        evidence["halt"] = dict(halt)
+    return evidence
+
+
+def _classify_no_trade_for_valuation(
+    row: Mapping[str, Any] | None,
+    close_cutoff: datetime,
+    *,
+    data_kind: str,
+) -> tuple[bool, str | None]:
+    """Return whether ``row`` confirms full-day no-trade by ``close_cutoff``.
+
+    When False, returns a specific ``valuation_gap_reason`` distinguishing
+    missing bars, unknown status, late notices, conflicting evidence and
+    resumed partial halts without a confirmed close.
+    """
+    if row is None:
+        return False, "missing_bar"
+    confirmed_shape, shape_reason = confirmed_no_trade_shape(row, data_kind=data_kind)
+    if confirmed_shape:
+        if not _available_by(dict(row), close_cutoff):
+            available_at = _parse_instant(row.get("available_at"))
+            if available_at is not None and available_at > close_cutoff:
+                return False, "status_evidence_after_cutoff"
+            return False, "missing_status_availability_evidence"
+        return True, None
+    if shape_reason is not None:
+        return False, shape_reason
+    if row.get("trading_status") == "trading" and _valid_price(row.get("close")):
+        ts_field = "close_available_at" if data_kind == "real" else "available_at"
+        available_at = _parse_instant(row.get(ts_field))
+        if available_at is not None and available_at > close_cutoff:
+            return False, "close_evidence_after_cutoff"
+        return False, "missing_close_availability_evidence"
+    return False, "missing_or_unconfirmed_unadjusted_close"
+
+
+@dataclass
+class _CarryState:
+    """Per-symbol carry-forward valuation anchor and chain-break status."""
+
+    anchor: dict[str, Any] | None = None
+    chain_broken: bool = False
+
+    def reset(self) -> None:
+        self.anchor = None
+        self.chain_broken = False
+
+    def break_chain(self) -> None:
+        if self.anchor is not None:
+            self.chain_broken = True
+        self.anchor = None
+
+
+def _missing_holding(
+    quantity: float, gap_reason: str | None, *, close: float | None = None
+) -> dict[str, Any]:
+    return {
+        "quantity": quantity,
+        "close": close,
+        "market_value": None,
+        "valuation_price": None,
+        "valuation_basis": "missing",
+        "gap_reason": gap_reason,
+    }
+
+
+def _valuation_gap(
+    day: str,
+    symbol: str,
+    gap_reason: str | None,
+    *,
+    status: str | None = None,
+    row: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    gap: dict[str, Any] = {
+        "date": day,
+        "symbol": symbol,
+        "reason": "missing_or_unconfirmed_unadjusted_close",
+        "valuation_gap_reason": gap_reason,
+    }
+    if status is not None:
+        gap["trading_status"] = status
+    if row is not None and isinstance(row.get("halt"), dict):
+        gap["halt"] = row["halt"]
+    return gap
+
+
+def _adjust_carried_basis_for_actions(
+    day: str,
+    anchor: dict[str, Any],
+    applied_actions: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Adjust a carried-forward valuation anchor for corporate actions on ``day``."""
+    if not applied_actions:
+        return anchor, None
+    price = float(anchor["valuation_price"])
+    adjustments = [dict(item) for item in anchor["adjustments"]]
+    for action in applied_actions:
+        action_type = action.get("type")
+        if action_type == "cash_dividend":
+            amount = float(action["cash_per_share"])
+            new_price = price - amount
+            extra: dict[str, Any] = {
+                "cash_per_share": amount,
+                "pay_date": action["pay_date"],
+            }
+        elif action_type == "share_adjustment":
+            ratio = float(action["ratio"])
+            new_price = price / ratio
+            extra = {"ratio": ratio}
+        else:
+            return None, "suspended_corporate_action_unadjusted"
+        if not _valid_price(new_price) or new_price <= _EPSILON:
+            return None, "carried_valuation_price_non_positive"
+        entry: dict[str, Any] = {
+            "date": day,
+            "type": action_type,
+            **extra,
+            "terms_evidence": action["terms_evidence"],
+            "available_at": action["available_at"],
+            "availability_evidence": action["availability_evidence"],
+            "valuation_price_before": price,
+            "valuation_price_after": new_price,
+        }
+        if "sequence" in action:
+            entry["sequence"] = action["sequence"]
+        adjustments.append(entry)
+        price = new_price
+    updated = dict(anchor)
+    updated["valuation_price"] = price
+    updated["adjustments"] = adjustments
+    return updated, None
+
+
+def _valuation_carry_forward(
+    day: str,
+    raw_bars: dict[tuple[str, str], dict],
+    shares: dict[str, float],
+    cash: float,
+    receivables: list[dict[str, Any]],
+    unresolved: dict[str, list[dict[str, str]]],
+    carry_states: dict[str, _CarryState],
+    applied_actions_today: Mapping[str, list[dict[str, Any]]],
+    *,
+    data_kind: str = "synthetic",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Value holdings under ``carry-forward-suspended-v1`` (ADR 0003)."""
+    holdings: dict[str, Any] = {}
+    gaps: list[dict[str, Any]] = []
+    carried_symbols: list[str] = []
+    market_value = 0.0
+    valid = True
+    close_cutoff = datetime.combine(
+        datetime.fromisoformat(day).date(), time(23, 59, 59), tzinfo=_CN_TZ
+    )
+    for symbol in ETF_SYMBOLS:
+        quantity = shares[symbol]
+        state = carry_states[symbol]
+        row = raw_bars.get((day, symbol))
+        status = row.get("trading_status") if row is not None else None
+        markable = status == "trading" or (
+            data_kind == "real" and status == "partial_halt"
+        )
+        close_conflict = row is not None and (
+            row.get("status_conflict") is not None
+            or (
+                data_kind == "real"
+                and status == "partial_halt"
+                and halt_conflicts_with_trade(row.get("halt"), day, row)
+            )
+        )
+        raw_close = row.get("close") if row is not None else None
+        has_trusted_close = (
+            row is not None
+            and markable
+            and not close_conflict
+            and _valid_price(raw_close)
+            and _close_available(row, close_cutoff, data_kind)
+        )
+
+        if quantity <= _EPSILON:
+            state.reset()
+            trusted_close = float(raw_close) if has_trusted_close else None
+            if unresolved[symbol]:
+                valid = False
+                for action_gap in unresolved[symbol]:
+                    gaps.append({"symbol": symbol, **action_gap})
+                holdings[symbol] = _missing_holding(
+                    quantity, unresolved[symbol][0]["reason"], close=trusted_close
+                )
+            else:
+                holdings[symbol] = {
+                    "quantity": quantity,
+                    "close": trusted_close,
+                    "market_value": 0.0,
+                    "valuation_price": None,
+                    "valuation_basis": "not_held",
+                }
+            continue
+
+        if has_trusted_close:
+            actual_close = float(raw_close)
+            state.anchor = {
+                "source_close_date": day,
+                "source_close_price": actual_close,
+                "source_close_evidence": _close_source_evidence(row, data_kind=data_kind),
+                "valuation_price": actual_close,
+                "carried_sessions": 0,
+                "adjustments": [],
+            }
+            state.chain_broken = False
+            if unresolved[symbol]:
+                valid = False
+                for action_gap in unresolved[symbol]:
+                    gaps.append({"symbol": symbol, **action_gap})
+                holdings[symbol] = _missing_holding(
+                    quantity, unresolved[symbol][0]["reason"], close=actual_close
+                )
+            else:
+                value = quantity * actual_close
+                market_value += value
+                holdings[symbol] = {
+                    "quantity": quantity,
+                    "close": actual_close,
+                    "market_value": value,
+                    "valuation_price": actual_close,
+                    "valuation_basis": "actual_close",
+                }
+            continue
+
+        confirmed_no_trade, non_trade_reason = _classify_no_trade_for_valuation(
+            row, close_cutoff, data_kind=data_kind
+        )
+        if confirmed_no_trade:
+            if unresolved[symbol]:
+                valid = False
+                state.break_chain()
+                for action_gap in unresolved[symbol]:
+                    gaps.append({"symbol": symbol, **action_gap})
+                holdings[symbol] = _missing_holding(
+                    quantity, unresolved[symbol][0]["reason"]
+                )
+                continue
+
+            anchor = state.anchor
+            if anchor is None:
+                valid = False
+                gap_reason = (
+                    "carry_forward_chain_broken"
+                    if state.chain_broken
+                    else "missing_authorized_prior_close"
+                )
+                gaps.append(_valuation_gap(day, symbol, gap_reason, status=status))
+                holdings[symbol] = _missing_holding(quantity, gap_reason)
+                continue
+
+            day_actions = applied_actions_today.get(symbol, [])
+            if day_actions:
+                adjusted, adj_gap_reason = _adjust_carried_basis_for_actions(
+                    day, anchor, day_actions
+                )
+                if adjusted is None:
+                    valid = False
+                    state.break_chain()
+                    gaps.append(_valuation_gap(day, symbol, adj_gap_reason, status=status))
+                    holdings[symbol] = _missing_holding(quantity, adj_gap_reason)
+                    continue
+                anchor = adjusted
+                state.anchor = anchor
+
+            anchor["carried_sessions"] += 1
+            valuation_price = float(anchor["valuation_price"])
+            value = quantity * valuation_price
+            market_value += value
+            carried_symbols.append(symbol)
+            holdings[symbol] = {
+                "quantity": quantity,
+                "close": None,
+                "market_value": value,
+                "valuation_price": valuation_price,
+                "valuation_basis": "carried_forward_prior_close",
+                "carry_forward": {
+                    "source_close_date": anchor["source_close_date"],
+                    "source_close_price": anchor["source_close_price"],
+                    "source_close_evidence": dict(anchor["source_close_evidence"]),
+                    "valuation_price": valuation_price,
+                    "carried_sessions": anchor["carried_sessions"],
+                    "adjustments": [dict(item) for item in anchor["adjustments"]],
+                    "status_evidence": _status_source_evidence(row),
+                },
+            }
+            continue
+
+        # Not a trusted close and not a confirmed full-day no-trade: gap & break chain.
+        valid = False
+        state.break_chain()
+        gaps.append(_valuation_gap(day, symbol, non_trade_reason, status=status, row=row))
+        if unresolved[symbol]:
+            for action_gap in unresolved[symbol]:
+                gaps.append({"symbol": symbol, **action_gap})
+        holdings[symbol] = _missing_holding(quantity, non_trade_reason)
+
+    receivable_total = math.fsum(item["amount"] for item in receivables)
+    nav = cash + market_value + receivable_total if valid else None
+    day_basis = (
+        "missing"
+        if not valid
+        else "carried_forward"
+        if carried_symbols
+        else "actual_close"
+    )
+    return {
+        "date": day,
+        "nav": nav,
+        "cash": cash,
+        "market_value": market_value if valid else None,
+        "dividend_receivables": receivable_total if valid else None,
+        "receivables": [dict(item) for item in receivables],
+        "holdings": holdings,
+        "valuation_basis": day_basis,
+        "carried_forward_symbols": sorted(carried_symbols),
+    }, gaps
 
 
 def _valuation(
