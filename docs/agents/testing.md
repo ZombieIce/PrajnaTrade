@@ -16,8 +16,10 @@ scripts/test.sh tests/test_acceptance_cli.py -q
 ```
 
 `scripts/test.sh` defaults `PYTHON` to `python`, sets `PYTHONPATH=src` and
-`PYTHONDONTWRITEBYTECODE=1`, and prints the mode and command. Point it at a
-specific interpreter with `PYTHON=/path/to/python scripts/test.sh fast`.
+`PYTHONDONTWRITEBYTECODE=1`, enables `pytest-xdist` (`-n auto --dist worksteal`)
+when installed (set `PYTEST_WORKERS=0` for serial runs), and prints the mode
+and command. Point it at a specific interpreter with
+`PYTHON=/path/to/python scripts/test.sh fast`.
 
 A single test file, without the wrapper:
 
@@ -25,10 +27,12 @@ A single test file, without the wrapper:
 PYTHONPATH=src python -m pytest -q tests/test_acceptance_cli.py
 ```
 
-[CI](../../.github/workflows/tests.yml) runs the full suite on macOS and Ruff on
-Linux. Run the relevant CLI tests first for local iteration. If a provider
-test raises `PermissionError` while binding a loopback HTTP server, run that
-test on the host or use the full CI result for the same commit.
+[CI](../../.github/workflows/tests.yml) splits the suite across parallel jobs:
+`pytest (fast, ubuntu)` runs `-m "not isolation"` with `pytest-xdist` on Linux,
+`pytest (isolation, macos)` runs `-m isolation` with `pytest-xdist` on macOS,
+and `ruff` runs on Linux. Run the relevant CLI tests first for local iteration.
+If a provider test raises `PermissionError` while binding a loopback HTTP
+server, run that test on the host or use the full CI result for the same commit.
 
 ## Isolation tests
 

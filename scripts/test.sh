@@ -13,17 +13,25 @@ export PYTHONPATH=src
 export PYTHONDONTWRITEBYTECODE=1
 
 mode="${1:-full}"
+xdist_args=()
+if [ "${PYTEST_WORKERS:-auto}" != "0" ] && "$PYTHON" -c "import xdist" 2>/dev/null; then
+  if [ "$mode" = "full" ] && [ -z "${PYTEST_WORKERS:-}" ]; then
+    xdist_args=(-n auto --maxprocesses=4 --dist worksteal)
+  else
+    xdist_args=(-n "${PYTEST_WORKERS:-auto}" --dist worksteal)
+  fi
+fi
 
 case "$mode" in
   fast)
     echo "mode: fast (excludes tests marked 'isolation')"
-    echo "+ $PYTHON -m pytest -q -m \"not isolation\""
-    exec "$PYTHON" -m pytest -q -m "not isolation"
+    echo "+ $PYTHON -m pytest -q ${xdist_args[*]} -m \"not isolation\""
+    exec "$PYTHON" -m pytest -q "${xdist_args[@]}" -m "not isolation"
     ;;
   full)
     echo "mode: full (entire suite)"
-    echo "+ $PYTHON -m pytest -q"
-    exec "$PYTHON" -m pytest -q
+    echo "+ $PYTHON -m pytest -q ${xdist_args[*]}"
+    exec "$PYTHON" -m pytest -q "${xdist_args[@]}"
     ;;
   *)
     echo "mode: pytest passthrough"

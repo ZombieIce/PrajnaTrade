@@ -1104,6 +1104,7 @@ def test_cli_refuses_generated_python_when_memory_limit_is_unavailable(
         "--provider", "mock", "--seed", "11", "--experiments", "2",
         "--isolated-generated-python",
         "--holdout-start", "2024-01-19", "--holdout-end", "2024-01-24",
+        use_subprocess=True,
     )
     assert started.returncode == 2
     assert "memory_limit_unavailable" in started.stderr

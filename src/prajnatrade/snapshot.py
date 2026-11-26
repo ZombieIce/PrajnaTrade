@@ -11,8 +11,7 @@ import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.trading_status import halt_conflicts_with_volume
+from prajnatrade.trading_status import ETF_SYMBOLS, halt_conflicts_with_volume
 from prajnatrade.trading_status import halt_covers_session as halt_covers_session
 
 KINDS = ("calendar", "raw_bars", "corporate_actions", "derived")

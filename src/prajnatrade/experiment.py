@@ -36,19 +36,11 @@ from prajnatrade.snapshot import (
     read_discovery,
     slice_content,
 )
-from prajnatrade.snapshot_baseline import (
+from prajnatrade.trading_status import (
     ACTUAL_OPEN_RULES,
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
-    first_ready_open,
-    run_discovery_equal_weight,
-    run_discovery_strategy,
-)
-from prajnatrade.strategies import (
-    STRATEGY_FAMILIES,
-    make_strategy,
-    normalize_strategy_spec,
 )
 
 
@@ -434,6 +426,8 @@ def campaign_create(
         discovery_split=split_descriptor,
         full_history=full_history,
     )
+    from prajnatrade.snapshot_baseline import run_discovery_equal_weight
+
     baseline = run_discovery_equal_weight(
         data,
         snapshot_id,
@@ -722,6 +716,8 @@ def _normalize_request(raw: object) -> dict[str, Any]:
     strategy = raw["strategy"]
     if not isinstance(strategy, dict):
         raise ValueError("Strategy must be a JSON object.")
+    from prajnatrade.strategies import STRATEGY_FAMILIES, normalize_strategy_spec
+
     family = strategy.get("family")
     if family in STRATEGY_FAMILIES:
         if set(strategy) - {"family", "history_requirements"}:
@@ -1002,6 +998,9 @@ def _run_attempt(
             _attempt_history_options(connection, campaign_id, policy, data, request["strategy"])
             if policy is not None else {}
         )
+        from prajnatrade.snapshot_baseline import run_discovery_strategy
+        from prajnatrade.strategies import make_strategy
+
         strategy = None
         if family == "python":
             if executor_config.get("kind") != "container":
@@ -1155,6 +1154,8 @@ def _attempt_history_options(
         policy, json.loads(content) if content is not None else None,
         strategy["history_requirements"],
     )
+    from prajnatrade.snapshot_baseline import first_ready_open
+
     if first_ready_open(data, **options) != policy["scoring_start"]:
         raise ProtocolError(
             "INSUFFICIENT_HISTORY", "discovery", "inspect",

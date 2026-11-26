@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_left
 from collections.abc import Mapping
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -35,21 +35,32 @@ from prajnatrade.backtest import (
 )
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.snapshot import read_discovery
-from prajnatrade.trading_status import halt_conflicts_with_volume, halt_covers_session
+from prajnatrade.trading_status import (
+    ACTUAL_OPEN_RULES as ACTUAL_OPEN_RULES,
+)
+from prajnatrade.trading_status import (
+    CN_TZ as CN_TZ,
+)
+from prajnatrade.trading_status import (
+    EXECUTION_PRICE_BASIS as EXECUTION_PRICE_BASIS,
+)
+from prajnatrade.trading_status import (
+    EXECUTION_RULE_VERSIONS as EXECUTION_RULE_VERSIONS,
+)
+from prajnatrade.trading_status import (
+    NEXT_OPEN_RULES as NEXT_OPEN_RULES,
+)
+from prajnatrade.trading_status import (
+    RETRY_INITIAL_RULES as RETRY_INITIAL_RULES,
+)
+from prajnatrade.trading_status import (
+    halt_conflicts_with_volume,
+    halt_covers_session,
+)
 
-#: Asia/Shanghai is the trading-time anchor for both baselines and Shadow Live.
-CN_TZ = timezone(timedelta(hours=8))
 _CN_TZ = CN_TZ  # backward-compatible private alias
 _TARGET_WEIGHTS = {symbol: 1.0 / len(ETF_SYMBOLS) for symbol in ETF_SYMBOLS}
 _EPSILON = 1e-12
-NEXT_OPEN_RULES = "next-open-v1"
-RETRY_INITIAL_RULES = "retry-initial-v1"
-#: Fill an order effective before the open at the sealed, evidenced actual daily
-#: open, including a halted-at-open session whose bar carries that open (ADR 0002).
-ACTUAL_OPEN_RULES = "actual-open-v1"
-EXECUTION_RULE_VERSIONS = (NEXT_OPEN_RULES, RETRY_INITIAL_RULES, ACTUAL_OPEN_RULES)
-#: The sealed execution basis echoed by every fill and by a round receipt.
-EXECUTION_PRICE_BASIS = "unadjusted_open"
 
 
 def run_discovery_strategy(
