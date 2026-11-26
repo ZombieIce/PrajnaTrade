@@ -22,14 +22,15 @@ import subprocess
 from pathlib import Path
 
 from cli_helpers import agent_cli, assert_hex, cli, ok, rejected, write_json
+from test_actual_open_cli import day_at, make_confirmed_suspension, schema_v3_fixture
 from test_discovery_split_cli import V1_PROTOCOL, V2_PROTOCOL, v2_round_input
 from test_experiment_cli import campaign_options
 from test_formal_validation_cli import (
-    _split_for_payload,
     add_version,
     formal_scenario,
     legacy_scenario,
     round_uses,
+    split_for_payload,
     submit_locked_experiment,
     validate_current,
     validate_version_id,
@@ -41,7 +42,6 @@ from test_research_loop_cli import (
     round_input,
     round_status,
     submit_version,
-    suspend_derived,
     trending_snapshot,
     validate_version,
     version_input,
@@ -55,6 +55,9 @@ from test_version_review_cli import (
     return_input,
     review,
 )
+
+from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.snapshot_baseline import ACTUAL_OPEN_RULES
 
 REVIEWER = "research-lead"
 REVIEW_REASON = "The passed receipt and explicit observation confirmation admit this version."
@@ -947,7 +950,7 @@ def trailing_only_successor_payload() -> dict:
     sealed snapshot identity changes.
     """
     payload = trending_snapshot(15)
-    trailing = _split_for_payload(payload)["trailing"]
+    trailing = split_for_payload(payload)["trailing"]
     trailing_dates = {
         row["date"]
         for row in payload["calendar"]
@@ -964,8 +967,8 @@ def test_v2_open_discloses_a_corrected_successor_on_the_same_development_slice(
 ) -> None:
     base = trending_snapshot(15)
     successor = trailing_only_successor_payload()
-    first_split = _split_for_payload(base)
-    second_split = _split_for_payload(successor)
+    first_split = split_for_payload(base)
+    second_split = split_for_payload(successor)
     assert second_split["development"] == first_split["development"]
     assert second_split["trailing"] != first_split["trailing"]
 
@@ -1435,15 +1438,27 @@ def test_returned_v1_is_reselected_on_its_reused_formal_receipt(tmp_path: Path) 
 def test_failed_and_insufficient_formal_receipts_cannot_be_approved(
     tmp_path: Path,
 ) -> None:
+    payload = trending_snapshot(15)
+    trailing_end = split_for_payload(payload)["trailing"]["end"]
+    for row in payload["raw_bars"]:
+        if row["date"] == trailing_end:
+            row.update({"open": 5, "high": 5, "low": 5, "close": 5})
+    for row in payload["derived"]:
+        if row["date"] == trailing_end:
+            row["value"] = 5
     failed_scenario = formal_scenario(
         tmp_path,
+        payload=payload,
         name="failed-approval",
         hard_conditions=[
-            {"id": "impossible", "metric": "net_return", "operator": ">=", "value": 10}
+            {"id": "loss-limit", "metric": "net_return", "operator": ">=", "value": -0.01}
         ],
     )
+    assert failed_scenario["experiment"]["discovery"]["metrics"]["total_return"] >= -0.01
     failed = ok(validate_current(failed_scenario))
     assert failed["outcome"] == "failed"
+    assert failed["discovery_precheck"]["status"] == "eligible"
+    assert len(round_uses(failed_scenario)) == 1
     failed_calendar = calendar_file(tmp_path, name="failed-calendar.json")[0]
     rejected(
         approve_version(
@@ -1458,23 +1473,21 @@ def test_failed_and_insufficient_formal_receipts_cannot_be_approved(
         phase="review",
     )
 
-    payload = trending_snapshot(15)
-    preview = _split_for_payload(payload)
-    index = {row["date"]: position for position, row in enumerate(payload["calendar"])}
-    dev_end = index[preview["development"]["end"]]
-    for day_index in (dev_end - 1, dev_end):
-        suspend_derived(payload, day_index)
+    payload = schema_v3_fixture(15)
+    suspended_day = day_at(7)
+    make_confirmed_suspension(payload, suspended_day, ETF_SYMBOLS[0])
     insufficient_scenario = formal_scenario(
         tmp_path,
         payload=payload,
         name="insufficient-approval",
-        requirements=[
-            {"id": "strategy_lookback", "observations": 3, "mode": "consecutive_sessions"}
-        ],
+        execution_rules=ACTUAL_OPEN_RULES,
     )
+    assert suspended_day in insufficient_scenario["trailing_dates"]
     insufficient = ok(validate_current(insufficient_scenario))
     assert insufficient["outcome"] == "insufficient_evidence"
-    assert insufficient["reason"] == "SCORING_START_INSUFFICIENT"
+    assert insufficient["reason"] == "COVERAGE_INSUFFICIENT"
+    assert insufficient["discovery_precheck"]["status"] == "eligible"
+    assert len(round_uses(insufficient_scenario)) == 1
     insufficient_calendar = calendar_file(tmp_path, name="insufficient-calendar.json")[0]
     rejected(
         approve_version(
