@@ -34,7 +34,8 @@ from prajnatrade.backtest import (
     equal_weight_buy_and_hold,
 )
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.snapshot import halt_covers_session, read_discovery
+from prajnatrade.snapshot import read_discovery
+from prajnatrade.trading_status import halt_conflicts_with_volume, halt_covers_session
 
 #: Asia/Shanghai is the trading-time anchor for both baselines and Shadow Live.
 CN_TZ = timezone(timedelta(hours=8))
@@ -951,9 +952,8 @@ def is_executable_open(
     already effective before the open retrospectively, so no publication time
     gates the fill: a ``trading`` row needs a valid open and positive volume,
     and a ``partial_halt`` row also needs the sealed price source and a halt
-    window that does not cover the whole session (a covered session is a
-    confirmed no-trade day).  The daily open is a matching base price only,
-    never a signal input; signal inputs keep their own point-in-time cutoffs
+    window that leaves part of the session open for trading. The daily open is
+    a matching base price only. Signal inputs keep their own point-in-time cutoffs
     (ADR 0002).
     """
     if row is None or not _valid_price(row.get("open")):
@@ -1101,8 +1101,12 @@ def unfilled_reason(row: dict | None) -> str:
     # fill: the required open is missing.  An explicit null is not a conflict.
     if row.get("open_conflict") is not None:
         return "missing_required_open"
-    if status == "partial_halt" and halt_covers_session(row.get("halt"), row.get("date")):
-        return "confirmed_no_trade"
+    if status == "partial_halt":
+        halt, day = row.get("halt"), row.get("date")
+        if halt_conflicts_with_volume(halt, day, row.get("volume")):
+            return "unknown_trading_status"
+        if halt_covers_session(halt, day):
+            return "confirmed_no_trade"
     return "missing_required_open"
 
 
