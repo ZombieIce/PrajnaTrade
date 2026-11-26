@@ -49,7 +49,7 @@ LEGACY_POSITION_EVIDENCE = {
 
 def _v3_run(
     tmp_path, name, payload, *, family="equal_weight", parameters=None,
-    execution_rules=ACTUAL_OPEN_RULES,
+    execution_rules=ACTUAL_OPEN_RULES, slippage_bps=0,
 ):
     """Seal a schema-3 payload and run one public-CLI Campaign on it."""
     project = tmp_path / f"{name}-project"
@@ -57,7 +57,7 @@ def _v3_run(
     ok(cli("project", "init", "--project", str(project)))
     campaign = create_campaign(
         project, sealed["store"], sealed["snapshot_id"],
-        "--execution-rules", execution_rules,
+        "--execution-rules", execution_rules, "--slippage-bps", str(slippage_bps),
     )
     experiment = submit_experiment(
         project, campaign["campaign_id"], tmp_path / f"{name}-experiment.json", "run",
@@ -492,6 +492,24 @@ def test_actual_open_sell_then_buy_uses_realized_sell_net(tmp_path):
     assert blocked_run["metrics"]["ending_equity"] == pytest.approx(99950.02498750624)
 
 
+def _partial_exit_snapshot():
+    held, seller = ETF_SYMBOLS[:2]
+    # Nine sessions seal to a five-session Discovery interval: the entry fills
+    # on its fourth session and the exit is attempted on its last one.
+    payload = schema_v3_fixture(9)
+    for symbol, values in (
+        (held, (100.0, 100.0, 110.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0)),
+        (seller, (100.0, 100.0, 105.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0)),
+    ):
+        for index, value in enumerate(values):
+            derived_row(payload, day_at(index), symbol)["value"] = value
+    for symbol in ETF_SYMBOLS[2:]:
+        for index in range(9):
+            derived_row(payload, day_at(index), symbol)["value"] = 100.0
+    make_confirmed_suspension(payload, day_at(4), held)
+    return payload
+
+
 def test_actual_open_explicit_exits_execute_when_another_holding_is_unpriced(
     tmp_path,
 ):
@@ -504,23 +522,9 @@ def test_actual_open_explicit_exits_execute_when_another_holding_is_unpriced(
     keeps every share and is recorded with its sealed-row reason.
     """
     entry_day, exit_day = day_at(3), day_at(4)
-    seller, retained = ETF_SYMBOLS[0], ETF_SYMBOLS[1]
-    # Nine sessions seal to a five-session Discovery interval: the entry fills
-    # on its fourth session and the exit is attempted on its last one.
-    payload = schema_v3_fixture(9)
-    for symbol, values in (
-        (seller, (100.0, 100.0, 110.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0)),
-        (retained, (100.0, 100.0, 105.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0)),
-    ):
-        for index, value in enumerate(values):
-            derived_row(payload, day_at(index), symbol)["value"] = value
-    for symbol in ETF_SYMBOLS[2:]:
-        for index in range(9):
-            derived_row(payload, day_at(index), symbol)["value"] = 100.0
-    make_confirmed_suspension(payload, exit_day, seller)
-
+    seller, retained = ETF_SYMBOLS[:2]
     sample = _v3_run(
-        tmp_path, "explicit-exit", payload,
+        tmp_path, "explicit-exit", _partial_exit_snapshot(),
         family="momentum",
         parameters={"lookback": 2, "top_k": 2, "cash_if_negative": True},
     )
@@ -579,6 +583,84 @@ def test_actual_open_explicit_exits_execute_when_another_holding_is_unpriced(
     assert [
         attempt for attempt in benchmark["order_attempts"] if attempt["date"] == exit_day
     ] == []
+
+
+def test_actual_open_explicit_sell_funds_single_full_target_with_unknown_equity(tmp_path):
+    entry_day, switch_day = day_at(3), day_at(4)
+    held, seller, buyer = ETF_SYMBOLS[:3]
+    payload = _partial_exit_snapshot()
+    derived_row(payload, entry_day, buyer)["value"] = 120.0
+    sample = _v3_run(
+        tmp_path, "cash-funded-switch", payload, family="trend_filter",
+        parameters={"lookback": 2}, slippage_bps=10,
+    )
+    candidate, _benchmark = _sides(sample["experiment"])
+    signal = candidate["signals"][-1]
+    assert signal["target_weights"][held] == signal["target_weights"][seller] == 0.0
+    assert signal["target_weights"][buyer] == 1.0
+    assert candidate["order_attempts"][-1] == {
+        "signal_date": entry_day,
+        "date": switch_day,
+        "attempts": 1,
+        "status": "partially_filled",
+        "filled_symbols": [seller, buyer],
+        "unfilled": [{"symbol": held, "reason": "confirmed_no_trade"}],
+        "basket_complete": False,
+    }
+
+    fills = [fill for fill in candidate["fills"] if fill["date"] == switch_day]
+    assert [(fill["symbol"], fill["side"]) for fill in fills] == [
+        (seller, "sell"), (buyer, "buy"),
+    ]
+    sell, buy = fills
+    # Each initial parcel cost 50,000 including the 5 bp fee and 10 bp slippage.
+    # The open is 10 for both trades. The exit realizes 49,850.22473778096 after
+    # costs, buying 4,977.553654519489 shares at 10.01 plus the 5 bp fee.
+    assert sell["quantity"] == pytest.approx(4992.508740634678)
+    assert sell["price"] == pytest.approx(9.99)
+    assert sell["fee"] == pytest.approx(24.937581159470215)
+    assert sell["slippage"] == pytest.approx(49.92508740634678)
+    assert buy["quantity"] == pytest.approx(4977.553654519489)
+    assert buy["price"] == pytest.approx(10.01)
+    assert buy["fee"] == pytest.approx(24.912656040870044)
+    assert buy["slippage"] == pytest.approx(49.775536545194894)
+
+    before, after = candidate["equity_curve"][-2:]
+    assert before["cash"] == pytest.approx(0.0, abs=1e-9)
+    assert after["cash"] == pytest.approx(0.0, abs=1e-9)
+    assert after["holdings"][held]["quantity"] == before["holdings"][held]["quantity"]
+    assert after["holdings"][seller]["quantity"] == 0.0
+    assert after["holdings"][buyer]["quantity"] == pytest.approx(4977.553654519489)
+    assert after["nav"] is None
+    assert candidate["metrics"]["fees_paid"] == pytest.approx(99.82524969409338)
+    assert candidate["position_evidence"]["basket_build_state"] == "partial"
+    assert candidate["position_evidence"]["unfilled_basket_signals"] == 1
+
+
+def test_actual_open_cash_capped_buy_requires_spendable_cash(tmp_path):
+    entry_day, switch_day = day_at(3), day_at(4)
+    held, seller, buyer = ETF_SYMBOLS[:3]
+    payload = _partial_exit_snapshot()
+    derived_row(payload, entry_day, buyer)["value"] = 120.0
+    make_confirmed_suspension(payload, switch_day, seller)
+    for symbol in (held, seller):
+        # The two cash-capped entries at this price can leave rounding dust.
+        raw_row(payload, entry_day, symbol).update(open=11.0, high=11.0)
+    sample = _v3_run(
+        tmp_path, "cash-funded-switch-blocked", payload, family="trend_filter",
+        parameters={"lookback": 2}, slippage_bps=10,
+    )
+    candidate, _benchmark = _sides(sample["experiment"])
+    before, after = candidate["equity_curve"][-2:]
+    assert before["cash"] == pytest.approx(0.0, abs=1e-9)
+    assert after["cash"] == before["cash"]
+    assert after["holdings"][buyer]["quantity"] == 0.0
+    assert [fill["date"] for fill in candidate["fills"]] == [entry_day, entry_day]
+    assert candidate["order_attempts"][-1]["unfilled"] == [
+        {"symbol": held, "reason": "confirmed_no_trade"},
+        {"symbol": seller, "reason": "confirmed_no_trade"},
+        {"symbol": buyer, "reason": "equity_basis_unknown"},
+    ]
 
 
 def test_actual_open_held_no_trade_sells_only_the_explicit_exit(tmp_path):

@@ -10,6 +10,8 @@ import pandas as pd
 
 from prajnatrade.data import CASH, ETF_SYMBOLS, ValidatedData
 
+_CASH_ROUNDING_EPSILON = 1e-8
+
 Strategy = Callable[
     [pd.DataFrame, Mapping[str, Any]], Mapping[str, float] | None
 ]
@@ -285,12 +287,15 @@ def _rebalance_at_open(
     shares: dict[str, float],
     fee_rate: float,
     slippage_rate: float,
+    *,
+    cash_capped_buy: str | None = None,
 ) -> tuple[list[dict[str, Any]], float, dict[str, float], dict[str, float]]:
     """Match sells then buys at the given opens, skipping symbols without one.
 
     A symbol whose open is absent or not a positive price is left untouched: it
     cannot trade, so its shares and cash stay in the account. Without a missing
     price the result is the same as matching every symbol at its open.
+    A designated cash-capped buy is the only buy and uses cash after sells.
     """
     fills: list[dict[str, Any]] = []
     costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
@@ -318,13 +323,18 @@ def _rebalance_at_open(
     buys: list[tuple[str, float, float, float, float]] = []
     total_buy_cost = 0.0
     for symbol in ETF_SYMBOLS:
-        quantity = max(0.0, target_shares[symbol] - shares[symbol])
-        if quantity <= 1e-12:
-            continue
         market_price = _execution_price(open_prices.get(symbol))
         if market_price is None:
             continue
         fill_price = market_price * (1.0 + slippage_rate)
+        if symbol == cash_capped_buy:
+            if cash < _CASH_ROUNDING_EPSILON:
+                continue
+            quantity = cash / (fill_price * (1.0 + fee_rate))
+        else:
+            quantity = max(0.0, target_shares[symbol] - shares[symbol])
+        if quantity <= 1e-12:
+            continue
         fee = quantity * fill_price * fee_rate
         cost = quantity * fill_price + fee
         buys.append((symbol, quantity, market_price, fill_price, fee))
@@ -345,7 +355,7 @@ def _rebalance_at_open(
         costs["fees"] += fee
         costs["slippage"] += slippage_cost
 
-    if cash < 0 and cash > -1e-8:
+    if -_CASH_ROUNDING_EPSILON < cash < 0:
         cash = 0.0
     return fills, cash, shares, costs
 
