@@ -314,10 +314,9 @@ a known execution gap, sorted by date and symbol.
   contradicted by positive reported volume. With `status_conflict`, the
   manifest and preflight receipt include both evidence references.
 
-`gaps` keeps its exact historical shape and population for every schema
-version, so old consumers are unchanged: an evidenced actual open is no longer
-declared as a raw-bar gap, while a confirmed no-trade day, a missing required
-open and a source conflict still are. The formal trailing pre-read gate reads
+`gaps` keeps its historical shape and reports missing raw fields. The
+execution-evidence block also reports a regular row with zero volume when
+all raw fields are present. The formal trailing pre-read gate reads
 `execution_evidence` when the sealed manifest claims schema 3. Reseal snapshots
 built with the provisional schema-3 classification before a new formal read.
 Under [the formal gate](#formal-trailing-validation-protocol-v2), a trailing
