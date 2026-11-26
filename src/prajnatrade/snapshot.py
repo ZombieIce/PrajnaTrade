@@ -694,6 +694,7 @@ def _prepare(
 
     records: dict[str, list[dict]] = {}
     real_raw_bars: dict[tuple[str, str], dict] = {}
+    action_sequences: dict[tuple[str, str], set[int]] = {}
     for kind in KINDS:
         rows = data.get(kind)
         if not isinstance(rows, list) or (kind != "corporate_actions" and not rows):
@@ -723,6 +724,17 @@ def _prepare(
                     raise ValueError("Invalid corporate action terms evidence.")
                 if action_type == "cash_dividend" and row["pay_date"] is not None:
                     _date(row["pay_date"])
+                if "sequence" in row:
+                    sequence = row["sequence"]
+                    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+                        raise ValueError("Invalid corporate action sequence.")
+                    seq_key = (row["date"], row["symbol"])
+                    seen = action_sequences.setdefault(seq_key, set())
+                    if sequence in seen:
+                        raise ValueError(
+                            "Duplicate corporate action sequence for date and symbol."
+                        )
+                    seen.add(sequence)
                 if is_real:
                     _real_corporate_action(row)
             if kind in ("raw_bars", "derived"):
@@ -753,7 +765,20 @@ def _prepare(
                         evidence_kinds=evidence_kinds,
                     )
                     real_raw_bars[(row["date"], row["symbol"])] = row
-        records[kind] = sorted(rows, key=lambda row: (row["date"], row.get("symbol", ""), _bytes(row)))
+        if kind == "corporate_actions":
+            records[kind] = sorted(
+                rows,
+                key=lambda row: (
+                    row["date"],
+                    row.get("symbol", ""),
+                    (0, row["sequence"]) if "sequence" in row else (1, 0),
+                    _bytes(row),
+                ),
+            )
+        else:
+            records[kind] = sorted(
+                rows, key=lambda row: (row["date"], row.get("symbol", ""), _bytes(row))
+            )
     if is_real:
         _real_derived(records["derived"], real_raw_bars, schema_version=schema_version)
 
