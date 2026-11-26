@@ -99,6 +99,16 @@ unchanged v1 kickoff/locked/receipt shape, and includes one direct unit test of
 `snapshot.verify_discovery_split` for tampered descriptors and payloads. The
 file is fast and not marked `isolation`.
 
+## Dual-loop synthetic acceptance (#35)
+
+`tests/test_issue35_synthetic_acceptance_cli.py` follows two locked versions
+from one 70/30 Discovery split through formal Validation, manual
+simulated-tracking approval and daily Shadow Live updates. It verifies the
+orders against their next-session terminal states and recomputes the common
+interval and both full histories from the verified ledger reports. The test
+runs in fast mode. The [evidence index](../acceptance/issue-35-synthetic.md)
+lists the replay command and retained artifacts.
+
 ## Authorized full-history tests (#61)
 
 `tests/test_full_history_cli.py` drives the public `snapshot seal --full-history`,
@@ -235,8 +245,7 @@ CLI and scored under `actual-open-v1`: the `execution_evidence` classifications
 are `actual_open_after_halt` / `confirmed_no_trade`, the equal-weight Discovery
 fill on the halt day uses base price `10.5` and echoes the sealed
 `open_evidence`, and the confirmed no-trade symbol never fills (4/5). The real
-45-row verification stays with #35; the file is fast and not marked
-`isolation`.
+45-row verification belongs to actual use. This file runs in fast mode.
 
 ## Formal trailing Validation tests (#50-T2)
 

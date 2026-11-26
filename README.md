@@ -254,9 +254,9 @@ can record `missing_required_open`. A confirmed whole-day halt is `suspended`
 with null prices. If the vendor reports positive trading volume against a
 whole-day halt notice, the row is `unknown` and the seal records
 `unknown_status`. `build_snapshot_input` uses the converted closes to derive
-total returns and assembles the document `snapshot seal` accepts. The real
-re-acquisition and its 45-row verification are tracked by #35. Schema-2 manifests
-and their receipts retain their historical format and interpretation.
+total returns and assembles the document `snapshot seal` accepts. Real
+re-acquisition and its 45-row verification belong to actual use. Schema-2
+manifests and their receipts retain their historical format and interpretation.
 The test suite uses synthetic fixtures.
 The [ADR](docs/adr/0002-actual-daily-open-execution.md) records why the fill
 price is a matching base price and never a signal input.
@@ -1503,9 +1503,9 @@ version, submission, experiment, `validation` (kind/protocol/development/
 trailing/scoring/warmup/provenance/usage/summary), `details`, `feedback`,
 `review_state` and `tracking`; a manual admission read appears as a `manual`
 use row and a consumed admission; the published `provenance` block names the
-snapshot, the frozen partition and both slice content hashes. This is a
-synthetic mechanism check: it does not collect the real #35 receipt or claim
-real-chain evidence.
+snapshot, the frozen partition and both slice content hashes. The
+[synthetic #35 acceptance](docs/acceptance/issue-35-synthetic.md) follows
+two formal receipts through approval and into their simulated ledgers.
 
 After a corrected data source or a platform fix, use `round revalidate` when
 the original selection reason still holds:
@@ -1777,11 +1777,9 @@ receipt records the `outcome` and `reason`; approval is refused later.
 synthetic prices, a synthetic feed and no broker, real order, credential or
 network. The public-CLI tests demonstrate the #43 round, receipt, review and
 observation rules and the #50 split, formal Validation, admission, detail,
-feedback, reuse-disclosure and traceability mechanisms; they are not evidence of
-real forward performance, do not satisfy the #35 real-chain gate (which needs a
-real receipt linking the snapshot, round, version, warmup source, actual
-development and scoring dates, usage and feedback) and do not change the #17
-acceptance verdict.
+feedback, reuse-disclosure and traceability mechanisms. The
+[#35 evidence index](docs/acceptance/issue-35-synthetic.md) shows the combined
+synthetic replay. The historical #17 report records the real-use verdict.
 
 ### Direction-bound research (#37)
 
@@ -2959,8 +2957,7 @@ transaction.
 **Synthetic scope.** This remains a synthetic mechanism test: synthetic
 snapshot/journal, synthetic prices and a synthetic feed, with no real notice,
 real market data, broker or network. It demonstrates the accounting and
-idempotency rules of #16/#33; it is not evidence of real forward performance and
-does not complete the real-chain acceptance of #35.
+idempotency rules of #16/#33.
 
 #### 7. Multi-version forward comparison (#34)
 
@@ -3063,10 +3060,9 @@ store.
 
 **Synthetic scope.** The comparison is synthetic engineering evidence: synthetic
 releases, synthetic feed and synthetic prices, with no real forward sessions,
-no broker and no network. It demonstrates the #9/#34 comparison rules; it is
-not evidence of real forward performance and does not satisfy the real-chain
-gate of #35 (two real independently validated releases over at least two
-common committed real forward sessions).
+no broker and no network. It demonstrates the #9/#34 comparison rules.
+The [#35 replay](docs/acceptance/issue-35-synthetic.md) applies the same
+comparison to two independently approved simulated-tracking versions.
 
 **Other limits.**
 
@@ -3095,7 +3091,15 @@ common committed real forward sessions).
   remains synthetic mechanism evidence: no real broker, no real orders, no real
   market data and no end-to-end acceptance claim.
 
-## End-to-end acceptance (#35, synthetic tooling only — not passed)
+## Dual-loop synthetic acceptance (#35)
+
+The public-CLI replay follows the 70/30 Discovery split, formal Validation and
+manual simulated-tracking approval into two Shadow Live accounts. The
+[evidence index](docs/acceptance/issue-35-synthetic.md) gives the replay command,
+expected and measured results, and artifact paths for all three acceptance
+conditions.
+
+## Historical six-scenario acceptance (#17)
 
 `prajnatrade acceptance report` is the operator-only acceptance checklist for
 issue #17. It validates one strict evidence manifest and renders a deterministic
