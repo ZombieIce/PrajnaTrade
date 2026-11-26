@@ -12,6 +12,7 @@ import pytest
 from cli_helpers import cli, ok, write_json
 from test_actual_open_cli import (
     day_at,
+    derived_row,
     make_confirmed_suspension,
     raw_row,
     schema_v3_fixture,
@@ -856,6 +857,98 @@ def test_account_isolation_replay_idempotency_and_strict_close_control(tmp_path:
     assert "valuation_summary" not in strict_disc
     assert strict_disc["metrics"]["max_drawdown"] is None
     assert strict_curve[resume_day]["nav"] == pytest.approx(1020.0)
+
+
+def test_unresolved_corporate_action_gap_persists_after_exiting_position(
+    tmp_path: Path,
+) -> None:
+    """Bug 1 regression: unresolved corporate action gap must persist after exiting position."""
+    # 20 sessions -> Discovery = 12 sessions (indices 0..11).
+    # Day 3: momentum(lookback=2, top_k=1) buys 100 shares of TARGET @ 10.0.
+    # Day 4: TARGET is confirmed suspended AND has a late corporate action (09:31)
+    #        -> unresolved[TARGET] records corporate_action_terms_or_availability_unknown.
+    # Days 5..11: TARGET resumes trading @ 10.0 (flat derived=10.0), while SYMBOLS[1]
+    #             surges in derived values so the signal at day 7 close (window 5..7)
+    #             rotates 100% into SYMBOLS[1] at day 8 open, selling ALL shares of TARGET!
+    # Days 8..11: shares[TARGET] == 0.0, yet unknown cash entitlement from day 4 means
+    #             NAV, total_return, and max_drawdown MUST stay unavailable (None)!
+    payload = schema_v3_fixture(20)
+    set_constant_prices(payload, raw_price=10.0)
+    other = SYMBOLS[1]
+    buy_day = day_at(3)
+    susp_day = day_at(4)
+    exit_day = day_at(8)
+    make_confirmed_suspension(payload, susp_day, TARGET)
+    for idx in range(5, 12):
+        day = day_at(idx)
+        derived_row(payload, day, TARGET)["value"] = 10.0
+        derived_row(payload, day, other)["value"] = round(10.0 * (1.20 ** (idx - 4)), 6)
+
+    payload["corporate_actions"] = [
+        _action(
+            date=susp_day,
+            symbol=TARGET,
+            action_type="cash_dividend",
+            available_at=f"{susp_day}T09:31:00+08:00",
+            cash_per_share=0.20,
+            pay_date=day_at(6),
+        ),
+    ]
+
+    sealed = seal_v3(tmp_path, payload, store="store-unres-exit", name="unres-exit")
+    proj, camp = init_campaign(
+        tmp_path,
+        sealed["store"],
+        sealed["snapshot_id"],
+        initial_cash=1000.0,
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+        execution_rules="actual-open-v1",
+        valuation_policy="carry-forward-suspended-v1",
+        project_name="proj-unres-exit",
+    )
+    rec = submit_strategy(tmp_path, proj, camp["campaign_id"], "sub-unres-exit")
+    disc = rec["discovery"]
+    curve = {p["date"]: p for p in disc["equity_curve"]}
+
+    # Verify TARGET was bought on day 3 and completely exited on day 8.
+    assert curve[buy_day]["holdings"][TARGET]["quantity"] == pytest.approx(100.0)
+    assert any(
+        f["date"] == exit_day and f["symbol"] == TARGET and f["side"] == "sell"
+        for f in disc["fills"]
+    )
+    assert curve[exit_day]["holdings"][TARGET]["quantity"] == pytest.approx(0.0)
+    assert curve[exit_day]["holdings"][other]["quantity"] > 0.0
+
+    # Unresolved action gap on day 4 MUST persist through day 8..11 even after exiting TARGET!
+    for idx in (4, 8, 9, 10, 11):
+        point = curve[day_at(idx)]
+        assert point["nav"] is None, f"expected nav=None on {day_at(idx)} after unresolved action"
+        assert point["valuation_basis"] == "missing"
+        assert point["holdings"][TARGET]["valuation_basis"] == "missing"
+        assert (
+            point["holdings"][TARGET]["gap_reason"]
+            == "corporate_action_terms_or_availability_unknown"
+        )
+    assert disc["metrics"]["total_return"] is None
+    assert disc["metrics"]["max_drawdown"] is None
+
+    # Control: strict-close-v1 also keeps nav=None after exiting TARGET.
+    proj_strict, camp_strict = init_campaign(
+        tmp_path,
+        sealed["store"],
+        sealed["snapshot_id"],
+        valuation_policy="strict-close-v1",
+        project_name="proj-unres-exit-strict",
+    )
+    strict_rec = submit_strategy(
+        tmp_path, proj_strict, camp_strict["campaign_id"], "sub-unres-exit-strict"
+    )
+    strict_curve = {p["date"]: p for p in strict_rec["discovery"]["equity_curve"]}
+    for idx in (8, 9, 10, 11):
+        assert strict_curve[day_at(idx)]["nav"] is None
+    assert strict_rec["discovery"]["metrics"]["total_return"] is None
+
 
 
 

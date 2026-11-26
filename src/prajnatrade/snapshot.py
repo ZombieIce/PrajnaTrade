@@ -11,7 +11,13 @@ import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from prajnatrade.trading_status import ETF_SYMBOLS, halt_conflicts_with_volume
+from prajnatrade.trading_status import (
+    ETF_SYMBOLS,
+    confirmed_no_trade_shape,
+    halt_conflicts_with_trade,
+    halt_conflicts_with_volume,
+    has_status_evidence_id,
+)
 from prajnatrade.trading_status import halt_covers_session as halt_covers_session
 
 KINDS = ("calendar", "raw_bars", "corporate_actions", "derived")
@@ -249,7 +255,7 @@ def _open_source_evidence(row: dict, evidence_kinds: dict[str, str]) -> dict | N
 
 
 def _valid_status_evidence_id(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+    return has_status_evidence_id(value)
 
 
 def _status_evidence(
@@ -510,42 +516,24 @@ def _complete_row(row: dict, kind: str, *, is_real: bool) -> bool:
     if status == "trading":
         return all(row.get(field) is not None for field in RAW_FIELDS)
     if status == "partial_halt":
-        return row.get("close") is not None
+        return row.get("close") is not None and not halt_conflicts_with_trade(
+            row.get("halt"), row["date"], row
+        )
     return False
 
 
-def _confirmed_no_trade_row(
-    row: dict, *, is_real: bool, schema_version: int,
-) -> bool:
+def _confirmed_no_trade_row(row: dict, *, is_real: bool) -> bool:
     """Whether a raw bar is a confirmed whole-day no-trade session (ADR 0003).
 
     Such a session preserves frozen common/authorized range boundaries instead of
     silently truncating them; missing, unknown, unexplained or conflicting rows
-    remain incomplete.
+    remain incomplete. Real snapshots require ``status_evidence_id`` (schema 3+)
+    so schema-2 real snapshots match carry-forward valuation rules.
     """
-    if row.get("open_conflict") is not None or row.get("status_conflict") is not None:
-        return False
-    status = row.get("trading_status")
-    if status == "suspended":
-        if any(row.get(field) is not None for field in RAW_FIELDS):
-            return False
-        if row.get("halt") is not None and not halt_covers_session(row["halt"], row["date"]):
-            return False
-        if is_real and schema_version >= 3 and not _valid_status_evidence_id(
-            row.get("status_evidence_id")
-        ):
-            return False
-        return True
-    if is_real and status == "partial_halt":
-        halt = row.get("halt")
-        volume = row.get("volume")
-        return (
-            halt_covers_session(halt, row["date"])
-            and volume in (None, 0)
-            and all(row.get(field) is None for field in ("open", "high", "low", "close"))
-            and (schema_version < 3 or _valid_status_evidence_id(row.get("status_evidence_id")))
-        )
-    return False
+    confirmed, _ = confirmed_no_trade_shape(
+        row, data_kind="real" if is_real else "synthetic"
+    )
+    return confirmed
 
 
 def _execution_evidence_row(row: dict) -> dict | None:
@@ -837,7 +825,6 @@ def _prepare(
                     _confirmed_no_trade_row(
                         indexed["raw_bars"][day, symbol],
                         is_real=is_real,
-                        schema_version=schema_version,
                     )
                     and (
                         indexed["derived"][day, symbol].get("value") is None

@@ -47,6 +47,12 @@ from test_research_loop_cli import (
     validate_version,
     version_input,
 )
+from test_suspended_valuation_cli import (
+    init_campaign,
+    schema_v3_on_dates,
+    set_constant_prices,
+    weekday_dates,
+)
 
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.discovery_summary import summarize_discovery_quarters
@@ -92,25 +98,21 @@ def _zero_cost_split_campaign(
     """Seal a dividend-free payload and freeze a zero-cost 70/30 split Campaign."""
     sealed = seal_v3(root, payload, name=name)
     store = sealed["store"]
-    project = root / name
-    ok(cli("project", "init", "--project", str(project)))
-    args = [
-        "campaign", "create",
-        "--project", str(project),
-        "--store", str(store),
-        "--snapshot-id", sealed["snapshot_id"],
-        "--attempts", "8",
-        "--max-seconds", "180",
-        "--initial-cash", str(initial_cash),
-        "--transaction-cost-bps", "0",
-        "--slippage-bps", "0",
-        "--discovery-warmup-sessions", str(warmup),
-        "--discovery-split", "70/30",
-        "--execution-rules", execution_rules,
-    ]
-    if valuation_policy is not None:
-        args += ["--valuation-policy", valuation_policy]
-    campaign = ok(cli(*args))
+    project, campaign = init_campaign(
+        root,
+        store,
+        sealed["snapshot_id"],
+        initial_cash=initial_cash,
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+        execution_rules=execution_rules,
+        valuation_policy=valuation_policy,
+        discovery_split="70/30",
+        discovery_warmup_sessions=warmup,
+        attempts=8,
+        max_seconds=180,
+        project_name=name,
+    )
     return project, store, campaign
 
 
@@ -121,50 +123,13 @@ def _dividend_free_v3_fixture(
     raw_price: float = 10.0,
 ) -> dict:
     """Dividend-free schema-3 fixture where SYMBOLS[0] leads momentum(lookback=2, top_k=1)."""
-    payload = schema_v3_fixture(session_count)
+    payload = (
+        schema_v3_on_dates(weekday_dates(start_date, session_count))
+        if start_date is not None
+        else schema_v3_fixture(session_count)
+    )
     payload["corporate_actions"] = []
-    if start_date is not None:
-        # Shift calendar dates so fixtures can cleanly span calendar quarters.
-        old_dates = [row["date"] for row in payload["calendar"]]
-        new_dates: list[str] = []
-        cursor = start_date
-        while len(new_dates) < len(old_dates):
-            if cursor.weekday() < 5:
-                new_dates.append(cursor.isoformat())
-            cursor += timedelta(days=1)
-        mapping = dict(zip(old_dates, new_dates, strict=True))
-        for row in payload["calendar"]:
-            new_day = mapping[row["date"]]
-            row["date"] = new_day
-            row["available_at"] = f"{new_day}T08:00:00+08:00"
-        for row in payload["raw_bars"]:
-            new_day = mapping[row["date"]]
-            row["date"] = new_day
-            row["available_at"] = f"{new_day}T20:00:00+08:00"
-            row["open_available_at"] = f"{new_day}T09:30:00+08:00"
-            row["close_available_at"] = f"{new_day}T15:05:00+08:00"
-        for row in payload["derived"]:
-            new_day = mapping[row["date"]]
-            row["date"] = new_day
-            row["available_at"] = f"{new_day}T20:00:00+08:00"
-        for symbol_cov in payload["symbol_coverage"].values():
-            symbol_cov["start"] = new_dates[0]
-            symbol_cov["end"] = new_dates[-1]
-        for source in payload["sources"].values():
-            source["coverage_start"] = new_dates[0]
-            source["coverage_end"] = new_dates[-1]
-
-    days = [row["date"] for row in payload["calendar"]]
-    for index, day in enumerate(days):
-        for sym_idx, symbol in enumerate(SYMBOLS):
-            row = raw_row(payload, day, symbol)
-            row["open"] = raw_price
-            row["high"] = raw_price
-            row["low"] = raw_price
-            row["close"] = raw_price
-            drow = derived_row(payload, day, symbol)
-            slope = 0.05 if sym_idx == 0 else 0.001 * (len(SYMBOLS) - sym_idx)
-            drow["value"] = round(10.0 * ((1.0 + slope) ** index), 6)
+    set_constant_prices(payload, raw_price=raw_price)
     return payload
 
 
