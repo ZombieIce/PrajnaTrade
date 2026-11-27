@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
@@ -10,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from prajnatrade.trading_status import (
+    CASH,
     ETF_SYMBOLS,
     halt_conflicts_with_trade,
 )
@@ -57,22 +59,24 @@ def normalize_decision_policy(
     *,
     signal_cutoff: str | None = None,
     signal_timezone: str | None = None,
+    monthly_deferral: bool | None = None,
 ) -> dict[str, Any]:
     """Validate and return a canonical frozen decision policy dict."""
     if isinstance(policy, Mapping):
         version = policy.get("version")
         cutoff_raw = signal_cutoff if signal_cutoff is not None else policy.get("signal_cutoff", DEFAULT_SIGNAL_CUTOFF)
         tz_raw = signal_timezone if signal_timezone is not None else policy.get("signal_timezone", DEFAULT_SIGNAL_TIMEZONE)
-        extra = (
-            {"monthly_deferral": bool(policy["monthly_deferral"])}
-            if "monthly_deferral" in policy
-            else {}
-        )
+        if monthly_deferral is not None:
+            extra = {"monthly_deferral": bool(monthly_deferral)}
+        elif "monthly_deferral" in policy:
+            extra = {"monthly_deferral": bool(policy["monthly_deferral"])}
+        else:
+            extra = {}
     elif isinstance(policy, str):
         version = policy
         cutoff_raw = signal_cutoff if signal_cutoff is not None else DEFAULT_SIGNAL_CUTOFF
         tz_raw = signal_timezone if signal_timezone is not None else DEFAULT_SIGNAL_TIMEZONE
-        extra = {}
+        extra = {"monthly_deferral": bool(monthly_deferral)} if monthly_deferral is not None else {}
     else:
         raise ValueError(f"Unsupported decision_policy: {policy!r}.")
 
@@ -323,4 +327,183 @@ def select_common_observations(
         "observation_values": selected_values,
         "latest_values": latest_values,
         "requirements": results,
+    }
+
+
+STRATEGY_PURPOSES = ("monthly", "risk_control", "rebalance", "initial")
+
+
+def compute_prior_close_weights(
+    nav_point: Mapping[str, Any] | None,
+    shares: Mapping[str, float],
+    cash: float,
+    receivables: float = 0.0,
+    *,
+    symbols: Sequence[str] = ETF_SYMBOLS,
+) -> dict[str, float] | None:
+    """Compute portfolio close weights from ``nav_point``, or ``None`` when NAV is unavailable."""
+    if not isinstance(nav_point, Mapping):
+        return None
+    nav_raw = nav_point.get("nav")
+    if nav_raw is None:
+        return None
+    nav = float(nav_raw)
+    if not math.isfinite(nav) or nav <= 0.0:
+        return None
+    positions = nav_point.get("positions")
+    if not isinstance(positions, Mapping):
+        positions = nav_point.get("holdings")
+    if not isinstance(positions, Mapping):
+        return None
+    weights: dict[str, float] = {}
+    for symbol in symbols:
+        held = float(shares.get(symbol, 0.0))
+        pos = positions.get(symbol)
+        mv = pos.get("market_value") if isinstance(pos, Mapping) else None
+        if mv is None:
+            if held > 1e-12:
+                return None
+            weights[symbol] = 0.0
+        else:
+            weights[symbol] = float(mv) / nav
+    weights[CASH] = (float(cash) + float(receivables)) / nav
+    return weights
+
+
+def _month_session_and_week_start(
+    signal_date: str,
+    sessions: Sequence[str],
+) -> tuple[int, bool]:
+    """Return 1-based ``month_session`` and ``week_start`` for ``signal_date`` on ``sessions``."""
+    month_prefix = signal_date[:7]
+    iso_week = date.fromisoformat(signal_date).isocalendar()[:2]
+    month_count = 0
+    prev_day: str | None = None
+    found = False
+    for day in sessions:
+        if day > signal_date:
+            break
+        if day[:7] == month_prefix:
+            month_count += 1
+        if day == signal_date:
+            found = True
+            break
+        prev_day = day
+    if not found:
+        month_count = 1
+    week_start = prev_day is None or date.fromisoformat(prev_day).isocalendar()[:2] != iso_week
+    return month_count, week_start
+
+
+def build_strategy_state(
+    *,
+    signal_date: str,
+    sessions: Sequence[str],
+    cash: float,
+    shares: Mapping[str, float],
+    equity: float | None,
+    prior_close_weights: Mapping[str, float] | None,
+    rebalance_anchor_date: str | None = None,
+    previous_order_attempted: Mapping[str, Any] | None = None,
+    last_filled_target: Mapping[str, float] | None = None,
+    last_monthly_filled_target: Mapping[str, float] | None = None,
+    history_windows: Mapping[str, Sequence[str]] | None = None,
+    monthly_deferral: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the canonical point-in-time strategy state dict shared across stages."""
+    month_session, week_start = _month_session_and_week_start(signal_date, sessions)
+    state: dict[str, Any] = {
+        "cash": float(cash),
+        "shares": {symbol: float(shares.get(symbol, 0.0)) for symbol in ETF_SYMBOLS},
+        "equity": float(equity) if equity is not None else None,
+        "signal_date": signal_date,
+        "month_session": month_session,
+        "week_start": week_start,
+        "rebalance_anchor_date": rebalance_anchor_date,
+        "previous_order_attempted": dict(previous_order_attempted) if previous_order_attempted is not None else None,
+        "last_filled_target": dict(last_filled_target) if last_filled_target is not None else None,
+        "last_monthly_filled_target": (
+            dict(last_monthly_filled_target) if last_monthly_filled_target is not None else None
+        ),
+        "prior_close_weights": dict(prior_close_weights) if prior_close_weights is not None else None,
+    }
+    if history_windows is not None:
+        state["history_windows"] = {k: list(v) for k, v in history_windows.items()}
+    if monthly_deferral is not None:
+        state["deferred_monthly"] = True
+        state["monthly_deferral"] = dict(monthly_deferral)
+    else:
+        state["deferred_monthly"] = False
+    return state
+
+
+def _validate_target_weights(weights: Mapping[str, Any]) -> dict[str, float]:
+    if not isinstance(weights, Mapping):
+        raise ValueError("Strategy must return a mapping of asset weights or None.")
+    unknown = sorted(set(weights) - set((*ETF_SYMBOLS, CASH)))
+    if unknown:
+        raise ValueError(f"Strategy returned unsupported assets: {', '.join(unknown)}.")
+    normalized: dict[str, float] = {}
+    for symbol in (*ETF_SYMBOLS, CASH):
+        raw = weights.get(symbol, 0.0)
+        try:
+            weight = float(raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Weight for {symbol} must be numeric.") from error
+        if not math.isfinite(weight) or weight < 0 or weight > 1:
+            raise ValueError(f"Weight for {symbol} must be finite and between 0 and 1.")
+        normalized[symbol] = weight
+    if not math.isclose(sum(normalized.values()), 1.0, rel_tol=0.0, abs_tol=1e-8):
+        raise ValueError("ETF and CASH weights must sum to 1.")
+    return normalized
+
+
+def parse_strategy_output(
+    raw_result: Any,
+    *,
+    signal_date: str,
+) -> dict[str, Any] | None:
+    """Parse plain-weight or structured strategy output into a canonical target record."""
+    if raw_result is None:
+        return None
+    if isinstance(raw_result, Mapping) and "weights" in raw_result:
+        raw_weights = raw_result.get("weights")
+        if raw_weights is None:
+            return None
+        normalized = _validate_target_weights(raw_weights)
+        purpose = str(raw_result.get("purpose", "rebalance"))
+        if purpose not in STRATEGY_PURPOSES:
+            raise ValueError(
+                f"Unsupported strategy purpose {purpose!r}; expected one of {STRATEGY_PURPOSES}."
+            )
+        cycle = raw_result.get("cycle")
+        if cycle is not None and not isinstance(cycle, str):
+            raise ValueError(f"Strategy cycle must be a string, got {cycle!r}.")
+        raw_fixed = raw_result.get("fixed_amounts")
+        fixed_amounts: dict[str, float] | None = None
+        if raw_fixed is not None:
+            if not isinstance(raw_fixed, Mapping):
+                raise ValueError("fixed_amounts must be a mapping of symbol to non-negative float.")
+            unknown_fixed = sorted(set(raw_fixed) - set(ETF_SYMBOLS))
+            if unknown_fixed:
+                raise ValueError(f"Unsupported fixed_amounts symbols: {', '.join(unknown_fixed)}.")
+            fixed_amounts = {}
+            for sym, val in raw_fixed.items():
+                amount = float(val)
+                if not math.isfinite(amount) or amount < 0.0:
+                    raise ValueError(f"fixed_amounts[{sym}] must be finite and non-negative.")
+                if amount > 0.0:
+                    fixed_amounts[sym] = amount
+        return {
+            "weights": normalized,
+            "purpose": purpose,
+            "cycle": cycle if cycle is not None else signal_date[:7],
+            "fixed_amounts": fixed_amounts or None,
+        }
+    normalized = _validate_target_weights(raw_result)
+    return {
+        "weights": normalized,
+        "purpose": "rebalance",
+        "cycle": signal_date[:7],
+        "fixed_amounts": None,
     }

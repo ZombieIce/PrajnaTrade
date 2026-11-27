@@ -273,6 +273,15 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_export.add_argument("--snapshot-id", required=True)
     shadow_export.add_argument("--through-date", required=True)
     shadow_export.add_argument("--output", required=True, type=Path)
+    shadow_migrate = shadow_commands.add_parser(
+        "migrate-state",
+        help="verify or migrate a legacy Shadow ledger's stateful tracking state",
+    )
+    shadow_migrate.add_argument("--ledger", required=True, type=Path)
+    shadow_migrate.add_argument("--version", required=True)
+    shadow_migrate.add_argument("--new-start-date", default=None)
+    shadow_migrate.add_argument("--initial-cash", type=float, default=None)
+    shadow_migrate.add_argument("--initial-positions", default=None)
 
     acceptance = commands.add_parser(
         "acceptance",
@@ -327,6 +336,10 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     create.add_argument(
         "--signal-timezone", default=None,
         help="frozen signal cutoff IANA timezone (requires --decision-policy)",
+    )
+    create.add_argument(
+        "--monthly-deferral", action="store_true", default=None,
+        help="enable intra-month deferral of paused scheduled monthly signals (requires --decision-policy)",
     )
     create.add_argument(
         "--lot-size", type=int,
@@ -897,6 +910,7 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 decision_policy=args.decision_policy,
                 signal_cutoff=args.signal_cutoff,
                 signal_timezone=args.signal_timezone,
+                monthly_deferral=True if args.monthly_deferral else None,
                 lot_size=args.lot_size,
                 lot_sizes=parsed_lot_sizes,
                 strategy_executor=args.strategy_executor,
@@ -1527,6 +1541,19 @@ def _shadow_command(args: argparse.Namespace) -> int:
                 args.snapshot_id,
                 through_date=args.through_date,
                 output=args.output,
+            )
+        elif args.shadow_command == "migrate-state":
+            parsed_pos = (
+                json.loads(args.initial_positions)
+                if args.initial_positions is not None
+                else None
+            )
+            result = shadow.verify_or_migrate_ledger(
+                args.ledger,
+                args.version,
+                new_start_date=args.new_start_date,
+                initial_cash=args.initial_cash,
+                initial_positions=parsed_pos,
             )
         else:
             result = shadow.write_report(args.ledger, args.version, args.output)

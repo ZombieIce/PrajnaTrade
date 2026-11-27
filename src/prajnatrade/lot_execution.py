@@ -285,6 +285,8 @@ def match_open_lot_day(
     attempt = {
         "signal_date": signal.get("date", day),
         "date": day,
+        "purpose": signal.get("purpose", "rebalance"),
+        "cycle": signal.get("cycle", str(signal.get("date", day))[:7]),
         "attempts": 1,
         "status": (
             "filled"
@@ -297,6 +299,7 @@ def match_open_lot_day(
         "unfilled": unfilled,
         "basket_complete": batch_complete,
         "batch_complete": batch_complete,
+        "zero_trade_satisfied": bool(batch_complete and not day_fills),
         "cash_constrained": cash_constrained,
         "lot_rounding_residual": float(lot_rounding_residual),
         "residual_reason": residual_reason,

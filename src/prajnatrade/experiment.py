@@ -539,6 +539,7 @@ def campaign_create(
     decision_policy: str | None = None,
     signal_cutoff: str | None = None,
     signal_timezone: str | None = None,
+    monthly_deferral: bool | None = None,
     lot_size: int | None = None,
     lot_sizes: Mapping[str, int] | None = None,
     strategy_executor: str = "none",
@@ -568,9 +569,12 @@ def campaign_create(
             decision_policy,
             signal_cutoff=signal_cutoff,
             signal_timezone=signal_timezone,
+            monthly_deferral=monthly_deferral,
         )
-    elif signal_cutoff is not None or signal_timezone is not None:
-        raise ValueError("--signal-cutoff and --signal-timezone require --decision-policy.")
+    elif signal_cutoff is not None or signal_timezone is not None or monthly_deferral is not None:
+        raise ValueError(
+            "--signal-cutoff, --signal-timezone, and --monthly-deferral require --decision-policy."
+        )
     executor_config = _resolve_executor_config(
         strategy_executor, strategy_image, executor,
     )
