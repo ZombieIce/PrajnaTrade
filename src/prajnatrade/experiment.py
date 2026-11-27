@@ -71,6 +71,8 @@ def _runtime_components(
         or valuation_version != STRICT_CLOSE_VALUATION
     ):
         files += ("trading_status.py",)
+    if valuation_version != STRICT_CLOSE_VALUATION:
+        files += ("valuation.py",)
     if history_policy is not None:
         files += ("experiment.py",)
     executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}

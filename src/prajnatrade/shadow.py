@@ -102,6 +102,21 @@ from prajnatrade.strategies import (
     make_strategy,
     normalize_strategy_spec,
 )
+from prajnatrade.trading_status import (
+    CARRY_FORWARD_SUSPENDED_VALUATION,
+    STRICT_CLOSE_VALUATION,
+    VALUATION_POLICY_VERSIONS,
+    halt_conflicts_with_volume,
+    halt_covers_session,
+    has_status_evidence_id,
+    valuation_policy_version,
+)
+from prajnatrade.valuation import (
+    CarryState,
+    classify_no_trade_for_valuation,
+    close_available,
+    value_carry_forward_session,
+)
 
 SCHEMA_VERSION = 1
 SCOPE = "synthetic"
@@ -250,13 +265,28 @@ class Feed:
         if not isinstance(payload, dict):
             raise ValueError("The Shadow Live feed must be a JSON object.")
         kind_version = (payload.get("data_kind"), payload.get("schema_version"))
-        if kind_version not in ((DATA_KIND, SCHEMA_VERSION), ("real", 2)):
-            raise ValueError("The Shadow Live feed must declare synthetic v1 or real v2.")
+        if kind_version not in (
+            (DATA_KIND, SCHEMA_VERSION),
+            ("real", 2),
+            ("synthetic", 3),
+            ("real", 3),
+        ):
+            raise ValueError(
+                "The Shadow Live feed must declare synthetic v1/v3 or real v2/v3."
+            )
         self.data_kind = kind_version[0]
+        self.schema_version = kind_version[1]
         is_real = self.data_kind == "real"
-        if is_real and payload.get("raw_price_basis") != "unadjusted":
-            raise ValueError("A real Shadow Live feed requires unadjusted raw prices.")
-        trading_statuses = snapshot.REAL_STATUSES if is_real else TRADING_STATUSES
+        is_v3 = self.schema_version >= 3
+        if (is_real or is_v3) and payload.get("raw_price_basis") != "unadjusted":
+            raise ValueError(
+                "A real or schema-3 Shadow Live feed requires unadjusted raw prices."
+            )
+        evidence_kinds = _feed_evidence_kinds(payload) if is_v3 else {}
+        self.evidence_kinds = evidence_kinds
+        trading_statuses = (
+            snapshot.REAL_STATUSES if (is_real or is_v3) else TRADING_STATUSES
+        )
         symbols = payload.get("symbols")
         if (
             not isinstance(symbols, list)
@@ -325,6 +355,10 @@ class Feed:
                 raise ValueError(f"Invalid OHLC values in raw_bars for {session} {symbol}.")
             if is_real:
                 _real_raw_timestamps(row)
+            elif is_v3:
+                _optional_raw_timestamps(row)
+            if is_v3:
+                _validate_v3_raw_bar(row, session, evidence_kinds)
             key = (session, symbol)
             if key in self.raw:
                 raise ValueError(f"Duplicate raw_bars row for {session} {symbol}.")
@@ -355,6 +389,7 @@ class Feed:
             raise ValueError("corporate_actions must be an array.")
         actions: list[dict[str, Any]] = []
         action_ids: set[str] = set()
+        action_sequences: dict[tuple[str, str], set[int]] = {}
         for raw_action in action_rows:
             if not isinstance(raw_action, dict):
                 raise ValueError("corporate_actions rows must be objects.")
@@ -372,6 +407,16 @@ class Feed:
             if action_id in action_ids:
                 raise ValueError(f"Duplicate corporate action id {action_id!r}.")
             action_ids.add(action_id)
+            if "sequence" in raw_action:
+                sequence = raw_action["sequence"]
+                if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+                    raise ValueError(f"{action_id} has invalid corporate action sequence.")
+                seen_seq = action_sequences.setdefault((session, symbol), set())
+                if sequence in seen_seq:
+                    raise ValueError(
+                        f"Duplicate corporate action sequence {sequence} for {session} {symbol}."
+                    )
+                seen_seq.add(sequence)
             action = dict(raw_action)
             action["action_id"] = action_id
             action["date"] = session
@@ -398,7 +443,15 @@ class Feed:
             ):
                 raise ValueError(f"{action_id} has invalid terms_evidence.")
             actions.append(action)
-        actions.sort(key=lambda item: (item["date"], item["symbol"], item["type"], item["action_id"]))
+        actions.sort(
+            key=lambda item: (
+                item["date"],
+                item["symbol"],
+                (0, item["sequence"]) if "sequence" in item else (1, 0),
+                item["type"],
+                item["action_id"],
+            )
+        )
         self.actions = tuple(actions)
         self.actions_by_date: dict[str, tuple[dict[str, Any], ...]] = {}
         for action in actions:
@@ -457,6 +510,302 @@ def _real_raw_timestamps(row: dict[str, Any]) -> None:
             shadow_calendar.parse_timestamp(row[timestamp], timestamp)
 
 
+def _optional_raw_timestamps(row: dict[str, Any]) -> None:
+    for field in ("open", "close"):
+        timestamp = f"{field}_available_at"
+        if row.get(timestamp) is not None:
+            shadow_calendar.parse_timestamp(row[timestamp], timestamp)
+
+
+def _feed_evidence_kinds(payload: dict[str, Any]) -> dict[str, str]:
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != {"items"}:
+        raise ValueError("A schema-3 Shadow Live feed requires an evidence block with only items.")
+    items = evidence["items"]
+    if not isinstance(items, list) or not items:
+        raise ValueError("The evidence block requires at least one item.")
+    kinds: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {
+            "id", "kind", "reference", "sha256", "available_at",
+        }:
+            raise ValueError(
+                "Each evidence item needs id, kind, reference, sha256 and available_at."
+            )
+        for key in ("id", "kind", "reference"):
+            if not isinstance(item[key], str) or not item[key].strip():
+                raise ValueError(f"Invalid evidence {key}.")
+        if item["id"] in kinds:
+            raise ValueError("Evidence item ids must be unique.")
+        if not isinstance(item["sha256"], str) or not snapshot.HEX_SHA256.fullmatch(item["sha256"]):
+            raise ValueError("Evidence sha256 must be 64 lowercase hex characters.")
+        shadow_calendar.parse_timestamp(item["available_at"], "evidence.available_at")
+        kinds[item["id"]] = item["kind"]
+    return kinds
+
+
+def _validate_halt_window(value: object, *, required: bool) -> dict[str, Any] | None:
+    if value is None:
+        if required:
+            raise ValueError("A partial_halt raw bar requires a halt window.")
+        return None
+    if not isinstance(value, dict) or set(value) != {"start", "end"}:
+        raise ValueError("Halt must be an object with start and end timestamps.")
+    start = shadow_calendar.parse_timestamp(value["start"], "halt.start")
+    end = shadow_calendar.parse_timestamp(value["end"], "halt.end")
+    if end <= start:
+        raise ValueError("The halt window must end after it starts.")
+    return value
+
+
+def _validate_quote_conflict(
+    row: dict[str, Any],
+    field: str,
+    evidence_kinds: dict[str, str],
+) -> None:
+    conflict_key = f"{field}_conflict"
+    value = row.get(conflict_key)
+    if value is None:
+        return
+    if row.get("trading_status") == "suspended":
+        raise ValueError(
+            f"A suspended raw bar cannot carry {conflict_key}: a confirmed no-trade day has no {field}."
+        )
+    if row.get(field) is not None:
+        raise ValueError(f"A {conflict_key} raw bar must not store an executable {field} price.")
+    if not isinstance(value, dict) or set(value) != {"sources"}:
+        raise ValueError(f"{conflict_key} must be an object with only sources.")
+    sources = value["sources"]
+    if not isinstance(sources, list) or len(sources) < 2:
+        raise ValueError(f"{conflict_key} requires at least two source entries.")
+    names: list[str] = []
+    quotes: list[float] = []
+    for entry in sources:
+        if not isinstance(entry, dict) or set(entry) != {"source", "evidence_id", field}:
+            raise ValueError(f"Each {conflict_key} source needs source, evidence_id and {field}.")
+        name = entry["source"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Invalid {conflict_key} source name.")
+        evidence_id = entry["evidence_id"]
+        if not isinstance(evidence_id, str) or evidence_id not in evidence_kinds:
+            raise ValueError(f"Unknown {conflict_key} evidence_id in raw_bars.")
+        if evidence_kinds[evidence_id] not in snapshot.PRICE_EVIDENCE_KINDS:
+            raise ValueError(f"{conflict_key} evidence_id must name a price_archive evidence item.")
+        price = entry[field]
+        _optional_number(price, f"{conflict_key}.{field}", positive=True)
+        if price is None:
+            raise ValueError(f"{conflict_key} {field} prices must be positive and finite.")
+        names.append(name)
+        quotes.append(float(price))
+    if len(set(names)) != len(names):
+        raise ValueError(f"{conflict_key} sources must be distinct.")
+    if len(set(quotes)) < 2:
+        raise ValueError(f"{conflict_key} requires at least two distinct {field} values.")
+
+
+def _validate_v3_raw_bar(
+    row: dict[str, Any],
+    session: str,
+    evidence_kinds: dict[str, str],
+) -> None:
+    _validate_quote_conflict(row, "open", evidence_kinds)
+    _validate_quote_conflict(row, "close", evidence_kinds)
+    open_source = row.get("open_source")
+    if row.get("open") is None:
+        if open_source is not None:
+            raise ValueError("A raw bar without an open cannot carry open_source.")
+    else:
+        if not isinstance(open_source, dict) or set(open_source) != {"source", "evidence_id"}:
+            raise ValueError("A schema-3 raw bar with an open requires open_source with source and evidence_id.")
+        if not isinstance(open_source.get("source"), str) or not open_source["source"].strip():
+            raise ValueError("Invalid open_source source.")
+        ev_id = open_source.get("evidence_id")
+        if ev_id not in evidence_kinds:
+            raise ValueError("Unknown open_source evidence_id in raw_bars.")
+        if evidence_kinds[ev_id] not in snapshot.PRICE_EVIDENCE_KINDS:
+            raise ValueError(
+                "open_source evidence_id must name a price_archive evidence item; "
+                "a trading-status notice is not a price source."
+            )
+    status = row.get("trading_status")
+    if status == "trading":
+        if row.get("halt") is not None:
+            raise ValueError("A trading raw bar cannot declare a halt window.")
+    elif status == "partial_halt":
+        halt = _validate_halt_window(row.get("halt"), required=True)
+        if row.get("open") is not None:
+            if halt_covers_session(halt, session):
+                raise ValueError(
+                    "A partial_halt raw bar with an actual open cannot have a halt window covering the whole session."
+                )
+            volume = row.get("volume")
+            if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume <= 0:
+                raise ValueError("A partial_halt raw bar with an actual open requires positive volume.")
+        if halt_conflicts_with_volume(halt, session, row.get("volume")) and any(
+            row.get(field) is not None for field in ("high", "low", "close")
+        ):
+            raise ValueError(
+                "A partial_halt raw bar requires null high, low and close when positive volume contradicts a whole-session halt."
+            )
+    elif status == "suspended":
+        if any(row.get(field) is not None for field in ("open", "high", "low", "close", "volume")):
+            raise ValueError("A suspended raw bar requires null open, high, low, close and volume.")
+        _validate_halt_window(row.get("halt"), required=False)
+    elif row.get("halt") is not None:
+        raise ValueError("An unknown raw bar cannot declare a halt window.")
+
+    status_ev = row.get("status_evidence_id")
+    if status_ev is None:
+        if row.get("status_conflict") is not None:
+            raise ValueError("status_conflict requires status_evidence_id.")
+        if status in ("partial_halt", "suspended"):
+            raise ValueError("A schema-3 partial_halt or suspended raw bar requires status_evidence_id.")
+    else:
+        if not has_status_evidence_id(status_ev):
+            raise ValueError("status_evidence_id must be a nonempty string when provided.")
+        if status_ev not in evidence_kinds:
+            raise ValueError("Unknown status_evidence_id in raw_bars.")
+        if evidence_kinds[status_ev] not in snapshot.STATUS_EVIDENCE_KINDS:
+            raise ValueError(
+                "status_evidence_id must name a trading-status evidence item "
+                "(a halt, suspension or resumption notice)."
+            )
+        if isinstance(open_source, dict) and status_ev == open_source.get("evidence_id"):
+            raise ValueError(
+                "status_evidence_id must name the trading-status notice, not the open price source."
+            )
+
+    status_conflict = row.get("status_conflict")
+    if status_conflict is not None:
+        if not isinstance(status_conflict, dict) or set(status_conflict) != {"price_evidence_id", "halt"}:
+            raise ValueError("status_conflict requires price_evidence_id and halt.")
+        if (
+            status != "unknown"
+            or row.get("open_conflict") is not None
+            or any(row.get(field) is not None for field in ("open", "high", "low", "close", "volume"))
+        ):
+            raise ValueError("status_conflict requires unknown status and null OHLCV without open_conflict.")
+        price_id = status_conflict["price_evidence_id"]
+        if not isinstance(price_id, str) or evidence_kinds.get(price_id) not in snapshot.PRICE_EVIDENCE_KINDS:
+            raise ValueError("status_conflict price_evidence_id must name a price_archive.")
+        conflict_halt = _validate_halt_window(status_conflict["halt"], required=True)
+        if not halt_covers_session(conflict_halt, session):
+            raise ValueError("status_conflict requires a whole-day halt window.")
+
+
+def export_daily_feed_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    through_date: str,
+    source_snapshot_id: str | None = None,
+) -> dict[str, Any]:
+    """Project a Discovery payload into a Shadow Live daily feed up to ``through_date``."""
+    cutoff_date = snapshot._date(through_date)
+    calendar = [
+        dict(row) for row in payload.get("calendar", []) if str(row.get("date")) <= cutoff_date
+    ]
+    if not calendar:
+        raise ValueError(f"No sessions in payload on or before {cutoff_date}.")
+    raw_bars = [
+        dict(row) for row in payload.get("raw_bars", []) if str(row.get("date")) <= cutoff_date
+    ]
+    derived = [
+        dict(row) for row in payload.get("derived", []) if str(row.get("date")) <= cutoff_date
+    ]
+    corporate_actions = [
+        dict(row)
+        for row in payload.get("corporate_actions", [])
+        if str(row.get("date")) <= cutoff_date
+    ]
+    exported: dict[str, Any] = {
+        "schema_version": payload.get("schema_version"),
+        "data_kind": payload.get("data_kind"),
+        "symbols": list(payload.get("symbols", ETF_SYMBOLS)),
+        "calendar": calendar,
+        "raw_bars": raw_bars,
+        "derived": derived,
+        "corporate_actions": corporate_actions,
+    }
+    if "raw_price_basis" in payload:
+        exported["raw_price_basis"] = payload["raw_price_basis"]
+    if "derivation" in payload:
+        exported["derivation"] = dict(payload["derivation"])
+    if "sources" in payload:
+        exported["sources"] = dict(payload["sources"])
+    if "evidence" in payload and isinstance(payload["evidence"], Mapping):
+        referenced_ids: set[str] = set()
+        for row in raw_bars:
+            open_src = row.get("open_source")
+            if isinstance(open_src, Mapping) and isinstance(open_src.get("evidence_id"), str):
+                referenced_ids.add(open_src["evidence_id"])
+            if isinstance(row.get("status_evidence_id"), str):
+                referenced_ids.add(row["status_evidence_id"])
+            for c_key in ("open_conflict", "close_conflict"):
+                c_val = row.get(c_key)
+                if isinstance(c_val, Mapping):
+                    for src in c_val.get("sources", []):
+                        if isinstance(src, Mapping) and isinstance(src.get("evidence_id"), str):
+                            referenced_ids.add(src["evidence_id"])
+            sc = row.get("status_conflict")
+            if isinstance(sc, Mapping) and isinstance(sc.get("price_evidence_id"), str):
+                referenced_ids.add(sc["price_evidence_id"])
+        items = [
+            dict(item)
+            for item in payload["evidence"].get("items", [])
+            if item.get("id") in referenced_ids
+            or str(item.get("available_at", ""))[:10] <= cutoff_date
+        ]
+        exported["evidence"] = {"items": items}
+    if source_snapshot_id is not None:
+        exported["source_snapshot_id"] = source_snapshot_id
+    # Validate the exported feed through Feed() before returning.
+    Feed(exported)
+    return exported
+
+
+def build_daily_feed_from_snapshot(
+    snapshot_store: str | Path,
+    snapshot_id: str,
+    *,
+    through_date: str,
+    output: str | Path | None = None,
+) -> dict[str, Any]:
+    """Read Discovery-only snapshot data and export a daily Shadow feed through ``through_date``."""
+    envelope = snapshot.read_discovery(Path(snapshot_store), snapshot_id, "discovery")
+    if "data" in envelope:
+        payload = {
+            "schema_version": envelope["schema_version"],
+            "data_kind": envelope["data_kind"],
+            **envelope["data"],
+        }
+        if envelope["schema_version"] >= 2:
+            payload.setdefault("raw_price_basis", "unadjusted")
+        manifest = snapshot.manifest(Path(snapshot_store), snapshot_id)
+        if "evidence" in manifest and "evidence" not in payload:
+            payload["evidence"] = manifest["evidence"]
+    else:
+        payload = envelope
+    exported = export_daily_feed_from_payload(
+        payload, through_date=through_date, source_snapshot_id=snapshot_id
+    )
+    if output is not None:
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(exported, indent=2, sort_keys=True, allow_nan=False),
+            encoding="utf-8",
+        )
+    return {
+        "status": "ok",
+        "snapshot_id": snapshot_id,
+        "through_date": snapshot._date(through_date),
+        "schema_version": exported["schema_version"],
+        "data_kind": exported["data_kind"],
+        "sessions": len(exported["calendar"]),
+        **({"output": str(output)} if output is not None else {}),
+    }
+
+
 def _before(value: str | None, cutoff: datetime) -> bool:
     if not value:
         return False
@@ -473,10 +822,12 @@ def _valid_close(
     if row is None or not _valid_price(row.get("close")):
         return False
     if data_kind == "real":
-        return row.get("trading_status") in ("trading", "partial_halt") and available_by(
-            {**row, "available_at": row["close_available_at"]}, cutoff
+        return row.get("trading_status") in ("trading", "partial_halt") and close_available(
+            row, cutoff, data_kind
         )
-    return row.get("trading_status") == "trading" and available_by(row, cutoff)
+    return row.get("trading_status") == "trading" and close_available(
+        row, cutoff, data_kind
+    )
 
 
 def _terms_valid(action: dict) -> bool:
@@ -2106,6 +2457,12 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
             "RELEASE_INVALID",
             f"The release artifact's frozen strategy parameters are invalid: {error}",
         ) from error
+    val_policy = valuation_policy_version(execution["execution_rules"])
+    if val_policy not in VALUATION_POLICY_VERSIONS:
+        raise _Blocked(
+            "RELEASE_INVALID",
+            f"The release artifact declares unsupported valuation policy {val_policy!r}.",
+        )
     return {
         "strategy": identity,
         **runtime,
@@ -2115,6 +2472,7 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
         "slippage_bps": float(execution["slippage_bps"]),
         "signal_window_sessions": window,
         "execution_rules": execution["execution_rules"],
+        "valuation_policy": val_policy,
     }
 
 
@@ -2377,6 +2735,15 @@ def _initial_prior(execution: dict[str, Any]) -> dict[str, Any]:
         "start_date": None,
         "last_committed_date": None,
         "committed_at": None,
+        **(
+            {
+                "carry_states": {
+                    symbol: CarryState().to_dict() for symbol in ETF_SYMBOLS
+                }
+            }
+            if execution.get("valuation_policy") == CARRY_FORWARD_SUSPENDED_VALUATION
+            else {}
+        ),
     }
 
 
@@ -2422,6 +2789,11 @@ def _prior_from_result(
         "start_date": result["progress"]["start_date"],
         "last_committed_date": result["date"],
         "committed_at": committed_at,
+        **(
+            {"carry_states": result["valuation_state"]}
+            if "valuation_state" in result
+            else {}
+        ),
     }
 
 
@@ -2577,8 +2949,40 @@ def _build_input(
         )
         blockers.extend(correction_blockers)
 
+    val_policy = execution.get("valuation_policy", STRICT_CLOSE_VALUATION)
+    carry_states = prior.get("carry_states") or {}
     for symbol in sorted(set(held) | buy_symbols):
         if not _valid_close(raw.get(symbol), close_cutoff, data_kind=feed.data_kind):
+            if (
+                val_policy == CARRY_FORWARD_SUSPENDED_VALUATION
+                and symbol not in buy_symbols
+            ):
+                confirmed_no_trade, non_trade_reason = classify_no_trade_for_valuation(
+                    raw.get(symbol), close_cutoff, data_kind=feed.data_kind
+                )
+                if confirmed_no_trade:
+                    c_state = CarryState.from_dict(carry_states.get(symbol))
+                    if c_state.anchor is not None:
+                        continue
+                    gap_reason = (
+                        "carry_forward_chain_broken"
+                        if c_state.chain_broken
+                        else "missing_authorized_prior_close"
+                    )
+                    blockers.append(
+                        (
+                            "missing_close",
+                            f"{symbol} valuation blocked ({gap_reason}) on {session}.",
+                        )
+                    )
+                    continue
+                blockers.append(
+                    (
+                        "missing_close",
+                        f"{symbol} valuation blocked ({non_trade_reason}) on {session}.",
+                    )
+                )
+                continue
             blockers.append(
                 (
                     "missing_close",
@@ -2953,98 +3357,205 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
     start_shares = dict(shares)
 
     # (a) corporate actions: share adjustments first, then cash-dividend
-    # entitlements for start-of-day holdings on the ex-date.
+    # entitlements for start-of-day holdings on the ex-date (or sequence-ordered
+    # per held symbol under carry-forward-suspended-v1).
+    val_policy = execution.get("valuation_policy", STRICT_CLOSE_VALUATION)
     applied: list[dict[str, Any]] = []
     booked = [dict(item) for item in prior.get("booked_dividends", [])]
-    adjustments = sorted(
-        (action for action in actions if action["type"] == "share_adjustment"),
-        key=lambda action: (action["symbol"], action["action_id"]),
-    )
-    dividends = sorted(
-        (action for action in actions if action["type"] == "cash_dividend"),
-        key=lambda action: (action["symbol"], action["action_id"]),
-    )
-    for action in adjustments:
-        symbol = action["symbol"]
-        quantity = start_shares.get(symbol, 0.0)
-        if quantity <= _EPSILON:
-            applied.append(
-                {
+    applied_actions_today: dict[str, list[dict[str, Any]]] = {
+        symbol: [] for symbol in ETF_SYMBOLS
+    }
+    if val_policy == CARRY_FORWARD_SUSPENDED_VALUATION:
+        ordered_actions: list[dict[str, Any]] = []
+        by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for action in actions:
+            by_symbol.setdefault(action["symbol"], []).append(action)
+        for symbol in sorted(by_symbol):
+            sym_actions = by_symbol[symbol]
+            if start_shares.get(symbol, 0.0) <= _EPSILON:
+                for action in sorted(sym_actions, key=lambda item: item["action_id"]):
+                    ordered_actions.append(action)
+                continue
+            if len(sym_actions) > 1:
+                seqs = [item.get("sequence") for item in sym_actions]
+                if not all(
+                    "sequence" in item
+                    and not isinstance(seq, bool)
+                    and isinstance(seq, int)
+                    and seq >= 1
+                    for item, seq in zip(sym_actions, seqs, strict=True)
+                ) or len(set(seqs)) != len(seqs):
+                    raise _Blocked(
+                        "missing_action_terms",
+                        f"{symbol} has ambiguous same-day corporate action order on {session}.",
+                        detail={"symbol": symbol, "date": session, "reason": "corporate_action_order_ambiguous"},
+                    )
+                sym_actions = sorted(sym_actions, key=lambda item: item["sequence"])
+            elif "sequence" in sym_actions[0]:
+                seq = sym_actions[0]["sequence"]
+                if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+                    raise _Blocked(
+                        "missing_action_terms",
+                        f"{symbol} has invalid corporate action sequence on {session}.",
+                        detail={"symbol": symbol, "date": session, "reason": "corporate_action_order_ambiguous"},
+                    )
+            for action in sym_actions:
+                if not available_by(action, open_cutoff) or not _terms_valid(action):
+                    raise _Blocked(
+                        "missing_action_terms",
+                        f"{action['action_id']} has unresolved or unavailable terms.",
+                    )
+            ordered_actions.extend(sym_actions)
+        for action in ordered_actions:
+            symbol = action["symbol"]
+            if start_shares.get(symbol, 0.0) <= _EPSILON:
+                applied.append(
+                    {
+                        "action_id": action["action_id"],
+                        "type": action["type"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "status": "ignored_not_held",
+                    }
+                )
+                continue
+            applied_actions_today[symbol].append(dict(action))
+            if action["type"] == "share_adjustment":
+                ratio = float(action["ratio"])
+                before = shares[symbol]
+                shares[symbol] = before * ratio
+                applied.append(
+                    {
+                        "action_id": action["action_id"],
+                        "type": action["type"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "ratio": ratio,
+                        "status": "applied",
+                        "shares_before": before,
+                        "shares_after": shares[symbol],
+                    }
+                )
+            else:
+                quantity = shares[symbol]
+                amount_per_share = float(action["cash_per_share"])
+                amount = quantity * amount_per_share
+                entitlement = {
                     "action_id": action["action_id"],
-                    "type": action["type"],
                     "symbol": symbol,
                     "ex_date": session,
-                    "status": "ignored_not_held",
+                    "pay_date": action["pay_date"],
+                    "quantity": quantity,
+                    "cash_per_share": amount_per_share,
+                    "amount": amount,
                 }
-            )
-            continue
-        if not available_by(action, open_cutoff) or not _terms_valid(action):
-            raise _Blocked(
-                "missing_action_terms",
-                f"{action['action_id']} has unresolved or unavailable terms.",
-            )
-        ratio = float(action["ratio"])
-        before = shares[symbol]
-        shares[symbol] = before * ratio
-        applied.append(
-            {
-                "action_id": action["action_id"],
-                "type": action["type"],
-                "symbol": symbol,
-                "ex_date": session,
-                "ratio": ratio,
-                "status": "applied",
-                "shares_before": before,
-                "shares_after": shares[symbol],
-            }
+                receivables.append(entitlement)
+                dividend_entitled_total += amount
+                booked.append(
+                    {
+                        "action_id": action["action_id"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "pay_date": action["pay_date"],
+                        "quantity": quantity,
+                        "cash_per_share": amount_per_share,
+                        "booked_cash_per_share": amount_per_share,
+                        "amount": amount,
+                        "status": "receivable",
+                        "applied_revisions": [],
+                    }
+                )
+                applied.append({**entitlement, "type": action["type"], "status": "receivable"})
+    else:
+        adjustments = sorted(
+            (action for action in actions if action["type"] == "share_adjustment"),
+            key=lambda action: (action["symbol"], action["action_id"]),
         )
-    for action in dividends:
-        symbol = action["symbol"]
-        quantity = start_shares.get(symbol, 0.0)
-        if quantity <= _EPSILON:
+        dividends = sorted(
+            (action for action in actions if action["type"] == "cash_dividend"),
+            key=lambda action: (action["symbol"], action["action_id"]),
+        )
+        for action in adjustments:
+            symbol = action["symbol"]
+            quantity = start_shares.get(symbol, 0.0)
+            if quantity <= _EPSILON:
+                applied.append(
+                    {
+                        "action_id": action["action_id"],
+                        "type": action["type"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "status": "ignored_not_held",
+                    }
+                )
+                continue
+            if not available_by(action, open_cutoff) or not _terms_valid(action):
+                raise _Blocked(
+                    "missing_action_terms",
+                    f"{action['action_id']} has unresolved or unavailable terms.",
+                )
+            ratio = float(action["ratio"])
+            before = shares[symbol]
+            shares[symbol] = before * ratio
             applied.append(
                 {
                     "action_id": action["action_id"],
                     "type": action["type"],
                     "symbol": symbol,
                     "ex_date": session,
-                    "status": "ignored_not_held",
+                    "ratio": ratio,
+                    "status": "applied",
+                    "shares_before": before,
+                    "shares_after": shares[symbol],
                 }
             )
-            continue
-        if not available_by(action, open_cutoff) or not _terms_valid(action):
-            raise _Blocked(
-                "missing_action_terms",
-                f"{action['action_id']} has unresolved or unavailable terms.",
-            )
-        amount_per_share = float(action["cash_per_share"])
-        amount = quantity * amount_per_share
-        entitlement = {
-            "action_id": action["action_id"],
-            "symbol": symbol,
-            "ex_date": session,
-            "pay_date": action["pay_date"],
-            "quantity": quantity,
-            "cash_per_share": amount_per_share,
-            "amount": amount,
-        }
-        receivables.append(entitlement)
-        dividend_entitled_total += amount
-        booked.append(
-            {
+        for action in dividends:
+            symbol = action["symbol"]
+            quantity = start_shares.get(symbol, 0.0)
+            if quantity <= _EPSILON:
+                applied.append(
+                    {
+                        "action_id": action["action_id"],
+                        "type": action["type"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "status": "ignored_not_held",
+                    }
+                )
+                continue
+            if not available_by(action, open_cutoff) or not _terms_valid(action):
+                raise _Blocked(
+                    "missing_action_terms",
+                    f"{action['action_id']} has unresolved or unavailable terms.",
+                )
+            amount_per_share = float(action["cash_per_share"])
+            amount = quantity * amount_per_share
+            entitlement = {
                 "action_id": action["action_id"],
                 "symbol": symbol,
                 "ex_date": session,
                 "pay_date": action["pay_date"],
                 "quantity": quantity,
                 "cash_per_share": amount_per_share,
-                "booked_cash_per_share": amount_per_share,
                 "amount": amount,
-                "status": "receivable",
-                "applied_revisions": [],
             }
-        )
-        applied.append({**entitlement, "type": action["type"], "status": "receivable"})
+            receivables.append(entitlement)
+            dividend_entitled_total += amount
+            booked.append(
+                {
+                    "action_id": action["action_id"],
+                    "symbol": symbol,
+                    "ex_date": session,
+                    "pay_date": action["pay_date"],
+                    "quantity": quantity,
+                    "cash_per_share": amount_per_share,
+                    "booked_cash_per_share": amount_per_share,
+                    "amount": amount,
+                    "status": "receivable",
+                    "applied_revisions": [],
+                }
+            )
+            applied.append({**entitlement, "type": action["type"], "status": "receivable"})
 
     # (a2) apply the frozen applicable correction set once, before the open:
     # an unpaid entitlement adjusts its receivable, an already-paid one adjusts
@@ -3306,31 +3817,71 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
         )
 
     # (d) value at the unadjusted close plus cash and unpaid receivables.
-    positions: dict[str, dict[str, Any]] = {}
-    market_value = 0.0
-    for symbol in ETF_SYMBOLS:
-        quantity = shares[symbol]
-        row = raw.get(symbol)
-        close: float | None = None
-        if quantity > _EPSILON and not _valid_close(row, close_cutoff, data_kind=data_kind):
+    carry_states: dict[str, CarryState] = {}
+    valuation_extra: dict[str, Any] = {}
+    if val_policy == CARRY_FORWARD_SUSPENDED_VALUATION:
+        carry_states = {
+            symbol: CarryState.from_dict((prior.get("carry_states") or {}).get(symbol))
+            for symbol in ETF_SYMBOLS
+        }
+        nav_point, val_gaps = value_carry_forward_session(
+            session,
+            raw,
+            shares,
+            cash,
+            receivables,
+            {symbol: [] for symbol in ETF_SYMBOLS},
+            carry_states,
+            applied_actions_today,
+            data_kind=data_kind,
+        )
+        if val_gaps or nav_point["nav"] is None:
+            first_gap = val_gaps[0] if val_gaps else {"symbol": "", "valuation_gap_reason": "missing_close"}
+            gap_reason = first_gap.get("valuation_gap_reason") or first_gap.get("reason")
             raise _Blocked(
                 "missing_close",
-                f"{symbol} is held but has no confirmed unadjusted close "
-                f"available by {close_cutoff.isoformat()}.",
+                f"{first_gap['symbol']} valuation blocked ({gap_reason}) on {session}.",
+                detail=first_gap,
             )
-        if _valid_close(row, close_cutoff, data_kind=data_kind):
-            close = float(row["close"])
-        value = quantity * close if quantity > _EPSILON and close is not None else 0.0
-        if quantity > _EPSILON and close is None:  # pragma: no cover - guarded above
-            raise _Blocked("missing_close", f"{symbol} cannot be valued.")
-        market_value += value
-        positions[symbol] = {
-            "quantity": quantity,
-            "close": close,
-            "market_value": value,
+        positions = nav_point["holdings"]
+        market_value = float(nav_point["market_value"])
+        receivable_total = float(nav_point["dividend_receivables"])
+        nav = float(nav_point["nav"])
+        valuation_extra = {
+            "valuation_policy": CARRY_FORWARD_SUSPENDED_VALUATION,
+            "valuation_basis": nav_point["valuation_basis"],
+            "carried_forward_symbols": nav_point["carried_forward_symbols"],
+            "valuation_state": {
+                symbol: state_obj.to_dict()
+                for symbol, state_obj in carry_states.items()
+            },
         }
-    receivable_total = math.fsum(item["amount"] for item in receivables)
-    nav = cash + market_value + receivable_total
+    else:
+        positions = {}
+        market_value = 0.0
+        for symbol in ETF_SYMBOLS:
+            quantity = shares[symbol]
+            row = raw.get(symbol)
+            close: float | None = None
+            if quantity > _EPSILON and not _valid_close(row, close_cutoff, data_kind=data_kind):
+                raise _Blocked(
+                    "missing_close",
+                    f"{symbol} is held but has no confirmed unadjusted close "
+                    f"available by {close_cutoff.isoformat()}.",
+                )
+            if _valid_close(row, close_cutoff, data_kind=data_kind):
+                close = float(row["close"])
+            value = quantity * close if quantity > _EPSILON and close is not None else 0.0
+            if quantity > _EPSILON and close is None:  # pragma: no cover - guarded above
+                raise _Blocked("missing_close", f"{symbol} cannot be valued.")
+            market_value += value
+            positions[symbol] = {
+                "quantity": quantity,
+                "close": close,
+                "market_value": value,
+            }
+        receivable_total = math.fsum(item["amount"] for item in receivables)
+        nav = cash + market_value + receivable_total
 
     # (e) generate the next session's signal only when the release is enabled at
     # this session's after-close signal point.
@@ -3484,6 +4035,7 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
         "market_value": market_value,
         "dividend_receivables": receivable_total,
         "nav": nav,
+        **valuation_extra,
         "fees": {"day": day_fees, "total": fees_total},
         "slippage": {"day": day_slippage, "total": slippage_total},
         "signal": signal,

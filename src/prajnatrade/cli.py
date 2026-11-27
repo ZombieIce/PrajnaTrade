@@ -244,6 +244,14 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_compare.add_argument(
         "--output", type=Path, help="write the deterministic comparison document"
     )
+    shadow_export = shadow_commands.add_parser(
+        "export-feed",
+        help="export a verifiable daily Shadow feed from a sealed Discovery payload",
+    )
+    shadow_export.add_argument("--store", required=True, type=Path)
+    shadow_export.add_argument("--snapshot-id", required=True)
+    shadow_export.add_argument("--through-date", required=True)
+    shadow_export.add_argument("--output", required=True, type=Path)
 
     acceptance = commands.add_parser(
         "acceptance",
@@ -1426,6 +1434,13 @@ def _shadow_command(args: argparse.Namespace) -> int:
         if args.shadow_command == "compare":
             result = shadow.compare(
                 args.ledger, args.data, args.versions, args.output
+            )
+        elif args.shadow_command == "export-feed":
+            result = shadow.build_daily_feed_from_snapshot(
+                args.store,
+                args.snapshot_id,
+                through_date=args.through_date,
+                output=args.output,
             )
         else:
             result = shadow.write_report(args.ledger, args.version, args.output)
