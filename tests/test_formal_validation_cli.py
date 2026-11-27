@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 from cli_helpers import (
+    agent_cli,
     assert_hex,
     cli,
     cli_env,
@@ -1605,7 +1606,7 @@ def test_late_suspension_pause_is_audited_and_keeps_discovery_day_eligible(
         {"question": "Audit the formal signal-pause receipt.", "records": ["signal_pauses"]},
     )
     details = ok(
-        cli(
+        agent_cli(
             "round", "detail",
             "--project", str(scenario["project"]),
             "--round-id", scenario["opened"]["round_id"],
@@ -1613,7 +1614,14 @@ def test_late_suspension_pause_is_audited_and_keeps_discovery_day_eligible(
             "--input", str(detail_input),
         )
     )
-    assert details["details"]["signal_pauses"] == receipt["signal_pauses"]
+    published_pauses = details["details"]["signal_pauses"]
+    assert published_pauses["status"] == "verified"
+    for side in ("candidate", "benchmark"):
+        assert published_pauses[side]["paused_signal_days"] == 1
+        assert published_pauses[side]["decision_days"] == receipt["signal_pauses"][side]["decision_days"]
+        assert "events" not in published_pauses[side]
+        assert "decision_dates" not in published_pauses[side]
+        assert "known_no_trade_sessions" not in published_pauses[side]
     replay = ok(validate_current(scenario))
     assert replay["reused"] is True
     assert len(round_uses(scenario)) == 1

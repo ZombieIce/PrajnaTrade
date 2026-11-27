@@ -89,7 +89,10 @@ private reuse (`snapshot._read_json` and friends) is legacy, not precedent.
   records, recorded-at) and `feedback` rows to `round status`, and the
   agent+operator `round detail` / `round feedback` commands over the project
   database only; a detail query projects the published receipt allowlist and
-  never the trusted-only `curves`, a sealed payload or a ledger. The agent never
+  never the trusted-only `curves`, a sealed payload or a ledger. Position detail
+  omits daily account rows, run detail omits whole-lot order attempts, and
+  signal-pause detail exposes only aggregate counts and policy results; the
+  operator receipt retains the detailed reconciliation evidence. The agent never
   sees a per-session curve, ledger row/price, `query_debited`/
   `opened_protected_source` internals, a per-version review decision's
   reviewer/reason, an admission's reviewer/reason, a sealed payload, protected

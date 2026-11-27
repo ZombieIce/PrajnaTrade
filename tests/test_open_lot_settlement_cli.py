@@ -503,21 +503,32 @@ def test_match_open_lot_day_discloses_late_resume_sell_funding_same_day_buy() ->
     assert assumptions["funded_buy_symbols"] == ["518880"]
 
 
-def test_discovery_and_formal_validation_freeze_lot_rules_and_size_at_actual_open(tmp_path) -> None:
-    import json
+def test_discovery_and_formal_validation_freeze_lot_rules_and_size_at_actual_open(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pathlib import Path
 
-    from cli_helpers import cli, ok, write_json
+    from cli_helpers import agent_cli, cli, ok, write_json
     from test_actual_open_cli import schema_v3_fixture, seal_v3
     from test_formal_validation_cli import formal_scenario
     from test_protected_eval_cli import create_campaign, submit_experiment
 
-    from prajnatrade.experiment import _runtime_components, runtime_identity
+    from prajnatrade import lot_execution
+    from prajnatrade.experiment import runtime_identity
     from prajnatrade.trading_status import NEXT_OPEN_RULES
 
-    # Guardrail: legacy runtime_identity must not include lot_execution.py
-    assert "lot_execution.py" not in _runtime_components(execution_rules={"version": NEXT_OPEN_RULES})
-    assert "lot_execution.py" in _runtime_components(execution_rules={"version": ACTUAL_OPEN_LOT_RULES})
     assert runtime_identity() == runtime_identity(execution_rules={"version": NEXT_OPEN_RULES})
+    legacy = runtime_identity(execution_rules={"version": NEXT_OPEN_RULES})
+    lot_identity = runtime_identity(execution_rules={"version": ACTUAL_OPEN_LOT_RULES})
+    lot_path = Path(lot_execution.__file__)
+    read_bytes = Path.read_bytes
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            Path, "read_bytes",
+            lambda path: read_bytes(path) + b"\n" if path == lot_path else read_bytes(path),
+        )
+        assert runtime_identity(execution_rules={"version": NEXT_OPEN_RULES}) == legacy
+        assert runtime_identity(execution_rules={"version": ACTUAL_OPEN_LOT_RULES}) != lot_identity
 
     # Build a 15-session schema-3 fixture (development=6, trailing=3) with close=10, open=12
     payload = schema_v3_fixture(15)
@@ -576,8 +587,6 @@ def test_discovery_and_formal_validation_freeze_lot_rules_and_size_at_actual_ope
     assert sub["discovery"]["baseline_comparison"]["baseline"]["metrics"]["fills"] == 5
 
     # Formal validation on trailing segment also freezes lot_sizes & sizes at open=12.0
-    from test_formal_validation_cli import formal_scenario
-
     scenario = formal_scenario(
         tmp_path,
         name="lot-formal",
@@ -620,19 +629,31 @@ def test_discovery_and_formal_validation_freeze_lot_rules_and_size_at_actual_ope
             order["actual_filled_lots"] for order in entry_attempt["lot_orders"]
         } == {16}
         assert entry_attempt["batch_complete"] is True
+    detail_input = write_json(
+        tmp_path / "lot-detail.json",
+        {"question": "Compare lot accounting.", "records": ["runs.candidate", "runs.benchmark"]},
+    )
+    detail = ok(agent_cli(
+        "round", "detail", "--project", str(project),
+        "--round-id", scenario["opened"]["round_id"],
+        "--version-id", scenario["version"]["version_id"], "--input", str(detail_input),
+    ))
+    for side in ("candidate", "benchmark"):
+        assert "order_attempts" in receipt["runs"][side]
+        assert "order_attempts" not in detail["details"][f"runs.{side}"]
+        assert detail["details"][f"runs.{side}"]["metrics"]["lot_order_count"] == 5
 
 
 def test_shadow_live_freezes_pre_open_weights_and_reconciles_with_discovery(tmp_path) -> None:
     import json
+    from datetime import date, timedelta
 
     from cli_helpers import cli, ok
     from test_actual_open_cli import schema_v3_fixture
     from test_shadow_cli import day_record, shadow_report
-    from test_shadow_feed_v3_valuation_cli import _build_manual_tracking_release
+    from test_shadow_feed_v3_valuation_cli import build_manual_tracking_release
 
     from prajnatrade.trading_status import STRICT_CLOSE_VALUATION
-
-    from datetime import date, timedelta
 
     payload = schema_v3_fixture(8)
     payload["data_kind"] = "synthetic"
@@ -667,7 +688,7 @@ def test_shadow_live_freezes_pre_open_weights_and_reconciles_with_discovery(tmp_
 
     store = tmp_path / "release-store"
     ledger = tmp_path / "shadow-ledger"
-    reg = _build_manual_tracking_release(
+    reg = build_manual_tracking_release(
         store,
         sessions,
         valuation_policy=STRICT_CLOSE_VALUATION,
@@ -797,7 +818,7 @@ def test_shadow_live_freezes_pre_open_weights_and_reconciles_with_discovery(tmp_
     # Legacy next-open-v1 Shadow release still freezes concrete share quantities
     store_legacy = tmp_path / "release-store-legacy"
     ledger_legacy = tmp_path / "shadow-ledger-legacy"
-    reg_legacy = _build_manual_tracking_release(
+    reg_legacy = build_manual_tracking_release(
         store_legacy,
         sessions,
         valuation_policy=STRICT_CLOSE_VALUATION,

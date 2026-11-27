@@ -4341,6 +4341,42 @@ _FEEDBACK_IDENTITY_FIELDS = (
 )
 
 
+def _safe_detail(record: str, value: object) -> object:
+    if record in {"runs.candidate", "runs.benchmark"} and isinstance(value, Mapping):
+        return {key: item for key, item in value.items() if key != "order_attempts"}
+    if record == "checks.position" and isinstance(value, Mapping):
+        return {
+            key: (
+                {field: item for field, item in side.items() if field != "daily_account"}
+                if key in {"candidate", "benchmark"} and isinstance(side, Mapping)
+                else side
+            )
+            for key, side in value.items()
+        }
+    if record == "signal_pauses" and isinstance(value, Mapping):
+        result = {
+            key: value[key]
+            for key in ("status", "reason", "policy", "limit_exceeded")
+            if key in value
+        }
+        for side in ("candidate", "benchmark"):
+            report = value.get(side)
+            if isinstance(report, Mapping):
+                result[side] = {
+                    key: report[key]
+                    for key in (
+                        "status", "decision_days", "paused_signal_days",
+                        "longest_consecutive_paused_days", "limit", "limit_met",
+                    )
+                    if key in report
+                }
+                rebalances = report.get("affected_monthly_rebalances")
+                if isinstance(rebalances, list):
+                    result[side]["affected_monthly_rebalance_count"] = len(rebalances)
+        return result
+    return value
+
+
 def _detail_block(receipt: Mapping[str, Any], record: str) -> object:
     """The published receipt block a record name projects (``_DETAIL_MISSING``)."""
     if record == "summary":
@@ -4404,7 +4440,7 @@ def _detail_request(round_id: str, version_id: str, receipt: Mapping[str, Any], 
         if value is _DETAIL_MISSING:
             unavailable.append(record)
         else:
-            details[record] = value
+            details[record] = _safe_detail(record, value)
     if unavailable:
         raise _rejected(
             "DETAIL_RECORD_UNAVAILABLE", "detail", "inspect",
@@ -4440,7 +4476,10 @@ def _detail_view(
         "status": "completed",
         "reused": reused,
         **dict(request),
-        "details": resolution["details"],
+        "details": {
+            record: _safe_detail(record, value)
+            for record, value in resolution["details"].items()
+        },
         "recorded_at": resolution["recorded_at"],
     }
 
