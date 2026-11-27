@@ -270,7 +270,11 @@ def test_detail_query_records_the_question_and_returns_only_requested_blocks(
     assert resolved["records"] == records
     assert set(resolved["details"]) == set(records)
     assert resolved["details"]["summary"] == validated["summary"]
-    assert resolved["details"]["checks.position"] == validated["checks"]["position"]
+    for side in ("candidate", "benchmark"):
+        published = resolved["details"]["checks.position"][side]
+        assert "daily_account" in validated["checks"]["position"][side]
+        assert "daily_account" not in published
+        assert published["held_sessions"] == validated["checks"]["position"][side]["held_sessions"]
     assert resolved["details"]["provenance"] == validated["provenance"]
     assert resolved["details"]["runs.candidate"] == validated["runs"]["candidate"]
     assert resolved["details"]["fills.candidate"] == validated["runs"]["candidate"]["fills"]
@@ -318,6 +322,20 @@ def test_detail_query_records_the_question_and_returns_only_requested_blocks(
     assert replay["recorded_at"] == resolved["recorded_at"]
     assert replay["details"] == resolved["details"]
     assert len(detail_rows(scenario)) == 1
+    # Older saved resolutions may contain the formerly published daily account.
+    legacy_resolution = dict(resolution)
+    legacy_resolution["details"] = {
+        **resolution["details"], "checks.position": validated["checks"]["position"],
+    }
+    project_db = scenario["project"] / ".prajnatrade" / "project.sqlite"
+    with sqlite3.connect(project_db) as connection:
+        connection.execute(
+            "UPDATE research_loop_details SET resolution_json = ? WHERE detail_access_id = ?",
+            (json.dumps(legacy_resolution), resolved["detail_access_id"]),
+        )
+    legacy_replay = ok(round_detail(scenario["project"], round_id, version_id, source))
+    assert legacy_replay["reused"] is True
+    assert legacy_replay["details"] == resolved["details"]
     operator = ok(
         round_detail(scenario["project"], round_id, version_id, source, agent=False)
     )

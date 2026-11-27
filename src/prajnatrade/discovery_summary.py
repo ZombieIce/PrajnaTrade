@@ -9,7 +9,7 @@ from typing import Any
 
 from prajnatrade.valuation import parse_instant
 
-_DECISION_STATUSES = {"generated", "no_target", "paused"}
+_DECISION_STATUSES = {"generated", "no_target", "paused", "insufficient_history"}
 
 
 def summarize_signal_pauses(run: Mapping[str, Any]) -> dict[str, Any]:
@@ -123,7 +123,7 @@ def summarize_signal_pauses(run: Mapping[str, Any]) -> dict[str, Any]:
         evidence_symbols = [
             item.get("symbol") for item in evidence if isinstance(item, Mapping)
         ]
-        if (
+        explanations_hold = not (
             pause.get("date") != day
             or len(reason_symbols) != len(reasons)
             or len(evidence_symbols) != len(evidence)
@@ -134,15 +134,13 @@ def summarize_signal_pauses(run: Mapping[str, Any]) -> dict[str, Any]:
             or not isinstance(pause.get("symbols"), list)
             or sorted(reason_symbols) != pause.get("symbols")
             or set(reason_symbols) != set(evidence_symbols)
-        ):
-            explanations_hold = False
+        )
         evidence_by_symbol = {
             item.get("symbol"): item
             for item in evidence
             if isinstance(item, Mapping)
         }
         rendered_reasons = []
-        explanations_hold = True
         for reason in reasons:
             if not isinstance(reason, Mapping):
                 explanations_hold = False
