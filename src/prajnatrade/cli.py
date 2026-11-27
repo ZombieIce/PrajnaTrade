@@ -20,6 +20,11 @@ if TYPE_CHECKING:
     from prajnatrade.providers import ResearchProvider
 
 
+def _add_plugin_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--plugin-config", type=Path, default=None)
+    parser.add_argument("--plugin", action="append", default=[], dest="plugin_specs")
+
+
 def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="prajnatrade-agent" if agent_only else "prajnatrade")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -30,11 +35,25 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         project_action = project_commands.add_parser(action)
         project_action.add_argument("--project", required=True, type=Path)
 
+    plugin_parser = commands.add_parser(
+        "plugin",
+        help="list registered local strategy plugins" if agent_only else "register or list local strategy plugins",
+    )
+    plugin_commands = plugin_parser.add_subparsers(dest="plugin_command", required=True)
+    plugin_list = plugin_commands.add_parser("list", help="list registered local strategy plugins")
+    plugin_list.add_argument("--project", required=True, type=Path)
+    if not agent_only:
+        plugin_register = plugin_commands.add_parser("register", help="register operator-approved local strategy plugins")
+        plugin_register.add_argument("--project", required=True, type=Path)
+        _add_plugin_flags(plugin_register)
+
     experiment = commands.add_parser("experiment", help="submit, inspect, and resume Discovery experiments")
     experiment_commands = experiment.add_subparsers(dest="experiment_command", required=True)
     submit = experiment_commands.add_parser("submit")
     submit.add_argument("--project", required=True, type=Path)
     submit.add_argument("--input", required=True, type=Path)
+    if not agent_only:
+        _add_plugin_flags(submit)
     for action in ("status", "resume"):
         lookup = experiment_commands.add_parser(action)
         lookup.add_argument("--project", required=True, type=Path)
@@ -212,6 +231,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         dest="release_ids",
         help="process this exact release ID (repeatable); default is every tracked version",
     )
+    _add_plugin_flags(shadow_update)
     shadow_report = shadow_commands.add_parser(
         "report", help="dump the committed day records for trusted audit"
     )
@@ -511,6 +531,7 @@ def _add_research_loop_workflow(
     validate.add_argument("--snapshot-store", required=True, type=Path)
     validate.add_argument("--round-id", required=True)
     validate.add_argument("--version-id", required=True)
+    _add_plugin_flags(validate)
 
     revalidate = rounds.add_parser(
         "revalidate",
@@ -529,6 +550,7 @@ def _add_research_loop_workflow(
         "--evidence-snapshot-id",
         help="corrected successor snapshot to recompute the Discovery evidence on",
     )
+    _add_plugin_flags(revalidate)
 
     reviewed = rounds.add_parser(
         "review", help="record the human approve, return or end decision for one version"
@@ -739,7 +761,12 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     raise ProtocolError(
                         "INVALID_SUBMISSION", "admission", "correct", str(error),
                     ) from error
-                result = experiment_submit(args.project, request)
+                result = experiment_submit(
+                    args.project,
+                    request,
+                    plugin_config=getattr(args, "plugin_config", None),
+                    plugin_specs=getattr(args, "plugin_specs", ()),
+                )
             elif args.experiment_command == "status":
                 result = experiment_status(args.project, args.campaign_id, args.submission_id)
             else:
@@ -801,6 +828,30 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 else project_status(args.project)
             )
             print(json.dumps(result, sort_keys=True))
+            return 0
+        if args.command == "plugin":
+            from prajnatrade.experiment import list_registered_plugins, register_plugins
+            from prajnatrade.plugins import PluginError
+
+            try:
+                if args.plugin_command == "list":
+                    result = list_registered_plugins(args.project)
+                else:
+                    result = register_plugins(
+                        args.project,
+                        plugin_config=args.plugin_config,
+                        plugin_specs=args.plugin_specs,
+                    )
+            except PluginError as error:
+                print(
+                    json.dumps(
+                        {"schema_version": 1, "status": "rejected", "error": error.details},
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                )
+                return 2
+            print(json.dumps(result, sort_keys=True, allow_nan=False))
             return 0
         if args.command == "campaign":
             from prajnatrade.experiment import campaign_create
@@ -1096,6 +1147,8 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 args.snapshot_store,
                 args.round_id,
                 args.version_id,
+                plugin_config=args.plugin_config,
+                plugin_specs=args.plugin_specs,
             )
         elif args.round_action == "revalidate":
             result = research_loop.revalidate(
@@ -1106,6 +1159,8 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 args.version_id,
                 args.reason,
                 evidence_snapshot_id=args.evidence_snapshot_id,
+                plugin_config=args.plugin_config,
+                plugin_specs=args.plugin_specs,
             )
         elif args.round_action == "review":
             source = (
@@ -1420,6 +1475,8 @@ def _shadow_command(args: argparse.Namespace) -> int:
                 args.date,
                 getattr(args, "release_ids", None),
                 corrections_store=getattr(args, "corrections_store", None),
+                plugin_config=getattr(args, "plugin_config", None),
+                plugin_specs=getattr(args, "plugin_specs", ()),
             )
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 2 if blocked else 0

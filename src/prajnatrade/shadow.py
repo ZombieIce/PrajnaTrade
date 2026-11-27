@@ -1001,6 +1001,8 @@ def update(
     corrections_store: str | Path | None = None,
     expected_sessions: tuple[str, ...] | None = None,
     expected_data_kind: str | None = None,
+    plugin_config: str | Path | None = None,
+    plugin_specs: list[str] | tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], bool]:
     """Process every tracked version up to ``target_date``; return (report, blocked).
 
@@ -1076,8 +1078,16 @@ def update(
         candidates = requested
     else:
         candidates = _tracked_release_directories(database, store_path, target)
+    from prajnatrade.plugins import load_plugin_registry
+
+    plugin_registry = load_plugin_registry(
+        plugin_config=plugin_config, plugin_specs=plugin_specs,
+    )
     versions = [
-        _version_result(database, store_path, feed, target, release_id, corrections)
+        _version_result(
+            database, store_path, feed, target, release_id, corrections,
+            plugin_registry=plugin_registry,
+        )
         for release_id in candidates
     ]
     blocked = any(version["status"] == "blocked" for version in versions)
@@ -1940,9 +1950,14 @@ def _version_result(
     target: str,
     release_id: str,
     corrections: dict[str, Any] | None = None,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     try:
-        return _run_version(database, store, feed, target, release_id, corrections)
+        return _run_version(
+            database, store, feed, target, release_id, corrections,
+            plugin_registry=plugin_registry,
+        )
     except _Blocked as error:
         progress = _progress_or_none(database, release_id)
         last = progress["last_committed_date"] if progress else None
@@ -2028,7 +2043,11 @@ def _version_entry(
     }
 
 
-def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
+def _execution_settings(
+    artifact: dict[str, Any],
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     execution = artifact.get("execution")
     required = (
         "strategy",
@@ -2046,7 +2065,9 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
         )
     strategy = execution["strategy"]
     family = strategy.get("family") if isinstance(strategy, dict) else None
-    if family not in (*STRATEGY_FAMILIES, "python"):
+    if family not in (*STRATEGY_FAMILIES, "python") and not (
+        isinstance(strategy, dict) and isinstance(strategy.get("plugin"), dict)
+    ):
         raise _Blocked("UNSUPPORTED_STRATEGY", f"The release declares family {family!r}.")
     parameters = execution["parameters"]
     if not isinstance(parameters, dict):
@@ -2098,6 +2119,22 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
             runtime = {
                 "strategy_spec": version,
                 "container_executor": executor_from_config(config),
+            }
+        elif "plugin" in strategy or family not in (
+            "equal_weight", "momentum", "trend_filter", "inverse_volatility",
+        ):
+            from prajnatrade.plugins import PluginError
+
+            try:
+                version = normalize_strategy_spec(
+                    {**strategy, "parameters": parameters},
+                    plugin_registry=plugin_registry,
+                )
+            except PluginError as error:
+                raise _Blocked(error.code, error.message) from error
+            runtime = {
+                "strategy_spec": version,
+                "plugin_registry": plugin_registry,
             }
         else:
             normalize_strategy_spec(identity)
@@ -2152,6 +2189,8 @@ def _run_version(
     target: str,
     release_id: str,
     corrections: dict[str, Any] | None = None,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     progress = database.get_progress(release_id)
     if progress is not None and progress.get("state") == "ended":
@@ -2179,7 +2218,7 @@ def _run_version(
             "FEED_SCOPE_MISMATCH",
             f"This release requires a {artifact['scope']} Shadow Live feed.",
         )
-    execution = _execution_settings(artifact)
+    execution = _execution_settings(artifact, plugin_registry=plugin_registry)
     try:
         states = {
             session: release.state_at(store, release_id, session)
@@ -2871,9 +2910,8 @@ def _possible_target_symbols(
     whether a position is open, so this is exact for them and conservative for
     an unknown (never generated) strategy.
     """
-    if "container_executor" in execution:
-        # Generated code is called once, against the actual settled account.
-        # Price checks for its targets happen when building the orders.
+    if "container_executor" in execution or "plugin_registry" in execution:
+        # Generated code and local plugins are called once, against the actual settled account.
         return set()
     try:
         strategy = make_strategy(
@@ -3371,6 +3409,7 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
                     execution.get("strategy_spec", execution["strategy"]),
                     container_executor=execution.get("container_executor"),
                     evidence_callback=invocations.append,
+                    plugin_registry=execution.get("plugin_registry"),
                 )
                 weights = strategy(
                     pd.DataFrame(history_rows),
@@ -3381,6 +3420,10 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
                     "strategy_isolation_failed", f"The frozen container strategy failed: {error}",
                 ) from error
             except (ValueError, TypeError) as error:
+                from prajnatrade.plugins import PluginError
+
+                if isinstance(error, PluginError):
+                    raise _Blocked(error.code, error.message) from error
                 raise _Blocked(
                     "strategy_error",
                     f"The frozen strategy failed on the after-close signal input: {error}",
