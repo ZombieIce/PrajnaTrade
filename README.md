@@ -977,6 +977,43 @@ round with `reused: true`; different content for the same Campaign is
 `ROUND_ALREADY_OPENED`. Changing the objective or the evaluation standard opens
 a new round; changed strategy experiments are charged to the Campaign budget.
 
+Position scoring is account-specific. By default, actual candidate and
+benchmark portfolios are scored independently, and an incomplete latest target
+is disclosed without blocking. To freeze additional requirements, a round may
+include:
+
+```json
+{
+  "position_policy": {
+    "candidate": {
+      "require_initial_position": false,
+      "required_symbols": ["511260", "518880"],
+      "minimum_required_hold_sessions": 3,
+      "require_end_of_period_target": false
+    },
+    "benchmark": {
+      "require_initial_position": true,
+      "required_symbols": ["511260", "518880", "515080", "513300", "159612"],
+      "minimum_required_hold_sessions": 5,
+      "require_end_of_period_target": true
+    }
+  }
+}
+```
+
+Each side must supply all four fields. `required_symbols` must contain unique
+supported ETFs; every listed ETF must be held simultaneously on a qualifying
+date. An empty list counts dates with any ETF holding. Counts and first
+qualifying dates come from that account's actual daily ledger, not the date of
+its first fill. `require_initial_position: false` permits an explicitly
+intentional cash state but still rejects a run with no position evidence.
+`require_end_of_period_target: true` makes the latest positive target batch a
+hard condition; the default is disclosure-only, and a normal whole-lot tail
+that fills every executable target lot is complete. A failed frozen condition
+visible in Discovery blocks before the trailing read and consumes no use;
+conditions first visible in the trailing segment are assessed in the formal
+receipt after its counted read.
+
 **Protocol v2: a frozen 70/30 split.** A Campaign created with
 `--discovery-split 70/30` (see the
 [Campaign section](#external-discovery-experiment-protocol)) freezes a v2
