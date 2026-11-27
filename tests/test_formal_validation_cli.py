@@ -76,6 +76,7 @@ from test_research_loop_cli import (
 from prajnatrade.data import ETF_SYMBOLS
 from prajnatrade.decision_window import AFTER_CLOSE_COMMON_POLICY, normalize_decision_policy
 from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_LOT_RULES,
     ACTUAL_OPEN_RULES,
     CARRY_FORWARD_SUSPENDED_VALUATION,
     EXECUTION_PRICE_BASIS,
@@ -143,6 +144,7 @@ def formal_scenario(
     requirements: list[dict] | None = None,
     hard_conditions: list[dict] | None = None,
     signal_pause_policy: dict | None = None,
+    position_policy: dict | None = None,
     as_of: str | None = None,
     execution_rules: str | None = None,
     valuation_policy: str | None = None,
@@ -168,6 +170,8 @@ def formal_scenario(
         contract["hard_conditions"] = hard_conditions
     if signal_pause_policy is not None:
         contract["signal_pause_policy"] = signal_pause_policy
+    if position_policy is not None:
+        contract["position_policy"] = position_policy
     opened = ok(
         open_round(
             project,
@@ -625,17 +629,14 @@ def test_discovery_and_formal_validation_score_one_frozen_actual_open_rule(
     assert set(fills["discovery"]) == set(fills["formal"])
 
 
-def test_a_partial_benchmark_build_fails_the_formal_position_check(
+def test_a_partial_benchmark_build_is_disclosed_but_does_not_block_by_default(
     tmp_path: Path,
 ) -> None:
-    """B4: a 4/5 entry basket is evidence, not a satisfied scoring premise.
+    """A 4/5 entry basket is disclosed while the actual account is scored.
 
     The benchmark's entry day carries one confirmed suspended symbol, which the
-    pre-read gate accepts as benign.  The run proceeds and spends exactly one
-    use, but the benchmark filled only four of its five required symbols, so the
-    formal position prerequisite is not met: the receipt is
-    ``insufficient_evidence`` / ``POSITION_EVIDENCE_INSUFFICIENT`` and records
-    the four fills and both sides' build state.
+    pre-read gate accepts as benign.  The formal read evaluates the actual
+    portfolio by default and discloses the incomplete latest target separately.
     """
     entry_day = day_at(6)
     suspended = ETF_SYMBOLS[2]
@@ -647,23 +648,33 @@ def test_a_partial_benchmark_build_fails_the_formal_position_check(
         name="partial-build",
         execution_rules=ACTUAL_OPEN_RULES,
     )
+    assert scenario["opened"]["kickoff"]["position_policy"]["candidate"] == {
+        "require_initial_position": False,
+        "required_symbols": [],
+        "minimum_required_hold_sessions": 0,
+        "require_end_of_period_target": False,
+    }
     split = scenario["split"]
     assert split["trailing"]["start"] == entry_day
     assert split["trailing"]["sessions"] == 3
 
     validated = ok(validate_current(scenario))
-    assert validated["outcome"] == "insufficient_evidence"
-    assert validated["reason"] == "POSITION_EVIDENCE_INSUFFICIENT"
+    assert validated["outcome"] == "passed"
+    assert validated["reason"] is None
     position = validated["checks"]["position"]
-    assert position["ok"] is False
-    # Both sides publish their build state; only the benchmark is partial, but
-    # either side failing the premise fails the check.
+    assert position["ok"] is True
+    # Both sides publish their build state; only the benchmark is partial.
     assert position["benchmark"]["basket_build_state"] == "partial"
     assert position["benchmark"]["unfilled_basket_signals"] == 1
     assert position["benchmark"]["fills"] == 4
     assert position["candidate"]["basket_build_state"] == "completed"
     assert position["candidate"]["unfilled_basket_signals"] == 0
     assert position["candidate"]["fills"] == 1
+    candidate_account = position["candidate"]["daily_account"]
+    assert candidate_account[0]["date"] == entry_day
+    assert isinstance(candidate_account[0]["cash"], (int, float))
+    assert 99_000.0 < candidate_account[0]["nav"] <= 100_000.0
+    assert sum(value > 0 for value in candidate_account[0]["holdings"].values()) == 1
 
     # The four fills are accounted honestly and the suspended symbol never
     # fills; the receipt keeps its #56 identity.
@@ -673,6 +684,10 @@ def test_a_partial_benchmark_build_fails_the_formal_position_check(
         symbol for symbol in ETF_SYMBOLS if symbol != suspended
     ]
     assert all(fill["date"] == entry_day for fill in benchmark["fills"])
+    benchmark_account = position["benchmark"]["daily_account"][0]
+    assert 19_000.0 < benchmark_account["cash"] < 21_000.0
+    assert 99_000.0 < benchmark_account["nav"] <= 100_000.0
+    assert sum(value > 0 for value in benchmark_account["holdings"].values()) == 4
     assert validated["provenance"]["snapshot_schema_version"] == 3
     assert validated["provenance"]["execution_rule_version"] == ACTUAL_OPEN_RULES
     assert validated["provenance"]["price_basis"] == EXECUTION_PRICE_BASIS
@@ -680,6 +695,252 @@ def test_a_partial_benchmark_build_fails_the_formal_position_check(
     # A completed run is evidence: the counted read happened and its use stays.
     assert validated["usage"]["sequence"] == 1
     assert _validation_ledger_counts(scenario) == (1, 1)
+    replayed = ok(validate_current(scenario))
+    assert replayed["receipt_hash"] == validated["receipt_hash"]
+    assert _validation_ledger_counts(scenario) == (1, 1)
+
+
+def test_frozen_strict_end_target_blocks_partial_build_before_counted_read(
+    tmp_path: Path,
+) -> None:
+    entry_day = day_at(6)
+    suspended = ETF_SYMBOLS[2]
+    payload = schema_v3_fixture(15)
+    make_confirmed_suspension(payload, entry_day, suspended)
+    policy = {
+        side: {
+            "require_initial_position": True,
+            "required_symbols": [],
+            "minimum_required_hold_sessions": 0,
+            "require_end_of_period_target": True,
+        }
+        for side in ("candidate", "benchmark")
+    }
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="strict-position",
+        execution_rules=ACTUAL_OPEN_LOT_RULES,
+        position_policy=policy,
+    )
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "insufficient_evidence"
+    assert validated["reason"] == "POSITION_EVIDENCE_INSUFFICIENT"
+    position = validated["checks"]["position"]
+    assert position["ok"] is False
+    assert position["benchmark"]["end_of_period_target"]["required"] is True
+    assert position["benchmark"]["end_of_period_target"]["state"] == "partial"
+    assert position["benchmark"]["end_of_period_target"]["satisfied"] is False
+    assert validated["usage"]["sequence"] == 1
+    assert len(round_uses(scenario)) == 1
+
+
+def test_frozen_strict_end_target_accepts_a_completed_whole_lot_batch(
+    tmp_path: Path,
+) -> None:
+    policy = {
+        side: {
+            "require_initial_position": True,
+            "required_symbols": [],
+            "minimum_required_hold_sessions": 0,
+            "require_end_of_period_target": True,
+        }
+        for side in ("candidate", "benchmark")
+    }
+    scenario = formal_scenario(
+        tmp_path,
+        payload=schema_v3_fixture(15),
+        name="whole-lot-target",
+        execution_rules=ACTUAL_OPEN_LOT_RULES,
+        position_policy=policy,
+    )
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "passed"
+    for side in ("candidate", "benchmark"):
+        target = validated["checks"]["position"][side]["end_of_period_target"]
+        assert target["required"] is True
+        assert target["state"] == "completed"
+        assert target["satisfied"] is True
+
+
+def test_unmet_frozen_hold_day_requirement_blocks_before_counted_read(
+    tmp_path: Path,
+) -> None:
+    policy = {
+        side: {
+            "require_initial_position": True,
+            "required_symbols": [],
+            "minimum_required_hold_sessions": 100,
+            "require_end_of_period_target": False,
+        }
+        for side in ("candidate", "benchmark")
+    }
+    scenario = formal_scenario(
+        tmp_path, name="hold-days-precheck", position_policy=policy,
+    )
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_PRECHECK_INSUFFICIENT", phase="validation"
+    )
+    position = blocked["precheck"]["scoring_prerequisites"]["position"]
+    assert blocked["counted"] is False
+    assert position["ok"] is False
+    assert position["candidate"]["required_hold_sessions"] < 100
+    assert position["candidate"]["failed_conditions"] == [
+        "REQUIRED_HOLD_SESSIONS_NOT_MET"
+    ]
+    assert round_uses(scenario) == []
+
+
+def test_frozen_required_hold_days_use_each_accounts_actual_daily_positions(
+    tmp_path: Path,
+) -> None:
+    entry_day = day_at(6)
+    suspended = ETF_SYMBOLS[2]
+    payload = schema_v3_fixture(15)
+    make_confirmed_suspension(payload, entry_day, suspended)
+    policy = {
+        "candidate": {
+            "require_initial_position": True,
+            "required_symbols": [],
+            "minimum_required_hold_sessions": 3,
+            "require_end_of_period_target": False,
+        },
+        "benchmark": {
+            "require_initial_position": True,
+            "required_symbols": list(ETF_SYMBOLS),
+            "minimum_required_hold_sessions": 1,
+            "require_end_of_period_target": False,
+        },
+    }
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="daily-position",
+        execution_rules=ACTUAL_OPEN_RULES,
+        position_policy=policy,
+    )
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "insufficient_evidence"
+    assert validated["reason"] == "POSITION_EVIDENCE_INSUFFICIENT"
+    position = validated["checks"]["position"]
+    assert position["candidate"]["required_hold_sessions"] == 3
+    assert position["candidate"]["first_required_hold_date"] == entry_day
+    assert position["candidate"]["ok"] is True
+    assert position["benchmark"]["required_symbols"] == list(ETF_SYMBOLS)
+    assert position["benchmark"]["required_hold_sessions"] == 0
+    assert position["benchmark"]["first_required_hold_date"] is None
+    assert position["benchmark"]["ok"] is False
+    assert validated["usage"]["sequence"] == 1
+    assert len(round_uses(scenario)) == 1
+
+
+def test_frozen_policy_can_allow_candidate_cash_without_weakening_benchmark(
+    tmp_path: Path,
+) -> None:
+    payload = schema_v3_fixture(15)
+    date_index = {row["date"]: index for index, row in enumerate(payload["calendar"])}
+    for row in payload["derived"]:
+        row["value"] = 10.0 - date_index[row["date"]] * 0.1
+    policy = {
+        "candidate": {
+            "require_initial_position": False,
+            "required_symbols": [],
+            "minimum_required_hold_sessions": 0,
+            "require_end_of_period_target": False,
+        },
+        "benchmark": {
+            "require_initial_position": True,
+            "required_symbols": [],
+            "minimum_required_hold_sessions": 0,
+            "require_end_of_period_target": False,
+        },
+    }
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="intentional-cash",
+        family="momentum",
+        parameters={"lookback": 2, "cash_if_negative": True},
+        position_policy=policy,
+    )
+
+    validated = ok(validate_current(scenario))
+    assert validated["outcome"] == "passed"
+    position = validated["checks"]["position"]
+    assert position["candidate"]["state"] == "intentional_cash"
+    assert position["candidate"]["ok"] is True
+    assert position["benchmark"]["state"] == "initial_position_established"
+    assert position["benchmark"]["ok"] is True
+
+
+def test_five_symbol_hold_dates_follow_partial_build_completion_and_later_sale(
+    tmp_path: Path,
+) -> None:
+    payload = schema_v3_fixture(40)
+    date_index = {row["date"]: index for index, row in enumerate(payload["calendar"])}
+    for row in payload["derived"]:
+        index = date_index[row["date"]]
+        if row["symbol"] == ETF_SYMBOLS[4]:
+            row["value"] = 10.0 if index < 8 else 10.0 + (index - 7) * 0.25
+        elif row["symbol"] == ETF_SYMBOLS[3]:
+            row["value"] = (
+                10.0 + index * 0.15
+                if index <= 12
+                else 10.0 + 12 * 0.15 - (index - 12) * 0.3
+            )
+        else:
+            row["value"] = 10.0 + index * 0.15
+    policy = {
+        "candidate": {
+            "require_initial_position": True,
+            "required_symbols": list(ETF_SYMBOLS),
+            "minimum_required_hold_sessions": 1,
+            "require_end_of_period_target": False,
+        },
+        "benchmark": {
+            "require_initial_position": True,
+            "required_symbols": list(ETF_SYMBOLS),
+            "minimum_required_hold_sessions": 1,
+            "require_end_of_period_target": False,
+        },
+    }
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="five-symbol-timeline",
+        family="trend_filter",
+        parameters={"lookback": 2},
+        execution_rules=ACTUAL_OPEN_LOT_RULES,
+        decision_policy=normalize_decision_policy(AFTER_CLOSE_COMMON_POLICY),
+        position_policy=policy,
+    )
+
+    validated = ok(validate_current(scenario))
+    discovery_position = (
+        validated["discovery_precheck"]["scoring_prerequisites"]["position"]
+        ["candidate"]
+    )
+    accounts = discovery_position["daily_account"]
+    held_counts = [
+        (point["date"], sum(quantity > 0 for quantity in point["holdings"].values()))
+        for point in accounts
+    ]
+    first_four = next(index for index, (_, count) in enumerate(held_counts) if count == 4)
+    first_five = next(index for index, (_, count) in enumerate(held_counts) if count == 5)
+    later_four = next(
+        index for index, (_, count) in enumerate(held_counts[first_five + 1:], first_five + 1)
+        if count == 4
+    )
+    required_dates = discovery_position["required_hold_dates"]
+    assert held_counts[first_four][0] not in required_dates
+    assert held_counts[first_five][0] in required_dates
+    assert held_counts[later_four][0] not in required_dates
+    assert discovery_position["first_required_hold_date"] == held_counts[first_five][0]
+    assert discovery_position["required_hold_sessions"] == len(required_dates)
 
 
 def test_formal_validation_is_distinguishable_from_the_v1_replay(tmp_path: Path) -> None:

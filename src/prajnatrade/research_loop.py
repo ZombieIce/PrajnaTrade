@@ -160,8 +160,7 @@ OPERATORS = {
     "==": operator.eq,
 }
 _POSITION_STATES = {"initial_position_established", "intentional_cash"}
-#: Basket-build states that leave a required basket unfinished; a formal
-#: position prerequisite is not satisfied while either side reports one.
+# Rounds created before the frozen per-account position policy keep this gate.
 _UNFINISHED_BUILD_STATES = {"partial", "unfilled"}
 _OBSERVATION_FORMULA = (
     "ceil(sessions / max(1, opportunities)) * minimum_opportunities, "
@@ -481,7 +480,7 @@ def _round_contract(source: object) -> dict[str, Any]:
             "disclosed_risks", "scoring_policy", "observation", "invalidation", "reviewer",
             "approval_reason",
         },
-        frozenset({"validation_policy", "signal_pause_policy"}),
+        frozenset({"validation_policy", "signal_pause_policy", "position_policy"}),
     )
     comparison = _object(payload["comparison"], {"benchmark", "statement"})
     if comparison["benchmark"] != BENCHMARK:
@@ -508,6 +507,8 @@ def _round_contract(source: object) -> dict[str, Any]:
         contract["signal_pause_policy"] = _signal_pause_policy(
             payload["signal_pause_policy"]
         )
+    if "position_policy" in payload:
+        contract["position_policy"] = _position_policy(payload["position_policy"])
     return contract
 
 
@@ -540,6 +541,57 @@ def _signal_pause_policy(raw: object) -> dict[str, Any]:
         "value": limit,
         "scope": "each_account",
         "counting": "unique_decision_date",
+    }
+
+
+def _position_policy(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != {"candidate", "benchmark"}:
+        raise ValueError("position_policy must define candidate and benchmark.")
+    policy = {}
+    for side in ("candidate", "benchmark"):
+        entry = _object(
+            raw[side],
+            {
+                "require_initial_position", "required_symbols",
+                "minimum_required_hold_sessions", "require_end_of_period_target",
+            },
+        )
+        if type(entry["require_initial_position"]) is not bool:
+            raise ValueError(f"position_policy.{side}.require_initial_position must be boolean.")
+        if type(entry["require_end_of_period_target"]) is not bool:
+            raise ValueError(
+                f"position_policy.{side}.require_end_of_period_target must be boolean."
+            )
+        symbols = _texts(entry["required_symbols"], f"position_policy.{side}.required_symbols")
+        if len(set(symbols)) != len(symbols):
+            raise ValueError(f"position_policy.{side}.required_symbols must be unique.")
+        unknown = set(symbols) - set(ETF_SYMBOLS)
+        if unknown:
+            raise ValueError(
+                f"position_policy.{side}.required_symbols contains unsupported ETFs: "
+                f"{', '.join(sorted(unknown))}."
+            )
+        policy[side] = {
+            "require_initial_position": entry["require_initial_position"],
+            "required_symbols": [symbol for symbol in ETF_SYMBOLS if symbol in symbols],
+            "minimum_required_hold_sessions": _non_negative_integer(
+                entry["minimum_required_hold_sessions"],
+                f"position_policy.{side}.minimum_required_hold_sessions",
+            ),
+            "require_end_of_period_target": entry["require_end_of_period_target"],
+        }
+    return policy
+
+
+def _default_position_policy() -> dict[str, Any]:
+    return {
+        side: {
+            "require_initial_position": False,
+            "required_symbols": [],
+            "minimum_required_hold_sessions": 0,
+            "require_end_of_period_target": False,
+        }
+        for side in ("candidate", "benchmark")
     }
 
 
@@ -664,6 +716,18 @@ def prepare_round(
             "campaign_id": campaign_id,
         }
     )
+    if split is not None and "position_policy" not in contract:
+        with _project(project) as connection:
+            previous = connection.execute(
+                "SELECT kickoff_json FROM research_loop_rounds WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+        if previous is None:
+            contract["position_policy"] = _default_position_policy()
+        else:
+            prior_kickoff = json.loads(previous["kickoff_json"])["kickoff"]
+            if "position_policy" in prior_kickoff:
+                contract["position_policy"] = prior_kickoff["position_policy"]
     kickoff = {
         **contract,
         "scoring_policy": {**contract["scoring_policy"], "frozen": frozen},
@@ -1010,15 +1074,16 @@ def _protocol_hash(kickoff: Mapping[str, Any]) -> str:
         "hard_conditions": kickoff["hard_conditions"],
         "selection_rules": kickoff["selection_rules"],
     }
-    # Protocol v1 hashes only the legacy contract fields.  Protocol v2 also
-    # binds the trailing-validation protocol block and the frozen split so a
-    # locked version traces to the partition protocol it was scored under.
+    # Protocol v1 hashes only the legacy contract fields. Protocol v2 also
+    # binds its partition and the frozen position criteria to locked versions.
     if "protocol" in kickoff:
         body["protocol"] = kickoff["protocol"]
         split = kickoff["research_partition"]
         body["research_partition"] = {
             key: split[key] for key in ("split_hash", "development", "trailing")
         }
+        if "position_policy" in kickoff:
+            body["position_policy"] = kickoff["position_policy"]
     return _hash(body)
 
 
@@ -1510,14 +1575,112 @@ def _gap_summary(gaps: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _position_summary(run: Mapping[str, Any]) -> dict[str, Any]:
+def _position_summary(
+    run: Mapping[str, Any], policy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     evidence = run["position_evidence"]
     readiness = run.get("history_readiness") or {}
+    if policy is None:
+        summary = {
+            "state": evidence["state"],
+            "invested_sessions": evidence["invested_sessions"],
+            "first_position_signal_date": evidence["first_position_signal_date"],
+            "first_fill_date": evidence["first_fill_date"],
+            "fills": run["metrics"]["fills"],
+            "unfilled_orders": run["metrics"]["orders_unfilled"],
+            "intentional_cash_sessions": list(readiness.get("ready_cash_sessions", [])),
+        }
+        for key in ("basket_build_state", "unfilled_basket_signals"):
+            if key in evidence:
+                summary[key] = evidence[key]
+        return summary
+
+    required_symbols = list(policy["required_symbols"])
+    held_dates = []
+    required_hold_dates = []
+    daily_account = []
+    for point in run.get("equity_curve") or []:
+        holdings = point.get("holdings")
+        if not isinstance(holdings, Mapping):
+            continue
+        held_symbols = {
+            symbol for symbol, holding in holdings.items()
+            if isinstance(holding, Mapping)
+            and isinstance(holding.get("quantity"), (int, float))
+            and not isinstance(holding.get("quantity"), bool)
+            and float(holding["quantity"]) > 1e-12
+        }
+        if held_symbols:
+            held_dates.append(point["date"])
+        if (
+            all(symbol in held_symbols for symbol in required_symbols)
+            if required_symbols else bool(held_symbols)
+        ):
+            required_hold_dates.append(point["date"])
+        daily_account.append({
+            "date": point["date"],
+            "nav": point.get("nav"),
+            "cash": point.get("cash"),
+            "holdings": {
+                symbol: float(holding["quantity"])
+                for symbol, holding in holdings.items()
+                if isinstance(holding, Mapping)
+                and isinstance(holding.get("quantity"), (int, float))
+                and not isinstance(holding.get("quantity"), bool)
+            },
+        })
+
+    attempts = run.get("order_attempts") or []
+    latest = attempts[-1] if attempts else None
+    latest_complete = (
+        bool(latest["batch_complete"])
+        if latest is not None and "batch_complete" in latest
+        else latest is not None and latest.get("status") == "filled"
+    )
+    build_state = (
+        "completed" if latest_complete
+        else "partial" if latest is not None and latest.get("filled_symbols")
+        else "unfilled" if latest is not None
+        else "none"
+    )
+    end_target = {
+        "required": policy["require_end_of_period_target"],
+        "state": build_state,
+        "satisfied": (
+            not policy["require_end_of_period_target"] or build_state == "completed"
+        ),
+    }
+
+    failed_conditions = []
+    state = evidence["state"]
+    if state not in _POSITION_STATES:
+        failed_conditions.append("POSITION_NOT_ESTABLISHED")
+    if policy["require_initial_position"] and state != "initial_position_established":
+        failed_conditions.append("INITIAL_POSITION_REQUIRED")
+    if len(required_hold_dates) < policy["minimum_required_hold_sessions"]:
+        failed_conditions.append("REQUIRED_HOLD_SESSIONS_NOT_MET")
+    if not end_target["satisfied"]:
+        failed_conditions.append("END_OF_PERIOD_TARGET_INCOMPLETE")
+
     summary = {
-        "state": evidence["state"],
+        "ok": not failed_conditions,
+        "state": state,
         "invested_sessions": evidence["invested_sessions"],
         "first_position_signal_date": evidence["first_position_signal_date"],
         "first_fill_date": evidence["first_fill_date"],
+        "held_sessions": len(held_dates),
+        "first_held_date": held_dates[0] if held_dates else None,
+        "required_symbols": required_symbols,
+        "required_hold_dates": required_hold_dates,
+        "required_hold_sessions": len(required_hold_dates),
+        "first_required_hold_date": (
+            required_hold_dates[0] if required_hold_dates else None
+        ),
+        "daily_account": daily_account,
+        "minimum_required_hold_sessions": policy["minimum_required_hold_sessions"],
+        "require_initial_position": policy["require_initial_position"],
+        "end_of_period_target": end_target,
+        "failed_conditions": failed_conditions,
         "fills": run["metrics"]["fills"],
         "unfilled_orders": run["metrics"]["orders_unfilled"],
         "intentional_cash_sessions": list(readiness.get("ready_cash_sessions", [])),
@@ -1933,28 +2096,37 @@ def _data_availability_check(
 
 
 def _position_check(
-    candidate: Mapping[str, Any], benchmark: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    frozen_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The formal position prerequisite for both sides of the frozen comparison.
 
-    A side satisfies it when its position evidence state targets a real
-    position or explicit cash *and* its latest basket build is not still
-    unfinished: a plan that required the whole basket and filled only part of it
-    (``partial``) or none of it (``unfilled``) leaves the scored premise unmet
-    even though shares were bought.  A run without a build state (the legacy
-    execution rules) is judged by its position state alone, exactly as before.
+    Actual portfolios are scored by default: a partially filled latest target
+    remains visible but is not itself a blocker. An explicit frozen policy may
+    require initial investment, simultaneous holdings on a minimum number of
+    actual sessions, or a complete end-of-period target.
     """
-    def satisfied(run: Mapping[str, Any]) -> bool:
-        evidence = run["position_evidence"]
-        if evidence["state"] not in _POSITION_STATES:
-            return False
-        build_state = evidence.get("basket_build_state")
-        return build_state is None or build_state not in _UNFINISHED_BUILD_STATES
+    if frozen_policy is None:
+        def legacy_satisfied(run: Mapping[str, Any]) -> bool:
+            evidence = run["position_evidence"]
+            if evidence["state"] not in _POSITION_STATES:
+                return False
+            build_state = evidence.get("basket_build_state")
+            return build_state is None or build_state not in _UNFINISHED_BUILD_STATES
 
+        return {
+            "ok": legacy_satisfied(candidate) and legacy_satisfied(benchmark),
+            "candidate": _position_summary(candidate),
+            "benchmark": _position_summary(benchmark),
+        }
+    policy = frozen_policy
+    candidate_report = _position_summary(candidate, policy["candidate"])
+    benchmark_report = _position_summary(benchmark, policy["benchmark"])
     return {
-        "ok": satisfied(candidate) and satisfied(benchmark),
-        "candidate": _position_summary(candidate),
-        "benchmark": _position_summary(benchmark),
+        "ok": candidate_report["ok"] and benchmark_report["ok"],
+        "candidate": candidate_report,
+        "benchmark": benchmark_report,
     }
 
 
@@ -2069,7 +2241,7 @@ def _receipt(
     data_availability = _data_availability_check(
         candidate, benchmark, replay["snapshot"], signal_pauses,
     )
-    position = _position_check(candidate, benchmark)
+    position = _position_check(candidate, benchmark, kickoff.get("position_policy"))
     costs = {
         "ok": all(
             _within(run_metrics["fees_paid"], original_metrics["fees_paid"])
@@ -2495,7 +2667,7 @@ def _formal_discovery_precheck(
         discovery, baseline, snapshot_evidence,
         pause_reports,
     )
-    position = _position_check(discovery, baseline)
+    position = _position_check(discovery, baseline, kickoff.get("position_policy"))
     prerequisites = {
         "scoring_start": scoring_start,
         "coverage": coverage,
@@ -3003,7 +3175,7 @@ def _formal_receipt(
         "coverage": _coverage_check(
             candidate, benchmark, runs["scoring_start"], expected
         ),
-        "position": _position_check(candidate, benchmark),
+        "position": _position_check(candidate, benchmark, kickoff.get("position_policy")),
         "segment": dict(runs["segment"]),
         "hard_conditions": [
             _hard_condition(condition, candidate_metrics)

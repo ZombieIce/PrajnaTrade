@@ -536,6 +536,7 @@ def test_round_submit_locks_the_v2_protocol_and_agent_status_shows_the_split(
         "hard_conditions": opened["kickoff"]["hard_conditions"],
         "selection_rules": opened["kickoff"]["selection_rules"],
         "protocol": V2_PROTOCOL,
+        "position_policy": opened["kickoff"]["position_policy"],
         "research_partition": {
             key: split[key] for key in ("split_hash", "development", "trailing")
         },

@@ -268,6 +268,15 @@ corrected successor produces a formal revalidation epoch with the prior receipt
 and affected diff while a changed development slice is refused with
 `EVIDENCE_DEVELOPMENT_MISMATCH`. The file is fast and not marked `isolation`.
 
+The #81-C cases freeze per-account `position_policy` through the public
+`round open`/`round validate` CLI. They reconcile the actual daily cash, NAV and
+holdings timeline through a four-to-five-to-four ETF basket, verify independent
+candidate/benchmark hold-date counts and intentional-cash permission, and
+compare default partial-target disclosure with an explicitly strict end target.
+They also check that a completed whole-lot batch satisfies the strict rule,
+known Discovery blockers use no read, a valid read counts once, and replay does
+not count it again.
+
 ## Formal Validation pre-read execution gate and 329-day receipt tests (#59)
 
 `tests/test_formal_validation_cli.py` also owns the end-to-end #56/#59 acceptance
