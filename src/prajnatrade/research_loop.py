@@ -99,6 +99,7 @@ from prajnatrade.experiment import (
 )
 from prajnatrade.research_direction import direction_id
 from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_LOT_RULES,
     ACTUAL_OPEN_RULES,
     EXECUTION_PRICE_BASIS,
     NEXT_OPEN_RULES,
@@ -1320,6 +1321,8 @@ def _evidence_runs(
     rule_version = rules.get("version", NEXT_OPEN_RULES)
     valuation_version = valuation_policy_version(rules)
     decision_policy = locked.get("decision_policy")
+    lot_sizes = rules.get("execution", {}).get("lot_sizes")
+    symbol_order = rules.get("execution", {}).get("symbol_order")
     options = {
         "data_kind": source["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
@@ -1329,6 +1332,8 @@ def _evidence_runs(
         "slippage_bps": locked["base_costs"]["slippage_bps"],
         "execution_rule_version": rule_version,
         "valuation_policy_version": valuation_version,
+        "lot_sizes": lot_sizes,
+        "symbol_order": symbol_order,
         "history_requirements": locked["history_requirements"],
         "scoring_start": scoring_start,
         "decision_policy": decision_policy,
@@ -1354,6 +1359,8 @@ def _evidence_runs(
         slippage_bps=locked["base_costs"]["slippage_bps"],
         execution_rule_version=rule_version,
         valuation_policy_version=valuation_version,
+        lot_sizes=lot_sizes,
+        symbol_order=symbol_order,
         history_requirements=[],
         scoring_start=scoring_start,
         decision_policy=decision_policy,
@@ -1957,7 +1964,7 @@ def _receipt(
     decision_policy = submission["locked"].get("decision_policy")
     if (
         (type(snapshot_schema_version) is int and snapshot_schema_version >= 3)
-        or execution_rule_version == ACTUAL_OPEN_RULES
+        or execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES)
         or valuation_version != STRICT_CLOSE_VALUATION
         or decision_policy is not None
     ):
@@ -1967,6 +1974,14 @@ def _receipt(
             "execution_rule_version": execution_rule_version,
             "price_basis": EXECUTION_PRICE_BASIS,
         }
+        if execution_rule_version == ACTUAL_OPEN_LOT_RULES:
+            exec_rules = submission["locked"]["execution_rules"].get("execution", {})
+            if "lot_sizes" in exec_rules:
+                provenance["lot_sizes"] = dict(exec_rules["lot_sizes"])
+            if "daily_simulation_assumptions" in exec_rules:
+                provenance["daily_simulation_assumptions"] = dict(
+                    exec_rules["daily_simulation_assumptions"]
+                )
         if valuation_version != STRICT_CLOSE_VALUATION:
             provenance["valuation_policy_version"] = valuation_version
         if decision_policy is not None:
@@ -2552,6 +2567,8 @@ def _formal_runs(
     rule_version = rules.get("version", NEXT_OPEN_RULES)
     valuation_version = valuation_policy_version(rules)
     decision_policy = locked.get("decision_policy")
+    lot_sizes = rules.get("execution", {}).get("lot_sizes")
+    symbol_order = rules.get("execution", {}).get("symbol_order")
     options = {
         "data_kind": evaluation["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
@@ -2561,6 +2578,8 @@ def _formal_runs(
         "slippage_bps": locked["base_costs"]["slippage_bps"],
         "execution_rule_version": rule_version,
         "valuation_policy_version": valuation_version,
+        "lot_sizes": lot_sizes,
+        "symbol_order": symbol_order,
         "history_requirements": list(locked["history_requirements"] or []),
         "scoring_start": scoring_start,
         "decision_policy": decision_policy,
@@ -2586,6 +2605,8 @@ def _formal_runs(
         slippage_bps=locked["base_costs"]["slippage_bps"],
         execution_rule_version=rule_version,
         valuation_policy_version=valuation_version,
+        lot_sizes=lot_sizes,
+        symbol_order=symbol_order,
         history_requirements=[],
         scoring_start=scoring_start,
         decision_policy=decision_policy,
@@ -2760,6 +2781,20 @@ def _formal_receipt(
             "version", NEXT_OPEN_RULES
         ),
         "price_basis": EXECUTION_PRICE_BASIS,
+        **(
+            {
+                "lot_sizes": dict(
+                    submission["locked"]["execution_rules"].get("execution", {}).get("lot_sizes", {})
+                ),
+                "daily_simulation_assumptions": dict(
+                    submission["locked"]["execution_rules"]
+                    .get("execution", {})
+                    .get("daily_simulation_assumptions", {"late_resume_sell_funds_same_day_buy": True})
+                ),
+            }
+            if submission["locked"]["execution_rules"].get("version") == ACTUAL_OPEN_LOT_RULES
+            else {}
+        ),
         **(
             {"valuation_policy_version": valuation_version}
             if valuation_version != STRICT_CLOSE_VALUATION

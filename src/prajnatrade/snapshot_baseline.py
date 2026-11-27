@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_left
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any
@@ -34,7 +34,14 @@ from prajnatrade.backtest import (
     equal_weight_buy_and_hold,
 )
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.lot_execution import (
+    classify_unfilled_reason,
+    match_open_lot_day,
+)
 from prajnatrade.snapshot import read_discovery
+from prajnatrade.trading_status import (
+    ACTUAL_OPEN_LOT_RULES as ACTUAL_OPEN_LOT_RULES,
+)
 from prajnatrade.trading_status import (
     ACTUAL_OPEN_RULES as ACTUAL_OPEN_RULES,
 )
@@ -63,7 +70,6 @@ from prajnatrade.trading_status import (
     VALUATION_POLICY_VERSIONS as VALUATION_POLICY_VERSIONS,
 )
 from prajnatrade.trading_status import (
-    halt_conflicts_with_volume,
     halt_covers_session,
 )
 from prajnatrade.trading_status import (
@@ -89,6 +95,8 @@ def run_discovery_strategy(
     slippage_bps: float = 0.0,
     execution_rule_version: str = NEXT_OPEN_RULES,
     valuation_policy_version: str = STRICT_CLOSE_VALUATION,
+    lot_sizes: Mapping[str, int] | None = None,
+    symbol_order: Sequence[str] | None = None,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
@@ -109,6 +117,8 @@ def run_discovery_strategy(
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rule_version,
         valuation_policy_version=valuation_policy_version,
+        lot_sizes=lot_sizes,
+        symbol_order=symbol_order,
         history_requirements=history_requirements,
         scoring_start=scoring_start,
         decision_policy=decision_policy,
@@ -162,6 +172,8 @@ def run_partition_strategy(
     slippage_bps: float = 0.0,
     execution_rule_version: str = NEXT_OPEN_RULES,
     valuation_policy_version: str = STRICT_CLOSE_VALUATION,
+    lot_sizes: Mapping[str, int] | None = None,
+    symbol_order: Sequence[str] | None = None,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     decision_policy: Mapping[str, Any] | None = None,
@@ -334,7 +346,22 @@ def run_partition_strategy(
                 for symbol in ETF_SYMBOLS
                 if (row := raw_bars.get((day, symbol))) is not None
             }
-            if execution_rule_version == ACTUAL_OPEN_RULES:
+            if execution_rule_version == ACTUAL_OPEN_LOT_RULES:
+                attempt, day_fills, cash, shares, costs = match_open_lot_day(
+                    day,
+                    signal,
+                    weights,
+                    open_prices,
+                    raw_bars,
+                    cash,
+                    shares,
+                    fee_rate,
+                    slippage_rate,
+                    lot_sizes=lot_sizes,
+                    symbol_order=symbol_order or ETF_SYMBOLS,
+                    fixed_amounts=signal.get("fixed_amounts"),
+                )
+            elif execution_rule_version == ACTUAL_OPEN_RULES:
                 # Every required symbol matches on its own: one missing open no
                 # longer aborts the basket, and no sell funds a buy unless it
                 # actually filled.
@@ -379,7 +406,7 @@ def run_partition_strategy(
             for fill in day_fills:
                 fill["raw_open"] = open_prices[fill["symbol"]]
                 fill["price_basis"] = EXECUTION_PRICE_BASIS
-                if execution_rule_version == ACTUAL_OPEN_RULES:
+                if execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES):
                     open_source = raw_bars[(day, fill["symbol"])].get("open_source")
                     if isinstance(open_source, Mapping):
                         fill["open_evidence"] = {
@@ -783,7 +810,7 @@ def _position_evidence(
         "first_position_signal_date": positive[0]["date"] if positive else None,
         "first_fill_date": fills[0]["date"] if fills else None,
     }
-    if execution_rule_version == ACTUAL_OPEN_RULES:
+    if execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES):
         latest = positive_attempts[-1] if positive_attempts else None
         # ``partial`` means the last positive target started building: at least
         # one fill and at least one unfilled required symbol.  A target that
@@ -861,7 +888,7 @@ def _metrics(
         "signal_gaps": len(signal_gaps),
         "valuation_gaps": len(valuation_gaps),
     }
-    if execution_rule_version == ACTUAL_OPEN_RULES:
+    if execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES):
         # A partial attempt still counts as unfilled above; this additive count
         # records the baskets that matched some symbols but not all of them.
         metrics["orders_partially_filled"] = sum(
@@ -919,6 +946,8 @@ def run_discovery_equal_weight(
     slippage_bps: float,
     execution_rule_version: str = NEXT_OPEN_RULES,
     valuation_policy_version: str = STRICT_CLOSE_VALUATION,
+    lot_sizes: Mapping[str, int] | None = None,
+    symbol_order: Sequence[str] | None = None,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
@@ -947,6 +976,8 @@ def run_discovery_equal_weight(
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rule_version,
         valuation_policy_version=valuation_policy_version,
+        lot_sizes=lot_sizes,
+        symbol_order=symbol_order,
         history_requirements=history_requirements,
         scoring_start=scoring_start,
         prior_history=prior_history,
@@ -1219,7 +1250,7 @@ def is_executable_open(
     if row is None or not _valid_price(row.get("open")):
         return False
     status = row.get("trading_status")
-    if execution_rule_version == ACTUAL_OPEN_RULES:
+    if execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES):
         if not _valid_price(row.get("volume")):
             return False
         if status == "partial_halt":
@@ -1350,24 +1381,7 @@ def _match_actual_open_day(
 
 def unfilled_reason(row: dict | None) -> str:
     """Classify a required symbol the sealed row shows cannot match today."""
-    if row is None:
-        return "missing_bar"
-    status = row.get("trading_status")
-    if status == "unknown":
-        return "unknown_trading_status"
-    if status == "suspended":
-        return "confirmed_no_trade"
-    # A sealed source conflict is never resolved into a confirmed no-trade or a
-    # fill: the required open is missing.  An explicit null is not a conflict.
-    if row.get("open_conflict") is not None:
-        return "missing_required_open"
-    if status == "partial_halt":
-        halt, day = row.get("halt"), row.get("date")
-        if halt_conflicts_with_volume(halt, day, row.get("volume")):
-            return "unknown_trading_status"
-        if halt_covers_session(halt, day):
-            return "confirmed_no_trade"
-    return "missing_required_open"
+    return classify_unfilled_reason(row)
 
 
 def _close_available(row: dict, cutoff: datetime, data_kind: str) -> bool:
