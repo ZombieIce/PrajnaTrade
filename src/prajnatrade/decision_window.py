@@ -177,6 +177,49 @@ def _observation_source(
     }
 
 
+def _pause_evidence(
+    symbol: str,
+    reason: str,
+    raw: Mapping[str, Any] | None,
+    drv: Mapping[str, Any] | None,
+    *,
+    data_kind: str,
+) -> dict[str, Any]:
+    """Keep the point-in-time evidence that explains a paused decision."""
+    raw = raw or {}
+    drv = drv or {}
+    if reason == "derived_after_cutoff":
+        return {
+            "symbol": symbol,
+            "reason": reason,
+            "source": "derived",
+            "evidence_available_at": drv.get("available_at"),
+            "availability_evidence": drv.get("availability_evidence"),
+        }
+    if reason == "close_after_cutoff":
+        available_at = (
+            raw.get("close_available_at")
+            if data_kind == "real" or raw.get("close_available_at") is not None
+            else raw.get("available_at")
+        )
+        return {
+            "symbol": symbol,
+            "reason": reason,
+            "source": "raw_close",
+            "evidence_available_at": available_at,
+            "availability_evidence": raw.get("availability_evidence"),
+        }
+    return {
+        "symbol": symbol,
+        "reason": reason,
+        "source": "trading_status",
+        "evidence_available_at": raw.get("available_at"),
+        "availability_evidence": raw.get("availability_evidence"),
+        "status_evidence_id": raw.get("status_evidence_id"),
+        "trading_status": raw.get("trading_status"),
+    }
+
+
 def select_common_observations(
     sessions: Sequence[str],
     raw_bars: Mapping[tuple[str, str], Mapping[str, Any]],
@@ -205,18 +248,34 @@ def select_common_observations(
 
     pause_symbols: list[str] = []
     pause_reasons: list[dict[str, str]] = []
+    pause_evidence: list[dict[str, Any]] = []
+    confirmed_no_trade: list[dict[str, Any]] = []
     for symbol in symbols:
         raw = raw_bars.get((decision_date, symbol))
         drv = derived.get((decision_date, symbol))
-        confirmed_no_trade, _ = classify_no_trade_for_valuation(
+        no_trade, _ = classify_no_trade_for_valuation(
             raw, cutoff, data_kind=data_kind, schema_version=schema_version
         )
-        if confirmed_no_trade:
+        if no_trade:
+            assert raw is not None
+            confirmed_no_trade.append(
+                {
+                    "symbol": symbol,
+                    "reason": "confirmed_full_day_suspension",
+                    "evidence_available_at": raw.get("available_at"),
+                    "availability_evidence": raw.get("availability_evidence"),
+                    "status_evidence_id": raw.get("status_evidence_id"),
+                    "trading_status": raw.get("trading_status"),
+                }
+            )
             continue
         reason = _check_symbol_observation(decision_date, raw, drv, cutoff, data_kind)
         if reason is not None:
             pause_symbols.append(symbol)
             pause_reasons.append({"symbol": symbol, "reason": reason})
+            pause_evidence.append(
+                _pause_evidence(symbol, reason, raw, drv, data_kind=data_kind)
+            )
 
     if pause_symbols:
         return {
@@ -228,7 +287,10 @@ def select_common_observations(
                 "date": decision_date,
                 "symbols": sorted(pause_symbols),
                 "reasons": pause_reasons,
+                "evidence": pause_evidence,
+                "confirmed_no_trade": confirmed_no_trade,
             },
+            "confirmed_no_trade": confirmed_no_trade,
             "ready": False,
             "observation_dates": [],
             "observation_sources": {},
@@ -321,6 +383,7 @@ def select_common_observations(
         "signal_cutoff": cutoff_iso,
         "signal_status": "ready" if ready else "insufficient_history",
         "signal_pause": None,
+        "confirmed_no_trade": confirmed_no_trade,
         "ready": ready,
         "observation_dates": observation_dates,
         "observation_sources": selected_sources,

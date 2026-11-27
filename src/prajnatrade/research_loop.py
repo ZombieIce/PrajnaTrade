@@ -86,7 +86,10 @@ from zoneinfo import ZoneInfo
 from prajnatrade import release, shadow_calendar, snapshot
 from prajnatrade.container_executor import executor_from_config
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.discovery_summary import summarize_discovery_quarters
+from prajnatrade.discovery_summary import (
+    summarize_discovery_quarters,
+    summarize_signal_pauses,
+)
 from prajnatrade.experiment import (
     ProtocolError,
     campaign_discovery,
@@ -177,6 +180,7 @@ _OPTIONAL_RECEIPT_FIELDS = (
     "prior_validation_id", "validation_kind", "protocol", "development", "trailing",
     "scoring", "warmup", "provenance", "usage", "summary", "runs",
     "original_validation", "recomputed_validation", "discovery_precheck",
+    "signal_pauses",
 )
 VALIDATION_KIND_TRAILING = "trailing_validation"
 _VALIDATION_USE_FIELDS = (
@@ -477,7 +481,7 @@ def _round_contract(source: object) -> dict[str, Any]:
             "disclosed_risks", "scoring_policy", "observation", "invalidation", "reviewer",
             "approval_reason",
         },
-        frozenset({"validation_policy"}),
+        frozenset({"validation_policy", "signal_pause_policy"}),
     )
     comparison = _object(payload["comparison"], {"benchmark", "statement"})
     if comparison["benchmark"] != BENCHMARK:
@@ -500,6 +504,10 @@ def _round_contract(source: object) -> dict[str, Any]:
     }
     if "validation_policy" in payload:
         contract["validation_policy"] = payload["validation_policy"]
+    if "signal_pause_policy" in payload:
+        contract["signal_pause_policy"] = _signal_pause_policy(
+            payload["signal_pause_policy"]
+        )
     return contract
 
 
@@ -518,6 +526,21 @@ def _validation_policy(raw: object) -> dict[str, int]:
             "validation_policy.auto_validation_limit must be a positive integer.",
         )
     return {"auto_validation_limit": limit}
+
+
+def _signal_pause_policy(raw: object) -> dict[str, Any]:
+    entry = _object(raw, {"max_paused_signal_days"})
+    limit = _non_negative_integer(
+        entry["max_paused_signal_days"],
+        "signal_pause_policy.max_paused_signal_days",
+    )
+    return {
+        "metric": "paused_signal_days",
+        "operator": "<=",
+        "value": limit,
+        "scope": "each_account",
+        "counting": "unique_decision_date",
+    }
 
 
 def _frozen_scoring_policy(policy: object) -> dict[str, Any]:
@@ -1744,17 +1767,43 @@ def _affected(
 
 
 def _scoring_start_check(
-    candidate: Mapping[str, Any], benchmark: Mapping[str, Any], scoring_start: str,
+    candidate: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    scoring_start: str,
+    signal_pauses: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     readiness = candidate.get("history_readiness") or {}
     first_scored_open = readiness.get("first_scored_open")
-    return {
+    signal_pauses = signal_pauses or {}
+
+    def side_starts(run: Mapping[str, Any], label: str) -> bool:
+        run_readiness = run.get("history_readiness") or {}
+        first_open = run_readiness.get("first_scored_open")
+        if (
+            run["start_date"] == scoring_start
+            and isinstance(first_open, dict)
+            and first_open.get("ready") is True
+            and run_readiness.get("first_ready_date") == scoring_start
+        ):
+            return True
+        report = signal_pauses.get(label)
+        if not isinstance(report, Mapping):
+            return False
+        return any(
+            event.get("date") == scoring_start
+            and event.get("rule_compliant") is True
+            and event.get("nav_reconciled") is True
+            and event.get("prior_orders", {}).get("processing_verified") is True
+            for event in report.get("events", [])
+            if isinstance(event, Mapping)
+        )
+
+    result = {
         "ok": (
             candidate["start_date"] == scoring_start
             and benchmark["start_date"] == scoring_start
-            and isinstance(first_scored_open, dict)
-            and first_scored_open.get("ready") is True
-            and readiness.get("first_ready_date") == scoring_start
+            and side_starts(candidate, "candidate")
+            and side_starts(benchmark, "benchmark")
         ),
         "expected": scoring_start,
         "candidate": {
@@ -1764,6 +1813,19 @@ def _scoring_start_check(
         },
         "benchmark": {"start_date": benchmark["start_date"]},
     }
+    if signal_pauses is not None:
+        result["pause_override"] = {
+            "candidate": (
+                readiness.get("first_ready_date") != scoring_start
+                and side_starts(candidate, "candidate")
+            ),
+            "benchmark": (
+                (benchmark.get("history_readiness") or {}).get("first_ready_date")
+                != scoring_start
+                and side_starts(benchmark, "benchmark")
+            ),
+        }
+    return result
 
 
 def _coverage_check(
@@ -1806,25 +1868,65 @@ def _data_availability_check(
     candidate: Mapping[str, Any],
     benchmark: Mapping[str, Any],
     snapshot: Mapping[str, Any],
+    signal_pauses: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     candidate_valuation = candidate["gaps"]["valuation"]
     benchmark_valuation = benchmark["gaps"]["valuation"]
+    if signal_pauses is None:
+        return {
+            "ok": not (
+                candidate["signal_gaps"]
+                or candidate_valuation
+                or benchmark["signal_gaps"]
+                or benchmark_valuation
+            ),
+            "snapshot": snapshot,
+            "candidate": {
+                "signal_gaps": _gap_summary(candidate["signal_gaps"]),
+                "valuation_gaps": _gap_summary(candidate_valuation),
+            },
+            "benchmark": {
+                "signal_gaps": _gap_summary(benchmark["signal_gaps"]),
+                "valuation_gaps": _gap_summary(benchmark_valuation),
+            },
+        }
+
+    def side_report(label: str, run: Mapping[str, Any]) -> dict[str, Any]:
+        report = signal_pauses.get(label, {})
+        accepted_dates = {
+            event.get("date")
+            for event in report.get("events", [])
+            if isinstance(event, Mapping) and event.get("rule_compliant") is True
+        } if isinstance(report, Mapping) else set()
+        unexplained = [
+            item for item in run["signal_gaps"]
+            if not isinstance(item, Mapping)
+            or item.get("date") not in accepted_dates
+        ]
+        return {
+            "signal_gaps": _gap_summary(run["signal_gaps"]),
+            "accepted_signal_pause_days": len(accepted_dates),
+            "unexplained_signal_gaps": _gap_summary(unexplained),
+            "valuation_gaps": _gap_summary(run["gaps"]["valuation"]),
+        }
+
+    candidate_report = side_report("candidate", candidate)
+    benchmark_report = side_report("benchmark", benchmark)
     return {
-        "ok": not (
-            candidate["signal_gaps"]
-            or candidate_valuation
-            or benchmark["signal_gaps"]
-            or benchmark_valuation
+        "ok": (
+            candidate_report["unexplained_signal_gaps"]["count"] == 0
+            and benchmark_report["unexplained_signal_gaps"]["count"] == 0
+            and not candidate_valuation
+            and not benchmark_valuation
+            and all(
+                not isinstance(report, Mapping)
+                or report.get("status") in {"verified", "not_applicable"}
+                for report in signal_pauses.values()
+            )
         ),
         "snapshot": snapshot,
-        "candidate": {
-            "signal_gaps": _gap_summary(candidate["signal_gaps"]),
-            "valuation_gaps": _gap_summary(candidate_valuation),
-        },
-        "benchmark": {
-            "signal_gaps": _gap_summary(benchmark["signal_gaps"]),
-            "valuation_gaps": _gap_summary(benchmark_valuation),
-        },
+        "candidate": candidate_report,
+        "benchmark": benchmark_report,
     }
 
 
@@ -1851,6 +1953,64 @@ def _position_check(
         "ok": satisfied(candidate) and satisfied(benchmark),
         "candidate": _position_summary(candidate),
         "benchmark": _position_summary(benchmark),
+    }
+
+
+def _signal_pause_precheck(
+    discovery: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    quarterly: Mapping[str, Any] | None,
+    frozen_policy: Mapping[str, Any] | None,
+    *,
+    require_bound_summary: bool = True,
+) -> dict[str, Any]:
+    """Verify each account's pause ledger and apply the optional frozen cap."""
+    reports = {
+        "candidate": summarize_signal_pauses(discovery),
+        "benchmark": summarize_signal_pauses(benchmark),
+    }
+    recorded = quarterly.get("signal_pauses") if quarterly is not None else None
+    if isinstance(recorded, Mapping):
+        if recorded != reports:
+            return {
+                "status": "insufficient_evidence",
+                "reason": "PAUSE_SUMMARY_MISMATCH",
+                **reports,
+            }
+    elif require_bound_summary and any(
+        report["paused_signal_days"] for report in reports.values()
+    ):
+        # Older summaries did not bind pause evidence.  They remain readable
+        # when no pause needs an exception, but cannot authorize one.
+        return {
+            "status": "insufficient_evidence",
+            "reason": "PAUSE_EVIDENCE_NOT_BOUND",
+            **reports,
+        }
+
+    for report in reports.values():
+        if frozen_policy is not None:
+            report["limit"] = dict(frozen_policy)
+            report["limit_met"] = (
+                report["paused_signal_days"] <= frozen_policy["value"]
+            )
+        else:
+            report["limit"] = None
+            report["limit_met"] = True
+    verified = all(
+        report["status"] in {"verified", "not_applicable"}
+        for report in reports.values()
+    )
+    exceeded = [
+        side
+        for side, report in reports.items()
+        if report["limit_met"] is False
+    ]
+    return {
+        "status": "verified" if verified else "insufficient_evidence",
+        "policy": dict(frozen_policy) if frozen_policy is not None else None,
+        "limit_exceeded": exceeded,
+        **reports,
     }
 
 
@@ -1886,9 +2046,27 @@ def _receipt(
         replay, reference, reference_name=reference_name
     )
 
-    scoring_start_check = _scoring_start_check(candidate, benchmark, scoring_start)
+    pause_policy_enabled = (
+        submission["locked"].get("decision_policy") is not None
+        or kickoff.get("signal_pause_policy") is not None
+    )
+    signal_pauses = (
+        _signal_pause_precheck(
+            candidate,
+            benchmark,
+            None,
+            kickoff.get("signal_pause_policy"),
+            require_bound_summary=False,
+        )
+        if pause_policy_enabled else None
+    )
+    scoring_start_check = _scoring_start_check(
+        candidate, benchmark, scoring_start, signal_pauses,
+    )
     coverage = _coverage_check(candidate, benchmark, scoring_start, expected)
-    data_availability = _data_availability_check(candidate, benchmark, replay["snapshot"])
+    data_availability = _data_availability_check(
+        candidate, benchmark, replay["snapshot"], signal_pauses,
+    )
     position = _position_check(candidate, benchmark)
     costs = {
         "ok": all(
@@ -1932,6 +2110,12 @@ def _receipt(
         },
         "hard_conditions": hard_conditions,
     }
+    if signal_pauses is not None:
+        checks["signal_pauses"] = {
+            "ok": signal_pauses["status"] in {"verified", "not_applicable"},
+            "status": signal_pauses["status"],
+            "limit_exceeded": signal_pauses["limit_exceeded"],
+        }
     observation = observation_recommendation(
         candidate, kickoff["observation"]["minimum_opportunities"]
     )
@@ -1952,6 +2136,8 @@ def _receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    if signal_pauses is not None:
+        receipt["signal_pauses"] = signal_pauses
     # Additive #56/#68 identity, published only for the opt-in protocols: a
     # schema-3 snapshot, the actual-open execution rule, or a non-legacy
     # valuation policy.  A legacy schema-1/2 v1 receipt under legacy rules
@@ -1996,12 +2182,16 @@ def _receipt(
 def _verdict(checks: Mapping[str, Any], comparison: Mapping[str, Any]) -> tuple[str, str | None]:
     if any(item["status"] == "failed" for item in checks["hard_conditions"]):
         return "failed", "HARD_CONDITION_NOT_MET"
+    if checks.get("signal_pauses", {}).get("limit_exceeded"):
+        return "failed", "SIGNAL_PAUSE_LIMIT_NOT_MET"
     if not comparison["matches_discovery"]:
         return "insufficient_evidence", "REPLAY_MISMATCH"
     if not checks["scoring_start"]["ok"]:
         return "insufficient_evidence", "SCORING_START_INSUFFICIENT"
     if not checks["coverage"]["ok"] or not checks["data_availability"]["ok"]:
         return "insufficient_evidence", "COVERAGE_INSUFFICIENT"
+    if not checks.get("signal_pauses", {}).get("ok", True):
+        return "insufficient_evidence", "SIGNAL_PAUSE_EVIDENCE_INSUFFICIENT"
     if not checks["position"]["ok"]:
         return "insufficient_evidence", "POSITION_EVIDENCE_INSUFFICIENT"
     if not checks["costs"]["ok"]:
@@ -2241,7 +2431,19 @@ def _formal_discovery_precheck(
         )
     except (KeyError, TypeError, ValueError):
         reject_binding("The Discovery quarterly summary cannot be verified.")
-    if expected_quarterly != quarterly:
+    summary_matches = expected_quarterly == quarterly
+    if not summary_matches and (
+        "signal_pauses" in expected_quarterly
+        and "signal_pauses" not in quarterly
+        and all(
+            summarize_signal_pauses(run)["paused_signal_days"] == 0
+            for run in (discovery, baseline)
+        )
+    ):
+        legacy_expected = dict(expected_quarterly)
+        legacy_expected.pop("signal_pauses")
+        summary_matches = legacy_expected == quarterly
+    if not summary_matches:
         reject_binding("The Discovery quarterly summary does not match its ledger receipt.")
 
     candidate_metrics = _metrics(discovery)
@@ -2254,7 +2456,27 @@ def _formal_discovery_precheck(
         0, development["sessions"] - scoring_policy["warmup_sessions"],
     )
     expected_dates = [expected_end] * expected_sessions
-    scoring_start = _scoring_start_check(discovery, baseline, expected_start)
+    signal_pauses = _signal_pause_precheck(
+        discovery,
+        baseline,
+        quarterly,
+        kickoff.get("signal_pause_policy"),
+    )
+    pause_policy_enabled = (
+        locked.get("decision_policy") is not None
+        or kickoff.get("signal_pause_policy") is not None
+    )
+    pause_reports = (
+        {
+            side: signal_pauses[side]
+            for side in ("candidate", "benchmark")
+            if isinstance(signal_pauses.get(side), Mapping)
+        }
+        if pause_policy_enabled else None
+    )
+    scoring_start = _scoring_start_check(
+        discovery, baseline, expected_start, pause_reports,
+    )
     coverage = _coverage_check(
         discovery, baseline, expected_start, expected_dates,
     )
@@ -2269,6 +2491,7 @@ def _formal_discovery_precheck(
     }
     data_availability = _data_availability_check(
         discovery, baseline, snapshot_evidence,
+        pause_reports,
     )
     position = _position_check(discovery, baseline)
     prerequisites = {
@@ -2277,6 +2500,11 @@ def _formal_discovery_precheck(
         "data_availability": data_availability,
         "position": position,
     }
+    if pause_policy_enabled:
+        prerequisites["signal_pauses"] = {
+            "ok": signal_pauses["status"] in {"verified", "not_applicable"},
+            "status": signal_pauses["status"],
+        }
     hard_failed = any(item["status"] == "failed" for item in hard_conditions)
     hard_unavailable = any(item["status"] == "unavailable" for item in hard_conditions)
     hard_metric_names = {
@@ -2294,6 +2522,8 @@ def _formal_discovery_precheck(
         "scoring_prerequisites": prerequisites,
         "disclosure_only_metrics_unavailable": unavailable_disclosures,
     }
+    if pause_policy_enabled:
+        precheck["signal_pauses"] = signal_pauses
     if hard_failed:
         precheck["status"] = "rejected"
         raise _rejected(
@@ -2303,6 +2533,17 @@ def _formal_discovery_precheck(
             allowance=dict(allowance) if allowance is not None else None,
             outcome="rejected",
             reason="HARD_CONDITION_NOT_MET",
+            precheck=precheck,
+        )
+    if signal_pauses["status"] == "verified" and signal_pauses["limit_exceeded"]:
+        precheck["status"] = "rejected"
+        raise _rejected(
+            "VALIDATION_PRECHECK_REJECTED", "validation", "inspect",
+            "A frozen signal-pause limit is exceeded by the Discovery evidence.",
+            counted=False,
+            allowance=dict(allowance) if allowance is not None else None,
+            outcome="rejected",
+            reason="SIGNAL_PAUSE_LIMIT_NOT_MET",
             precheck=precheck,
         )
     if hard_unavailable or any(not item["ok"] for item in prerequisites.values()):
@@ -2654,10 +2895,14 @@ def _formal_verdict(checks: Mapping[str, Any]) -> tuple[str, str | None]:
     """The formal protocol's verdict precedence (design contract §4)."""
     if any(item["status"] == "failed" for item in checks["hard_conditions"]):
         return "failed", "HARD_CONDITION_NOT_MET"
+    if checks.get("signal_pauses", {}).get("limit_exceeded"):
+        return "failed", "SIGNAL_PAUSE_LIMIT_NOT_MET"
     if not checks["scoring_start"]["ok"]:
         return "insufficient_evidence", "SCORING_START_INSUFFICIENT"
     if not checks["coverage"]["ok"] or not checks["data_availability"]["ok"]:
         return "insufficient_evidence", "COVERAGE_INSUFFICIENT"
+    if not checks.get("signal_pauses", {}).get("ok", True):
+        return "insufficient_evidence", "SIGNAL_PAUSE_EVIDENCE_INSUFFICIENT"
     if not checks["position"]["ok"]:
         return "insufficient_evidence", "POSITION_EVIDENCE_INSUFFICIENT"
     if any(item["status"] == "unavailable" for item in checks["hard_conditions"]):
@@ -2732,12 +2977,26 @@ def _formal_receipt(
     candidate_metrics = _metrics(candidate)
     benchmark_metrics = _metrics(benchmark)
     expected = runs["expected_sessions"]
+    pause_policy_enabled = (
+        submission["locked"].get("decision_policy") is not None
+        or kickoff.get("signal_pause_policy") is not None
+    )
+    signal_pauses = (
+        _signal_pause_precheck(
+            candidate,
+            benchmark,
+            None,
+            kickoff.get("signal_pause_policy"),
+            require_bound_summary=False,
+        )
+        if pause_policy_enabled else None
+    )
     checks = {
         "data_availability": _data_availability_check(
-            candidate, benchmark, runs["snapshot"]
+            candidate, benchmark, runs["snapshot"], signal_pauses,
         ),
         "scoring_start": _scoring_start_check(
-            candidate, benchmark, runs["scoring_start"]
+            candidate, benchmark, runs["scoring_start"], signal_pauses,
         ),
         "coverage": _coverage_check(
             candidate, benchmark, runs["scoring_start"], expected
@@ -2749,6 +3008,12 @@ def _formal_receipt(
             for condition in kickoff["hard_conditions"]
         ],
     }
+    if signal_pauses is not None:
+        checks["signal_pauses"] = {
+            "ok": signal_pauses["status"] in {"verified", "not_applicable"},
+            "status": signal_pauses["status"],
+            "limit_exceeded": signal_pauses["limit_exceeded"],
+        }
     observation = observation_recommendation(
         candidate, kickoff["observation"]["minimum_opportunities"]
     )
@@ -2856,6 +3121,8 @@ def _formal_receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    if signal_pauses is not None:
+        receipt["signal_pauses"] = signal_pauses
     if discovery_precheck is not None:
         receipt["discovery_precheck"] = dict(discovery_precheck)
     if corrected is not None:
@@ -3886,11 +4153,11 @@ _DETAIL_RECORD_NAMES = (
     "summary", "metrics.candidate", "metrics.benchmark", "runs.candidate",
     "runs.benchmark", "fills.candidate", "fills.benchmark", "observation",
     "protocol", "provenance", "usage", "development", "trailing", "scoring",
-    "warmup", "replay",
+    "warmup", "replay", "signal_pauses",
 )
 _DETAIL_CHECK_GROUPS = (
     "data_availability", "scoring_start", "coverage", "position", "costs",
-    "replay", "segment", "hard_conditions",
+    "replay", "segment", "hard_conditions", "signal_pauses",
 )
 _DETAIL_MISSING = object()
 

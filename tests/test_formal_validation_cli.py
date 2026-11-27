@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 from copy import deepcopy
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,7 @@ from cli_helpers import (
 )
 from test_actual_open_cli import (
     OPEN_SOURCE,
+    STATUS_EVIDENCE,
     conflict_references,
     day_at,
     derived_row,
@@ -42,6 +44,7 @@ from test_actual_open_cli import (
     make_confirmed_suspension,
     make_missing_required_open,
     make_open_conflict,
+    make_unknown_status,
     make_whole_day_halt,
     raw_row,
     schema_v3_fixture,
@@ -71,8 +74,10 @@ from test_research_loop_cli import (
 )
 
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.decision_window import AFTER_CLOSE_COMMON_POLICY, normalize_decision_policy
 from prajnatrade.snapshot_baseline import (
     ACTUAL_OPEN_RULES,
+    CARRY_FORWARD_SUSPENDED_VALUATION,
     EXECUTION_PRICE_BASIS,
     NEXT_OPEN_RULES,
 )
@@ -137,9 +142,11 @@ def formal_scenario(
     parameters: dict | None = None,
     requirements: list[dict] | None = None,
     hard_conditions: list[dict] | None = None,
+    signal_pause_policy: dict | None = None,
     as_of: str | None = None,
     execution_rules: str | None = None,
     valuation_policy: str | None = None,
+    decision_policy: dict | None = None,
     frozen_campaign: tuple[Path, Path, dict] | None = None,
 ) -> dict:
     """A split Campaign with one locked version, before any formal Validation."""
@@ -152,12 +159,15 @@ def formal_scenario(
             as_of=as_of,
             execution_rules=execution_rules,
             valuation_policy=valuation_policy,
+            decision_policy=decision_policy,
         )
     project, snapshots, campaign = frozen_campaign
     store = root / f"{name}-trusted"
     contract = v2_round_input(limit=limit)
     if hard_conditions is not None:
         contract["hard_conditions"] = hard_conditions
+    if signal_pause_policy is not None:
+        contract["signal_pause_policy"] = signal_pause_policy
     opened = ok(
         open_round(
             project,
@@ -1252,6 +1262,242 @@ def test_missing_disclosure_metric_does_not_block_trailing_validation(tmp_path: 
     )
     assert "sharpe" in receipt["discovery_precheck"]["disclosure_only_metrics_unavailable"]
     assert len(round_uses(scenario)) == 1
+
+
+def test_late_suspension_pause_is_audited_and_keeps_discovery_day_eligible(
+    tmp_path: Path,
+) -> None:
+    payload = schema_v3_fixture(30)
+    late_day = payload["calendar"][5]["date"]
+    row = make_confirmed_suspension(payload, late_day, ETF_SYMBOLS[0])
+    row["available_at"] = f"{late_day}T16:00:00+08:00"
+    known_day = payload["calendar"][6]["date"]
+    make_confirmed_suspension(payload, known_day, ETF_SYMBOLS[1])
+    trailing_pause_day = payload["calendar"][13]["date"]
+    trailing_derived = derived_row(payload, trailing_pause_day, ETF_SYMBOLS[2])
+    trailing_derived["available_at"] = f"{trailing_pause_day}T16:00:00+08:00"
+    policy = normalize_decision_policy(AFTER_CLOSE_COMMON_POLICY)
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        family="equal_weight",
+        parameters={},
+        execution_rules=ACTUAL_OPEN_RULES,
+        valuation_policy=CARRY_FORWARD_SUSPENDED_VALUATION,
+        decision_policy=policy,
+    )
+
+    receipt = ok(validate_current(scenario))
+    assert receipt["outcome"] == "passed"
+    pauses = receipt["discovery_precheck"]["signal_pauses"]
+    assert pauses["status"] == "verified"
+    for side in ("candidate", "benchmark"):
+        disclosure = pauses[side]
+        assert disclosure["decision_days"] > 0
+        assert disclosure["paused_signal_days"] == 1
+        assert disclosure["longest_consecutive_paused_days"] == 1
+        [event] = disclosure["events"]
+        assert event["date"] == late_day
+        assert event["decision_cutoff"] == f"{late_day}T15:30:00+08:00"
+        assert event["reasons"] == [
+            {
+                "symbol": ETF_SYMBOLS[0],
+                "reason": "non_trading_status:suspended",
+                "evidence_available_at": f"{late_day}T16:00:00+08:00",
+            }
+        ]
+        assert event["new_target_generated"] is False
+        assert event["prior_orders"]["processing_verified"] is True
+        assert event["nav_reconciled"] is True
+        assert event["valuation_gaps"] == []
+        assert disclosure["known_no_trade_sessions"] == [
+            {
+                "date": known_day,
+                "symbol": ETF_SYMBOLS[1],
+                "reason": "confirmed_full_day_suspension",
+                "decision_cutoff": f"{known_day}T15:30:00+08:00",
+                "evidence_available_at": f"{known_day}T15:05:00+08:00",
+                "status_evidence_id": STATUS_EVIDENCE,
+                "verified_before_cutoff": True,
+            }
+        ]
+    assert len(round_uses(scenario)) == 1
+    for side in ("candidate", "benchmark"):
+        trailing_pauses = receipt["signal_pauses"][side]
+        assert trailing_pauses["status"] == "verified"
+        assert trailing_pauses["paused_signal_days"] == 1
+        trailing_event = trailing_pauses["events"][0]
+        assert trailing_event["date"] == trailing_pause_day
+        assert trailing_event["reasons"] == [
+            {
+                "symbol": ETF_SYMBOLS[2],
+                "reason": "derived_after_cutoff",
+                "evidence_available_at": f"{trailing_pause_day}T16:00:00+08:00",
+            }
+        ]
+        assert trailing_event["prior_orders"]["processing_verified"] is True
+        assert trailing_event["prior_orders"]["expected_signal_dates"]
+        assert trailing_event["prior_orders"]["attempts"]
+        assert trailing_event["prior_orders"]["fills"]
+    detail_input = write_json(
+        tmp_path / "signal-pause-detail.json",
+        {"question": "Audit the formal signal-pause receipt.", "records": ["signal_pauses"]},
+    )
+    details = ok(
+        cli(
+            "round", "detail",
+            "--project", str(scenario["project"]),
+            "--round-id", scenario["opened"]["round_id"],
+            "--version-id", scenario["version"]["version_id"],
+            "--input", str(detail_input),
+        )
+    )
+    assert details["details"]["signal_pauses"] == receipt["signal_pauses"]
+    replay = ok(validate_current(scenario))
+    assert replay["reused"] is True
+    assert len(round_uses(scenario)) == 1
+
+    limited = formal_scenario(
+        tmp_path,
+        payload=deepcopy(payload),
+        name="limited",
+        family="equal_weight",
+        parameters={},
+        execution_rules=ACTUAL_OPEN_RULES,
+        valuation_policy=CARRY_FORWARD_SUSPENDED_VALUATION,
+        decision_policy=policy,
+        signal_pause_policy={"max_paused_signal_days": 0},
+    )
+    assert limited["opened"]["kickoff"]["signal_pause_policy"] == {
+        "metric": "paused_signal_days",
+        "operator": "<=",
+        "value": 0,
+        "scope": "each_account",
+        "counting": "unique_decision_date",
+    }
+    cap_rejection = rejected(
+        validate_current(limited), "VALIDATION_PRECHECK_REJECTED", phase="validation"
+    )
+    assert cap_rejection["reason"] == "SIGNAL_PAUSE_LIMIT_NOT_MET"
+    assert cap_rejection["counted"] is False
+    assert cap_rejection["precheck"]["signal_pauses"]["candidate"]["limit_met"] is False
+    assert cap_rejection["precheck"]["signal_pauses"]["benchmark"]["limit_met"] is False
+    assert round_uses(limited) == []
+
+
+def test_unexplained_signal_pause_is_free_insufficient_evidence(
+    tmp_path: Path,
+) -> None:
+    payload = schema_v3_fixture(30)
+    day = payload["calendar"][5]["date"]
+    row = make_confirmed_suspension(payload, day, ETF_SYMBOLS[0])
+    row["available_at"] = None
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="unexplained-pause",
+        family="equal_weight",
+        parameters={},
+        execution_rules=ACTUAL_OPEN_RULES,
+        valuation_policy=CARRY_FORWARD_SUSPENDED_VALUATION,
+        decision_policy=normalize_decision_policy(AFTER_CLOSE_COMMON_POLICY),
+    )
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_PRECHECK_INSUFFICIENT", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["reason"] == "SCORING_PREREQUISITES_NOT_MET"
+    assert blocked["precheck"]["signal_pauses"]["status"] == "insufficient_evidence"
+    assert blocked["precheck"]["signal_pauses"]["candidate"]["events"][0]["reasons"][0][
+        "evidence_available_at"
+    ] is None
+    assert round_uses(scenario) == []
+
+
+def test_reproducible_pause_does_not_hide_an_independent_valuation_gap(
+    tmp_path: Path,
+) -> None:
+    payload = schema_v3_fixture(30)
+    day = payload["calendar"][5]["date"]
+    late_row = make_confirmed_suspension(payload, day, ETF_SYMBOLS[0])
+    late_row["available_at"] = f"{day}T16:00:00+08:00"
+    make_unknown_status(payload, day, ETF_SYMBOLS[1])
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="independent-valuation-gap",
+        family="equal_weight",
+        parameters={},
+        execution_rules=ACTUAL_OPEN_RULES,
+        valuation_policy=CARRY_FORWARD_SUSPENDED_VALUATION,
+        decision_policy=normalize_decision_policy(AFTER_CLOSE_COMMON_POLICY),
+    )
+
+    blocked = rejected(
+        validate_current(scenario), "VALIDATION_PRECHECK_INSUFFICIENT", phase="validation"
+    )
+    assert blocked["counted"] is False
+    assert blocked["precheck"]["signal_pauses"]["candidate"]["events"][0][
+        "reasons"
+    ][0]["reason"] == "non_trading_status:suspended"
+    assert blocked["precheck"]["scoring_prerequisites"]["data_availability"][
+        "candidate"
+    ]["valuation_gaps"]["count"] == 1
+    assert round_uses(scenario) == []
+
+
+def test_pause_calendar_deduplicates_symbols_and_reports_missed_monthly_cycle(
+    tmp_path: Path,
+) -> None:
+    payload = schema_v3_fixture(30)
+    original_first_score = date.fromisoformat(payload["calendar"][3]["date"])
+    shift = date(2024, 2, 1) - original_first_score
+
+    def shift_dates(value):
+        if isinstance(value, dict):
+            return {key: shift_dates(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [shift_dates(item) for item in value]
+        if isinstance(value, str) and len(value) >= 10:
+            try:
+                original = date.fromisoformat(value[:10])
+            except ValueError:
+                return value
+            return (original + shift).isoformat() + value[10:]
+        return value
+
+    payload = shift_dates(payload)
+    first_pause = payload["calendar"][3]["date"]
+    next_pause = payload["calendar"][4]["date"]
+    for symbol in ETF_SYMBOLS[:2]:
+        row = make_confirmed_suspension(payload, first_pause, symbol)
+        row["available_at"] = f"{first_pause}T16:00:00+08:00"
+    row = make_confirmed_suspension(payload, next_pause, ETF_SYMBOLS[2])
+    row["available_at"] = f"{next_pause}T16:00:00+08:00"
+    policy = normalize_decision_policy(
+        AFTER_CLOSE_COMMON_POLICY, monthly_deferral=True
+    )
+    scenario = formal_scenario(
+        tmp_path,
+        payload=payload,
+        name="pause-calendar",
+        family="equal_weight",
+        parameters={},
+        execution_rules=ACTUAL_OPEN_RULES,
+        valuation_policy=CARRY_FORWARD_SUSPENDED_VALUATION,
+        decision_policy=policy,
+    )
+
+    receipt = ok(validate_current(scenario))
+    for side in ("candidate", "benchmark"):
+        disclosure = receipt["discovery_precheck"]["signal_pauses"][side]
+        assert disclosure["paused_signal_days"] == 2
+        assert disclosure["longest_consecutive_paused_days"] == 2
+        assert [len(event["reasons"]) for event in disclosure["events"]] == [2, 1]
+        [cycle] = disclosure["affected_monthly_rebalances"]
+        assert cycle["scheduled_date"] == first_pause
+        assert cycle["status"] == "not_executed"
 
 
 def test_missing_required_hard_condition_metric_is_free_insufficient_evidence(
