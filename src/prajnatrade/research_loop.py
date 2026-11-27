@@ -86,7 +86,10 @@ from zoneinfo import ZoneInfo
 from prajnatrade import release, shadow_calendar, snapshot
 from prajnatrade.container_executor import executor_from_config
 from prajnatrade.data import ETF_SYMBOLS
-from prajnatrade.discovery_summary import summarize_discovery_quarters
+from prajnatrade.discovery_summary import (
+    summarize_discovery_quarters,
+    summarize_signal_pauses,
+)
 from prajnatrade.experiment import (
     ProtocolError,
     campaign_discovery,
@@ -157,8 +160,7 @@ OPERATORS = {
     "==": operator.eq,
 }
 _POSITION_STATES = {"initial_position_established", "intentional_cash"}
-#: Basket-build states that leave a required basket unfinished; a formal
-#: position prerequisite is not satisfied while either side reports one.
+# Rounds created before the frozen per-account position policy keep this gate.
 _UNFINISHED_BUILD_STATES = {"partial", "unfilled"}
 _OBSERVATION_FORMULA = (
     "ceil(sessions / max(1, opportunities)) * minimum_opportunities, "
@@ -177,6 +179,7 @@ _OPTIONAL_RECEIPT_FIELDS = (
     "prior_validation_id", "validation_kind", "protocol", "development", "trailing",
     "scoring", "warmup", "provenance", "usage", "summary", "runs",
     "original_validation", "recomputed_validation", "discovery_precheck",
+    "signal_pauses",
 )
 VALIDATION_KIND_TRAILING = "trailing_validation"
 _VALIDATION_USE_FIELDS = (
@@ -477,7 +480,7 @@ def _round_contract(source: object) -> dict[str, Any]:
             "disclosed_risks", "scoring_policy", "observation", "invalidation", "reviewer",
             "approval_reason",
         },
-        frozenset({"validation_policy"}),
+        frozenset({"validation_policy", "signal_pause_policy", "position_policy"}),
     )
     comparison = _object(payload["comparison"], {"benchmark", "statement"})
     if comparison["benchmark"] != BENCHMARK:
@@ -500,6 +503,12 @@ def _round_contract(source: object) -> dict[str, Any]:
     }
     if "validation_policy" in payload:
         contract["validation_policy"] = payload["validation_policy"]
+    if "signal_pause_policy" in payload:
+        contract["signal_pause_policy"] = _signal_pause_policy(
+            payload["signal_pause_policy"]
+        )
+    if "position_policy" in payload:
+        contract["position_policy"] = _position_policy(payload["position_policy"])
     return contract
 
 
@@ -518,6 +527,72 @@ def _validation_policy(raw: object) -> dict[str, int]:
             "validation_policy.auto_validation_limit must be a positive integer.",
         )
     return {"auto_validation_limit": limit}
+
+
+def _signal_pause_policy(raw: object) -> dict[str, Any]:
+    entry = _object(raw, {"max_paused_signal_days"})
+    limit = _non_negative_integer(
+        entry["max_paused_signal_days"],
+        "signal_pause_policy.max_paused_signal_days",
+    )
+    return {
+        "metric": "paused_signal_days",
+        "operator": "<=",
+        "value": limit,
+        "scope": "each_account",
+        "counting": "unique_decision_date",
+    }
+
+
+def _position_policy(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, dict) or set(raw) != {"candidate", "benchmark"}:
+        raise ValueError("position_policy must define candidate and benchmark.")
+    policy = {}
+    for side in ("candidate", "benchmark"):
+        entry = _object(
+            raw[side],
+            {
+                "require_initial_position", "required_symbols",
+                "minimum_required_hold_sessions", "require_end_of_period_target",
+            },
+        )
+        if type(entry["require_initial_position"]) is not bool:
+            raise ValueError(f"position_policy.{side}.require_initial_position must be boolean.")
+        if type(entry["require_end_of_period_target"]) is not bool:
+            raise ValueError(
+                f"position_policy.{side}.require_end_of_period_target must be boolean."
+            )
+        symbols = _texts(entry["required_symbols"], f"position_policy.{side}.required_symbols")
+        if len(set(symbols)) != len(symbols):
+            raise ValueError(f"position_policy.{side}.required_symbols must be unique.")
+        unknown = set(symbols) - set(ETF_SYMBOLS)
+        if unknown:
+            raise ValueError(
+                f"position_policy.{side}.required_symbols contains unsupported ETFs: "
+                f"{', '.join(sorted(unknown))}."
+            )
+        policy[side] = {
+            "require_initial_position": entry["require_initial_position"],
+            "required_symbols": [symbol for symbol in ETF_SYMBOLS if symbol in symbols],
+            "minimum_required_hold_sessions": _non_negative_integer(
+                entry["minimum_required_hold_sessions"],
+                f"position_policy.{side}.minimum_required_hold_sessions",
+            ),
+            "require_end_of_period_target": entry["require_end_of_period_target"],
+        }
+    return policy
+
+
+def _default_position_policy() -> dict[str, Any]:
+    return {
+        side: {
+            "require_initial_position": False,
+            "required_symbols": [],
+            "minimum_required_hold_sessions": 0,
+            "require_end_of_period_target": False,
+        }
+        for side in ("candidate", "benchmark")
+    }
 
 
 def _frozen_scoring_policy(policy: object) -> dict[str, Any]:
@@ -641,6 +716,18 @@ def prepare_round(
             "campaign_id": campaign_id,
         }
     )
+    if split is not None and "position_policy" not in contract:
+        with _project(project) as connection:
+            previous = connection.execute(
+                "SELECT kickoff_json FROM research_loop_rounds WHERE campaign_id = ?",
+                (campaign_id,),
+            ).fetchone()
+        if previous is None:
+            contract["position_policy"] = _default_position_policy()
+        else:
+            prior_kickoff = json.loads(previous["kickoff_json"])["kickoff"]
+            if "position_policy" in prior_kickoff:
+                contract["position_policy"] = prior_kickoff["position_policy"]
     kickoff = {
         **contract,
         "scoring_policy": {**contract["scoring_policy"], "frozen": frozen},
@@ -987,15 +1074,16 @@ def _protocol_hash(kickoff: Mapping[str, Any]) -> str:
         "hard_conditions": kickoff["hard_conditions"],
         "selection_rules": kickoff["selection_rules"],
     }
-    # Protocol v1 hashes only the legacy contract fields.  Protocol v2 also
-    # binds the trailing-validation protocol block and the frozen split so a
-    # locked version traces to the partition protocol it was scored under.
+    # Protocol v1 hashes only the legacy contract fields. Protocol v2 also
+    # binds its partition and the frozen position criteria to locked versions.
     if "protocol" in kickoff:
         body["protocol"] = kickoff["protocol"]
         split = kickoff["research_partition"]
         body["research_partition"] = {
             key: split[key] for key in ("split_hash", "development", "trailing")
         }
+        if "position_policy" in kickoff:
+            body["position_policy"] = kickoff["position_policy"]
     return _hash(body)
 
 
@@ -1487,14 +1575,112 @@ def _gap_summary(gaps: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _position_summary(run: Mapping[str, Any]) -> dict[str, Any]:
+def _position_summary(
+    run: Mapping[str, Any], policy: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     evidence = run["position_evidence"]
     readiness = run.get("history_readiness") or {}
+    if policy is None:
+        summary = {
+            "state": evidence["state"],
+            "invested_sessions": evidence["invested_sessions"],
+            "first_position_signal_date": evidence["first_position_signal_date"],
+            "first_fill_date": evidence["first_fill_date"],
+            "fills": run["metrics"]["fills"],
+            "unfilled_orders": run["metrics"]["orders_unfilled"],
+            "intentional_cash_sessions": list(readiness.get("ready_cash_sessions", [])),
+        }
+        for key in ("basket_build_state", "unfilled_basket_signals"):
+            if key in evidence:
+                summary[key] = evidence[key]
+        return summary
+
+    required_symbols = list(policy["required_symbols"])
+    held_dates = []
+    required_hold_dates = []
+    daily_account = []
+    for point in run.get("equity_curve") or []:
+        holdings = point.get("holdings")
+        if not isinstance(holdings, Mapping):
+            continue
+        held_symbols = {
+            symbol for symbol, holding in holdings.items()
+            if isinstance(holding, Mapping)
+            and isinstance(holding.get("quantity"), (int, float))
+            and not isinstance(holding.get("quantity"), bool)
+            and float(holding["quantity"]) > 1e-12
+        }
+        if held_symbols:
+            held_dates.append(point["date"])
+        if (
+            all(symbol in held_symbols for symbol in required_symbols)
+            if required_symbols else bool(held_symbols)
+        ):
+            required_hold_dates.append(point["date"])
+        daily_account.append({
+            "date": point["date"],
+            "nav": point.get("nav"),
+            "cash": point.get("cash"),
+            "holdings": {
+                symbol: float(holding["quantity"])
+                for symbol, holding in holdings.items()
+                if isinstance(holding, Mapping)
+                and isinstance(holding.get("quantity"), (int, float))
+                and not isinstance(holding.get("quantity"), bool)
+            },
+        })
+
+    attempts = run.get("order_attempts") or []
+    latest = attempts[-1] if attempts else None
+    latest_complete = (
+        bool(latest["batch_complete"])
+        if latest is not None and "batch_complete" in latest
+        else latest is not None and latest.get("status") == "filled"
+    )
+    build_state = (
+        "completed" if latest_complete
+        else "partial" if latest is not None and latest.get("filled_symbols")
+        else "unfilled" if latest is not None
+        else "none"
+    )
+    end_target = {
+        "required": policy["require_end_of_period_target"],
+        "state": build_state,
+        "satisfied": (
+            not policy["require_end_of_period_target"] or build_state == "completed"
+        ),
+    }
+
+    failed_conditions = []
+    state = evidence["state"]
+    if state not in _POSITION_STATES:
+        failed_conditions.append("POSITION_NOT_ESTABLISHED")
+    if policy["require_initial_position"] and state != "initial_position_established":
+        failed_conditions.append("INITIAL_POSITION_REQUIRED")
+    if len(required_hold_dates) < policy["minimum_required_hold_sessions"]:
+        failed_conditions.append("REQUIRED_HOLD_SESSIONS_NOT_MET")
+    if not end_target["satisfied"]:
+        failed_conditions.append("END_OF_PERIOD_TARGET_INCOMPLETE")
+
     summary = {
-        "state": evidence["state"],
+        "ok": not failed_conditions,
+        "state": state,
         "invested_sessions": evidence["invested_sessions"],
         "first_position_signal_date": evidence["first_position_signal_date"],
         "first_fill_date": evidence["first_fill_date"],
+        "held_sessions": len(held_dates),
+        "first_held_date": held_dates[0] if held_dates else None,
+        "required_symbols": required_symbols,
+        "required_hold_dates": required_hold_dates,
+        "required_hold_sessions": len(required_hold_dates),
+        "first_required_hold_date": (
+            required_hold_dates[0] if required_hold_dates else None
+        ),
+        "daily_account": daily_account,
+        "minimum_required_hold_sessions": policy["minimum_required_hold_sessions"],
+        "require_initial_position": policy["require_initial_position"],
+        "end_of_period_target": end_target,
+        "failed_conditions": failed_conditions,
         "fills": run["metrics"]["fills"],
         "unfilled_orders": run["metrics"]["orders_unfilled"],
         "intentional_cash_sessions": list(readiness.get("ready_cash_sessions", [])),
@@ -1608,6 +1794,8 @@ def _run_record(run: Mapping[str, Any]) -> dict[str, Any]:
         "valuation_gaps": metrics["valuation_gaps"],
         "metrics": metrics,
     }
+    if any("lot_orders" in attempt for attempt in run.get("order_attempts", [])):
+        record["order_attempts"] = [dict(attempt) for attempt in run["order_attempts"]]
     if "valuation_summary" in run:
         record["valuation_summary"] = dict(run["valuation_summary"])
     return record
@@ -1744,17 +1932,43 @@ def _affected(
 
 
 def _scoring_start_check(
-    candidate: Mapping[str, Any], benchmark: Mapping[str, Any], scoring_start: str,
+    candidate: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    scoring_start: str,
+    signal_pauses: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     readiness = candidate.get("history_readiness") or {}
     first_scored_open = readiness.get("first_scored_open")
-    return {
+    signal_pauses = signal_pauses or {}
+
+    def side_starts(run: Mapping[str, Any], label: str) -> bool:
+        run_readiness = run.get("history_readiness") or {}
+        first_open = run_readiness.get("first_scored_open")
+        if (
+            run["start_date"] == scoring_start
+            and isinstance(first_open, dict)
+            and first_open.get("ready") is True
+            and run_readiness.get("first_ready_date") == scoring_start
+        ):
+            return True
+        report = signal_pauses.get(label)
+        if not isinstance(report, Mapping):
+            return False
+        return any(
+            event.get("date") == scoring_start
+            and event.get("rule_compliant") is True
+            and event.get("nav_reconciled") is True
+            and event.get("prior_orders", {}).get("processing_verified") is True
+            for event in report.get("events", [])
+            if isinstance(event, Mapping)
+        )
+
+    result = {
         "ok": (
             candidate["start_date"] == scoring_start
             and benchmark["start_date"] == scoring_start
-            and isinstance(first_scored_open, dict)
-            and first_scored_open.get("ready") is True
-            and readiness.get("first_ready_date") == scoring_start
+            and side_starts(candidate, "candidate")
+            and side_starts(benchmark, "benchmark")
         ),
         "expected": scoring_start,
         "candidate": {
@@ -1764,6 +1978,19 @@ def _scoring_start_check(
         },
         "benchmark": {"start_date": benchmark["start_date"]},
     }
+    if signal_pauses is not None:
+        result["pause_override"] = {
+            "candidate": (
+                readiness.get("first_ready_date") != scoring_start
+                and side_starts(candidate, "candidate")
+            ),
+            "benchmark": (
+                (benchmark.get("history_readiness") or {}).get("first_ready_date")
+                != scoring_start
+                and side_starts(benchmark, "benchmark")
+            ),
+        }
+    return result
 
 
 def _coverage_check(
@@ -1806,51 +2033,158 @@ def _data_availability_check(
     candidate: Mapping[str, Any],
     benchmark: Mapping[str, Any],
     snapshot: Mapping[str, Any],
+    signal_pauses: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     candidate_valuation = candidate["gaps"]["valuation"]
     benchmark_valuation = benchmark["gaps"]["valuation"]
+    if signal_pauses is None:
+        return {
+            "ok": not (
+                candidate["signal_gaps"]
+                or candidate_valuation
+                or benchmark["signal_gaps"]
+                or benchmark_valuation
+            ),
+            "snapshot": snapshot,
+            "candidate": {
+                "signal_gaps": _gap_summary(candidate["signal_gaps"]),
+                "valuation_gaps": _gap_summary(candidate_valuation),
+            },
+            "benchmark": {
+                "signal_gaps": _gap_summary(benchmark["signal_gaps"]),
+                "valuation_gaps": _gap_summary(benchmark_valuation),
+            },
+        }
+
+    def side_report(label: str, run: Mapping[str, Any]) -> dict[str, Any]:
+        report = signal_pauses.get(label, {})
+        accepted_dates = {
+            event.get("date")
+            for event in report.get("events", [])
+            if isinstance(event, Mapping) and event.get("rule_compliant") is True
+        } if isinstance(report, Mapping) else set()
+        unexplained = [
+            item for item in run["signal_gaps"]
+            if not isinstance(item, Mapping)
+            or item.get("date") not in accepted_dates
+        ]
+        return {
+            "signal_gaps": _gap_summary(run["signal_gaps"]),
+            "accepted_signal_pause_days": len(accepted_dates),
+            "unexplained_signal_gaps": _gap_summary(unexplained),
+            "valuation_gaps": _gap_summary(run["gaps"]["valuation"]),
+        }
+
+    candidate_report = side_report("candidate", candidate)
+    benchmark_report = side_report("benchmark", benchmark)
     return {
-        "ok": not (
-            candidate["signal_gaps"]
-            or candidate_valuation
-            or benchmark["signal_gaps"]
-            or benchmark_valuation
+        "ok": (
+            candidate_report["unexplained_signal_gaps"]["count"] == 0
+            and benchmark_report["unexplained_signal_gaps"]["count"] == 0
+            and not candidate_valuation
+            and not benchmark_valuation
+            and all(
+                not isinstance(report, Mapping)
+                or report.get("status") in {"verified", "not_applicable"}
+                for report in signal_pauses.values()
+            )
         ),
         "snapshot": snapshot,
-        "candidate": {
-            "signal_gaps": _gap_summary(candidate["signal_gaps"]),
-            "valuation_gaps": _gap_summary(candidate_valuation),
-        },
-        "benchmark": {
-            "signal_gaps": _gap_summary(benchmark["signal_gaps"]),
-            "valuation_gaps": _gap_summary(benchmark_valuation),
-        },
+        "candidate": candidate_report,
+        "benchmark": benchmark_report,
     }
 
 
 def _position_check(
-    candidate: Mapping[str, Any], benchmark: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    frozen_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The formal position prerequisite for both sides of the frozen comparison.
 
-    A side satisfies it when its position evidence state targets a real
-    position or explicit cash *and* its latest basket build is not still
-    unfinished: a plan that required the whole basket and filled only part of it
-    (``partial``) or none of it (``unfilled``) leaves the scored premise unmet
-    even though shares were bought.  A run without a build state (the legacy
-    execution rules) is judged by its position state alone, exactly as before.
+    Actual portfolios are scored by default: a partially filled latest target
+    remains visible but is not itself a blocker. An explicit frozen policy may
+    require initial investment, simultaneous holdings on a minimum number of
+    actual sessions, or a complete end-of-period target.
     """
-    def satisfied(run: Mapping[str, Any]) -> bool:
-        evidence = run["position_evidence"]
-        if evidence["state"] not in _POSITION_STATES:
-            return False
-        build_state = evidence.get("basket_build_state")
-        return build_state is None or build_state not in _UNFINISHED_BUILD_STATES
+    if frozen_policy is None:
+        def legacy_satisfied(run: Mapping[str, Any]) -> bool:
+            evidence = run["position_evidence"]
+            if evidence["state"] not in _POSITION_STATES:
+                return False
+            build_state = evidence.get("basket_build_state")
+            return build_state is None or build_state not in _UNFINISHED_BUILD_STATES
 
+        return {
+            "ok": legacy_satisfied(candidate) and legacy_satisfied(benchmark),
+            "candidate": _position_summary(candidate),
+            "benchmark": _position_summary(benchmark),
+        }
+    policy = frozen_policy
+    candidate_report = _position_summary(candidate, policy["candidate"])
+    benchmark_report = _position_summary(benchmark, policy["benchmark"])
     return {
-        "ok": satisfied(candidate) and satisfied(benchmark),
-        "candidate": _position_summary(candidate),
-        "benchmark": _position_summary(benchmark),
+        "ok": candidate_report["ok"] and benchmark_report["ok"],
+        "candidate": candidate_report,
+        "benchmark": benchmark_report,
+    }
+
+
+def _signal_pause_precheck(
+    discovery: Mapping[str, Any],
+    benchmark: Mapping[str, Any],
+    quarterly: Mapping[str, Any] | None,
+    frozen_policy: Mapping[str, Any] | None,
+    *,
+    require_bound_summary: bool = True,
+) -> dict[str, Any]:
+    """Verify each account's pause ledger and apply the optional frozen cap."""
+    reports = {
+        "candidate": summarize_signal_pauses(discovery),
+        "benchmark": summarize_signal_pauses(benchmark),
+    }
+    recorded = quarterly.get("signal_pauses") if quarterly is not None else None
+    if isinstance(recorded, Mapping):
+        if recorded != reports:
+            return {
+                "status": "insufficient_evidence",
+                "reason": "PAUSE_SUMMARY_MISMATCH",
+                **reports,
+            }
+    elif require_bound_summary and any(
+        report["paused_signal_days"] for report in reports.values()
+    ):
+        # Older summaries did not bind pause evidence.  They remain readable
+        # when no pause needs an exception, but cannot authorize one.
+        return {
+            "status": "insufficient_evidence",
+            "reason": "PAUSE_EVIDENCE_NOT_BOUND",
+            **reports,
+        }
+
+    for report in reports.values():
+        if frozen_policy is not None:
+            report["limit"] = dict(frozen_policy)
+            report["limit_met"] = (
+                report["paused_signal_days"] <= frozen_policy["value"]
+            )
+        else:
+            report["limit"] = None
+            report["limit_met"] = True
+    verified = all(
+        report["status"] in {"verified", "not_applicable"}
+        for report in reports.values()
+    )
+    exceeded = [
+        side
+        for side, report in reports.items()
+        if report["limit_met"] is False
+    ]
+    return {
+        "status": "verified" if verified else "insufficient_evidence",
+        "policy": dict(frozen_policy) if frozen_policy is not None else None,
+        "limit_exceeded": exceeded,
+        **reports,
     }
 
 
@@ -1886,10 +2220,28 @@ def _receipt(
         replay, reference, reference_name=reference_name
     )
 
-    scoring_start_check = _scoring_start_check(candidate, benchmark, scoring_start)
+    pause_policy_enabled = (
+        submission["locked"].get("decision_policy") is not None
+        or kickoff.get("signal_pause_policy") is not None
+    )
+    signal_pauses = (
+        _signal_pause_precheck(
+            candidate,
+            benchmark,
+            None,
+            kickoff.get("signal_pause_policy"),
+            require_bound_summary=False,
+        )
+        if pause_policy_enabled else None
+    )
+    scoring_start_check = _scoring_start_check(
+        candidate, benchmark, scoring_start, signal_pauses,
+    )
     coverage = _coverage_check(candidate, benchmark, scoring_start, expected)
-    data_availability = _data_availability_check(candidate, benchmark, replay["snapshot"])
-    position = _position_check(candidate, benchmark)
+    data_availability = _data_availability_check(
+        candidate, benchmark, replay["snapshot"], signal_pauses,
+    )
+    position = _position_check(candidate, benchmark, kickoff.get("position_policy"))
     costs = {
         "ok": all(
             _within(run_metrics["fees_paid"], original_metrics["fees_paid"])
@@ -1932,6 +2284,12 @@ def _receipt(
         },
         "hard_conditions": hard_conditions,
     }
+    if signal_pauses is not None:
+        checks["signal_pauses"] = {
+            "ok": signal_pauses["status"] in {"verified", "not_applicable"},
+            "status": signal_pauses["status"],
+            "limit_exceeded": signal_pauses["limit_exceeded"],
+        }
     observation = observation_recommendation(
         candidate, kickoff["observation"]["minimum_opportunities"]
     )
@@ -1952,6 +2310,8 @@ def _receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    if signal_pauses is not None:
+        receipt["signal_pauses"] = signal_pauses
     # Additive #56/#68 identity, published only for the opt-in protocols: a
     # schema-3 snapshot, the actual-open execution rule, or a non-legacy
     # valuation policy.  A legacy schema-1/2 v1 receipt under legacy rules
@@ -1996,12 +2356,16 @@ def _receipt(
 def _verdict(checks: Mapping[str, Any], comparison: Mapping[str, Any]) -> tuple[str, str | None]:
     if any(item["status"] == "failed" for item in checks["hard_conditions"]):
         return "failed", "HARD_CONDITION_NOT_MET"
+    if checks.get("signal_pauses", {}).get("limit_exceeded"):
+        return "failed", "SIGNAL_PAUSE_LIMIT_NOT_MET"
     if not comparison["matches_discovery"]:
         return "insufficient_evidence", "REPLAY_MISMATCH"
     if not checks["scoring_start"]["ok"]:
         return "insufficient_evidence", "SCORING_START_INSUFFICIENT"
     if not checks["coverage"]["ok"] or not checks["data_availability"]["ok"]:
         return "insufficient_evidence", "COVERAGE_INSUFFICIENT"
+    if not checks.get("signal_pauses", {}).get("ok", True):
+        return "insufficient_evidence", "SIGNAL_PAUSE_EVIDENCE_INSUFFICIENT"
     if not checks["position"]["ok"]:
         return "insufficient_evidence", "POSITION_EVIDENCE_INSUFFICIENT"
     if not checks["costs"]["ok"]:
@@ -2241,7 +2605,19 @@ def _formal_discovery_precheck(
         )
     except (KeyError, TypeError, ValueError):
         reject_binding("The Discovery quarterly summary cannot be verified.")
-    if expected_quarterly != quarterly:
+    summary_matches = expected_quarterly == quarterly
+    if not summary_matches and (
+        "signal_pauses" in expected_quarterly
+        and "signal_pauses" not in quarterly
+        and all(
+            summarize_signal_pauses(run)["paused_signal_days"] == 0
+            for run in (discovery, baseline)
+        )
+    ):
+        legacy_expected = dict(expected_quarterly)
+        legacy_expected.pop("signal_pauses")
+        summary_matches = legacy_expected == quarterly
+    if not summary_matches:
         reject_binding("The Discovery quarterly summary does not match its ledger receipt.")
 
     candidate_metrics = _metrics(discovery)
@@ -2254,7 +2630,27 @@ def _formal_discovery_precheck(
         0, development["sessions"] - scoring_policy["warmup_sessions"],
     )
     expected_dates = [expected_end] * expected_sessions
-    scoring_start = _scoring_start_check(discovery, baseline, expected_start)
+    signal_pauses = _signal_pause_precheck(
+        discovery,
+        baseline,
+        quarterly,
+        kickoff.get("signal_pause_policy"),
+    )
+    pause_policy_enabled = (
+        locked.get("decision_policy") is not None
+        or kickoff.get("signal_pause_policy") is not None
+    )
+    pause_reports = (
+        {
+            side: signal_pauses[side]
+            for side in ("candidate", "benchmark")
+            if isinstance(signal_pauses.get(side), Mapping)
+        }
+        if pause_policy_enabled else None
+    )
+    scoring_start = _scoring_start_check(
+        discovery, baseline, expected_start, pause_reports,
+    )
     coverage = _coverage_check(
         discovery, baseline, expected_start, expected_dates,
     )
@@ -2269,14 +2665,20 @@ def _formal_discovery_precheck(
     }
     data_availability = _data_availability_check(
         discovery, baseline, snapshot_evidence,
+        pause_reports,
     )
-    position = _position_check(discovery, baseline)
+    position = _position_check(discovery, baseline, kickoff.get("position_policy"))
     prerequisites = {
         "scoring_start": scoring_start,
         "coverage": coverage,
         "data_availability": data_availability,
         "position": position,
     }
+    if pause_policy_enabled:
+        prerequisites["signal_pauses"] = {
+            "ok": signal_pauses["status"] in {"verified", "not_applicable"},
+            "status": signal_pauses["status"],
+        }
     hard_failed = any(item["status"] == "failed" for item in hard_conditions)
     hard_unavailable = any(item["status"] == "unavailable" for item in hard_conditions)
     hard_metric_names = {
@@ -2294,6 +2696,8 @@ def _formal_discovery_precheck(
         "scoring_prerequisites": prerequisites,
         "disclosure_only_metrics_unavailable": unavailable_disclosures,
     }
+    if pause_policy_enabled:
+        precheck["signal_pauses"] = signal_pauses
     if hard_failed:
         precheck["status"] = "rejected"
         raise _rejected(
@@ -2303,6 +2707,17 @@ def _formal_discovery_precheck(
             allowance=dict(allowance) if allowance is not None else None,
             outcome="rejected",
             reason="HARD_CONDITION_NOT_MET",
+            precheck=precheck,
+        )
+    if signal_pauses["status"] == "verified" and signal_pauses["limit_exceeded"]:
+        precheck["status"] = "rejected"
+        raise _rejected(
+            "VALIDATION_PRECHECK_REJECTED", "validation", "inspect",
+            "A frozen signal-pause limit is exceeded by the Discovery evidence.",
+            counted=False,
+            allowance=dict(allowance) if allowance is not None else None,
+            outcome="rejected",
+            reason="SIGNAL_PAUSE_LIMIT_NOT_MET",
             precheck=precheck,
         )
     if hard_unavailable or any(not item["ok"] for item in prerequisites.values()):
@@ -2654,10 +3069,14 @@ def _formal_verdict(checks: Mapping[str, Any]) -> tuple[str, str | None]:
     """The formal protocol's verdict precedence (design contract §4)."""
     if any(item["status"] == "failed" for item in checks["hard_conditions"]):
         return "failed", "HARD_CONDITION_NOT_MET"
+    if checks.get("signal_pauses", {}).get("limit_exceeded"):
+        return "failed", "SIGNAL_PAUSE_LIMIT_NOT_MET"
     if not checks["scoring_start"]["ok"]:
         return "insufficient_evidence", "SCORING_START_INSUFFICIENT"
     if not checks["coverage"]["ok"] or not checks["data_availability"]["ok"]:
         return "insufficient_evidence", "COVERAGE_INSUFFICIENT"
+    if not checks.get("signal_pauses", {}).get("ok", True):
+        return "insufficient_evidence", "SIGNAL_PAUSE_EVIDENCE_INSUFFICIENT"
     if not checks["position"]["ok"]:
         return "insufficient_evidence", "POSITION_EVIDENCE_INSUFFICIENT"
     if any(item["status"] == "unavailable" for item in checks["hard_conditions"]):
@@ -2732,23 +3151,43 @@ def _formal_receipt(
     candidate_metrics = _metrics(candidate)
     benchmark_metrics = _metrics(benchmark)
     expected = runs["expected_sessions"]
+    pause_policy_enabled = (
+        submission["locked"].get("decision_policy") is not None
+        or kickoff.get("signal_pause_policy") is not None
+    )
+    signal_pauses = (
+        _signal_pause_precheck(
+            candidate,
+            benchmark,
+            None,
+            kickoff.get("signal_pause_policy"),
+            require_bound_summary=False,
+        )
+        if pause_policy_enabled else None
+    )
     checks = {
         "data_availability": _data_availability_check(
-            candidate, benchmark, runs["snapshot"]
+            candidate, benchmark, runs["snapshot"], signal_pauses,
         ),
         "scoring_start": _scoring_start_check(
-            candidate, benchmark, runs["scoring_start"]
+            candidate, benchmark, runs["scoring_start"], signal_pauses,
         ),
         "coverage": _coverage_check(
             candidate, benchmark, runs["scoring_start"], expected
         ),
-        "position": _position_check(candidate, benchmark),
+        "position": _position_check(candidate, benchmark, kickoff.get("position_policy")),
         "segment": dict(runs["segment"]),
         "hard_conditions": [
             _hard_condition(condition, candidate_metrics)
             for condition in kickoff["hard_conditions"]
         ],
     }
+    if signal_pauses is not None:
+        checks["signal_pauses"] = {
+            "ok": signal_pauses["status"] in {"verified", "not_applicable"},
+            "status": signal_pauses["status"],
+            "limit_exceeded": signal_pauses["limit_exceeded"],
+        }
     observation = observation_recommendation(
         candidate, kickoff["observation"]["minimum_opportunities"]
     )
@@ -2856,6 +3295,8 @@ def _formal_receipt(
         "opened_protected_source": False,
         "query_debited": False,
     }
+    if signal_pauses is not None:
+        receipt["signal_pauses"] = signal_pauses
     if discovery_precheck is not None:
         receipt["discovery_precheck"] = dict(discovery_precheck)
     if corrected is not None:
@@ -3886,11 +4327,11 @@ _DETAIL_RECORD_NAMES = (
     "summary", "metrics.candidate", "metrics.benchmark", "runs.candidate",
     "runs.benchmark", "fills.candidate", "fills.benchmark", "observation",
     "protocol", "provenance", "usage", "development", "trailing", "scoring",
-    "warmup", "replay",
+    "warmup", "replay", "signal_pauses",
 )
 _DETAIL_CHECK_GROUPS = (
     "data_availability", "scoring_start", "coverage", "position", "costs",
-    "replay", "segment", "hard_conditions",
+    "replay", "segment", "hard_conditions", "signal_pauses",
 )
 _DETAIL_MISSING = object()
 
@@ -3898,6 +4339,42 @@ _FEEDBACK_IDENTITY_FIELDS = (
     "schema_version", "round_id", "version_id", "validation_id", "receipt_hash",
     "impact", "detail_access_id", "next_experiment_id",
 )
+
+
+def _safe_detail(record: str, value: object) -> object:
+    if record in {"runs.candidate", "runs.benchmark"} and isinstance(value, Mapping):
+        return {key: item for key, item in value.items() if key != "order_attempts"}
+    if record == "checks.position" and isinstance(value, Mapping):
+        return {
+            key: (
+                {field: item for field, item in side.items() if field != "daily_account"}
+                if key in {"candidate", "benchmark"} and isinstance(side, Mapping)
+                else side
+            )
+            for key, side in value.items()
+        }
+    if record == "signal_pauses" and isinstance(value, Mapping):
+        result = {
+            key: value[key]
+            for key in ("status", "reason", "policy", "limit_exceeded")
+            if key in value
+        }
+        for side in ("candidate", "benchmark"):
+            report = value.get(side)
+            if isinstance(report, Mapping):
+                result[side] = {
+                    key: report[key]
+                    for key in (
+                        "status", "decision_days", "paused_signal_days",
+                        "longest_consecutive_paused_days", "limit", "limit_met",
+                    )
+                    if key in report
+                }
+                rebalances = report.get("affected_monthly_rebalances")
+                if isinstance(rebalances, list):
+                    result[side]["affected_monthly_rebalance_count"] = len(rebalances)
+        return result
+    return value
 
 
 def _detail_block(receipt: Mapping[str, Any], record: str) -> object:
@@ -3963,7 +4440,7 @@ def _detail_request(round_id: str, version_id: str, receipt: Mapping[str, Any], 
         if value is _DETAIL_MISSING:
             unavailable.append(record)
         else:
-            details[record] = value
+            details[record] = _safe_detail(record, value)
     if unavailable:
         raise _rejected(
             "DETAIL_RECORD_UNAVAILABLE", "detail", "inspect",
@@ -3999,7 +4476,10 @@ def _detail_view(
         "status": "completed",
         "reused": reused,
         **dict(request),
-        "details": resolution["details"],
+        "details": {
+            record: _safe_detail(record, value)
+            for record, value in resolution["details"].items()
+        },
         "recorded_at": resolution["recorded_at"],
     }
 

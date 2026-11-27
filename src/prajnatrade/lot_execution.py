@@ -158,20 +158,38 @@ def match_open_lot_day(
 
     sell_quantities: dict[str, float] = {}
     buy_demands: dict[str, float] = {}
+    target_amounts: dict[str, float] = {}
+    target_sides: dict[str, str] = {}
     for symbol in ordered_symbols:
         if symbol not in required:
             continue
         open_price = open_prices.get(symbol)
         if open_price is None:
+            if symbol in fixed_map:
+                target_amounts[symbol] = fixed_map[symbol]
+                target_sides[symbol] = "buy"
+            elif weights.get(symbol, 0.0) <= _EPSILON and new_shares[symbol] > _EPSILON:
+                target_sides[symbol] = "sell"
+            elif (
+                weights.get(symbol, 0.0) > _EPSILON
+                and not equity_unknown
+                and open_equity is not None
+            ):
+                target_amounts[symbol] = open_equity * float(weights[symbol])
+                target_sides[symbol] = "buy"
             continue
         held_qty = new_shares[symbol]
         if symbol in fixed_map:
             buy_demands[symbol] = fixed_map[symbol]
+            target_amounts[symbol] = fixed_map[symbol]
+            target_sides[symbol] = "buy"
             continue
         weight = float(weights.get(symbol, 0.0))
         if weight <= _EPSILON:
             if held_qty > _EPSILON:
                 sell_quantities[symbol] = held_qty
+                target_amounts[symbol] = held_qty * float(open_price)
+                target_sides[symbol] = "sell"
             continue
         if equity_unknown or open_equity is None:
             unfilled_reasons.setdefault(symbol, "equity_basis_unknown")
@@ -185,8 +203,12 @@ def match_open_lot_day(
             sell_qty = min(held_qty, float(lots_to_sell * lot_unit))
             if sell_qty > _EPSILON:
                 sell_quantities[symbol] = sell_qty
+                target_amounts[symbol] = abs(delta)
+                target_sides[symbol] = "sell"
         elif delta > _EPSILON:
             buy_demands[symbol] = delta
+            target_amounts[symbol] = delta
+            target_sides[symbol] = "buy"
 
     day_fills: list[dict[str, Any]] = []
     costs = {"notional": 0.0, "fees": 0.0, "slippage": 0.0}
@@ -217,11 +239,16 @@ def match_open_lot_day(
 
     available_cash = max(0.0, current_cash)
     total_demand = math.fsum(buy_demands.values())
-    cash_constrained = total_demand > available_cash + _CASH_TOLERANCE
-    scale = (available_cash / total_demand) if (cash_constrained and total_demand > 0) else 1.0
+    allocation_scaled = total_demand > available_cash + _CASH_TOLERANCE
+    scale = (
+        available_cash / total_demand
+        if allocation_scaled and total_demand > 0
+        else 1.0
+    )
 
     lot_rounding_residual = 0.0
     total_buy_cost = 0.0
+    target_lots: dict[str, int] = {}
     for symbol in ordered_symbols:
         demand = buy_demands.get(symbol, 0.0)
         if demand <= _EPSILON:
@@ -230,12 +257,13 @@ def match_open_lot_day(
         lot_unit = lots_map[symbol]
         fill_price = raw_open * (1.0 + slippage_rate)
         lot_cost = lot_unit * fill_price * (1.0 + fee_rate)
+        target_lots[symbol] = math.floor((demand + _CASH_TOLERANCE) / lot_cost)
         allocated = demand * scale
         lots = math.floor((allocated + _CASH_TOLERANCE) / lot_cost)
         while lots > 0 and lots * lot_cost > current_cash + _CASH_TOLERANCE:
             lots -= 1
         actual_cost = lots * lot_cost
-        lot_rounding_residual += max(0.0, allocated - actual_cost)
+        lot_rounding_residual += max(0.0, demand - actual_cost)
         if lots <= 0:
             continue
         buy_qty = float(lots * lot_unit)
@@ -257,13 +285,90 @@ def match_open_lot_day(
     if -_CASH_TOLERANCE < current_cash < 0.0:
         current_cash = 0.0
 
-    traded = {fill["symbol"] for fill in day_fills}
-    unfilled = [
-        {"symbol": symbol, "reason": unfilled_reasons[symbol]}
-        for symbol in required
-        if symbol in unfilled_reasons and symbol not in traded
-    ]
-    batch_complete = (not unfilled) and (not cash_constrained)
+    fills_by_symbol = {fill["symbol"]: fill for fill in day_fills}
+    traded = set(fills_by_symbol)
+    lot_orders: list[dict[str, Any]] = []
+    unfilled: list[dict[str, Any]] = []
+    for symbol in required:
+        lot_unit = lots_map[symbol]
+        open_price = open_prices.get(symbol)
+        planned_side = target_sides.get(symbol)
+        if open_price is None:
+            if planned_side == "sell":
+                target_quantity = float(new_shares[symbol])
+                executable_lots = target_quantity / lot_unit
+            else:
+                target_quantity = None
+                executable_lots = None
+            target_amount = target_amounts.get(symbol)
+        elif symbol in target_lots:
+            executable_lots = target_lots[symbol]
+            target_quantity = float(executable_lots * lot_unit)
+            target_amount = target_amounts.get(symbol)
+        elif symbol in sell_quantities:
+            target_quantity = float(sell_quantities[symbol])
+            executable_lots = target_quantity / lot_unit
+            target_amount = target_amounts.get(symbol)
+        elif symbol in unfilled_reasons:
+            target_quantity = None
+            executable_lots = None
+            target_amount = target_amounts.get(symbol)
+        else:
+            target_quantity = 0.0
+            executable_lots = 0
+            target_amount = 0.0
+
+        fill = fills_by_symbol.get(symbol)
+        actual_quantity = float(fill["quantity"]) if fill is not None else 0.0
+        actual_lots = actual_quantity / lot_unit
+        shortfall_lots = (
+            max(0.0, float(executable_lots) - actual_lots)
+            if executable_lots is not None
+            else None
+        )
+        reason = unfilled_reasons.get(symbol)
+        if shortfall_lots is not None and shortfall_lots > _EPSILON:
+            reason = "cash_constrained" if planned_side == "buy" else reason
+        order_status = (
+            "unfilled"
+            if reason is not None
+            else "filled"
+            if actual_quantity > _EPSILON
+            else "no_trade_required"
+        )
+        order = {
+            "symbol": symbol,
+            "side": planned_side,
+            "target_amount": target_amount,
+            "allocated_amount": (
+                float(buy_demands[symbol] * scale)
+                if symbol in buy_demands
+                else target_amount
+            ),
+            "target_executable_quantity": target_quantity,
+            "target_executable_lots": executable_lots,
+            "actual_filled_quantity": actual_quantity,
+            "actual_filled_lots": actual_lots,
+            "shortfall_lots": shortfall_lots,
+            "reason": reason,
+            "status": order_status,
+        }
+        lot_orders.append(order)
+        if reason is not None:
+            unfilled.append(
+                {
+                    "symbol": symbol,
+                    "reason": reason,
+                    "target_executable_lots": executable_lots,
+                    "actual_filled_lots": actual_lots,
+                    "shortfall_lots": shortfall_lots,
+                }
+            )
+
+    cash_constrained = any(
+        order["reason"] == "cash_constrained" for order in lot_orders
+    )
+    batch_complete = not unfilled
     if cash_constrained:
         residual_reason: str | None = "cash_constrained"
     elif lot_rounding_residual > _EPSILON:
@@ -297,6 +402,7 @@ def match_open_lot_day(
         ),
         "filled_symbols": [symbol for symbol in ordered_symbols if symbol in traded],
         "unfilled": unfilled,
+        "lot_orders": lot_orders,
         "basket_complete": batch_complete,
         "batch_complete": batch_complete,
         "zero_trade_satisfied": bool(batch_complete and not day_fills),

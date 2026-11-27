@@ -175,7 +175,7 @@ def test_export_feed_cli_emits_only_discovery_facts_through_date(tmp_path: Path)
     assert (future_date, "511260") not in loaded.raw
 
 
-def _build_manual_tracking_release(
+def build_manual_tracking_release(
     store: Path,
     sessions: list[str],
     *,
@@ -371,7 +371,7 @@ def test_shadow_carry_forward_valuation_corporate_actions_and_discovery_parity(
     future_sessions = [date_map[s] for s in sessions]
     feed_path = write_feed(tmp_path / "feed_future.json", future_payload)
     store2 = tmp_path / "store2"
-    rel2 = _build_manual_tracking_release(store2, future_sessions)
+    rel2 = build_manual_tracking_release(store2, future_sessions)
     rid2 = rel2["release_id"]
 
     res3, blocked3 = shadow.update(ledger, store2, feed_path, future_sessions[3], [rid2])
@@ -463,7 +463,7 @@ def test_shadow_carry_forward_gap_paths_zero_holding_and_strict_close_control(
 
     # Legacy strict-close-v1 control blocks on day 4 with missing_close
     strict_store = tmp_path / "strict_store"
-    strict_rel = _build_manual_tracking_release(
+    strict_rel = build_manual_tracking_release(
         strict_store, future_sessions, valuation_policy=STRICT_CLOSE_VALUATION
     )
     feed_path = write_feed(tmp_path / "feed.json", future_payload)
@@ -480,7 +480,7 @@ def test_shadow_carry_forward_gap_paths_zero_holding_and_strict_close_control(
     )
     late_feed = write_feed(tmp_path / "late_feed.json", late_payload)
     cf_store = tmp_path / "cf_store"
-    cf_rel = _build_manual_tracking_release(cf_store, future_sessions)
+    cf_rel = build_manual_tracking_release(cf_store, future_sessions)
     res_late, blocked_late = shadow.update(
         tmp_path / "late_ledger", cf_store, late_feed, future_sessions[4], [cf_rel["release_id"]]
     )
@@ -598,7 +598,7 @@ def test_shadow_backfill_never_rewrites_committed_days_and_detects_frozen_input_
     store = tmp_path / "store"
     ledger = tmp_path / "ledger"
     report_out = tmp_path / "report.json"
-    rel = _build_manual_tracking_release(store, future_sessions)
+    rel = build_manual_tracking_release(store, future_sessions)
     rid = rel["release_id"]
     feed_path = write_feed(tmp_path / "feed.json", future_payload)
 
@@ -698,7 +698,7 @@ def test_synthetic_v3_partial_halt_resumed_and_full_day_parity(tmp_path: Path) -
     store = tmp_path / "ph_store"
     ledger = tmp_path / "ph_ledger"
     report_out = tmp_path / "ph_report.json"
-    rel = _build_manual_tracking_release(store, future_sessions)
+    rel = build_manual_tracking_release(store, future_sessions)
     rid = rel["release_id"]
     feed_path = write_feed(tmp_path / "ph_feed.json", future_payload)
 

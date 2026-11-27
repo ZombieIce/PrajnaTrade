@@ -268,6 +268,15 @@ corrected successor produces a formal revalidation epoch with the prior receipt
 and affected diff while a changed development slice is refused with
 `EVIDENCE_DEVELOPMENT_MISMATCH`. The file is fast and not marked `isolation`.
 
+The #81-C cases freeze per-account `position_policy` through the public
+`round open`/`round validate` CLI. They reconcile the actual daily cash, NAV and
+holdings timeline through a four-to-five-to-four ETF basket, verify independent
+candidate/benchmark hold-date counts and intentional-cash permission, and
+compare default partial-target disclosure with an explicitly strict end target.
+They also check that a completed whole-lot batch satisfies the strict rule,
+known Discovery blockers use no read, a valid read counts once, and replay does
+not count it again.
+
 ## Formal Validation pre-read execution gate and 329-day receipt tests (#59)
 
 `tests/test_formal_validation_cli.py` also owns the end-to-end #56/#59 acceptance
@@ -460,6 +469,18 @@ unread and the Validation allowance unchanged; a missing disclosure-only metric
 and one-quarter performance disclosure may proceed. Counted Validation replay
 and interruption recovery keep #50's existing semantics.
 
+## Frozen decision-pause audit (#82)
+
+`tests/test_formal_validation_cli.py` drives public `round validate` with
+synthetic schema-3 snapshots under a frozen 15:30 cutoff. It contrasts timely
+confirmed suspensions, post-cutoff evidence, and unexplained/independent
+valuation gaps; verifies per-account pause counts, consecutive decision days,
+monthly deferral outcomes, no new target, prior-order settlement and daily NAV
+reconciliation; and checks default disclosure versus a frozen per-account pause
+cap. Invalid evidence and exceeded pre-read caps consume zero Validation uses,
+while a legal first read and replay consume one in total. The formal receipt
+also publishes the trailing segment's separate pause audit.
+
 ## Suspended holding carry-forward valuation (#68: #69, #70, #71)
 
 Three fast, non-`isolation` public-CLI suites cover Spec #68 (ADR 0003) on
@@ -517,6 +538,6 @@ Six fast, non-`isolation` public-CLI suites cover Spec #74 on offline synthetic 
 - `tests/test_local_plugins_cli.py` (#75 / #74-A): explicit `--plugin-config` / `--plugin` / `PRAJNATRADE_PLUGIN_CONFIG` registration (`plugin register`, operator-only), AST transitive local dependency closure and SHA-256 fingerprinting (including thin-wrapper imported helpers), rejection of unbindable dependencies / family conflicts / unregistered families / Protected Evaluation plugin attempts, cross-stage verification across Discovery / Formal Validation / Shadow (`PLUGIN_CONTENT_CHANGED` preserving committed Shadow days), and platform-fix revalidation eligibility (`REVALIDATION_INELIGIBLE` when plugin/rules change vs zero-allowance revalidation when identical).
 - `tests/test_shadow_feed_v3_valuation_cli.py` (#76 / #74-B): schema-3 Shadow feed validation (evidence roles, conflicts, corporate-action `sequence` sorting), no-lookahead `shadow export-feed`, and Shadow `carry-forward-suspended-v1` valuation (ex-dividend receivable/pay-date transfers, share splits, resumption without double-adjustment, and fail-closed gap/conflict/late-notice blockers).
 - `tests/test_decision_timing_observations_cli.py` (#77 / #74-C): frozen `after-close-common-v1` cutoff/timezone and `history_requirements` propagation, common-valid-close selection with whole-day suspension backfill, single-day signal pause on missing/late/conflicting data while prior orders settle independently, and pre-enablement warmup isolation.
-- `tests/test_open_lot_settlement_cli.py` (#78 / #74-D): frozen `actual-open-lot-v1` and `--lot-size`/`--lot-sizes`, pre-open `open_weight`/`fixed_amount` order freezing, open-time whole-lot matching with sells-first realized proceeds, proportional scaling, `lot_rounding_residual` vs `cash_constrained`, `equity_basis_unknown` with explicit exits & fixed-amount orders still executing, and `daily_simulation_assumptions` disclosure.
+- `tests/test_open_lot_settlement_cli.py` (#78 / #74-D, #81-B / #83): frozen `actual-open-lot-v1` and `--lot-size`/`--lot-sizes`, pre-open `open_weight`/`fixed_amount` order freezing, open-time whole-lot matching with sells-first realized proceeds, proportional scaling, `lot_rounding_residual` vs `cash_constrained`, `equity_basis_unknown` with explicit exits & fixed-amount orders still executing, and `daily_simulation_assumptions` disclosure. Public-CLI synthetic cases reconcile pre-allocation target lots, allocated amounts, actual fills, shortfall and completion metrics for $2,050/$3,000 targets against $2,000 cash, non-zero costs across multiple symbols, zero-trade targets and a missing-open reason; Discovery, Formal Validation and Shadow expose matching order evidence, and anchors advance only for complete or zero-trade-satisfied targets.
 - `tests/test_stateful_rebalance_cli.py` (#79 / #74-E): all 8 strategy state fields and `prior_close_weights` contract across Discovery/Validation/Shadow, zero-trade satisfied target anchor updates (200 held vs 205 target @ lot=100), non-advancement on `cash_constrained`/suspended/partial fills, cross-month signal attribution, non-monthly `risk_control` isolation from `last_monthly_filled_target`, intra-month deferral recovery / whole-month `not_executed` / no auto-resend of submitted partial orders, own initial account startup (`initial_cash`/`initial_positions`) & warmup, restart/replay idempotency, and `shadow migrate-state` for both uniquely reconstructible and `STATE_NOT_UNIQUELY_RECONSTRUCTIBLE` ledgers.
 - `tests/test_issue74_e2e_synthetic_acceptance_cli.py` (#79 / #74): full public-CLI E2E synthetic acceptance reusing #35 helpers across seal → plugin register → campaign → Discovery → Formal Validation → platform-fix revalidate → manual approval → `shadow export-feed`/`update`/`report`/`compare` + replay, with exact day-by-day expected/actual reconciliation and single-mutation negative counterexamples. The [evidence index](../acceptance/issue-74-synthetic.md) documents the replay commands, daily ledger table, counterexamples and artifact keys.

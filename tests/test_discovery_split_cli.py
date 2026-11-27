@@ -108,6 +108,7 @@ def split_campaign(
     as_of: str | None = None,
     execution_rules: str | None = None,
     valuation_policy: str | None = None,
+    decision_policy: dict | None = None,
 ) -> tuple[Path, Path, dict]:
     """Initialize a project, seal the payload, and freeze a split Campaign.
 
@@ -128,6 +129,14 @@ def split_campaign(
         arguments += ["--execution-rules", execution_rules]
     if valuation_policy is not None:
         arguments += ["--valuation-policy", valuation_policy]
+    if decision_policy is not None:
+        arguments += [
+            "--decision-policy", decision_policy["version"],
+            "--signal-cutoff", decision_policy["signal_cutoff"],
+            "--signal-timezone", decision_policy["signal_timezone"],
+        ]
+        if decision_policy.get("monthly_deferral"):
+            arguments.append("--monthly-deferral")
     campaign = ok(cli(*arguments))
     snapshots = project.parent / f"{project.name}-snapshot-store"
     return project, snapshots, campaign
@@ -527,6 +536,7 @@ def test_round_submit_locks_the_v2_protocol_and_agent_status_shows_the_split(
         "hard_conditions": opened["kickoff"]["hard_conditions"],
         "selection_rules": opened["kickoff"]["selection_rules"],
         "protocol": V2_PROTOCOL,
+        "position_policy": opened["kickoff"]["position_policy"],
         "research_partition": {
             key: split[key] for key in ("split_hash", "development", "trailing")
         },

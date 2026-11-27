@@ -644,6 +644,7 @@ def run_partition_strategy(
                         "signal_cutoff": obs_result["signal_cutoff"],
                         "signal_status": "paused",
                         "signal_pause": pause_info,
+                        "confirmed_no_trade": list(obs_result["confirmed_no_trade"]),
                         "observation_dates": [],
                         "observation_sources": {},
                     }
@@ -670,6 +671,7 @@ def run_partition_strategy(
                         "signal_cutoff": obs_result["signal_cutoff"],
                         "signal_status": obs_result["signal_status"],
                         "signal_pause": None,
+                        "confirmed_no_trade": list(obs_result["confirmed_no_trade"]),
                         "observation_dates": list(obs_result["observation_dates"]),
                         "observation_sources": obs_result["observation_sources"],
                     }
@@ -730,6 +732,7 @@ def run_partition_strategy(
                         "signal_cutoff": obs_result["signal_cutoff"],
                         "signal_status": "no_target",
                         "signal_pause": None,
+                        "confirmed_no_trade": list(obs_result["confirmed_no_trade"]),
                         "observation_dates": list(obs_days),
                         "observation_sources": obs_result["observation_sources"],
                     }
@@ -779,6 +782,7 @@ def run_partition_strategy(
                     "signal_cutoff": obs_result["signal_cutoff"],
                     "signal_status": "generated",
                     "signal_pause": None,
+                    "confirmed_no_trade": list(obs_result["confirmed_no_trade"]),
                     "purpose": purpose,
                     "cycle": cycle,
                     **deferral_fields,
@@ -1161,6 +1165,36 @@ def _metrics(
         # records the baskets that matched some symbols but not all of them.
         metrics["orders_partially_filled"] = sum(
             1 for attempt in order_attempts if attempt.get("status") == "partially_filled"
+        )
+    if execution_rule_version == ACTUAL_OPEN_LOT_RULES:
+        lot_orders = [
+            order
+            for attempt in order_attempts
+            for order in attempt.get("lot_orders", [])
+        ]
+        metrics.update(
+            {
+                "lot_order_count": len(lot_orders),
+                "lot_orders_filled": sum(
+                    order.get("status") == "filled" for order in lot_orders
+                ),
+                "lot_orders_unfilled": sum(
+                    order.get("status") == "unfilled" for order in lot_orders
+                ),
+                "target_executable_lots": math.fsum(
+                    float(order["target_executable_lots"])
+                    for order in lot_orders
+                    if order.get("target_executable_lots") is not None
+                ),
+                "actual_filled_lots": math.fsum(
+                    float(order["actual_filled_lots"]) for order in lot_orders
+                ),
+                "shortfall_lots": math.fsum(
+                    float(order["shortfall_lots"])
+                    for order in lot_orders
+                    if order.get("shortfall_lots") is not None
+                ),
+            }
         )
     if valuation_policy_version == CARRY_FORWARD_SUSPENDED_VALUATION:
         metrics["actual_close_sessions"] = sum(
