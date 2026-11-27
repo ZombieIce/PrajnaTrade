@@ -1840,9 +1840,12 @@ def _receipt(
         or kickoff.get("signal_pause_policy") is not None
     )
     common_checks, signal_pauses = validation_evidence.interpret_validation_evidence(
-        candidate, benchmark, scoring_start=scoring_start, expected_sessions=expected,
-        snapshot=replay["snapshot"], position_policy=kickoff.get("position_policy"),
-        signal_pause_policy=kickoff.get("signal_pause_policy"), pause_enabled=pause_policy_enabled,
+        validation_evidence.ValidationEvidenceContext(
+            candidate=candidate, benchmark=benchmark, scoring_start=scoring_start,
+            expected_sessions=expected, snapshot=replay["snapshot"],
+            position_policy=kickoff.get("position_policy"),
+            signal_pause_policy=kickoff.get("signal_pause_policy"), pause_enabled=pause_policy_enabled,
+        ),
     )
     costs = {
         "ok": all(
@@ -2243,9 +2246,12 @@ def _formal_discovery_precheck(
         "as_of": as_of,
     }
     common_checks, signal_pauses = validation_evidence.interpret_validation_evidence(
-        discovery, baseline, scoring_start=expected_start, expected_sessions=expected_dates,
-        snapshot=snapshot_evidence, position_policy=kickoff.get("position_policy"),
-        signal_pause_policy=kickoff.get("signal_pause_policy"), pause_enabled=pause_policy_enabled,
+        validation_evidence.ValidationEvidenceContext(
+            candidate=discovery, benchmark=baseline, scoring_start=expected_start,
+            expected_sessions=expected_dates, snapshot=snapshot_evidence,
+            position_policy=kickoff.get("position_policy"),
+            signal_pause_policy=kickoff.get("signal_pause_policy"), pause_enabled=pause_policy_enabled,
+        ),
         quarterly=quarterly, require_bound_summary=True,
     )
     assert signal_pauses is not None
@@ -2735,9 +2741,12 @@ def _formal_receipt(
         or kickoff.get("signal_pause_policy") is not None
     )
     common_checks, signal_pauses = validation_evidence.interpret_validation_evidence(
-        candidate, benchmark, scoring_start=runs["scoring_start"], expected_sessions=expected,
-        snapshot=runs["snapshot"], position_policy=kickoff.get("position_policy"),
-        signal_pause_policy=kickoff.get("signal_pause_policy"), pause_enabled=pause_policy_enabled,
+        validation_evidence.ValidationEvidenceContext(
+            candidate=candidate, benchmark=benchmark, scoring_start=runs["scoring_start"],
+            expected_sessions=expected, snapshot=runs["snapshot"],
+            position_policy=kickoff.get("position_policy"),
+            signal_pause_policy=kickoff.get("signal_pause_policy"), pause_enabled=pause_policy_enabled,
+        ),
     )
     checks = {
         **common_checks,

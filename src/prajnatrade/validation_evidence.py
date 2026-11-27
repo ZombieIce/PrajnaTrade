@@ -6,12 +6,25 @@ Callers own evidence binding, read gates, verdicts and receipt publication.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from prajnatrade.discovery_summary import summarize_signal_pauses
 
 _POSITION_STATES = {"initial_position_established", "intentional_cash"}
 _UNFINISHED_BUILD_STATES = {"partial", "unfilled"}
+
+
+@dataclass(frozen=True)
+class ValidationEvidenceContext:
+    candidate: Mapping[str, Any]
+    benchmark: Mapping[str, Any]
+    scoring_start: str
+    expected_sessions: list[str]
+    snapshot: Mapping[str, Any]
+    position_policy: Mapping[str, Any] | None
+    signal_pause_policy: Mapping[str, Any] | None
+    pause_enabled: bool
 
 
 def _gap_summary(gaps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -398,15 +411,8 @@ def _signal_pause_precheck(
 
 
 def interpret_validation_evidence(
-    candidate: Mapping[str, Any],
-    benchmark: Mapping[str, Any],
+    context: ValidationEvidenceContext,
     *,
-    scoring_start: str,
-    expected_sessions: list[str],
-    snapshot: Mapping[str, Any],
-    position_policy: Mapping[str, Any] | None,
-    signal_pause_policy: Mapping[str, Any] | None,
-    pause_enabled: bool,
     quarterly: Mapping[str, Any] | None = None,
     require_bound_summary: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -417,12 +423,12 @@ def interpret_validation_evidence(
     """
     pauses = (
         _signal_pause_precheck(
-            candidate, benchmark, quarterly, signal_pause_policy,
+            context.candidate, context.benchmark, quarterly, context.signal_pause_policy,
             require_bound_summary=require_bound_summary,
         )
-        if pause_enabled or require_bound_summary else None
+        if context.pause_enabled or require_bound_summary else None
     )
-    pause_reports = pauses if pause_enabled else None
+    pause_reports = pauses if context.pause_enabled else None
     if pause_reports is not None and require_bound_summary:
         pause_reports = {
             side: pauses[side]
@@ -431,12 +437,16 @@ def interpret_validation_evidence(
         }
     checks = {
         "data_availability": _data_availability_check(
-            candidate, benchmark, snapshot, pause_reports,
+            context.candidate, context.benchmark, context.snapshot, pause_reports,
         ),
         "scoring_start": _scoring_start_check(
-            candidate, benchmark, scoring_start, pause_reports,
+            context.candidate, context.benchmark, context.scoring_start, pause_reports,
         ),
-        "coverage": _coverage_check(candidate, benchmark, scoring_start, expected_sessions),
-        "position": _position_check(candidate, benchmark, position_policy),
+        "coverage": _coverage_check(
+            context.candidate, context.benchmark, context.scoring_start, context.expected_sessions,
+        ),
+        "position": _position_check(
+            context.candidate, context.benchmark, context.position_policy,
+        ),
     }
     return checks, pauses
