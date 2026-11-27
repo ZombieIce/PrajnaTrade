@@ -79,7 +79,7 @@ import math
 import os
 import re
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -92,6 +92,11 @@ from prajnatrade.container_executor import executor_from_config
 from prajnatrade.data import CASH, ETF_SYMBOLS
 from prajnatrade.experiment import runtime_matches
 from prajnatrade.isolation import IsolationError
+from prajnatrade.lot_execution import (
+    ACTUAL_OPEN_LOT_RULES,
+    match_open_lot_day,
+    normalize_lot_sizes,
+)
 from prajnatrade.snapshot_baseline import (
     _valid_price,
     available_by,
@@ -104,6 +109,8 @@ from prajnatrade.strategies import (
 )
 from prajnatrade.trading_status import (
     CARRY_FORWARD_SUSPENDED_VALUATION,
+    EXECUTION_RULE_VERSIONS,
+    NEXT_OPEN_RULES,
     STRICT_CLOSE_VALUATION,
     VALUATION_POLICY_VERSIONS,
     halt_conflicts_with_volume,
@@ -2500,6 +2507,26 @@ def _execution_settings(
             "RELEASE_INVALID",
             f"The release artifact declares unsupported valuation policy {val_policy!r}.",
         )
+    exec_rules_obj = execution["execution_rules"]
+    rule_version = (
+        exec_rules_obj.get("version", NEXT_OPEN_RULES)
+        if isinstance(exec_rules_obj, Mapping)
+        else NEXT_OPEN_RULES
+    )
+    if rule_version not in EXECUTION_RULE_VERSIONS:
+        raise _Blocked(
+            "RELEASE_INVALID",
+            f"The release artifact declares unsupported execution rules {rule_version!r}.",
+        )
+    lot_extra: dict[str, Any] = {}
+    if rule_version == ACTUAL_OPEN_LOT_RULES:
+        exec_block = (
+            exec_rules_obj.get("execution", {})
+            if isinstance(exec_rules_obj, Mapping)
+            else {}
+        )
+        lot_extra["lot_sizes"] = normalize_lot_sizes(exec_block.get("lot_sizes"))
+        lot_extra["symbol_order"] = list(exec_block.get("symbol_order", ETF_SYMBOLS))
     return {
         "strategy": identity,
         **runtime,
@@ -2509,7 +2536,9 @@ def _execution_settings(
         "slippage_bps": float(execution["slippage_bps"]),
         "signal_window_sessions": window,
         "execution_rules": execution["execution_rules"],
+        "execution_rule_version": rule_version,
         "valuation_policy": val_policy,
+        **lot_extra,
     }
 
 
@@ -2730,13 +2759,13 @@ def _committed_entry(
         {
             "order_id": order["order_id"],
             "symbol": order["symbol"],
-            "side": order["side"],
-            "quantity": order["quantity"],
+            "side": order.get("side"),
+            "quantity": order.get("quantity"),
             "status": order["status"],
             "reason": order["reason"],
         }
         for order in result["orders"]
-        if order["status"] != "filled"
+        if order["status"] not in ("filled", "no_trade_required")
     ]
     return _version_entry(
         release_id,
@@ -2949,11 +2978,28 @@ def _build_input(
         for symbol, quantity in prior["positions"].items()
         if quantity > _EPSILON
     }
+    rule_version = execution.get("execution_rule_version", NEXT_OPEN_RULES)
     pending = [dict(order) for order in prior["next_orders"]]
     buy_symbols = {
         order["symbol"]
         for order in pending
-        if order.get("side") == "buy" and order.get("symbol") in ETF_SYMBOLS
+        if order.get("symbol") in ETF_SYMBOLS
+        and (
+            order.get("side") == "buy"
+            or (
+                order.get("order_sizing_mode") in ("open_weight", "fixed_amount")
+                and (
+                    float(order.get("target_weight") or 0.0) > _EPSILON
+                    or float(order.get("fixed_amount") or 0.0) > _EPSILON
+                )
+                and is_executable_open(
+                    raw.get(order["symbol"]),
+                    open_cutoff,
+                    data_kind=feed.data_kind,
+                    execution_rule_version=rule_version,
+                )
+            )
+        )
     }
     blockers: list[tuple[str, str]] = []
     anomalies: list[dict[str, Any]] = []
@@ -2972,8 +3018,20 @@ def _build_input(
                         "open_evidence_missing",
                         f"{symbol} has no evidence for the {session} opening auction.",
                     ))
-                elif order["side"] == "buy" and is_executable_open(
-                    row, open_cutoff, data_kind=feed.data_kind
+                elif (
+                    order.get("side") == "buy"
+                    or (
+                        order.get("order_sizing_mode") in ("open_weight", "fixed_amount")
+                        and (
+                            float(order.get("target_weight") or 0.0) > _EPSILON
+                            or float(order.get("fixed_amount") or 0.0) > _EPSILON
+                        )
+                    )
+                ) and is_executable_open(
+                    row,
+                    open_cutoff,
+                    data_kind=feed.data_kind,
+                    execution_rule_version=rule_version,
                 ):
                     buy_symbols.add(symbol)
 
@@ -3652,139 +3710,281 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
 
     # (b) settle the previous session's pending orders at the unadjusted open,
     # sells before buys and then by symbol; exactly one terminal state each.
-    pending = sorted(
-        prior["next_orders"],
-        key=lambda order: (
-            0 if order.get("side") == "sell" else 1,
-            order.get("symbol", ""),
-            order.get("order_id", ""),
-        ),
-    )
+    # (b) settle pre-open persisted orders against actual opening prices.
+    rule_version = execution.get("execution_rule_version", NEXT_OPEN_RULES)
     orders: list[dict[str, Any]] = []
     fills: list[dict[str, Any]] = []
     day_fees = 0.0
     day_slippage = 0.0
-    for order in pending:
-        symbol = order["symbol"]
-        side = order["side"]
-        quantity = float(order["quantity"])
-        committed_at = prior.get("committed_at")
-        try:
-            persisted = (
-                datetime.fromisoformat(committed_at)
-                if isinstance(committed_at, str) and committed_at
-                else None
-            )
-        except ValueError:
-            persisted = None
-        persisted_before_deadline = (
-            persisted is not None
-            and persisted.tzinfo is not None
-            and persisted < open_cutoff
+    settlement_extra: dict[str, Any] = {}
+    committed_at = prior.get("committed_at")
+    try:
+        persisted = (
+            datetime.fromisoformat(committed_at)
+            if isinstance(committed_at, str) and committed_at
+            else None
         )
-        record = {
-            "order_id": order["order_id"],
-            "symbol": symbol,
-            "side": side,
-            "quantity": quantity,
-            "signal_date": order.get("signal_date"),
-            "execution_date": order.get("execution_date"),
-            "submitted_at": order.get("submitted_at"),
-            "deadline": order.get("deadline"),
-            # The creation-time planning estimate is kept only until settlement;
-            # this field records the actual durable persistence time of the
-            # signal day that created the order.
-            "persisted_before_deadline": persisted_before_deadline,
-            "persisted_at": committed_at,
-            "target_weight": order.get("target_weight"),
-            "date": session,
-            "status": None,
-            "reason": None,
-            "fill": None,
-        }
-        submitted_at = order.get("submitted_at")
-        try:
-            submitted = datetime.fromisoformat(submitted_at) if submitted_at else None
-        except (TypeError, ValueError):
-            submitted = None
-        if (
-            submitted is None
-            or submitted.tzinfo is None
-            or submitted >= open_cutoff
-            or not persisted_before_deadline
-        ):
-            record["status"] = "missed_deadline"
-            record["reason"] = (
-                "the order was not durably submitted before the execution "
-                "session's 09:30 Asia/Shanghai deadline; it is never filled "
-                "retroactively"
+    except ValueError:
+        persisted = None
+    persisted_before_deadline = (
+        persisted is not None
+        and persisted.tzinfo is not None
+        and persisted < open_cutoff
+    )
+
+    if rule_version == ACTUAL_OPEN_LOT_RULES and prior["next_orders"]:
+        symbol_order = list(execution.get("symbol_order", ETF_SYMBOLS))
+        order_rank = {sym: idx for idx, sym in enumerate(symbol_order)}
+        pending = sorted(
+            prior["next_orders"],
+            key=lambda order: (order_rank.get(order.get("symbol", ""), 999), order.get("order_id", "")),
+        )
+        timely_orders: list[dict[str, Any]] = []
+        for order in pending:
+            submitted_at = order.get("submitted_at")
+            try:
+                submitted = datetime.fromisoformat(submitted_at) if submitted_at else None
+            except (TypeError, ValueError):
+                submitted = None
+            base_record = {
+                "order_id": order["order_id"],
+                "symbol": order["symbol"],
+                "side": order.get("side"),
+                "order_sizing_mode": order.get("order_sizing_mode", "open_weight"),
+                "signal_date": order.get("signal_date"),
+                "execution_date": order.get("execution_date"),
+                "submitted_at": submitted_at,
+                "deadline": order.get("deadline"),
+                "persisted_before_deadline": persisted_before_deadline,
+                "persisted_at": committed_at,
+                "target_weight": order.get("target_weight"),
+                **({"fixed_amount": order["fixed_amount"]} if "fixed_amount" in order else {}),
+                "date": session,
+                "status": None,
+                "reason": None,
+                "fill": None,
+            }
+            if (
+                submitted is None
+                or submitted.tzinfo is None
+                or submitted >= open_cutoff
+                or not persisted_before_deadline
+            ):
+                base_record["status"] = "missed_deadline"
+                base_record["reason"] = (
+                    "the order was not durably submitted before the execution "
+                    "session's 09:30 Asia/Shanghai deadline; it is never filled "
+                    "retroactively"
+                )
+                orders.append(base_record)
+            else:
+                timely_orders.append((order, base_record))  # type: ignore[arg-type]
+
+        if timely_orders:
+            weights_map = {symbol: 0.0 for symbol in ETF_SYMBOLS}
+            fixed_map: dict[str, float] = {}
+            record_by_symbol: dict[str, dict[str, Any]] = {}
+            order_by_symbol: dict[str, dict[str, Any]] = {}
+            for order, base_record in timely_orders:  # type: ignore[misc]
+                sym = order["symbol"]
+                order_by_symbol[sym] = order
+                record_by_symbol[sym] = base_record
+                if order.get("order_sizing_mode") == "fixed_amount":
+                    fixed_map[sym] = float(order["fixed_amount"])
+                else:
+                    weights_map[sym] = float(order.get("target_weight") or 0.0)
+            open_prices = {
+                symbol: (
+                    float(row["open"])
+                    if is_executable_open(
+                        row,
+                        open_cutoff,
+                        data_kind=data_kind,
+                        execution_rule_version=ACTUAL_OPEN_LOT_RULES,
+                    )
+                    else None
+                )
+                for symbol in ETF_SYMBOLS
+                if (row := raw.get(symbol)) is not None
+            }
+            session_bars = {
+                (session, symbol): row
+                for symbol, row in raw.items()
+                if row is not None
+            }
+            attempt, day_fills, cash, shares, _ = match_open_lot_day(
+                session,
+                {"date": timely_orders[0][0].get("signal_date", session)},  # type: ignore[index]
+                weights_map,
+                open_prices,
+                session_bars,
+                cash,
+                shares,
+                fee_rate,
+                slippage_rate,
+                lot_sizes=execution.get("lot_sizes"),
+                symbol_order=symbol_order,
+                fixed_amounts=fixed_map or None,
             )
-            orders.append(record)
-            continue
-        row = raw.get(symbol)
-        if not is_executable_open(row, open_cutoff, data_kind=data_kind):
-            record["status"] = "missing_open"
-            record["reason"] = (
-                "no confirmed unadjusted open is available for this symbol; this "
-                "order expires without blocking the other orders"
-            )
-            orders.append(record)
-            continue
-        raw_open = float(row["open"])
-        if side == "buy":
-            price = raw_open * (1.0 + slippage_rate)
-            fee = quantity * price * fee_rate
-            cost = quantity * price + fee
-            if cost > cash + _cash_tolerance(cash):
-                record["status"] = "insufficient_cash"
+            fill_by_symbol: dict[str, dict[str, Any]] = {}
+            for fill in day_fills:
+                sym = fill["symbol"]
+                fill["order_id"] = order_by_symbol[sym]["order_id"]
+                open_source = (raw.get(sym) or {}).get("open_source")
+                if isinstance(open_source, Mapping):
+                    fill["open_evidence"] = {
+                        "source": open_source["source"],
+                        "evidence_id": open_source["evidence_id"],
+                    }
+                day_fees += fill["fee"]
+                day_slippage += fill["slippage"]
+                fees_total += fill["fee"]
+                slippage_total += fill["slippage"]
+                fill_by_symbol[sym] = fill
+                fills.append(fill)
+
+            unfilled_map = {item["symbol"]: item["reason"] for item in attempt["unfilled"]}
+            for sym, base_record in record_by_symbol.items():
+                if sym in fill_by_symbol:
+                    matched = fill_by_symbol[sym]
+                    base_record["side"] = matched["side"]
+                    base_record["quantity"] = matched["quantity"]
+                    base_record["status"] = "filled"
+                    base_record["fill"] = matched
+                elif sym in unfilled_map:
+                    base_record["status"] = "unfilled"
+                    base_record["reason"] = unfilled_map[sym]
+                elif attempt["cash_constrained"]:
+                    base_record["status"] = "cash_constrained"
+                    base_record["reason"] = "cash_constrained"
+                else:
+                    base_record["status"] = "no_trade_required"
+                    base_record["reason"] = attempt["residual_reason"] or "no_trade_required"
+                orders.append(base_record)
+
+            settlement_extra = {
+                "batch_complete": attempt["batch_complete"],
+                "cash_constrained": attempt["cash_constrained"],
+                "lot_rounding_residual": attempt["lot_rounding_residual"],
+                "residual_reason": attempt["residual_reason"],
+                "daily_simulation_assumptions": attempt["daily_simulation_assumptions"],
+            }
+    else:
+        pending = sorted(
+            prior["next_orders"],
+            key=lambda order: (
+                0 if order.get("side") == "sell" else 1,
+                order.get("symbol", ""),
+                order.get("order_id", ""),
+            ),
+        )
+        for order in pending:
+            symbol = order["symbol"]
+            side = order["side"]
+            quantity = float(order["quantity"])
+            record = {
+                "order_id": order["order_id"],
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "signal_date": order.get("signal_date"),
+                "execution_date": order.get("execution_date"),
+                "submitted_at": order.get("submitted_at"),
+                "deadline": order.get("deadline"),
+                # The creation-time planning estimate is kept only until settlement;
+                # this field records the actual durable persistence time of the
+                # signal day that created the order.
+                "persisted_before_deadline": persisted_before_deadline,
+                "persisted_at": committed_at,
+                "target_weight": order.get("target_weight"),
+                "date": session,
+                "status": None,
+                "reason": None,
+                "fill": None,
+            }
+            submitted_at = order.get("submitted_at")
+            try:
+                submitted = datetime.fromisoformat(submitted_at) if submitted_at else None
+            except (TypeError, ValueError):
+                submitted = None
+            if (
+                submitted is None
+                or submitted.tzinfo is None
+                or submitted >= open_cutoff
+                or not persisted_before_deadline
+            ):
+                record["status"] = "missed_deadline"
                 record["reason"] = (
-                    "available cash at the open is below the frozen order cost; "
-                    "the order is never resized, levered or partially filled"
+                    "the order was not durably submitted before the execution "
+                    "session's 09:30 Asia/Shanghai deadline; it is never filled "
+                    "retroactively"
                 )
                 orders.append(record)
                 continue
-            cash -= cost
-            shares[symbol] += quantity
-            slippage = quantity * (price - raw_open)
-        else:
-            if quantity > shares[symbol] + _EPSILON:
-                record["status"] = "insufficient_shares"
+            row = raw.get(symbol)
+            if not is_executable_open(row, open_cutoff, data_kind=data_kind):
+                record["status"] = "missing_open"
                 record["reason"] = (
-                    "start-of-settlement holdings are below the frozen sell "
-                    "quantity; the order is never resized and shorting is refused"
+                    "no confirmed unadjusted open is available for this symbol; this "
+                    "order expires without blocking the other orders"
                 )
                 orders.append(record)
                 continue
-            price = raw_open * (1.0 - slippage_rate)
-            fee = quantity * price * fee_rate
-            cash += quantity * price - fee
-            shares[symbol] -= quantity
-            if abs(shares[symbol]) <= _EPSILON:
-                shares[symbol] = 0.0
-            slippage = quantity * (raw_open - price)
-        fees_total += fee
-        slippage_total += slippage
-        day_fees += fee
-        day_slippage += slippage
-        fill = {
-            "date": session,
-            "order_id": order["order_id"],
-            "symbol": symbol,
-            "side": side,
-            "quantity": quantity,
-            "raw_open": raw_open,
-            "price": price,
-            "price_basis": "unadjusted_open",
-            "notional": quantity * raw_open,
-            "fee": fee,
-            "slippage": slippage,
-        }
-        record["status"] = "filled"
-        record["fill"] = fill
-        orders.append(record)
-        fills.append(fill)
-    if abs(cash) <= _cash_tolerance(cash):
-        cash = 0.0
+            raw_open = float(row["open"])
+            if side == "buy":
+                price = raw_open * (1.0 + slippage_rate)
+                fee = quantity * price * fee_rate
+                cost = quantity * price + fee
+                if cost > cash + _cash_tolerance(cash):
+                    record["status"] = "insufficient_cash"
+                    record["reason"] = (
+                        "available cash at the open is below the frozen order cost; "
+                        "the order is never resized, levered or partially filled"
+                    )
+                    orders.append(record)
+                    continue
+                cash -= cost
+                shares[symbol] += quantity
+                slippage = quantity * (price - raw_open)
+            else:
+                if quantity > shares[symbol] + _EPSILON:
+                    record["status"] = "insufficient_shares"
+                    record["reason"] = (
+                        "start-of-settlement holdings are below the frozen sell "
+                        "quantity; the order is never resized and shorting is refused"
+                    )
+                    orders.append(record)
+                    continue
+                price = raw_open * (1.0 - slippage_rate)
+                fee = quantity * price * fee_rate
+                cash += quantity * price - fee
+                shares[symbol] -= quantity
+                if abs(shares[symbol]) <= _EPSILON:
+                    shares[symbol] = 0.0
+                slippage = quantity * (raw_open - price)
+            fees_total += fee
+            slippage_total += slippage
+            day_fees += fee
+            day_slippage += slippage
+            fill = {
+                "date": session,
+                "order_id": order["order_id"],
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "raw_open": raw_open,
+                "price": price,
+                "price_basis": "unadjusted_open",
+                "notional": quantity * raw_open,
+                "fee": fee,
+                "slippage": slippage,
+            }
+            record["status"] = "filled"
+            record["fill"] = fill
+            orders.append(record)
+            fills.append(fill)
+        if abs(cash) <= _cash_tolerance(cash):
+            cash = 0.0
 
     _failpoint("shadow_after_fills")
 
@@ -3994,15 +4194,23 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
                     "total_return_values": latest_values,
                     "window": list(window["sessions"]),
                 }
-                next_orders = _next_orders(
-                    body,
-                    normalized,
-                    shares,
-                    cash,
-                    cash + market_value,
-                    fee_rate,
-                    slippage_rate,
-                )
+                if rule_version == ACTUAL_OPEN_LOT_RULES:
+                    next_orders = _next_open_lot_orders(
+                        body,
+                        normalized,
+                        shares,
+                        symbol_order=execution.get("symbol_order", ETF_SYMBOLS),
+                    )
+                else:
+                    next_orders = _next_orders(
+                        body,
+                        normalized,
+                        shares,
+                        cash,
+                        cash + market_value,
+                        fee_rate,
+                        slippage_rate,
+                    )
                 target_changed = _target_changed(prior.get("signal_target"), normalized)
                 if not next_orders and not target_changed:
                     # The target required no order and did not change: record the
@@ -4038,7 +4246,9 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
     )
 
     status = "committed"
-    if anomalies or any(order["status"] != "filled" for order in orders):
+    if anomalies or any(
+        order["status"] not in ("filled", "no_trade_required") for order in orders
+    ):
         status = "committed_with_anomalies"
     return {
         "schema_version": SCHEMA_VERSION,
@@ -4079,6 +4289,7 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
         "dividend_receivables": receivable_total,
         "nav": nav,
         **valuation_extra,
+        **settlement_extra,
         "fees": {"day": day_fees, "total": fees_total},
         "slippage": {"day": day_slippage, "total": slippage_total},
         "signal": signal,
@@ -4195,6 +4406,70 @@ def _next_orders(
             "side": intent["side"],
             "quantity": quantity,
             "target_weight": intent["weight"],
+        }
+        orders.append(
+            {
+                **identity,
+                "order_id": "ord-" + _hash(identity)[:32],
+                "execution_date": next_session,
+                "submitted_at": submitted_at,
+                "deadline": deadline.isoformat(),
+            }
+        )
+    return orders
+
+
+def _next_open_lot_orders(
+    body: dict[str, Any],
+    weights: dict[str, float],
+    shares: dict[str, float],
+    *,
+    fixed_amounts: Mapping[str, float] | None = None,
+    symbol_order: Sequence[str] = ETF_SYMBOLS,
+) -> list[dict[str, Any]]:
+    """Freeze pre-open target-weight / fixed-amount instructions without close sizing."""
+    session = body["date"]
+    next_session = body["session"]["next_session"]
+    deadline = _session_open(next_session)
+    submitted_at = _signal_point(session)
+    fixed_map = {
+        sym: float(val)
+        for sym, val in (fixed_amounts or {}).items()
+        if val is not None and float(val) > _EPSILON
+    }
+    orders: list[dict[str, Any]] = []
+    for symbol in symbol_order:
+        weight = float(weights.get(symbol, 0.0))
+        held = float(shares.get(symbol, 0.0))
+        if symbol in fixed_map:
+            mode = "fixed_amount"
+            identity = {
+                "version_id": body["version_id"],
+                "signal_date": session,
+                "symbol": symbol,
+                "order_sizing_mode": mode,
+                "fixed_amount": fixed_map[symbol],
+                "target_weight": weight,
+            }
+            orders.append(
+                {
+                    **identity,
+                    "order_id": "ord-" + _hash(identity)[:32],
+                    "execution_date": next_session,
+                    "submitted_at": submitted_at,
+                    "deadline": deadline.isoformat(),
+                }
+            )
+            continue
+        if weight <= _EPSILON and held <= _EPSILON:
+            continue
+        mode = "open_weight"
+        identity = {
+            "version_id": body["version_id"],
+            "signal_date": session,
+            "symbol": symbol,
+            "order_sizing_mode": mode,
+            "target_weight": weight,
         }
         orders.append(
             {

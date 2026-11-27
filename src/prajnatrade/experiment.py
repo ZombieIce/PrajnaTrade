@@ -37,8 +37,10 @@ from prajnatrade.snapshot import (
     slice_content,
 )
 from prajnatrade.trading_status import (
+    ACTUAL_OPEN_LOT_RULES,
     ACTUAL_OPEN_RULES,
     CARRY_FORWARD_SUSPENDED_VALUATION,
+    ETF_SYMBOLS,
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
@@ -66,12 +68,15 @@ def _runtime_components(
         "container_executor.py",
     )
     valuation_version = valuation_policy_version(execution_rules)
+    rule_version = execution_rules.get("version") if execution_rules is not None else None
     # Actual-open matching and carry-forward valuation consult trading_status.py.
     if (
-        (execution_rules is not None and execution_rules.get("version") == ACTUAL_OPEN_RULES)
+        rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES)
         or valuation_version != STRICT_CLOSE_VALUATION
     ):
         files += ("trading_status.py",)
+    if rule_version == ACTUAL_OPEN_LOT_RULES:
+        files += ("lot_execution.py",)
     if valuation_version != STRICT_CLOSE_VALUATION:
         files += ("valuation.py",)
     if history_policy is not None:
@@ -204,12 +209,19 @@ _NEXT_OPEN_EXECUTION = {
 
 
 def _execution_policy(
-    version: str, *, valuation_policy: str = STRICT_CLOSE_VALUATION,
+    version: str,
+    *,
+    valuation_policy: str = STRICT_CLOSE_VALUATION,
+    lot_sizes: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     if version not in EXECUTION_RULE_VERSIONS:
         raise ValueError(f"Unknown execution rules version: {version!r}.")
     if valuation_policy not in VALUATION_POLICY_VERSIONS:
         raise ValueError(f"Unknown valuation policy version: {valuation_policy!r}.")
+    if lot_sizes is not None and version != ACTUAL_OPEN_LOT_RULES:
+        raise ValueError(
+            "lot_sizes is only supported with execution rules actual-open-lot-v1."
+        )
     rules = {"version": version, **deepcopy(_NEXT_OPEN_EXECUTION)}
     if version == RETRY_INITIAL_RULES:
         rules["execution"].update(
@@ -229,6 +241,22 @@ def _execution_policy(
             funding="initial_cash_plus_realized_sell_net",
             order="sells_before_buys",
             matching="per_symbol",
+        )
+    elif version == ACTUAL_OPEN_LOT_RULES:
+        from prajnatrade.lot_execution import normalize_lot_sizes
+
+        rules["execution"].update(
+            halted_open="actual_daily_open_when_evidenced",
+            partial_halt_open_availability="not_gated_by_0930",
+            missing_required_open="symbol_not_filled",
+            partial_fill="recorded_per_symbol",
+            funding="initial_cash_plus_realized_sell_net",
+            order="sells_before_buys",
+            matching="per_symbol_whole_lot",
+            sizing="pre_open_frozen_target_weights",
+            lot_sizes=normalize_lot_sizes(lot_sizes),
+            symbol_order=list(ETF_SYMBOLS),
+            daily_simulation_assumptions={"late_resume_sell_funds_same_day_buy": True},
         )
     if valuation_policy == CARRY_FORWARD_SUSPENDED_VALUATION:
         rules["valuation"] = {
@@ -493,6 +521,8 @@ def campaign_create(
     as_of: str | None = None, *,
     execution_rules: str = NEXT_OPEN_RULES,
     valuation_policy: str = STRICT_CLOSE_VALUATION,
+    lot_size: int | None = None,
+    lot_sizes: Mapping[str, int] | None = None,
     strategy_executor: str = "none",
     strategy_image: str | None = None,
     executor: ContainerStrategyExecutor | None = None,
@@ -502,7 +532,16 @@ def campaign_create(
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("Attempts and execution seconds must be positive.")
-    execution_policy = _execution_policy(execution_rules, valuation_policy=valuation_policy)
+    if lot_size is not None and lot_sizes is not None:
+        raise ValueError("Specify either --lot-size or --lot-sizes, not both.")
+    resolved_lot_sizes = (
+        {symbol: lot_size for symbol in ETF_SYMBOLS}
+        if lot_size is not None
+        else lot_sizes
+    )
+    execution_policy = _execution_policy(
+        execution_rules, valuation_policy=valuation_policy, lot_sizes=resolved_lot_sizes
+    )
     executor_config = _resolve_executor_config(
         strategy_executor, strategy_image, executor,
     )
@@ -620,6 +659,8 @@ def campaign_create(
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rules,
         valuation_policy_version=valuation_policy,
+        lot_sizes=execution_policy["execution"].get("lot_sizes"),
+        symbol_order=execution_policy["execution"].get("symbol_order"),
         **baseline_options,
     )
     campaign_id = str(uuid.uuid4())
@@ -1293,6 +1334,8 @@ def _run_attempt(
             slippage_bps=config["slippage_bps"],
             execution_rule_version=rules.get("version", NEXT_OPEN_RULES),
             valuation_policy_version=valuation_policy_version(rules),
+            lot_sizes=rules.get("execution", {}).get("lot_sizes"),
+            symbol_order=rules.get("execution", {}).get("symbol_order"),
             **history_options,
         )
         benchmark = json.loads(campaign["baseline_json"])

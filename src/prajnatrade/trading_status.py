@@ -18,7 +18,15 @@ RETRY_INITIAL_RULES = "retry-initial-v1"
 #: Fill an order effective before the open at the sealed, evidenced actual daily
 #: open, including a halted-at-open session whose bar carries that open (ADR 0002).
 ACTUAL_OPEN_RULES = "actual-open-v1"
-EXECUTION_RULE_VERSIONS = (NEXT_OPEN_RULES, RETRY_INITIAL_RULES, ACTUAL_OPEN_RULES)
+#: Freeze target weights / fixed amounts pre-open and settle at actual open with
+#: whole-lot rounding and proportional cash allocation (Spec #74 / #78).
+ACTUAL_OPEN_LOT_RULES = "actual-open-lot-v1"
+EXECUTION_RULE_VERSIONS = (
+    NEXT_OPEN_RULES,
+    RETRY_INITIAL_RULES,
+    ACTUAL_OPEN_RULES,
+    ACTUAL_OPEN_LOT_RULES,
+)
 #: The sealed execution basis echoed by every fill and by a round receipt.
 EXECUTION_PRICE_BASIS = "unadjusted_open"
 

@@ -316,6 +316,14 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         help="freeze close valuation policy for held symbols (default: strict-close-v1)",
     )
     create.add_argument(
+        "--lot-size", type=int,
+        help="uniform positive integer lot size per ETF (only for actual-open-lot-v1)",
+    )
+    create.add_argument(
+        "--lot-sizes",
+        help="JSON mapping of ETF symbol to positive integer lot size (only for actual-open-lot-v1)",
+    )
+    create.add_argument(
         "--strategy-executor", choices=["none", "container"], default="none",
         help="verify generated Python in a Docker container (default: none)",
     )
@@ -864,12 +872,17 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
         if args.command == "campaign":
             from prajnatrade.experiment import campaign_create
 
+            parsed_lot_sizes = None
+            if args.lot_sizes is not None:
+                parsed_lot_sizes = json.loads(args.lot_sizes)
             result = campaign_create(
                 args.project, args.store, args.snapshot_id, args.attempts,
                 args.max_seconds, args.initial_cash, args.transaction_cost_bps,
                 args.slippage_bps, args.as_of,
                 execution_rules=args.execution_rules,
                 valuation_policy=args.valuation_policy,
+                lot_size=args.lot_size,
+                lot_sizes=parsed_lot_sizes,
                 strategy_executor=args.strategy_executor,
                 strategy_image=args.strategy_image,
                 discovery_warmup_sessions=args.discovery_warmup_sessions,
