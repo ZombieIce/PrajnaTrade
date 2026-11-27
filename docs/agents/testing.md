@@ -460,6 +460,18 @@ unread and the Validation allowance unchanged; a missing disclosure-only metric
 and one-quarter performance disclosure may proceed. Counted Validation replay
 and interruption recovery keep #50's existing semantics.
 
+## Frozen decision-pause audit (#82)
+
+`tests/test_formal_validation_cli.py` drives public `round validate` with
+synthetic schema-3 snapshots under a frozen 15:30 cutoff. It contrasts timely
+confirmed suspensions, post-cutoff evidence, and unexplained/independent
+valuation gaps; verifies per-account pause counts, consecutive decision days,
+monthly deferral outcomes, no new target, prior-order settlement and daily NAV
+reconciliation; and checks default disclosure versus a frozen per-account pause
+cap. Invalid evidence and exceeded pre-read caps consume zero Validation uses,
+while a legal first read and replay consume one in total. The formal receipt
+also publishes the trailing segment's separate pause audit.
+
 ## Suspended holding carry-forward valuation (#68: #69, #70, #71)
 
 Three fast, non-`isolation` public-CLI suites cover Spec #68 (ADR 0003) on

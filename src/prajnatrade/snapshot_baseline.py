@@ -644,6 +644,7 @@ def run_partition_strategy(
                         "signal_cutoff": obs_result["signal_cutoff"],
                         "signal_status": "paused",
                         "signal_pause": pause_info,
+                        "confirmed_no_trade": list(obs_result["confirmed_no_trade"]),
                         "observation_dates": [],
                         "observation_sources": {},
                     }
@@ -670,6 +671,7 @@ def run_partition_strategy(
                         "signal_cutoff": obs_result["signal_cutoff"],
                         "signal_status": obs_result["signal_status"],
                         "signal_pause": None,
+                        "confirmed_no_trade": list(obs_result["confirmed_no_trade"]),
                         "observation_dates": list(obs_result["observation_dates"]),
                         "observation_sources": obs_result["observation_sources"],
                     }
@@ -730,6 +732,7 @@ def run_partition_strategy(
                         "signal_cutoff": obs_result["signal_cutoff"],
                         "signal_status": "no_target",
                         "signal_pause": None,
+                        "confirmed_no_trade": list(obs_result["confirmed_no_trade"]),
                         "observation_dates": list(obs_days),
                         "observation_sources": obs_result["observation_sources"],
                     }
@@ -779,6 +782,7 @@ def run_partition_strategy(
                     "signal_cutoff": obs_result["signal_cutoff"],
                     "signal_status": "generated",
                     "signal_pause": None,
+                    "confirmed_no_trade": list(obs_result["confirmed_no_trade"]),
                     "purpose": purpose,
                     "cycle": cycle,
                     **deferral_fields,
