@@ -972,6 +972,29 @@ def test_formal_validation_is_distinguishable_from_the_v1_replay(tmp_path: Path)
     )
 
 
+def test_same_development_evidence_matches_lightweight_replay(tmp_path: Path) -> None:
+    formal = formal_scenario(tmp_path, payload=trending_snapshot(15), name="formal-match")
+    legacy = legacy_scenario(tmp_path, payload=trending_snapshot(10), name="legacy-match")
+    formal_receipt = ok(validate_current(formal))
+    legacy_receipt = ok(validate_current(legacy))
+    precheck = formal_receipt["discovery_precheck"]["scoring_prerequisites"]
+    replay_checks = legacy_receipt["checks"]
+
+    for name in ("scoring_start", "coverage"):
+        assert precheck[name] == replay_checks[name]
+    for side in ("candidate", "benchmark"):
+        assert precheck["data_availability"][side] == replay_checks["data_availability"][side]
+        for field in ("state", "invested_sessions", "first_position_signal_date", "first_fill_date"):
+            assert precheck["position"][side][field] == replay_checks["position"][side][field]
+        assert precheck["position"][side]["failed_conditions"] == []
+    assert precheck["data_availability"]["ok"] == replay_checks["data_availability"]["ok"]
+    assert precheck["position"]["ok"] == replay_checks["position"]["ok"]
+    assert formal_receipt["scoring"]["start"] == formal["split"]["trailing"]["start"]
+    assert len(round_uses(formal)) == 1
+    assert ok(validate_current(formal))["reused"] is True
+    assert len(round_uses(formal)) == 1
+
+
 def test_legacy_v1_receipt_keeps_its_data_availability_snapshot_shape(
     tmp_path: Path,
 ) -> None:
@@ -1553,6 +1576,10 @@ def test_late_suspension_pause_is_audited_and_keeps_discovery_day_eligible(
     assert receipt["outcome"] == "passed"
     pauses = receipt["discovery_precheck"]["signal_pauses"]
     assert pauses["status"] == "verified"
+    precheck = receipt["discovery_precheck"]["scoring_prerequisites"]
+    for name in ("scoring_start", "coverage", "data_availability", "position", "signal_pauses"):
+        assert precheck[name]["ok"] is True
+        assert receipt["checks"][name]["ok"] is True
     for side in ("candidate", "benchmark"):
         disclosure = pauses[side]
         assert disclosure["decision_days"] > 0
@@ -1588,6 +1615,12 @@ def test_late_suspension_pause_is_audited_and_keeps_discovery_day_eligible(
         trailing_pauses = receipt["signal_pauses"][side]
         assert trailing_pauses["status"] == "verified"
         assert trailing_pauses["paused_signal_days"] == 1
+        for checks in (precheck, receipt["checks"]):
+            availability = checks["data_availability"][side]
+            assert availability["accepted_signal_pause_days"] == 1
+            assert availability["unexplained_signal_gaps"]["count"] == 0
+            assert availability["valuation_gaps"]["count"] == 0
+            assert checks["position"][side]["failed_conditions"] == []
         trailing_event = trailing_pauses["events"][0]
         assert trailing_event["date"] == trailing_pause_day
         assert trailing_event["reasons"] == [
@@ -2277,6 +2310,44 @@ def formal_revalidation_scenario(tmp_path: Path) -> dict:
     scenario["fixture"] = fixture
     scenario["prior"] = ok(validate_current(scenario))
     return scenario
+
+
+def test_revalidation_tracks_extracted_evidence_rule_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cli_helpers
+
+    scenario = formal_revalidation_scenario(tmp_path)
+    prior = scenario["prior"]
+    first = ok(revalidate_version(scenario))
+    assert first["outcome"] == "passed"
+    assert ok(revalidate_version(scenario))["reused"] is True
+
+    copied_src = tmp_path / "changed-src"
+    shutil.copytree(src_path() / "prajnatrade", copied_src / "prajnatrade")
+    rules = copied_src / "prajnatrade" / "validation_evidence.py"
+    source = rules.read_text(encoding="utf-8")
+    old = '"ok": covered(candidate) and covered(benchmark),'
+    assert source.count(old) == 1
+    rules.write_text(source.replace(old, '"ok": False,'), encoding="utf-8")
+    monkeypatch.setattr(cli_helpers, "SRC_PATH", copied_src)
+    monkeypatch.setenv("PRAJNATRADE_TEST_CLI_SUBPROCESS", "1")
+
+    changed = ok(revalidate_version(scenario))
+    assert changed["reused"] is False
+    assert changed["revalidation_id"] != first["revalidation_id"]
+    assert changed["evidence"]["replay_engine_identity"] != first["evidence"]["replay_engine_identity"]
+    changed_path = (
+        scenario["store"] / "research-loop-validations" / f"{changed['validation_id']}.json"
+    )
+    changed_receipt = json.loads(changed_path.read_text(encoding="utf-8"))
+    assert changed_receipt["checks"]["coverage"]["ok"] is False
+    assert changed["outcome"] == "insufficient_evidence"
+    assert len(round_uses(scenario)) == 1
+    assert ok(revalidate_version(scenario))["revalidation_id"] == changed["revalidation_id"]
+    for receipt in (prior, first):
+        stored = scenario["store"] / "research-loop-validations" / f"{receipt['validation_id']}.json"
+        assert json.loads(stored.read_text(encoding="utf-8"))["receipt_hash"] == receipt["receipt_hash"]
 
 
 def test_v2_revalidate_on_a_trailing_only_successor(tmp_path: Path) -> None:
