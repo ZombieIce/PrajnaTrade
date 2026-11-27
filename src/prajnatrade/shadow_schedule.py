@@ -260,6 +260,8 @@ def tick(
     *,
     corrections_store: str | Path | None = None,
     now: datetime | None = None,
+    plugin_config: str | Path | None = None,
+    plugin_specs: list[str] | tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], bool]:
     """Process due sessions once and return the update and durable operator alerts."""
     clock = now if now is not None else datetime.now(UTC)

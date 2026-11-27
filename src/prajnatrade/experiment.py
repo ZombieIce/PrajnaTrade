@@ -58,6 +58,7 @@ def _runtime_components(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
+    plugins_active: bool = False,
 ) -> dict[str, str]:
     directory = Path(__file__).parent
     files = (
@@ -75,6 +76,8 @@ def _runtime_components(
         files += ("valuation.py",)
     if history_policy is not None:
         files += ("experiment.py",)
+    if plugins_active:
+        files += ("plugins.py",)
     executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}
     return {
         **{
@@ -106,6 +109,7 @@ def runtime_identity(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
+    plugins_active: bool = False,
 ) -> str:
     """Fingerprint the accounting dependencies and optional strategy executor.
 
@@ -114,10 +118,14 @@ def runtime_identity(
     (``experiment.py``). A source fix changes the corresponding identity.
     """
     dependencies = _runtime_components(
-        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+        strategy_executor,
+        execution_rules=execution_rules,
+        history_policy=history_policy,
+        plugins_active=plugins_active,
     )
     if (
         history_policy is None
+        and not plugins_active
         and execution_rules is not None
         and "version" not in execution_rules
         and dependencies["snapshot_baseline.py"] == _LEGACY_ACCOUNTING_SOURCE
@@ -132,15 +140,20 @@ def runtime_matches(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
+    plugins_active: bool = False,
 ) -> bool:
     """Check the exact current runtime or a compatible legacy dependency set."""
     dependencies = _runtime_components(
-        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+        strategy_executor,
+        execution_rules=execution_rules,
+        history_policy=history_policy,
+        plugins_active=plugins_active,
     )
     if stored == _fingerprint(dependencies):
         return True
     if (
         history_policy is not None
+        or plugins_active
         or "trading_status.py" in dependencies
         or "valuation_policy" in dependencies
         or any(
@@ -326,6 +339,20 @@ def project_init(project: Path) -> dict[str, object]:
             BEGIN SELECT RAISE(ABORT, 'frozen candidates are immutable'); END;
             """
         )
+        connection.execute(
+            """CREATE TABLE registered_plugins (
+                family TEXT PRIMARY KEY,
+                plugin_id TEXT NOT NULL,
+                entrypoint TEXT NOT NULL,
+                entrypoint_path TEXT NOT NULL,
+                base_dir TEXT NOT NULL,
+                entrypoint_sha256 TEXT NOT NULL,
+                dependencies_json TEXT NOT NULL,
+                dependencies_hash TEXT NOT NULL,
+                declared_dependencies_json TEXT NOT NULL DEFAULT '[]',
+                registered_at TEXT NOT NULL
+            )"""
+        )
         project_id = str(uuid.uuid4())
         connection.execute("INSERT INTO project VALUES (?)", (project_id,))
     return {"schema_version": 1, "project_id": project_id}
@@ -340,6 +367,124 @@ def project_status(project: Path) -> dict[str, object]:
     if row is None:
         raise ValueError("Project identity is missing.")
     return {"schema_version": 1, "project_id": row[0]}
+
+
+def register_plugins(
+    project: Path,
+    *,
+    plugin_config: Path | None = None,
+    plugin_specs: list[str] | tuple[str, ...] = (),
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate and record operator-approved local strategy plugins in project.sqlite."""
+    from prajnatrade.plugins import PluginError, load_plugin_registry, public_plugin_metadata
+
+    database = project / ".prajnatrade" / "project.sqlite"
+    if not database.is_file():
+        raise ValueError("Project is not initialized.")
+    registry = load_plugin_registry(
+        plugin_config=plugin_config, plugin_specs=plugin_specs, env=env,
+    )
+    if not registry:
+        raise PluginError(
+            "PLUGIN_ENTRYPOINT_UNRESOLVABLE",
+            "At least one --plugin-config, --plugin, or PRAJNATRADE_PLUGIN_CONFIG entry is required.",
+        )
+    now = datetime.now(UTC).isoformat()
+    recorded: list[dict[str, Any]] = []
+    with sqlite3.connect(database) as connection:
+        _ensure_project_schema(connection)
+        for family in sorted(registry):
+            entry = registry[family]
+            connection.execute(
+                """INSERT INTO registered_plugins (
+                    family, plugin_id, entrypoint, entrypoint_path, base_dir,
+                    entrypoint_sha256, dependencies_json, dependencies_hash,
+                    declared_dependencies_json, registered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(family) DO UPDATE SET
+                    plugin_id = excluded.plugin_id,
+                    entrypoint = excluded.entrypoint,
+                    entrypoint_path = excluded.entrypoint_path,
+                    base_dir = excluded.base_dir,
+                    entrypoint_sha256 = excluded.entrypoint_sha256,
+                    dependencies_json = excluded.dependencies_json,
+                    dependencies_hash = excluded.dependencies_hash,
+                    declared_dependencies_json = excluded.declared_dependencies_json,
+                    registered_at = excluded.registered_at""",
+                (
+                    entry["family"],
+                    entry["plugin_id"],
+                    entry["entrypoint"],
+                    entry["entrypoint_path"],
+                    entry["base_dir"],
+                    entry["entrypoint_sha256"],
+                    json.dumps(entry["dependencies"], sort_keys=True, separators=(",", ":")),
+                    entry["dependencies_hash"],
+                    json.dumps(entry.get("declared_dependencies", [])),
+                    now,
+                ),
+            )
+            recorded.append(public_plugin_metadata(entry))
+    return {"schema_version": 1, "status": "registered", "plugins": recorded}
+
+
+def list_registered_plugins(project: Path) -> dict[str, Any]:
+    """List operator-approved local strategy plugins for this project."""
+    database = project / ".prajnatrade" / "project.sqlite"
+    if not database.is_file():
+        raise ValueError("Project is not initialized.")
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        _ensure_project_schema(connection)
+        rows = connection.execute(
+            "SELECT family, plugin_id, entrypoint, entrypoint_sha256, dependencies_json, dependencies_hash "
+            "FROM registered_plugins ORDER BY family"
+        ).fetchall()
+    return {
+        "schema_version": 1,
+        "status": "ok",
+        "plugins": [
+            {
+                "family": row["family"],
+                "plugin_id": row["plugin_id"],
+                "entrypoint": row["entrypoint"],
+                "entrypoint_sha256": row["entrypoint_sha256"],
+                "dependencies": json.loads(row["dependencies_json"]),
+                "dependencies_hash": row["dependencies_hash"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def load_project_plugin_registry(project: Path) -> dict[str, dict[str, Any]]:
+    """Load registered plugin entries from project.sqlite for operator/agent execution."""
+    database = project / ".prajnatrade" / "project.sqlite"
+    if not database.is_file():
+        return {}
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        _ensure_project_schema(connection)
+        rows = connection.execute(
+            "SELECT family, plugin_id, entrypoint, entrypoint_path, base_dir, "
+            "entrypoint_sha256, dependencies_json, dependencies_hash, declared_dependencies_json "
+            "FROM registered_plugins ORDER BY family"
+        ).fetchall()
+    return {
+        row["family"]: {
+            "family": row["family"],
+            "plugin_id": row["plugin_id"],
+            "entrypoint": row["entrypoint"],
+            "entrypoint_path": row["entrypoint_path"],
+            "base_dir": row["base_dir"],
+            "entrypoint_sha256": row["entrypoint_sha256"],
+            "dependencies": json.loads(row["dependencies_json"]),
+            "dependencies_hash": row["dependencies_hash"],
+            "declared_dependencies": json.loads(row["declared_dependencies_json"]),
+        }
+        for row in rows
+    }
 
 
 def campaign_create(
@@ -645,6 +790,20 @@ def _ensure_project_schema(connection: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'frozen candidates are immutable'); END;
         """
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS registered_plugins (
+            family TEXT PRIMARY KEY,
+            plugin_id TEXT NOT NULL,
+            entrypoint TEXT NOT NULL,
+            entrypoint_path TEXT NOT NULL,
+            base_dir TEXT NOT NULL,
+            entrypoint_sha256 TEXT NOT NULL,
+            dependencies_json TEXT NOT NULL,
+            dependencies_hash TEXT NOT NULL,
+            declared_dependencies_json TEXT NOT NULL DEFAULT '[]',
+            registered_at TEXT NOT NULL
+        )"""
+    )
 
 
 class ProtocolError(Exception):
@@ -742,7 +901,11 @@ def _receipt(
     return result
 
 
-def _normalize_request(raw: object) -> dict[str, Any]:
+def _normalize_request(
+    raw: object,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("Submission must be an object.")
     required = {"schema_version", "campaign_id", "submission_id", "hypothesis", "strategy", "parameters"}
@@ -759,6 +922,7 @@ def _normalize_request(raw: object) -> dict[str, Any]:
     strategy = raw["strategy"]
     if not isinstance(strategy, dict):
         raise ValueError("Strategy must be a JSON object.")
+    from prajnatrade.plugins import PluginError
     from prajnatrade.strategies import STRATEGY_FAMILIES, normalize_strategy_spec
 
     family = strategy.get("family")
@@ -793,6 +957,20 @@ def _normalize_request(raw: object) -> dict[str, Any]:
         }
         if "parameter_schema" in spec:
             canonical_strategy["parameter_schema"] = spec["parameter_schema"]
+    elif isinstance(family, str) and family.strip():
+        if set(strategy) - {"family", "history_requirements"}:
+            raise PluginError(
+                "PLUGIN_REGISTRATION_FORBIDDEN",
+                "Submissions cannot supply plugin paths, entrypoints, or source; register via operator CLI.",
+            )
+        spec = normalize_strategy_spec(
+            {"family": family, "parameters": raw["parameters"]},
+            plugin_registry=plugin_registry,
+        )
+        canonical_strategy = {
+            "family": spec["family"],
+            "plugin": spec["plugin"],
+        }
     else:
         raise ValueError("Unsupported strategy family.")
     if "history_requirements" in strategy:
@@ -854,12 +1032,31 @@ def _timeout(_signum: int, _frame: object) -> None:
     raise _TimeExpired()
 
 
-def experiment_submit(project: Path, raw: object) -> dict[str, Any]:
+def experiment_submit(
+    project: Path,
+    raw: object,
+    *,
+    plugin_config: Path | None = None,
+    plugin_specs: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    from prajnatrade.plugins import PluginError, load_plugin_registry
+
+    registry = load_project_plugin_registry(project)
+    if plugin_config is not None or plugin_specs:
+        registry = {
+            **registry,
+            **load_plugin_registry(plugin_config=plugin_config, plugin_specs=plugin_specs),
+        }
     try:
-        request = _normalize_request(raw)
+        request = _normalize_request(raw, plugin_registry=registry)
+    except PluginError as error:
+        raise ProtocolError(error.code, "admission", "correct", error.message) from error
     except (ValueError, TypeError) as error:
         raise ProtocolError("INVALID_SUBMISSION", "admission", "correct", str(error)) from error
-    return _execute_request(project, request["campaign_id"], request["submission_id"], request)
+    return _execute_request(
+        project, request["campaign_id"], request["submission_id"], request,
+        plugin_registry=registry,
+    )
 
 
 def experiment_resume(project: Path, campaign_id: str, submission_id: str) -> dict[str, Any]:
@@ -876,7 +1073,12 @@ def _find_experiment(
 
 
 def _execute_request(
-    project: Path, campaign_id: str, submission_id: str, request: dict[str, Any] | None,
+    project: Path,
+    campaign_id: str,
+    submission_id: str,
+    request: dict[str, Any] | None,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     from prajnatrade.research_direction import require_discovery_work
 
@@ -920,7 +1122,16 @@ def _execute_request(
             )
         connection.commit()
         return _run_attempt(
-            connection, campaign, project_id, experiment_id, request, started, remaining,
+            connection,
+            campaign,
+            project_id,
+            experiment_id,
+            request,
+            started,
+            remaining,
+            plugin_registry=(
+                plugin_registry if plugin_registry is not None else load_project_plugin_registry(project)
+            ),
         )
 
 
@@ -1007,6 +1218,8 @@ def _executor_evidence(
 def _run_attempt(
     connection: sqlite3.Connection, campaign: sqlite3.Row, project_id: object,
     experiment_id: str, request: dict[str, Any], started: float, remaining: float,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     campaign_id = campaign["campaign_id"]
     family = request["strategy"]["family"]
@@ -1030,13 +1243,17 @@ def _run_attempt(
         executor_config = _executor_config(config)
         rules = config["execution_rules"]
         policy = config.get("history_policy")
+        plugins_active = "plugins.py" in config.get("runtime_dependencies", {})
         if not runtime_matches(
             config["runtime"], executor_config, execution_rules=rules, history_policy=policy,
+            plugins_active=plugins_active,
         ):
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec: dict[str, Any] = {
             "family": family, "parameters": request["parameters"],
         }
+        if "plugin" in request["strategy"]:
+            spec["plugin"] = request["strategy"]["plugin"]
         history_options = (
             _attempt_history_options(connection, campaign_id, policy, data, request["strategy"])
             if policy is not None else {}
@@ -1059,6 +1276,8 @@ def _run_attempt(
                 container_executor=executor_from_config(executor_config),
                 evidence_callback=executor_evidence.append,
             )
+        elif "plugin" in request["strategy"]:
+            strategy = make_strategy(spec, plugin_registry=plugin_registry)
         else:
             strategy = make_strategy(spec)
         window = signal_window_sessions(spec)
