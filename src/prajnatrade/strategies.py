@@ -27,15 +27,51 @@ STRATEGY_FAMILIES = (
 )
 
 
-def normalize_strategy_spec(spec: Mapping[str, object]) -> dict[str, object]:
+def normalize_strategy_spec(
+    spec: Mapping[str, object],
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, object]:
     if not isinstance(spec, Mapping):
         raise ValueError("Strategy must be a JSON object.")
     family = spec.get("family")
-    if family not in (*STRATEGY_FAMILIES, "python"):
-        raise ValueError(f"Unsupported strategy family: {family!r}.")
     params = spec.get("parameters", {})
     if not isinstance(params, Mapping):
         raise ValueError("Strategy parameters must be a JSON object.")
+    if family not in (*STRATEGY_FAMILIES, "python"):
+        from prajnatrade.plugins import (
+            PluginError,
+            normalize_plugin_parameters,
+            public_plugin_metadata,
+            resolve_plugin,
+            verify_plugin_identity,
+        )
+
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError(f"Unsupported strategy family: {family!r}.")
+        if plugin_registry is None:
+            raise PluginError(
+                "PLUGIN_NOT_REGISTERED",
+                f"Local plugin family {family!r} is not registered.",
+            )
+        if any(not isinstance(key, str) for key in params):
+            raise ValueError("Plugin strategy parameter keys must be strings.")
+        try:
+            raw_parameters = json.loads(json.dumps(params, allow_nan=False))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid plugin strategy parameters: {error}") from error
+        frozen_plugin = spec.get("plugin")
+        if isinstance(frozen_plugin, Mapping):
+            verified = verify_plugin_identity(frozen_plugin, plugin_registry)
+        else:
+            entry = resolve_plugin(family, plugin_registry)
+            verified = verify_plugin_identity(entry, plugin_registry)
+        parameters = normalize_plugin_parameters(verified, raw_parameters)
+        return {
+            "family": str(family),
+            "parameters": parameters,
+            "plugin": public_plugin_metadata(verified),
+        }
     if family == "python":
         source = spec.get("source")
         if not isinstance(source, str) or not source.strip() or len(source) > 20_000:
@@ -193,8 +229,12 @@ def parameter_constraints_hold(parameters: Mapping[str, object], constraints: li
     return True
 
 
-def strategy_fingerprint(spec: Mapping[str, object]) -> str:
-    normalized = normalize_strategy_spec(spec)
+def strategy_fingerprint(
+    spec: Mapping[str, object],
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
+) -> str:
+    normalized = normalize_strategy_spec(spec, plugin_registry=plugin_registry)
     payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -215,10 +255,16 @@ def make_strategy(
     isolation_limits: IsolationLimits | None = None,
     evidence_callback: Callable[[dict[str, Any]], None] | None = None,
     container_executor: ContainerStrategyExecutor | None = None,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> Strategy:
-    normalized = normalize_strategy_spec(spec)
+    normalized = normalize_strategy_spec(spec, plugin_registry=plugin_registry)
     family = normalized["family"]
     params = normalized["parameters"]
+    if family not in (*STRATEGY_FAMILIES, "python"):
+        from prajnatrade.plugins import make_plugin_strategy, verify_plugin_identity
+
+        verified = verify_plugin_identity(normalized["plugin"], plugin_registry)
+        return make_plugin_strategy(verified, params)
     if family == "python":
         if container_executor is not None:
             return _container_python_strategy(

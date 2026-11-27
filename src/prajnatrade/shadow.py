@@ -79,7 +79,7 @@ import math
 import os
 import re
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -90,8 +90,23 @@ from prajnatrade import dividend, release, shadow_calendar, snapshot
 from prajnatrade.backtest import _validate_weights
 from prajnatrade.container_executor import executor_from_config
 from prajnatrade.data import CASH, ETF_SYMBOLS
+from prajnatrade.decision_window import (
+    STRATEGY_PURPOSES,
+    advance_rebalance_anchor,
+    close_expired_deferral,
+    close_month_end_deferral,
+    consume_monthly_deferral,
+    initial_strategy_state,
+    maybe_trigger_monthly_deferral,
+    scheduled_monthly_session,
+)
 from prajnatrade.experiment import runtime_matches
 from prajnatrade.isolation import IsolationError
+from prajnatrade.lot_execution import (
+    ACTUAL_OPEN_LOT_RULES,
+    match_open_lot_day,
+    normalize_lot_sizes,
+)
 from prajnatrade.snapshot_baseline import (
     _valid_price,
     available_by,
@@ -101,6 +116,24 @@ from prajnatrade.strategies import (
     STRATEGY_FAMILIES,
     make_strategy,
     normalize_strategy_spec,
+)
+from prajnatrade.trading_status import (
+    CARRY_FORWARD_SUSPENDED_VALUATION,
+    EXECUTION_RULE_VERSIONS,
+    NEXT_OPEN_RULES,
+    STRICT_CLOSE_VALUATION,
+    VALUATION_POLICY_VERSIONS,
+    halt_conflicts_with_trade,
+    halt_conflicts_with_volume,
+    halt_covers_session,
+    has_status_evidence_id,
+    valuation_policy_version,
+)
+from prajnatrade.valuation import (
+    CarryState,
+    classify_no_trade_for_valuation,
+    close_available,
+    value_carry_forward_session,
 )
 
 SCHEMA_VERSION = 1
@@ -174,6 +207,10 @@ class ShadowRejection(Exception):
             "message": message,
         }
         self.context = dict(context or {})
+
+    @property
+    def code(self) -> str:
+        return self.details["code"]
 
 
 class ShadowFaultInjection(RuntimeError):
@@ -250,13 +287,28 @@ class Feed:
         if not isinstance(payload, dict):
             raise ValueError("The Shadow Live feed must be a JSON object.")
         kind_version = (payload.get("data_kind"), payload.get("schema_version"))
-        if kind_version not in ((DATA_KIND, SCHEMA_VERSION), ("real", 2)):
-            raise ValueError("The Shadow Live feed must declare synthetic v1 or real v2.")
+        if kind_version not in (
+            (DATA_KIND, SCHEMA_VERSION),
+            ("real", 2),
+            ("synthetic", 3),
+            ("real", 3),
+        ):
+            raise ValueError(
+                "The Shadow Live feed must declare synthetic v1/v3 or real v2/v3."
+            )
         self.data_kind = kind_version[0]
+        self.schema_version = kind_version[1]
         is_real = self.data_kind == "real"
-        if is_real and payload.get("raw_price_basis") != "unadjusted":
-            raise ValueError("A real Shadow Live feed requires unadjusted raw prices.")
-        trading_statuses = snapshot.REAL_STATUSES if is_real else TRADING_STATUSES
+        is_v3 = self.schema_version >= 3
+        if (is_real or is_v3) and payload.get("raw_price_basis") != "unadjusted":
+            raise ValueError(
+                "A real or schema-3 Shadow Live feed requires unadjusted raw prices."
+            )
+        evidence_kinds = _feed_evidence_kinds(payload) if is_v3 else {}
+        self.evidence_kinds = evidence_kinds
+        trading_statuses = (
+            snapshot.REAL_STATUSES if (is_real or is_v3) else TRADING_STATUSES
+        )
         symbols = payload.get("symbols")
         if (
             not isinstance(symbols, list)
@@ -325,6 +377,10 @@ class Feed:
                 raise ValueError(f"Invalid OHLC values in raw_bars for {session} {symbol}.")
             if is_real:
                 _real_raw_timestamps(row)
+            elif is_v3:
+                _optional_raw_timestamps(row)
+            if is_v3:
+                _validate_v3_raw_bar(row, session, evidence_kinds)
             key = (session, symbol)
             if key in self.raw:
                 raise ValueError(f"Duplicate raw_bars row for {session} {symbol}.")
@@ -355,6 +411,7 @@ class Feed:
             raise ValueError("corporate_actions must be an array.")
         actions: list[dict[str, Any]] = []
         action_ids: set[str] = set()
+        action_sequences: dict[tuple[str, str], set[int]] = {}
         for raw_action in action_rows:
             if not isinstance(raw_action, dict):
                 raise ValueError("corporate_actions rows must be objects.")
@@ -372,6 +429,16 @@ class Feed:
             if action_id in action_ids:
                 raise ValueError(f"Duplicate corporate action id {action_id!r}.")
             action_ids.add(action_id)
+            if "sequence" in raw_action:
+                sequence = raw_action["sequence"]
+                if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+                    raise ValueError(f"{action_id} has invalid corporate action sequence.")
+                seen_seq = action_sequences.setdefault((session, symbol), set())
+                if sequence in seen_seq:
+                    raise ValueError(
+                        f"Duplicate corporate action sequence {sequence} for {session} {symbol}."
+                    )
+                seen_seq.add(sequence)
             action = dict(raw_action)
             action["action_id"] = action_id
             action["date"] = session
@@ -398,7 +465,15 @@ class Feed:
             ):
                 raise ValueError(f"{action_id} has invalid terms_evidence.")
             actions.append(action)
-        actions.sort(key=lambda item: (item["date"], item["symbol"], item["type"], item["action_id"]))
+        actions.sort(
+            key=lambda item: (
+                item["date"],
+                item["symbol"],
+                (0, item["sequence"]) if "sequence" in item else (1, 0),
+                item["type"],
+                item["action_id"],
+            )
+        )
         self.actions = tuple(actions)
         self.actions_by_date: dict[str, tuple[dict[str, Any], ...]] = {}
         for action in actions:
@@ -457,6 +532,302 @@ def _real_raw_timestamps(row: dict[str, Any]) -> None:
             shadow_calendar.parse_timestamp(row[timestamp], timestamp)
 
 
+def _optional_raw_timestamps(row: dict[str, Any]) -> None:
+    for field in ("open", "close"):
+        timestamp = f"{field}_available_at"
+        if row.get(timestamp) is not None:
+            shadow_calendar.parse_timestamp(row[timestamp], timestamp)
+
+
+def _feed_evidence_kinds(payload: dict[str, Any]) -> dict[str, str]:
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != {"items"}:
+        raise ValueError("A schema-3 Shadow Live feed requires an evidence block with only items.")
+    items = evidence["items"]
+    if not isinstance(items, list) or not items:
+        raise ValueError("The evidence block requires at least one item.")
+    kinds: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {
+            "id", "kind", "reference", "sha256", "available_at",
+        }:
+            raise ValueError(
+                "Each evidence item needs id, kind, reference, sha256 and available_at."
+            )
+        for key in ("id", "kind", "reference"):
+            if not isinstance(item[key], str) or not item[key].strip():
+                raise ValueError(f"Invalid evidence {key}.")
+        if item["id"] in kinds:
+            raise ValueError("Evidence item ids must be unique.")
+        if not isinstance(item["sha256"], str) or not snapshot.HEX_SHA256.fullmatch(item["sha256"]):
+            raise ValueError("Evidence sha256 must be 64 lowercase hex characters.")
+        shadow_calendar.parse_timestamp(item["available_at"], "evidence.available_at")
+        kinds[item["id"]] = item["kind"]
+    return kinds
+
+
+def _validate_halt_window(value: object, *, required: bool) -> dict[str, Any] | None:
+    if value is None:
+        if required:
+            raise ValueError("A partial_halt raw bar requires a halt window.")
+        return None
+    if not isinstance(value, dict) or set(value) != {"start", "end"}:
+        raise ValueError("Halt must be an object with start and end timestamps.")
+    start = shadow_calendar.parse_timestamp(value["start"], "halt.start")
+    end = shadow_calendar.parse_timestamp(value["end"], "halt.end")
+    if end <= start:
+        raise ValueError("The halt window must end after it starts.")
+    return value
+
+
+def _validate_quote_conflict(
+    row: dict[str, Any],
+    field: str,
+    evidence_kinds: dict[str, str],
+) -> None:
+    conflict_key = f"{field}_conflict"
+    value = row.get(conflict_key)
+    if value is None:
+        return
+    if row.get("trading_status") == "suspended":
+        raise ValueError(
+            f"A suspended raw bar cannot carry {conflict_key}: a confirmed no-trade day has no {field}."
+        )
+    if row.get(field) is not None:
+        raise ValueError(f"A {conflict_key} raw bar must not store an executable {field} price.")
+    if not isinstance(value, dict) or set(value) != {"sources"}:
+        raise ValueError(f"{conflict_key} must be an object with only sources.")
+    sources = value["sources"]
+    if not isinstance(sources, list) or len(sources) < 2:
+        raise ValueError(f"{conflict_key} requires at least two source entries.")
+    names: list[str] = []
+    quotes: list[float] = []
+    for entry in sources:
+        if not isinstance(entry, dict) or set(entry) != {"source", "evidence_id", field}:
+            raise ValueError(f"Each {conflict_key} source needs source, evidence_id and {field}.")
+        name = entry["source"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Invalid {conflict_key} source name.")
+        evidence_id = entry["evidence_id"]
+        if not isinstance(evidence_id, str) or evidence_id not in evidence_kinds:
+            raise ValueError(f"Unknown {conflict_key} evidence_id in raw_bars.")
+        if evidence_kinds[evidence_id] not in snapshot.PRICE_EVIDENCE_KINDS:
+            raise ValueError(f"{conflict_key} evidence_id must name a price_archive evidence item.")
+        price = entry[field]
+        _optional_number(price, f"{conflict_key}.{field}", positive=True)
+        if price is None:
+            raise ValueError(f"{conflict_key} {field} prices must be positive and finite.")
+        names.append(name)
+        quotes.append(float(price))
+    if len(set(names)) != len(names):
+        raise ValueError(f"{conflict_key} sources must be distinct.")
+    if len(set(quotes)) < 2:
+        raise ValueError(f"{conflict_key} requires at least two distinct {field} values.")
+
+
+def _validate_v3_raw_bar(
+    row: dict[str, Any],
+    session: str,
+    evidence_kinds: dict[str, str],
+) -> None:
+    _validate_quote_conflict(row, "open", evidence_kinds)
+    _validate_quote_conflict(row, "close", evidence_kinds)
+    open_source = row.get("open_source")
+    if row.get("open") is None:
+        if open_source is not None:
+            raise ValueError("A raw bar without an open cannot carry open_source.")
+    else:
+        if not isinstance(open_source, dict) or set(open_source) != {"source", "evidence_id"}:
+            raise ValueError("A schema-3 raw bar with an open requires open_source with source and evidence_id.")
+        if not isinstance(open_source.get("source"), str) or not open_source["source"].strip():
+            raise ValueError("Invalid open_source source.")
+        ev_id = open_source.get("evidence_id")
+        if ev_id not in evidence_kinds:
+            raise ValueError("Unknown open_source evidence_id in raw_bars.")
+        if evidence_kinds[ev_id] not in snapshot.PRICE_EVIDENCE_KINDS:
+            raise ValueError(
+                "open_source evidence_id must name a price_archive evidence item; "
+                "a trading-status notice is not a price source."
+            )
+    status = row.get("trading_status")
+    if status == "trading":
+        if row.get("halt") is not None:
+            raise ValueError("A trading raw bar cannot declare a halt window.")
+    elif status == "partial_halt":
+        halt = _validate_halt_window(row.get("halt"), required=True)
+        if row.get("open") is not None:
+            if halt_covers_session(halt, session):
+                raise ValueError(
+                    "A partial_halt raw bar with an actual open cannot have a halt window covering the whole session."
+                )
+            volume = row.get("volume")
+            if isinstance(volume, bool) or not isinstance(volume, (int, float)) or volume <= 0:
+                raise ValueError("A partial_halt raw bar with an actual open requires positive volume.")
+        if halt_conflicts_with_volume(halt, session, row.get("volume")) and any(
+            row.get(field) is not None for field in ("high", "low", "close")
+        ):
+            raise ValueError(
+                "A partial_halt raw bar requires null high, low and close when positive volume contradicts a whole-session halt."
+            )
+    elif status == "suspended":
+        if any(row.get(field) is not None for field in ("open", "high", "low", "close", "volume")):
+            raise ValueError("A suspended raw bar requires null open, high, low, close and volume.")
+        _validate_halt_window(row.get("halt"), required=False)
+    elif row.get("halt") is not None:
+        raise ValueError("An unknown raw bar cannot declare a halt window.")
+
+    status_ev = row.get("status_evidence_id")
+    if status_ev is None:
+        if row.get("status_conflict") is not None:
+            raise ValueError("status_conflict requires status_evidence_id.")
+        if status in ("partial_halt", "suspended"):
+            raise ValueError("A schema-3 partial_halt or suspended raw bar requires status_evidence_id.")
+    else:
+        if not has_status_evidence_id(status_ev):
+            raise ValueError("status_evidence_id must be a nonempty string when provided.")
+        if status_ev not in evidence_kinds:
+            raise ValueError("Unknown status_evidence_id in raw_bars.")
+        if evidence_kinds[status_ev] not in snapshot.STATUS_EVIDENCE_KINDS:
+            raise ValueError(
+                "status_evidence_id must name a trading-status evidence item "
+                "(a halt, suspension or resumption notice)."
+            )
+        if isinstance(open_source, dict) and status_ev == open_source.get("evidence_id"):
+            raise ValueError(
+                "status_evidence_id must name the trading-status notice, not the open price source."
+            )
+
+    status_conflict = row.get("status_conflict")
+    if status_conflict is not None:
+        if not isinstance(status_conflict, dict) or set(status_conflict) != {"price_evidence_id", "halt"}:
+            raise ValueError("status_conflict requires price_evidence_id and halt.")
+        if (
+            status != "unknown"
+            or row.get("open_conflict") is not None
+            or any(row.get(field) is not None for field in ("open", "high", "low", "close", "volume"))
+        ):
+            raise ValueError("status_conflict requires unknown status and null OHLCV without open_conflict.")
+        price_id = status_conflict["price_evidence_id"]
+        if not isinstance(price_id, str) or evidence_kinds.get(price_id) not in snapshot.PRICE_EVIDENCE_KINDS:
+            raise ValueError("status_conflict price_evidence_id must name a price_archive.")
+        conflict_halt = _validate_halt_window(status_conflict["halt"], required=True)
+        if not halt_covers_session(conflict_halt, session):
+            raise ValueError("status_conflict requires a whole-day halt window.")
+
+
+def export_daily_feed_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    through_date: str,
+    source_snapshot_id: str | None = None,
+) -> dict[str, Any]:
+    """Project a Discovery payload into a Shadow Live daily feed up to ``through_date``."""
+    cutoff_date = snapshot.parse_iso_date(through_date)
+    calendar = [
+        dict(row) for row in payload.get("calendar", []) if str(row.get("date")) <= cutoff_date
+    ]
+    if not calendar:
+        raise ValueError(f"No sessions in payload on or before {cutoff_date}.")
+    raw_bars = [
+        dict(row) for row in payload.get("raw_bars", []) if str(row.get("date")) <= cutoff_date
+    ]
+    derived = [
+        dict(row) for row in payload.get("derived", []) if str(row.get("date")) <= cutoff_date
+    ]
+    corporate_actions = [
+        dict(row)
+        for row in payload.get("corporate_actions", [])
+        if str(row.get("date")) <= cutoff_date
+    ]
+    exported: dict[str, Any] = {
+        "schema_version": payload.get("schema_version"),
+        "data_kind": payload.get("data_kind"),
+        "symbols": list(payload.get("symbols", ETF_SYMBOLS)),
+        "calendar": calendar,
+        "raw_bars": raw_bars,
+        "derived": derived,
+        "corporate_actions": corporate_actions,
+    }
+    if "raw_price_basis" in payload:
+        exported["raw_price_basis"] = payload["raw_price_basis"]
+    if "derivation" in payload:
+        exported["derivation"] = dict(payload["derivation"])
+    if "sources" in payload:
+        exported["sources"] = dict(payload["sources"])
+    if "evidence" in payload and isinstance(payload["evidence"], Mapping):
+        referenced_ids: set[str] = set()
+        for row in raw_bars:
+            open_src = row.get("open_source")
+            if isinstance(open_src, Mapping) and isinstance(open_src.get("evidence_id"), str):
+                referenced_ids.add(open_src["evidence_id"])
+            if isinstance(row.get("status_evidence_id"), str):
+                referenced_ids.add(row["status_evidence_id"])
+            for c_key in ("open_conflict", "close_conflict"):
+                c_val = row.get(c_key)
+                if isinstance(c_val, Mapping):
+                    for src in c_val.get("sources", []):
+                        if isinstance(src, Mapping) and isinstance(src.get("evidence_id"), str):
+                            referenced_ids.add(src["evidence_id"])
+            sc = row.get("status_conflict")
+            if isinstance(sc, Mapping) and isinstance(sc.get("price_evidence_id"), str):
+                referenced_ids.add(sc["price_evidence_id"])
+        items = [
+            dict(item)
+            for item in payload["evidence"].get("items", [])
+            if item.get("id") in referenced_ids
+            or str(item.get("available_at", ""))[:10] <= cutoff_date
+        ]
+        exported["evidence"] = {"items": items}
+    if source_snapshot_id is not None:
+        exported["source_snapshot_id"] = source_snapshot_id
+    # Validate the exported feed through Feed() before returning.
+    Feed(exported)
+    return exported
+
+
+def build_daily_feed_from_snapshot(
+    snapshot_store: str | Path,
+    snapshot_id: str,
+    *,
+    through_date: str,
+    output: str | Path | None = None,
+) -> dict[str, Any]:
+    """Read Discovery-only snapshot data and export a daily Shadow feed through ``through_date``."""
+    envelope = snapshot.read_discovery(Path(snapshot_store), snapshot_id, "discovery")
+    if "data" in envelope:
+        payload = {
+            "schema_version": envelope["schema_version"],
+            "data_kind": envelope["data_kind"],
+            **envelope["data"],
+        }
+        if envelope["schema_version"] >= 2:
+            payload.setdefault("raw_price_basis", "unadjusted")
+        manifest = snapshot.manifest(Path(snapshot_store), snapshot_id)
+        if "evidence" in manifest and "evidence" not in payload:
+            payload["evidence"] = manifest["evidence"]
+    else:
+        payload = envelope
+    exported = export_daily_feed_from_payload(
+        payload, through_date=through_date, source_snapshot_id=snapshot_id
+    )
+    if output is not None:
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(exported, indent=2, sort_keys=True, allow_nan=False),
+            encoding="utf-8",
+        )
+    return {
+        "status": "ok",
+        "snapshot_id": snapshot_id,
+        "through_date": snapshot.parse_iso_date(through_date),
+        "schema_version": exported["schema_version"],
+        "data_kind": exported["data_kind"],
+        "sessions": len(exported["calendar"]),
+        **({"output": str(output)} if output is not None else {}),
+    }
+
+
 def _before(value: str | None, cutoff: datetime) -> bool:
     if not value:
         return False
@@ -468,15 +839,27 @@ def _before(value: str | None, cutoff: datetime) -> bool:
 
 
 def _valid_close(
-    row: dict | None, cutoff: datetime, *, data_kind: str = DATA_KIND
+    row: dict | None,
+    cutoff: datetime,
+    *,
+    data_kind: str = DATA_KIND,
+    schema_version: int | None = None,
 ) -> bool:
     if row is None or not _valid_price(row.get("close")):
         return False
-    if data_kind == "real":
-        return row.get("trading_status") in ("trading", "partial_halt") and available_by(
-            {**row, "available_at": row["close_available_at"]}, cutoff
+    allow_partial_halt = data_kind == "real" or (
+        schema_version is not None and schema_version >= 3
+    )
+    status = row.get("trading_status")
+    if allow_partial_halt:
+        if status == "partial_halt" and halt_conflicts_with_trade(
+            row.get("halt"), str(row.get("date")), row
+        ):
+            return False
+        return status in ("trading", "partial_halt") and close_available(
+            row, cutoff, data_kind
         )
-    return row.get("trading_status") == "trading" and available_by(row, cutoff)
+    return status == "trading" and close_available(row, cutoff, data_kind)
 
 
 def _terms_valid(action: dict) -> bool:
@@ -541,6 +924,16 @@ CREATE TABLE IF NOT EXISTS scope_pauses (
   message TEXT NOT NULL,
   recorded_at TEXT NOT NULL,
   PRIMARY KEY (version_id, session, scope, code)
+);
+CREATE TABLE IF NOT EXISTS state_migrations (
+  version_id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
+  migrated_from_date TEXT,
+  new_start_date TEXT,
+  initial_cash REAL,
+  initial_positions_json TEXT,
+  strategy_state_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 """
 
@@ -1001,6 +1394,8 @@ def update(
     corrections_store: str | Path | None = None,
     expected_sessions: tuple[str, ...] | None = None,
     expected_data_kind: str | None = None,
+    plugin_config: str | Path | None = None,
+    plugin_specs: list[str] | tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], bool]:
     """Process every tracked version up to ``target_date``; return (report, blocked).
 
@@ -1076,8 +1471,16 @@ def update(
         candidates = requested
     else:
         candidates = _tracked_release_directories(database, store_path, target)
+    from prajnatrade.plugins import load_plugin_registry
+
+    plugin_registry = load_plugin_registry(
+        plugin_config=plugin_config, plugin_specs=plugin_specs,
+    )
     versions = [
-        _version_result(database, store_path, feed, target, release_id, corrections)
+        _version_result(
+            database, store_path, feed, target, release_id, corrections,
+            plugin_registry=plugin_registry,
+        )
         for release_id in candidates
     ]
     blocked = any(version["status"] == "blocked" for version in versions)
@@ -1455,7 +1858,7 @@ def _report_summary(
             1
             for entry in entries
             for order in entry["result"]["orders"]
-            if order["status"] != "filled"
+            if order["status"] not in ("filled", "no_trade_required")
         ),
         "anomalies": sum(len(entry["result"]["anomalies"]) for entry in entries),
         "due_opportunities": opportunities["due_opportunities"],
@@ -1590,14 +1993,14 @@ def _comparison_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
             "date": result["date"],
             "order_id": order["order_id"],
             "symbol": order["symbol"],
-            "side": order["side"],
-            "quantity": order["quantity"],
+            "side": order.get("side"),
+            "quantity": order.get("quantity"),
             "status": order["status"],
             "reason": order["reason"],
         }
         for result in results
         for order in result["orders"]
-        if order["status"] != "filled"
+        if order["status"] not in ("filled", "no_trade_required")
     ]
     opportunities = _opportunity_evidence(results)
     return {
@@ -1940,9 +2343,14 @@ def _version_result(
     target: str,
     release_id: str,
     corrections: dict[str, Any] | None = None,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     try:
-        return _run_version(database, store, feed, target, release_id, corrections)
+        return _run_version(
+            database, store, feed, target, release_id, corrections,
+            plugin_registry=plugin_registry,
+        )
     except _Blocked as error:
         progress = _progress_or_none(database, release_id)
         last = progress["last_committed_date"] if progress else None
@@ -2028,7 +2436,11 @@ def _version_entry(
     }
 
 
-def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
+def _execution_settings(
+    artifact: dict[str, Any],
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     execution = artifact.get("execution")
     required = (
         "strategy",
@@ -2046,7 +2458,9 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
         )
     strategy = execution["strategy"]
     family = strategy.get("family") if isinstance(strategy, dict) else None
-    if family not in (*STRATEGY_FAMILIES, "python"):
+    if family not in (*STRATEGY_FAMILIES, "python") and not (
+        isinstance(strategy, dict) and isinstance(strategy.get("plugin"), dict)
+    ):
         raise _Blocked("UNSUPPORTED_STRATEGY", f"The release declares family {family!r}.")
     parameters = execution["parameters"]
     if not isinstance(parameters, dict):
@@ -2088,6 +2502,7 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
                 or not runtime_matches(
                     evaluation["runtime"], config, execution_rules=evaluation["execution_rules"],
                     history_policy=evaluation.get("history_policy"),
+                    decision_policy=evaluation.get("decision_policy"),
                 )
             ):
                 raise ValueError("The frozen Python execution runtime is unavailable.")
@@ -2099,6 +2514,22 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
                 "strategy_spec": version,
                 "container_executor": executor_from_config(config),
             }
+        elif "plugin" in strategy or family not in (
+            "equal_weight", "momentum", "trend_filter", "inverse_volatility",
+        ):
+            from prajnatrade.plugins import PluginError
+
+            try:
+                version = normalize_strategy_spec(
+                    {**strategy, "parameters": parameters},
+                    plugin_registry=plugin_registry,
+                )
+            except PluginError as error:
+                raise _Blocked(error.code, error.message) from error
+            runtime = {
+                "strategy_spec": version,
+                "plugin_registry": plugin_registry,
+            }
         else:
             normalize_strategy_spec(identity)
     except (KeyError, TypeError, ValueError) as error:
@@ -2106,15 +2537,75 @@ def _execution_settings(artifact: dict[str, Any]) -> dict[str, Any]:
             "RELEASE_INVALID",
             f"The release artifact's frozen strategy parameters are invalid: {error}",
         ) from error
+    val_policy = valuation_policy_version(execution["execution_rules"])
+    if val_policy not in VALUATION_POLICY_VERSIONS:
+        raise _Blocked(
+            "RELEASE_INVALID",
+            f"The release artifact declares unsupported valuation policy {val_policy!r}.",
+        )
+    dec_policy = execution.get("decision_policy")
+    normalized_dec_policy: dict[str, Any] | None = None
+    if dec_policy is not None:
+        from prajnatrade.decision_window import normalize_decision_policy
+
+        try:
+            normalized_dec_policy = normalize_decision_policy(dec_policy)
+        except ValueError as error:
+            raise _Blocked(
+                "RELEASE_INVALID",
+                f"The release artifact's decision_policy is invalid: {error}",
+            ) from error
+    hist_reqs = execution.get("history_requirements")
+    if hist_reqs is not None:
+        if not isinstance(hist_reqs, list):
+            raise _Blocked(
+                "RELEASE_INVALID",
+                "The release artifact's history_requirements must be a list.",
+            )
+    exec_rules_obj = execution["execution_rules"]
+    rule_version = (
+        exec_rules_obj.get("version", NEXT_OPEN_RULES)
+        if isinstance(exec_rules_obj, Mapping)
+        else NEXT_OPEN_RULES
+    )
+    if rule_version not in EXECUTION_RULE_VERSIONS:
+        raise _Blocked(
+            "RELEASE_INVALID",
+            f"The release artifact declares unsupported execution rules {rule_version!r}.",
+        )
+    lot_extra: dict[str, Any] = {}
+    if rule_version == ACTUAL_OPEN_LOT_RULES:
+        exec_block = (
+            exec_rules_obj.get("execution", {})
+            if isinstance(exec_rules_obj, Mapping)
+            else {}
+        )
+        lot_extra["lot_sizes"] = normalize_lot_sizes(exec_block.get("lot_sizes"))
+        lot_extra["symbol_order"] = list(exec_block.get("symbol_order", ETF_SYMBOLS))
     return {
         "strategy": identity,
         **runtime,
         "parameters": dict(parameters),
         "initial_cash": float(execution["initial_cash"]),
+        **(
+            {
+                "initial_positions": {
+                    symbol: float(execution["initial_positions"].get(symbol, 0.0))
+                    for symbol in ETF_SYMBOLS
+                }
+            }
+            if isinstance(execution.get("initial_positions"), Mapping)
+            else {}
+        ),
         "transaction_cost_bps": float(execution["transaction_cost_bps"]),
         "slippage_bps": float(execution["slippage_bps"]),
         "signal_window_sessions": window,
         "execution_rules": execution["execution_rules"],
+        "execution_rule_version": rule_version,
+        "valuation_policy": val_policy,
+        **({"decision_policy": normalized_dec_policy} if normalized_dec_policy is not None else {}),
+        **({"history_requirements": hist_reqs} if hist_reqs is not None else {}),
+        **lot_extra,
     }
 
 
@@ -2145,6 +2636,61 @@ def _check_authorized_sessions(
         )
 
 
+def _apply_clean_start_migration(
+    database: Ledger,
+    feed: Feed,
+    release_id: str,
+    target: str,
+    execution: dict[str, Any],
+    prior: dict[str, Any],
+    start_index: int,
+    *,
+    last_committed: str | None,
+) -> tuple[dict[str, Any], dict[str, Any], int, dict[str, Any] | None]:
+    """Apply an explicit clean-start migration row when starting or crossing its start date."""
+    mig_row = database.connection.execute(
+        "SELECT mode, new_start_date, initial_cash, initial_positions_json, strategy_state_json "
+        "FROM state_migrations WHERE version_id = ?",
+        (release_id,),
+    ).fetchone()
+    if mig_row is None or mig_row[0] != "clean_start":
+        return execution, prior, start_index, None
+    new_start = mig_row[1]
+    if last_committed is not None and (new_start is None or last_committed >= new_start):
+        return execution, prior, start_index, None
+    if new_start is not None:
+        if target < new_start:
+            early = _version_entry(
+                release_id,
+                "not_started",
+                target_date=target,
+                reason=(
+                    f"the clean-start migration begins on {new_start}, "
+                    f"after the target date {target}"
+                ),
+                reason_code="ENABLED_AFTER_TARGET",
+            )
+            return execution, prior, start_index, early
+        if new_start not in feed.index:
+            raise _Blocked(
+                "FEED_CALENDAR_MISMATCH",
+                f"Clean start date {new_start} is not in this feed's calendar.",
+            )
+        start_index = (
+            feed.index[new_start]
+            if last_committed is not None
+            else max(start_index, feed.index[new_start])
+        )
+    clean_exec = dict(execution)
+    if mig_row[2] is not None:
+        clean_exec["initial_cash"] = float(mig_row[2])
+    if mig_row[3] is not None:
+        clean_exec["initial_positions"] = json.loads(mig_row[3])
+    clean_prior = _initial_prior(clean_exec)
+    clean_prior["strategy_state"] = json.loads(mig_row[4])
+    return clean_exec, clean_prior, start_index, None
+
+
 def _run_version(
     database: Ledger,
     store: Path,
@@ -2152,6 +2698,8 @@ def _run_version(
     target: str,
     release_id: str,
     corrections: dict[str, Any] | None = None,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     progress = database.get_progress(release_id)
     if progress is not None and progress.get("state") == "ended":
@@ -2179,7 +2727,7 @@ def _run_version(
             "FEED_SCOPE_MISMATCH",
             f"This release requires a {artifact['scope']} Shadow Live feed.",
         )
-    execution = _execution_settings(artifact)
+    execution = _execution_settings(artifact, plugin_registry=plugin_registry)
     try:
         states = {
             session: release.state_at(store, release_id, session)
@@ -2262,6 +2810,12 @@ def _run_version(
                 reason_code="RETIRED_WITHOUT_HISTORY",
             )
         prior = _initial_prior(execution)
+        execution, prior, start_index, early = _apply_clean_start_migration(
+            database, feed, release_id, target, execution, prior, start_index,
+            last_committed=None,
+        )
+        if early is not None:
+            return early
     else:
         last = progress["last_committed_date"]
         if last == target:
@@ -2293,6 +2847,12 @@ def _run_version(
             )
         prior = _prior_from_ledger(database, release_id, last)
         start_index = feed.index[last] + 1
+        execution, prior, start_index, early = _apply_clean_start_migration(
+            database, feed, release_id, target, execution, prior, start_index,
+            last_committed=last,
+        )
+        if early is not None:
+            return early
 
     for index in range(start_index, target_index + 1):
         session = feed.sessions[index]
@@ -2333,13 +2893,13 @@ def _committed_entry(
         {
             "order_id": order["order_id"],
             "symbol": order["symbol"],
-            "side": order["side"],
-            "quantity": order["quantity"],
+            "side": order.get("side"),
+            "quantity": order.get("quantity"),
             "status": order["status"],
             "reason": order["reason"],
         }
         for order in result["orders"]
-        if order["status"] != "filled"
+        if order["status"] not in ("filled", "no_trade_required")
     ]
     return _version_entry(
         release_id,
@@ -2358,12 +2918,21 @@ def _committed_entry(
     )
 
 
+def _initial_strategy_state() -> dict[str, Any]:
+    return initial_strategy_state()
+
+
 def _initial_prior(execution: dict[str, Any]) -> dict[str, Any]:
     initial = float(execution["initial_cash"])
+    init_pos = execution.get("initial_positions") or {}
+    stateful_active = (
+        execution.get("decision_policy") is not None
+        or execution.get("execution_rule_version") == ACTUAL_OPEN_LOT_RULES
+    )
     return {
         "date": None,
         "cash": initial,
-        "positions": {symbol: 0.0 for symbol in ETF_SYMBOLS},
+        "positions": {symbol: float(init_pos.get(symbol, 0.0)) for symbol in ETF_SYMBOLS},
         "receivables": [],
         "booked_dividends": [],
         "deficit_revision_ids": [],
@@ -2377,6 +2946,23 @@ def _initial_prior(execution: dict[str, Any]) -> dict[str, Any]:
         "start_date": None,
         "last_committed_date": None,
         "committed_at": None,
+        **(
+            {
+                "carry_states": {
+                    symbol: CarryState().to_dict() for symbol in ETF_SYMBOLS
+                }
+            }
+            if execution.get("valuation_policy") == CARRY_FORWARD_SUSPENDED_VALUATION
+            else {}
+        ),
+        **(
+            {
+                "strategy_state": _initial_strategy_state(),
+                "signal_meta": None,
+            }
+            if stateful_active
+            else {}
+        ),
     }
 
 
@@ -2389,7 +2975,15 @@ def _prior_from_ledger(
             "PROGRESS_MISMATCH",
             f"The ledger progress points at {session} but no committed day is stored.",
         )
-    return _prior_from_result(day["result"], committed_at=day["committed_at"])
+    prior = _prior_from_result(day["result"], committed_at=day["committed_at"])
+    if "strategy_state" not in prior:
+        mig_row = database.connection.execute(
+            "SELECT strategy_state_json FROM state_migrations WHERE version_id = ?",
+            (release_id,),
+        ).fetchone()
+        if mig_row is not None:
+            prior["strategy_state"] = json.loads(mig_row[0])
+    return prior
 
 
 def _prior_from_result(
@@ -2422,6 +3016,21 @@ def _prior_from_result(
         "start_date": result["progress"]["start_date"],
         "last_committed_date": result["date"],
         "committed_at": committed_at,
+        **(
+            {"carry_states": result["valuation_state"]}
+            if "valuation_state" in result
+            else {}
+        ),
+        **(
+            {"strategy_state": result["strategy_state"]}
+            if "strategy_state" in result
+            else {}
+        ),
+        **(
+            {"signal_meta": result["signal_meta"]}
+            if "signal_meta" in result
+            else {}
+        ),
     }
 
 
@@ -2538,11 +3147,28 @@ def _build_input(
         for symbol, quantity in prior["positions"].items()
         if quantity > _EPSILON
     }
+    rule_version = execution.get("execution_rule_version", NEXT_OPEN_RULES)
     pending = [dict(order) for order in prior["next_orders"]]
     buy_symbols = {
         order["symbol"]
         for order in pending
-        if order.get("side") == "buy" and order.get("symbol") in ETF_SYMBOLS
+        if order.get("symbol") in ETF_SYMBOLS
+        and (
+            order.get("side") == "buy"
+            or (
+                order.get("order_sizing_mode") in ("open_weight", "fixed_amount")
+                and (
+                    float(order.get("target_weight") or 0.0) > _EPSILON
+                    or float(order.get("fixed_amount") or 0.0) > _EPSILON
+                )
+                and is_executable_open(
+                    raw.get(order["symbol"]),
+                    open_cutoff,
+                    data_kind=feed.data_kind,
+                    execution_rule_version=rule_version,
+                )
+            )
+        )
     }
     blockers: list[tuple[str, str]] = []
     anomalies: list[dict[str, Any]] = []
@@ -2561,8 +3187,20 @@ def _build_input(
                         "open_evidence_missing",
                         f"{symbol} has no evidence for the {session} opening auction.",
                     ))
-                elif order["side"] == "buy" and is_executable_open(
-                    row, open_cutoff, data_kind=feed.data_kind
+                elif (
+                    order.get("side") == "buy"
+                    or (
+                        order.get("order_sizing_mode") in ("open_weight", "fixed_amount")
+                        and (
+                            float(order.get("target_weight") or 0.0) > _EPSILON
+                            or float(order.get("fixed_amount") or 0.0) > _EPSILON
+                        )
+                    )
+                ) and is_executable_open(
+                    row,
+                    open_cutoff,
+                    data_kind=feed.data_kind,
+                    execution_rule_version=rule_version,
                 ):
                     buy_symbols.add(symbol)
 
@@ -2577,8 +3215,48 @@ def _build_input(
         )
         blockers.extend(correction_blockers)
 
+    val_policy = execution.get("valuation_policy", STRICT_CLOSE_VALUATION)
+    carry_states = prior.get("carry_states") or {}
     for symbol in sorted(set(held) | buy_symbols):
-        if not _valid_close(raw.get(symbol), close_cutoff, data_kind=feed.data_kind):
+        if not _valid_close(
+            raw.get(symbol),
+            close_cutoff,
+            data_kind=feed.data_kind,
+            schema_version=feed.schema_version,
+        ):
+            if (
+                val_policy == CARRY_FORWARD_SUSPENDED_VALUATION
+                and symbol not in buy_symbols
+            ):
+                confirmed_no_trade, non_trade_reason = classify_no_trade_for_valuation(
+                    raw.get(symbol),
+                    close_cutoff,
+                    data_kind=feed.data_kind,
+                    schema_version=feed.schema_version,
+                )
+                if confirmed_no_trade:
+                    c_state = CarryState.from_dict(carry_states.get(symbol))
+                    if c_state.anchor is not None:
+                        continue
+                    gap_reason = (
+                        "carry_forward_chain_broken"
+                        if c_state.chain_broken
+                        else "missing_authorized_prior_close"
+                    )
+                    blockers.append(
+                        (
+                            "missing_close",
+                            f"{symbol} valuation blocked ({gap_reason}) on {session}.",
+                        )
+                    )
+                    continue
+                blockers.append(
+                    (
+                        "missing_close",
+                        f"{symbol} valuation blocked ({non_trade_reason}) on {session}.",
+                    )
+                )
+                continue
             blockers.append(
                 (
                     "missing_close",
@@ -2617,8 +3295,43 @@ def _build_input(
                 )
             )
 
+    dec_policy = execution.get("decision_policy")
+    dec_window: dict[str, Any] | None = None
     signal_due = state == "enabled" and next_session is not None
-    if signal_due:
+    if dec_policy is not None:
+        from prajnatrade.decision_window import select_common_observations
+
+        reqs = execution.get("history_requirements")
+        if reqs is None:
+            reqs = [
+                {
+                    "id": "strategy_lookback",
+                    "observations": window_size,
+                    "mode": "valid_observations",
+                }
+            ]
+        dec_window = select_common_observations(
+            feed.sessions[: index + 1],
+            feed.raw,
+            feed.derived,
+            session,
+            dec_policy,
+            reqs,
+            data_kind=feed.data_kind,
+            schema_version=feed.schema_version,
+        )
+        if signal_due:
+            if dec_window["signal_status"] == "paused":
+                anomalies.append(dec_window["signal_pause"])
+            elif not dec_window["ready"]:
+                anomalies.append(
+                    {
+                        "code": "signal_window_incomplete",
+                        "date": session,
+                        "requirements": dec_window["requirements"],
+                    }
+                )
+    elif signal_due:
         if len(window_sessions) < window_size:
             if artifact.get("workflow") == release.RESEARCH_HOLDOUT:
                 blockers.append((
@@ -2660,10 +3373,20 @@ def _build_input(
                     for entry in derived_window
                 ]
                 sizing_symbols = _possible_target_symbols(
-                    execution, history_rows, prior, pending
+                    execution,
+                    history_rows,
+                    prior,
+                    pending,
+                    session=session,
+                    sessions=feed.sessions,
                 )
                 for symbol in sorted(sizing_symbols - set(held) - buy_symbols):
-                    if not _valid_close(raw.get(symbol), close_cutoff, data_kind=feed.data_kind):
+                    if not _valid_close(
+                        raw.get(symbol),
+                        close_cutoff,
+                        data_kind=feed.data_kind,
+                        schema_version=feed.schema_version,
+                    ):
                         blockers.append(
                             (
                                 "missing_close",
@@ -2676,6 +3399,7 @@ def _build_input(
         "schema_version": SCHEMA_VERSION,
         "kind": INPUT_KIND,
         **({"data_kind": feed.data_kind} if feed.data_kind != DATA_KIND else {}),
+        **({"feed_schema_version": feed.schema_version} if feed.schema_version >= 3 else {}),
         "version_id": release_id,
         "date": session,
         "release": {
@@ -2695,6 +3419,16 @@ def _build_input(
             "slippage_bps": execution["slippage_bps"],
             "signal_window_sessions": execution["signal_window_sessions"],
             "execution_rules": execution["execution_rules"],
+            **(
+                {"decision_policy": dec_policy}
+                if dec_policy is not None
+                else {}
+            ),
+            **(
+                {"history_requirements": execution["history_requirements"]}
+                if "history_requirements" in execution
+                else {}
+            ),
         },
         "release_state_at_signal_point": state,
         "previous": prior,
@@ -2708,6 +3442,12 @@ def _build_input(
                 "sessions": window_sessions,
                 "rows": derived_window,
             },
+            **({"decision_window": dec_window} if dec_window is not None else {}),
+            **(
+                {"feed_sessions": list(feed.sessions)}
+                if dec_policy is not None or rule_version == ACTUAL_OPEN_LOT_RULES
+                else {}
+            ),
         },
         "anomalies": anomalies,
         "corrections": correction_decisions,
@@ -2861,6 +3601,9 @@ def _possible_target_symbols(
     history_rows: list[dict[str, Any]],
     prior: dict[str, Any],
     pending: list[dict[str, Any]],
+    *,
+    session: str | None = None,
+    sessions: Sequence[str] | None = None,
 ) -> set[str]:
     """Symbols the frozen strategy could target, so their closes are required.
 
@@ -2871,9 +3614,8 @@ def _possible_target_symbols(
     whether a position is open, so this is exact for them and conservative for
     an unknown (never generated) strategy.
     """
-    if "container_executor" in execution:
-        # Generated code is called once, against the actual settled account.
-        # Price checks for its targets happen when building the orders.
+    if "container_executor" in execution or "plugin_registry" in execution:
+        # Generated code and local plugins are called once, against the actual settled account.
         return set()
     try:
         strategy = make_strategy(
@@ -2897,24 +3639,65 @@ def _possible_target_symbols(
             filled_shares[symbol] += quantity
         else:
             filled_shares[symbol] = max(0.0, filled_shares[symbol] - quantity)
-    states = (
-        {"cash": float(prior["cash"]), "shares": base_shares, "equity": float(prior["nav"])},
-        {
-            "cash": float(prior["cash"]),
-            "shares": filled_shares,
-            "equity": float(prior["nav"]),
-        },
+    use_stateful = (
+        execution.get("decision_policy") is not None
+        or execution.get("execution_rule_version") == ACTUAL_OPEN_LOT_RULES
     )
+    if use_stateful and session is not None:
+        from prajnatrade.decision_window import build_strategy_state, parse_strategy_output
+
+        st = prior.get("strategy_state") or {}
+        states: tuple[dict[str, Any], ...] = (
+            build_strategy_state(
+                signal_date=session,
+                sessions=sessions or [session],
+                cash=float(prior["cash"]),
+                shares=base_shares,
+                equity=float(prior["nav"]),
+                prior_close_weights=None,
+                rebalance_anchor_date=st.get("rebalance_anchor_date"),
+                previous_order_attempted=st.get("previous_order_attempted"),
+                last_filled_target=st.get("last_filled_target"),
+                last_monthly_filled_target=st.get("last_monthly_filled_target"),
+            ),
+            build_strategy_state(
+                signal_date=session,
+                sessions=sessions or [session],
+                cash=float(prior["cash"]),
+                shares=filled_shares,
+                equity=float(prior["nav"]),
+                prior_close_weights=None,
+                rebalance_anchor_date=st.get("rebalance_anchor_date"),
+                previous_order_attempted=st.get("previous_order_attempted"),
+                last_filled_target=st.get("last_filled_target"),
+                last_monthly_filled_target=st.get("last_monthly_filled_target"),
+            ),
+        )
+    else:
+        states = (
+            {"cash": float(prior["cash"]), "shares": base_shares, "equity": float(prior["nav"])},
+            {
+                "cash": float(prior["cash"]),
+                "shares": filled_shares,
+                "equity": float(prior["nav"]),
+            },
+        )
     targets: set[str] = set()
     for state in states:
         try:
-            weights = strategy(pd.DataFrame(history_rows), state)
+            raw_out = strategy(pd.DataFrame(history_rows), state)
         except (ValueError, TypeError):
             return set(ETF_SYMBOLS)
-        if weights is None:
+        if raw_out is None:
             continue
         try:
-            normalized = _validate_weights(weights)
+            if use_stateful and session is not None:
+                parsed = parse_strategy_output(raw_out, signal_date=session)
+                if parsed is None:
+                    continue
+                normalized = parsed["weights"]
+            else:
+                normalized = _validate_weights(raw_out)
         except ValueError:
             return set(ETF_SYMBOLS)
         targets.update(
@@ -2953,98 +3736,205 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
     start_shares = dict(shares)
 
     # (a) corporate actions: share adjustments first, then cash-dividend
-    # entitlements for start-of-day holdings on the ex-date.
+    # entitlements for start-of-day holdings on the ex-date (or sequence-ordered
+    # per held symbol under carry-forward-suspended-v1).
+    val_policy = execution.get("valuation_policy", STRICT_CLOSE_VALUATION)
     applied: list[dict[str, Any]] = []
     booked = [dict(item) for item in prior.get("booked_dividends", [])]
-    adjustments = sorted(
-        (action for action in actions if action["type"] == "share_adjustment"),
-        key=lambda action: (action["symbol"], action["action_id"]),
-    )
-    dividends = sorted(
-        (action for action in actions if action["type"] == "cash_dividend"),
-        key=lambda action: (action["symbol"], action["action_id"]),
-    )
-    for action in adjustments:
-        symbol = action["symbol"]
-        quantity = start_shares.get(symbol, 0.0)
-        if quantity <= _EPSILON:
-            applied.append(
-                {
+    applied_actions_today: dict[str, list[dict[str, Any]]] = {
+        symbol: [] for symbol in ETF_SYMBOLS
+    }
+    if val_policy == CARRY_FORWARD_SUSPENDED_VALUATION:
+        ordered_actions: list[dict[str, Any]] = []
+        by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for action in actions:
+            by_symbol.setdefault(action["symbol"], []).append(action)
+        for symbol in sorted(by_symbol):
+            sym_actions = by_symbol[symbol]
+            if start_shares.get(symbol, 0.0) <= _EPSILON:
+                for action in sorted(sym_actions, key=lambda item: item["action_id"]):
+                    ordered_actions.append(action)
+                continue
+            if len(sym_actions) > 1:
+                seqs = [item.get("sequence") for item in sym_actions]
+                if not all(
+                    "sequence" in item
+                    and not isinstance(seq, bool)
+                    and isinstance(seq, int)
+                    and seq >= 1
+                    for item, seq in zip(sym_actions, seqs, strict=True)
+                ) or len(set(seqs)) != len(seqs):
+                    raise _Blocked(
+                        "missing_action_terms",
+                        f"{symbol} has ambiguous same-day corporate action order on {session}.",
+                        detail={"symbol": symbol, "date": session, "reason": "corporate_action_order_ambiguous"},
+                    )
+                sym_actions = sorted(sym_actions, key=lambda item: item["sequence"])
+            elif "sequence" in sym_actions[0]:
+                seq = sym_actions[0]["sequence"]
+                if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+                    raise _Blocked(
+                        "missing_action_terms",
+                        f"{symbol} has invalid corporate action sequence on {session}.",
+                        detail={"symbol": symbol, "date": session, "reason": "corporate_action_order_ambiguous"},
+                    )
+            for action in sym_actions:
+                if not available_by(action, open_cutoff) or not _terms_valid(action):
+                    raise _Blocked(
+                        "missing_action_terms",
+                        f"{action['action_id']} has unresolved or unavailable terms.",
+                    )
+            ordered_actions.extend(sym_actions)
+        for action in ordered_actions:
+            symbol = action["symbol"]
+            if start_shares.get(symbol, 0.0) <= _EPSILON:
+                applied.append(
+                    {
+                        "action_id": action["action_id"],
+                        "type": action["type"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "status": "ignored_not_held",
+                    }
+                )
+                continue
+            applied_actions_today[symbol].append(dict(action))
+            if action["type"] == "share_adjustment":
+                ratio = float(action["ratio"])
+                before = shares[symbol]
+                shares[symbol] = before * ratio
+                applied.append(
+                    {
+                        "action_id": action["action_id"],
+                        "type": action["type"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "ratio": ratio,
+                        "status": "applied",
+                        "shares_before": before,
+                        "shares_after": shares[symbol],
+                    }
+                )
+            else:
+                quantity = shares[symbol]
+                amount_per_share = float(action["cash_per_share"])
+                amount = quantity * amount_per_share
+                entitlement = {
                     "action_id": action["action_id"],
-                    "type": action["type"],
                     "symbol": symbol,
                     "ex_date": session,
-                    "status": "ignored_not_held",
+                    "pay_date": action["pay_date"],
+                    "quantity": quantity,
+                    "cash_per_share": amount_per_share,
+                    "amount": amount,
                 }
-            )
-            continue
-        if not available_by(action, open_cutoff) or not _terms_valid(action):
-            raise _Blocked(
-                "missing_action_terms",
-                f"{action['action_id']} has unresolved or unavailable terms.",
-            )
-        ratio = float(action["ratio"])
-        before = shares[symbol]
-        shares[symbol] = before * ratio
-        applied.append(
-            {
-                "action_id": action["action_id"],
-                "type": action["type"],
-                "symbol": symbol,
-                "ex_date": session,
-                "ratio": ratio,
-                "status": "applied",
-                "shares_before": before,
-                "shares_after": shares[symbol],
-            }
+                receivables.append(entitlement)
+                dividend_entitled_total += amount
+                booked.append(
+                    {
+                        "action_id": action["action_id"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "pay_date": action["pay_date"],
+                        "quantity": quantity,
+                        "cash_per_share": amount_per_share,
+                        "booked_cash_per_share": amount_per_share,
+                        "amount": amount,
+                        "status": "receivable",
+                        "applied_revisions": [],
+                    }
+                )
+                applied.append({**entitlement, "type": action["type"], "status": "receivable"})
+    else:
+        adjustments = sorted(
+            (action for action in actions if action["type"] == "share_adjustment"),
+            key=lambda action: (action["symbol"], action["action_id"]),
         )
-    for action in dividends:
-        symbol = action["symbol"]
-        quantity = start_shares.get(symbol, 0.0)
-        if quantity <= _EPSILON:
+        dividends = sorted(
+            (action for action in actions if action["type"] == "cash_dividend"),
+            key=lambda action: (action["symbol"], action["action_id"]),
+        )
+        for action in adjustments:
+            symbol = action["symbol"]
+            quantity = start_shares.get(symbol, 0.0)
+            if quantity <= _EPSILON:
+                applied.append(
+                    {
+                        "action_id": action["action_id"],
+                        "type": action["type"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "status": "ignored_not_held",
+                    }
+                )
+                continue
+            if not available_by(action, open_cutoff) or not _terms_valid(action):
+                raise _Blocked(
+                    "missing_action_terms",
+                    f"{action['action_id']} has unresolved or unavailable terms.",
+                )
+            ratio = float(action["ratio"])
+            before = shares[symbol]
+            shares[symbol] = before * ratio
             applied.append(
                 {
                     "action_id": action["action_id"],
                     "type": action["type"],
                     "symbol": symbol,
                     "ex_date": session,
-                    "status": "ignored_not_held",
+                    "ratio": ratio,
+                    "status": "applied",
+                    "shares_before": before,
+                    "shares_after": shares[symbol],
                 }
             )
-            continue
-        if not available_by(action, open_cutoff) or not _terms_valid(action):
-            raise _Blocked(
-                "missing_action_terms",
-                f"{action['action_id']} has unresolved or unavailable terms.",
-            )
-        amount_per_share = float(action["cash_per_share"])
-        amount = quantity * amount_per_share
-        entitlement = {
-            "action_id": action["action_id"],
-            "symbol": symbol,
-            "ex_date": session,
-            "pay_date": action["pay_date"],
-            "quantity": quantity,
-            "cash_per_share": amount_per_share,
-            "amount": amount,
-        }
-        receivables.append(entitlement)
-        dividend_entitled_total += amount
-        booked.append(
-            {
+        for action in dividends:
+            symbol = action["symbol"]
+            quantity = start_shares.get(symbol, 0.0)
+            if quantity <= _EPSILON:
+                applied.append(
+                    {
+                        "action_id": action["action_id"],
+                        "type": action["type"],
+                        "symbol": symbol,
+                        "ex_date": session,
+                        "status": "ignored_not_held",
+                    }
+                )
+                continue
+            if not available_by(action, open_cutoff) or not _terms_valid(action):
+                raise _Blocked(
+                    "missing_action_terms",
+                    f"{action['action_id']} has unresolved or unavailable terms.",
+                )
+            amount_per_share = float(action["cash_per_share"])
+            amount = quantity * amount_per_share
+            entitlement = {
                 "action_id": action["action_id"],
                 "symbol": symbol,
                 "ex_date": session,
                 "pay_date": action["pay_date"],
                 "quantity": quantity,
                 "cash_per_share": amount_per_share,
-                "booked_cash_per_share": amount_per_share,
                 "amount": amount,
-                "status": "receivable",
-                "applied_revisions": [],
             }
-        )
-        applied.append({**entitlement, "type": action["type"], "status": "receivable"})
+            receivables.append(entitlement)
+            dividend_entitled_total += amount
+            booked.append(
+                {
+                    "action_id": action["action_id"],
+                    "symbol": symbol,
+                    "ex_date": session,
+                    "pay_date": action["pay_date"],
+                    "quantity": quantity,
+                    "cash_per_share": amount_per_share,
+                    "booked_cash_per_share": amount_per_share,
+                    "amount": amount,
+                    "status": "receivable",
+                    "applied_revisions": [],
+                }
+            )
+            applied.append({**entitlement, "type": action["type"], "status": "receivable"})
 
     # (a2) apply the frozen applicable correction set once, before the open:
     # an unpaid entitlement adjusts its receivable, an already-paid one adjusts
@@ -3103,139 +3993,431 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
 
     # (b) settle the previous session's pending orders at the unadjusted open,
     # sells before buys and then by symbol; exactly one terminal state each.
-    pending = sorted(
-        prior["next_orders"],
-        key=lambda order: (
-            0 if order.get("side") == "sell" else 1,
-            order.get("symbol", ""),
-            order.get("order_id", ""),
-        ),
-    )
+    # (b) settle pre-open persisted orders against actual opening prices.
+    rule_version = execution.get("execution_rule_version", NEXT_OPEN_RULES)
     orders: list[dict[str, Any]] = []
     fills: list[dict[str, Any]] = []
     day_fees = 0.0
     day_slippage = 0.0
-    for order in pending:
-        symbol = order["symbol"]
-        side = order["side"]
-        quantity = float(order["quantity"])
-        committed_at = prior.get("committed_at")
-        try:
-            persisted = (
-                datetime.fromisoformat(committed_at)
-                if isinstance(committed_at, str) and committed_at
-                else None
-            )
-        except ValueError:
-            persisted = None
-        persisted_before_deadline = (
-            persisted is not None
-            and persisted.tzinfo is not None
-            and persisted < open_cutoff
+    settlement_extra: dict[str, Any] = {}
+    dec_policy_init = execution.get("decision_policy")
+    stateful_active = dec_policy_init is not None or rule_version == ACTUAL_OPEN_LOT_RULES
+    monthly_deferral_enabled = bool(
+        isinstance(dec_policy_init, Mapping) and dec_policy_init.get("monthly_deferral")
+    )
+    scheduled_month_idx = scheduled_monthly_session(dec_policy_init)
+    prior_st = dict(prior.get("strategy_state") or {}) if stateful_active else {}
+    rebalance_anchor_date: str | None = prior_st.get("rebalance_anchor_date")
+    last_filled_target: dict[str, float] | None = prior_st.get("last_filled_target")
+    last_monthly_filled_target: dict[str, float] | None = prior_st.get("last_monthly_filled_target")
+    previous_order_attempted: dict[str, Any] | None = prior_st.get("previous_order_attempted")
+    monthly_signal_cycle: str | None = prior_st.get("monthly_signal_cycle")
+    active_deferral: dict[str, Any] | None = prior_st.get("active_deferral")
+    monthly_deferrals: list[dict[str, Any]] = list(prior_st.get("monthly_deferrals") or [])
+    if monthly_deferral_enabled:
+        active_deferral, monthly_deferrals = close_expired_deferral(
+            active_deferral, monthly_deferrals, current_cycle=session[:7]
         )
-        record = {
-            "order_id": order["order_id"],
-            "symbol": symbol,
-            "side": side,
-            "quantity": quantity,
-            "signal_date": order.get("signal_date"),
-            "execution_date": order.get("execution_date"),
-            "submitted_at": order.get("submitted_at"),
-            "deadline": order.get("deadline"),
-            # The creation-time planning estimate is kept only until settlement;
-            # this field records the actual durable persistence time of the
-            # signal day that created the order.
-            "persisted_before_deadline": persisted_before_deadline,
-            "persisted_at": committed_at,
-            "target_weight": order.get("target_weight"),
+    committed_at = prior.get("committed_at")
+    try:
+        persisted = (
+            datetime.fromisoformat(committed_at)
+            if isinstance(committed_at, str) and committed_at
+            else None
+        )
+    except ValueError:
+        persisted = None
+    persisted_before_deadline = (
+        persisted is not None
+        and persisted.tzinfo is not None
+        and persisted < open_cutoff
+    )
+
+    if rule_version == ACTUAL_OPEN_LOT_RULES and prior["next_orders"]:
+        symbol_order = list(execution.get("symbol_order", ETF_SYMBOLS))
+        order_rank = {sym: idx for idx, sym in enumerate(symbol_order)}
+        pending = sorted(
+            prior["next_orders"],
+            key=lambda order: (order_rank.get(order.get("symbol", ""), 999), order.get("order_id", "")),
+        )
+        timely_orders: list[dict[str, Any]] = []
+        for order in pending:
+            submitted_at = order.get("submitted_at")
+            try:
+                submitted = datetime.fromisoformat(submitted_at) if submitted_at else None
+            except (TypeError, ValueError):
+                submitted = None
+            base_record = {
+                "order_id": order["order_id"],
+                "symbol": order["symbol"],
+                "side": order.get("side"),
+                "order_sizing_mode": order.get("order_sizing_mode", "open_weight"),
+                "signal_date": order.get("signal_date"),
+                "execution_date": order.get("execution_date"),
+                "submitted_at": submitted_at,
+                "deadline": order.get("deadline"),
+                "persisted_before_deadline": persisted_before_deadline,
+                "persisted_at": committed_at,
+                "target_weight": order.get("target_weight"),
+                **({"fixed_amount": order["fixed_amount"]} if "fixed_amount" in order else {}),
+                "date": session,
+                "status": None,
+                "reason": None,
+                "fill": None,
+            }
+            if (
+                submitted is None
+                or submitted.tzinfo is None
+                or submitted >= open_cutoff
+                or not persisted_before_deadline
+            ):
+                base_record["status"] = "missed_deadline"
+                base_record["reason"] = (
+                    "the order was not durably submitted before the execution "
+                    "session's 09:30 Asia/Shanghai deadline; it is never filled "
+                    "retroactively"
+                )
+                orders.append(base_record)
+            else:
+                timely_orders.append((order, base_record))  # type: ignore[arg-type]
+
+        if timely_orders:
+            weights_map = {symbol: 0.0 for symbol in ETF_SYMBOLS}
+            fixed_map: dict[str, float] = {}
+            record_by_symbol: dict[str, dict[str, Any]] = {}
+            order_by_symbol: dict[str, dict[str, Any]] = {}
+            for order, base_record in timely_orders:  # type: ignore[misc]
+                sym = order["symbol"]
+                order_by_symbol[sym] = order
+                record_by_symbol[sym] = base_record
+                if order.get("order_sizing_mode") == "fixed_amount":
+                    fixed_map[sym] = float(order["fixed_amount"])
+                else:
+                    weights_map[sym] = float(order.get("target_weight") or 0.0)
+            open_prices = {
+                symbol: (
+                    float(row["open"])
+                    if is_executable_open(
+                        row,
+                        open_cutoff,
+                        data_kind=data_kind,
+                        execution_rule_version=ACTUAL_OPEN_LOT_RULES,
+                    )
+                    else None
+                )
+                for symbol in ETF_SYMBOLS
+                if (row := raw.get(symbol)) is not None
+            }
+            session_bars = {
+                (session, symbol): row
+                for symbol, row in raw.items()
+                if row is not None
+            }
+            sig_meta = prior.get("signal_meta") or {}
+            attempt, day_fills, cash, shares, _ = match_open_lot_day(
+                session,
+                {
+                    "date": timely_orders[0][0].get("signal_date", session),
+                    "purpose": sig_meta.get("purpose", "rebalance"),
+                    "cycle": sig_meta.get("cycle", str(timely_orders[0][0].get("signal_date", session))[:7]),
+                },  # type: ignore[index]
+                weights_map,
+                open_prices,
+                session_bars,
+                cash,
+                shares,
+                fee_rate,
+                slippage_rate,
+                lot_sizes=execution.get("lot_sizes"),
+                symbol_order=symbol_order,
+                fixed_amounts=fixed_map or None,
+            )
+            fill_by_symbol: dict[str, dict[str, Any]] = {}
+            for fill in day_fills:
+                sym = fill["symbol"]
+                fill["order_id"] = order_by_symbol[sym]["order_id"]
+                open_source = (raw.get(sym) or {}).get("open_source")
+                if isinstance(open_source, Mapping):
+                    fill["open_evidence"] = {
+                        "source": open_source["source"],
+                        "evidence_id": open_source["evidence_id"],
+                    }
+                day_fees += fill["fee"]
+                day_slippage += fill["slippage"]
+                fees_total += fill["fee"]
+                slippage_total += fill["slippage"]
+                fill_by_symbol[sym] = fill
+                fills.append(fill)
+
+            unfilled_map = {item["symbol"]: item["reason"] for item in attempt["unfilled"]}
+            for sym, base_record in record_by_symbol.items():
+                if sym in fill_by_symbol:
+                    matched = fill_by_symbol[sym]
+                    base_record["side"] = matched["side"]
+                    base_record["quantity"] = matched["quantity"]
+                    base_record["status"] = "filled"
+                    base_record["fill"] = matched
+                elif sym in unfilled_map:
+                    base_record["status"] = "unfilled"
+                    base_record["reason"] = unfilled_map[sym]
+                elif attempt["cash_constrained"]:
+                    base_record["status"] = "cash_constrained"
+                    base_record["reason"] = "cash_constrained"
+                else:
+                    base_record["status"] = "no_trade_required"
+                    base_record["reason"] = attempt["residual_reason"] or "no_trade_required"
+                orders.append(base_record)
+
+            settlement_extra = {
+                "batch_complete": attempt["batch_complete"],
+                "zero_trade_satisfied": attempt.get("zero_trade_satisfied", False),
+                "cash_constrained": attempt["cash_constrained"],
+                "lot_rounding_residual": attempt["lot_rounding_residual"],
+                "residual_reason": attempt["residual_reason"],
+                "daily_simulation_assumptions": attempt["daily_simulation_assumptions"],
+            }
+            if stateful_active:
+                sig_date_att = str(attempt["signal_date"])
+                target_w = sig_meta.get("weights") or weights_map
+                att_purpose = str(attempt.get("purpose", "rebalance"))
+                (
+                    rebalance_anchor_date,
+                    last_filled_target,
+                    last_monthly_filled_target,
+                    previous_order_attempted,
+                ) = advance_rebalance_anchor(
+                    rebalance_anchor_date=rebalance_anchor_date,
+                    last_filled_target=last_filled_target,
+                    last_monthly_filled_target=last_monthly_filled_target,
+                    attempt=attempt,
+                    batch_ok=bool(attempt["batch_complete"]),
+                    signal_date=sig_date_att,
+                    target_weights=target_w,
+                    purpose=att_purpose,
+                )
+        elif stateful_active:
+            sig_meta = prior.get("signal_meta") or {}
+            previous_order_attempted = {
+                "signal_date": pending[0].get("signal_date", session),
+                "date": session,
+                "purpose": sig_meta.get("purpose", "rebalance"),
+                "cycle": sig_meta.get("cycle", str(pending[0].get("signal_date", session))[:7]),
+                "status": "missed_deadline",
+                "batch_complete": False,
+                "zero_trade_satisfied": False,
+                "cash_constrained": False,
+            }
+    elif (
+        rule_version == ACTUAL_OPEN_LOT_RULES
+        and stateful_active
+        and prior.get("signal_meta") is not None
+        and persisted_before_deadline
+    ):
+        sig_meta = prior["signal_meta"]
+        sig_date_att = str(sig_meta.get("signal_date") or prior.get("date") or session)
+        att_purpose = str(sig_meta.get("purpose", "rebalance"))
+        att_cycle = str(sig_meta.get("cycle", sig_date_att[:7]))
+        target_w = dict(sig_meta.get("weights") or {s: (1.0 if s == CASH else 0.0) for s in (*ETF_SYMBOLS, CASH)})
+        attempt = {
+            "signal_date": sig_date_att,
             "date": session,
-            "status": None,
-            "reason": None,
-            "fill": None,
+            "purpose": att_purpose,
+            "cycle": att_cycle,
+            "attempts": 1,
+            "status": "filled",
+            "filled_symbols": [],
+            "unfilled": [],
+            "basket_complete": True,
+            "batch_complete": True,
+            "zero_trade_satisfied": True,
+            "cash_constrained": False,
+            "lot_rounding_residual": 0.0,
+            "residual_reason": None,
+            "daily_simulation_assumptions": {
+                "late_resume_sell_funds_same_day_buy": True,
+                "triggered": False,
+                "late_resume_sell_symbols": [],
+                "funded_buy_symbols": [],
+            },
         }
-        submitted_at = order.get("submitted_at")
-        try:
-            submitted = datetime.fromisoformat(submitted_at) if submitted_at else None
-        except (TypeError, ValueError):
-            submitted = None
-        if (
-            submitted is None
-            or submitted.tzinfo is None
-            or submitted >= open_cutoff
-            or not persisted_before_deadline
-        ):
-            record["status"] = "missed_deadline"
-            record["reason"] = (
-                "the order was not durably submitted before the execution "
-                "session's 09:30 Asia/Shanghai deadline; it is never filled "
-                "retroactively"
-            )
-            orders.append(record)
-            continue
-        row = raw.get(symbol)
-        if not is_executable_open(row, open_cutoff, data_kind=data_kind):
-            record["status"] = "missing_open"
-            record["reason"] = (
-                "no confirmed unadjusted open is available for this symbol; this "
-                "order expires without blocking the other orders"
-            )
-            orders.append(record)
-            continue
-        raw_open = float(row["open"])
-        if side == "buy":
-            price = raw_open * (1.0 + slippage_rate)
-            fee = quantity * price * fee_rate
-            cost = quantity * price + fee
-            if cost > cash + _cash_tolerance(cash):
-                record["status"] = "insufficient_cash"
+        settlement_extra = {
+            "batch_complete": True,
+            "zero_trade_satisfied": True,
+            "cash_constrained": False,
+            "lot_rounding_residual": 0.0,
+            "residual_reason": None,
+            "daily_simulation_assumptions": attempt["daily_simulation_assumptions"],
+        }
+        (
+            rebalance_anchor_date,
+            last_filled_target,
+            last_monthly_filled_target,
+            previous_order_attempted,
+        ) = advance_rebalance_anchor(
+            rebalance_anchor_date=rebalance_anchor_date,
+            last_filled_target=last_filled_target,
+            last_monthly_filled_target=last_monthly_filled_target,
+            attempt=attempt,
+            batch_ok=True,
+            signal_date=sig_date_att,
+            target_weights=target_w,
+            purpose=att_purpose,
+        )
+    else:
+        pending = sorted(
+            prior["next_orders"],
+            key=lambda order: (
+                0 if order.get("side") == "sell" else 1,
+                order.get("symbol", ""),
+                order.get("order_id", ""),
+            ),
+        )
+        for order in pending:
+            symbol = order["symbol"]
+            side = order["side"]
+            quantity = float(order["quantity"])
+            record = {
+                "order_id": order["order_id"],
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "signal_date": order.get("signal_date"),
+                "execution_date": order.get("execution_date"),
+                "submitted_at": order.get("submitted_at"),
+                "deadline": order.get("deadline"),
+                # The creation-time planning estimate is kept only until settlement;
+                # this field records the actual durable persistence time of the
+                # signal day that created the order.
+                "persisted_before_deadline": persisted_before_deadline,
+                "persisted_at": committed_at,
+                "target_weight": order.get("target_weight"),
+                "date": session,
+                "status": None,
+                "reason": None,
+                "fill": None,
+            }
+            submitted_at = order.get("submitted_at")
+            try:
+                submitted = datetime.fromisoformat(submitted_at) if submitted_at else None
+            except (TypeError, ValueError):
+                submitted = None
+            if (
+                submitted is None
+                or submitted.tzinfo is None
+                or submitted >= open_cutoff
+                or not persisted_before_deadline
+            ):
+                record["status"] = "missed_deadline"
                 record["reason"] = (
-                    "available cash at the open is below the frozen order cost; "
-                    "the order is never resized, levered or partially filled"
+                    "the order was not durably submitted before the execution "
+                    "session's 09:30 Asia/Shanghai deadline; it is never filled "
+                    "retroactively"
                 )
                 orders.append(record)
                 continue
-            cash -= cost
-            shares[symbol] += quantity
-            slippage = quantity * (price - raw_open)
-        else:
-            if quantity > shares[symbol] + _EPSILON:
-                record["status"] = "insufficient_shares"
+            row = raw.get(symbol)
+            if not is_executable_open(row, open_cutoff, data_kind=data_kind):
+                record["status"] = "missing_open"
                 record["reason"] = (
-                    "start-of-settlement holdings are below the frozen sell "
-                    "quantity; the order is never resized and shorting is refused"
+                    "no confirmed unadjusted open is available for this symbol; this "
+                    "order expires without blocking the other orders"
                 )
                 orders.append(record)
                 continue
-            price = raw_open * (1.0 - slippage_rate)
-            fee = quantity * price * fee_rate
-            cash += quantity * price - fee
-            shares[symbol] -= quantity
-            if abs(shares[symbol]) <= _EPSILON:
-                shares[symbol] = 0.0
-            slippage = quantity * (raw_open - price)
-        fees_total += fee
-        slippage_total += slippage
-        day_fees += fee
-        day_slippage += slippage
-        fill = {
-            "date": session,
-            "order_id": order["order_id"],
-            "symbol": symbol,
-            "side": side,
-            "quantity": quantity,
-            "raw_open": raw_open,
-            "price": price,
-            "price_basis": "unadjusted_open",
-            "notional": quantity * raw_open,
-            "fee": fee,
-            "slippage": slippage,
-        }
-        record["status"] = "filled"
-        record["fill"] = fill
-        orders.append(record)
-        fills.append(fill)
-    if abs(cash) <= _cash_tolerance(cash):
-        cash = 0.0
+            raw_open = float(row["open"])
+            if side == "buy":
+                price = raw_open * (1.0 + slippage_rate)
+                fee = quantity * price * fee_rate
+                cost = quantity * price + fee
+                if cost > cash + _cash_tolerance(cash):
+                    record["status"] = "insufficient_cash"
+                    record["reason"] = (
+                        "available cash at the open is below the frozen order cost; "
+                        "the order is never resized, levered or partially filled"
+                    )
+                    orders.append(record)
+                    continue
+                cash -= cost
+                shares[symbol] += quantity
+                slippage = quantity * (price - raw_open)
+            else:
+                if quantity > shares[symbol] + _EPSILON:
+                    record["status"] = "insufficient_shares"
+                    record["reason"] = (
+                        "start-of-settlement holdings are below the frozen sell "
+                        "quantity; the order is never resized and shorting is refused"
+                    )
+                    orders.append(record)
+                    continue
+                price = raw_open * (1.0 - slippage_rate)
+                fee = quantity * price * fee_rate
+                cash += quantity * price - fee
+                shares[symbol] -= quantity
+                if abs(shares[symbol]) <= _EPSILON:
+                    shares[symbol] = 0.0
+                slippage = quantity * (raw_open - price)
+            fees_total += fee
+            slippage_total += slippage
+            day_fees += fee
+            day_slippage += slippage
+            fill = {
+                "date": session,
+                "order_id": order["order_id"],
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "raw_open": raw_open,
+                "price": price,
+                "price_basis": "unadjusted_open",
+                "notional": quantity * raw_open,
+                "fee": fee,
+                "slippage": slippage,
+            }
+            record["status"] = "filled"
+            record["fill"] = fill
+            orders.append(record)
+            fills.append(fill)
+        if abs(cash) <= _cash_tolerance(cash):
+            cash = 0.0
+        if stateful_active and orders:
+            sig_meta = prior.get("signal_meta") or {}
+            sig_date_att = str(orders[0].get("signal_date") or prior.get("date") or session)
+            att_purpose = str(sig_meta.get("purpose", "rebalance"))
+            att_cycle = str(sig_meta.get("cycle", sig_date_att[:7]))
+            all_filled = all(o.get("status") == "filled" for o in orders)
+            attempt_summary = {
+                "signal_date": sig_date_att,
+                "date": session,
+                "purpose": att_purpose,
+                "cycle": att_cycle,
+                "status": "filled" if all_filled else "partially_filled",
+                "batch_complete": all_filled,
+                "zero_trade_satisfied": False,
+            }
+            target_w = sig_meta.get("weights") or {
+                s: float(next((o["target_weight"] for o in orders if o.get("symbol") == s), 0.0))
+                for s in ETF_SYMBOLS
+            }
+            if CASH not in target_w:
+                target_w = {
+                    **target_w,
+                    CASH: max(0.0, 1.0 - math.fsum(target_w.get(s, 0.0) for s in ETF_SYMBOLS)),
+                }
+            (
+                rebalance_anchor_date,
+                last_filled_target,
+                last_monthly_filled_target,
+                previous_order_attempted,
+            ) = advance_rebalance_anchor(
+                rebalance_anchor_date=rebalance_anchor_date,
+                last_filled_target=last_filled_target,
+                last_monthly_filled_target=last_monthly_filled_target,
+                attempt=attempt_summary,
+                batch_ok=all_filled,
+                signal_date=sig_date_att,
+                target_weights=target_w,
+                purpose=att_purpose,
+            )
 
     _failpoint("shadow_after_fills")
 
@@ -3306,31 +4488,77 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
         )
 
     # (d) value at the unadjusted close plus cash and unpaid receivables.
-    positions: dict[str, dict[str, Any]] = {}
-    market_value = 0.0
-    for symbol in ETF_SYMBOLS:
-        quantity = shares[symbol]
-        row = raw.get(symbol)
-        close: float | None = None
-        if quantity > _EPSILON and not _valid_close(row, close_cutoff, data_kind=data_kind):
+    feed_schema_version = body.get("feed_schema_version")
+    carry_states: dict[str, CarryState] = {}
+    valuation_extra: dict[str, Any] = {}
+    if val_policy == CARRY_FORWARD_SUSPENDED_VALUATION:
+        carry_states = {
+            symbol: CarryState.from_dict((prior.get("carry_states") or {}).get(symbol))
+            for symbol in ETF_SYMBOLS
+        }
+        nav_point, val_gaps = value_carry_forward_session(
+            session,
+            raw,
+            shares,
+            cash,
+            receivables,
+            {symbol: [] for symbol in ETF_SYMBOLS},
+            carry_states,
+            applied_actions_today,
+            data_kind=data_kind,
+            schema_version=feed_schema_version,
+        )
+        if val_gaps or nav_point["nav"] is None:
+            first_gap = val_gaps[0] if val_gaps else {"symbol": "", "valuation_gap_reason": "missing_close"}
+            gap_reason = first_gap.get("valuation_gap_reason") or first_gap.get("reason")
             raise _Blocked(
                 "missing_close",
-                f"{symbol} is held but has no confirmed unadjusted close "
-                f"available by {close_cutoff.isoformat()}.",
+                f"{first_gap['symbol']} valuation blocked ({gap_reason}) on {session}.",
+                detail=first_gap,
             )
-        if _valid_close(row, close_cutoff, data_kind=data_kind):
-            close = float(row["close"])
-        value = quantity * close if quantity > _EPSILON and close is not None else 0.0
-        if quantity > _EPSILON and close is None:  # pragma: no cover - guarded above
-            raise _Blocked("missing_close", f"{symbol} cannot be valued.")
-        market_value += value
-        positions[symbol] = {
-            "quantity": quantity,
-            "close": close,
-            "market_value": value,
+        positions = nav_point["holdings"]
+        market_value = float(nav_point["market_value"])
+        receivable_total = float(nav_point["dividend_receivables"])
+        nav = float(nav_point["nav"])
+        valuation_extra = {
+            "valuation_policy": CARRY_FORWARD_SUSPENDED_VALUATION,
+            "valuation_basis": nav_point["valuation_basis"],
+            "carried_forward_symbols": nav_point["carried_forward_symbols"],
+            "valuation_state": {
+                symbol: state_obj.to_dict()
+                for symbol, state_obj in carry_states.items()
+            },
         }
-    receivable_total = math.fsum(item["amount"] for item in receivables)
-    nav = cash + market_value + receivable_total
+    else:
+        positions = {}
+        market_value = 0.0
+        for symbol in ETF_SYMBOLS:
+            quantity = shares[symbol]
+            row = raw.get(symbol)
+            close: float | None = None
+            if quantity > _EPSILON and not _valid_close(
+                row, close_cutoff, data_kind=data_kind, schema_version=feed_schema_version
+            ):
+                raise _Blocked(
+                    "missing_close",
+                    f"{symbol} is held but has no confirmed unadjusted close "
+                    f"available by {close_cutoff.isoformat()}.",
+                )
+            if _valid_close(
+                row, close_cutoff, data_kind=data_kind, schema_version=feed_schema_version
+            ):
+                close = float(row["close"])
+            value = quantity * close if quantity > _EPSILON and close is not None else 0.0
+            if quantity > _EPSILON and close is None:  # pragma: no cover - guarded above
+                raise _Blocked("missing_close", f"{symbol} cannot be valued.")
+            market_value += value
+            positions[symbol] = {
+                "quantity": quantity,
+                "close": close,
+                "market_value": value,
+            }
+        receivable_total = math.fsum(item["amount"] for item in receivables)
+        nav = cash + market_value + receivable_total
 
     # (e) generate the next session's signal only when the release is enabled at
     # this session's after-close signal point.
@@ -3338,7 +4566,192 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
     next_orders: list[dict[str, Any]] = []
     invocations: list[dict[str, Any]] = []
     target_changed = False
-    if state == "enabled" and next_session is not None:
+    dec_policy = execution.get("decision_policy")
+    decision_extra: dict[str, Any] = {}
+    signal_meta: dict[str, Any] | None = None
+    if dec_policy is not None:
+        from prajnatrade.decision_window import (
+            build_strategy_state,
+            compute_prior_close_weights,
+            parse_strategy_output,
+        )
+
+        dw = body["session"]["decision_window"]
+        sig_status = dw["signal_status"]
+        sig_pause = dw["signal_pause"]
+        obs_dates = list(dw["observation_dates"])
+        obs_sources = dw["observation_sources"]
+        sig_cutoff = dw["signal_cutoff"]
+        feed_sessions = body["session"].get("feed_sessions") or [session]
+        deferral_fields: dict[str, Any] = {}
+        if state == "enabled" and next_session is not None:
+            if sig_status == "paused":
+                reqs_for_warmup = execution.get("history_requirements") or [
+                    {"observations": execution["signal_window_sessions"]}
+                ]
+                max_req_obs = max((int(req["observations"]) for req in reqs_for_warmup), default=1)
+                sessions_through = sum(1 for d in feed_sessions if d <= session)
+                active_deferral = maybe_trigger_monthly_deferral(
+                    enabled=monthly_deferral_enabled,
+                    active_deferral=active_deferral,
+                    monthly_signal_cycle=monthly_signal_cycle,
+                    signal_date=session,
+                    sessions=feed_sessions,
+                    pause_info=sig_pause or {},
+                    scheduled_month_session=scheduled_month_idx,
+                    warmup_ready=sessions_through >= max_req_obs,
+                )
+            elif sig_status == "ready":
+                obs_values = dw["observation_values"]
+                history_rows = [
+                    {"date": obs_day, "symbol": symbol, "close": value}
+                    for obs_day in obs_dates
+                    for symbol, value in obs_values[obs_day].items()
+                ]
+                prior_close_weights = compute_prior_close_weights(
+                    {"nav": nav, "positions": positions},
+                    shares,
+                    cash,
+                    receivable_total,
+                )
+                deferral_ctx = (
+                    active_deferral
+                    if (
+                        monthly_deferral_enabled
+                        and active_deferral is not None
+                        and active_deferral["cycle"] == session[:7]
+                    )
+                    else None
+                )
+                strategy_state_ctx = build_strategy_state(
+                    signal_date=session,
+                    sessions=feed_sessions,
+                    cash=cash,
+                    shares=shares,
+                    equity=nav,
+                    prior_close_weights=prior_close_weights,
+                    rebalance_anchor_date=rebalance_anchor_date,
+                    previous_order_attempted=previous_order_attempted,
+                    last_filled_target=last_filled_target,
+                    last_monthly_filled_target=last_monthly_filled_target,
+                    history_windows=dw["windows"],
+                    monthly_deferral=deferral_ctx,
+                )
+                try:
+                    strategy = make_strategy(
+                        execution.get("strategy_spec", execution["strategy"]),
+                        container_executor=execution.get("container_executor"),
+                        evidence_callback=invocations.append,
+                        plugin_registry=execution.get("plugin_registry"),
+                    )
+                    raw_output = strategy(pd.DataFrame(history_rows), strategy_state_ctx)
+                except IsolationError as error:
+                    raise _Blocked(
+                        "strategy_isolation_failed", f"The frozen container strategy failed: {error}",
+                    ) from error
+                except (ValueError, TypeError) as error:
+                    from prajnatrade.plugins import PluginError
+
+                    if isinstance(error, PluginError):
+                        raise _Blocked(error.code, error.message) from error
+                    raise _Blocked(
+                        "strategy_error",
+                        f"The frozen strategy failed on the after-close signal input: {error}",
+                    ) from error
+                try:
+                    parsed_output = parse_strategy_output(raw_output, signal_date=session)
+                except ValueError as error:
+                    raise _Blocked(
+                        "strategy_error",
+                        f"The frozen strategy returned invalid target weights: {error}",
+                    ) from error
+                if parsed_output is not None:
+                    normalized = parsed_output["weights"]
+                    purpose = parsed_output["purpose"]
+                    cycle = parsed_output["cycle"]
+                    fixed_amounts = parsed_output["fixed_amounts"]
+                    if purpose == "monthly":
+                        monthly_signal_cycle = session[:7]
+                    deferral_fields, active_deferral, monthly_deferrals = consume_monthly_deferral(
+                        active_deferral=deferral_ctx,
+                        monthly_deferrals=monthly_deferrals,
+                        purpose=purpose,
+                        signal_date=session,
+                        execution_date=next_session,
+                    )
+                    sig_status = "generated"
+                    signal_meta = {
+                        "signal_date": session,
+                        "purpose": purpose,
+                        "cycle": cycle,
+                        "weights": normalized,
+                    }
+                    signal = {
+                        "date": session,
+                        "execution_date": next_session,
+                        "target_weights": normalized,
+                        "purpose": purpose,
+                        "cycle": cycle,
+                        **({"fixed_amounts": fixed_amounts} if fixed_amounts else {}),
+                        **deferral_fields,
+                        "total_return_values": dw["latest_values"],
+                        "window": list(obs_dates),
+                        "observation_dates": list(obs_dates),
+                        "observation_sources": obs_sources,
+                        "signal_cutoff": sig_cutoff,
+                        "signal_status": "generated",
+                        "signal_pause": None,
+                    }
+                    if rule_version == ACTUAL_OPEN_LOT_RULES:
+                        next_orders = _next_open_lot_orders(
+                            body,
+                            normalized,
+                            shares,
+                            fixed_amounts=fixed_amounts,
+                            symbol_order=execution.get("symbol_order", ETF_SYMBOLS),
+                        )
+                    else:
+                        next_orders = _next_orders(
+                            body,
+                            normalized,
+                            shares,
+                            cash,
+                            cash + market_value,
+                            fee_rate,
+                            slippage_rate,
+                        )
+                    target_changed = _target_changed(prior.get("signal_target"), normalized)
+                    if not next_orders and not target_changed:
+                        signal["opportunity"] = {
+                            "due": False,
+                            "reason": "no_target_change",
+                        }
+                    elif next_orders and not target_changed:
+                        signal["opportunity"] = {
+                            "due": False,
+                            "reason": "target_unchanged",
+                        }
+                else:
+                    sig_status = "no_target"
+        else:
+            sig_status = "disabled" if state != "enabled" else "no_next_session"
+        if monthly_deferral_enabled:
+            active_deferral, monthly_deferrals = close_month_end_deferral(
+                active_deferral,
+                monthly_deferrals,
+                session=session,
+                next_session=next_session,
+            )
+        decision_extra = {
+            "decision_policy": dec_policy,
+            "signal_cutoff": sig_cutoff,
+            "signal_status": sig_status,
+            "signal_pause": sig_pause,
+            "observation_dates": obs_dates,
+            "observation_sources": obs_sources,
+            **deferral_fields,
+        }
+    elif state == "enabled" and next_session is not None:
         window = body["session"]["derived_window"]
         if len(window["sessions"]) >= execution["signal_window_sessions"]:
             history_rows: list[dict[str, Any]] = []
@@ -3371,59 +4784,121 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
                     execution.get("strategy_spec", execution["strategy"]),
                     container_executor=execution.get("container_executor"),
                     evidence_callback=invocations.append,
+                    plugin_registry=execution.get("plugin_registry"),
                 )
-                weights = strategy(
-                    pd.DataFrame(history_rows),
-                    {"cash": cash, "shares": dict(shares), "equity": nav},
-                )
+                if stateful_active:
+                    from prajnatrade.decision_window import (
+                        build_strategy_state,
+                        compute_prior_close_weights,
+                        parse_strategy_output,
+                    )
+
+                    feed_sessions = body["session"].get("feed_sessions") or [session]
+                    prior_close_weights = compute_prior_close_weights(
+                        {"nav": nav, "positions": positions},
+                        shares,
+                        cash,
+                        receivable_total,
+                    )
+                    state_arg = build_strategy_state(
+                        signal_date=session,
+                        sessions=feed_sessions,
+                        cash=cash,
+                        shares=shares,
+                        equity=nav,
+                        prior_close_weights=prior_close_weights,
+                        rebalance_anchor_date=rebalance_anchor_date,
+                        previous_order_attempted=previous_order_attempted,
+                        last_filled_target=last_filled_target,
+                        last_monthly_filled_target=last_monthly_filled_target,
+                    )
+                else:
+                    state_arg = {"cash": cash, "shares": dict(shares), "equity": nav}
+                weights = strategy(pd.DataFrame(history_rows), state_arg)
             except IsolationError as error:
                 raise _Blocked(
                     "strategy_isolation_failed", f"The frozen container strategy failed: {error}",
                 ) from error
             except (ValueError, TypeError) as error:
+                from prajnatrade.plugins import PluginError
+
+                if isinstance(error, PluginError):
+                    raise _Blocked(error.code, error.message) from error
                 raise _Blocked(
                     "strategy_error",
                     f"The frozen strategy failed on the after-close signal input: {error}",
                 ) from error
             if weights is not None:
+                fixed_amounts = None
+                purpose = "rebalance"
+                cycle = session[:7]
                 try:
-                    normalized = _validate_weights(weights)
+                    if stateful_active:
+                        parsed_out = parse_strategy_output(weights, signal_date=session)
+                        if parsed_out is None:
+                            normalized = None
+                        else:
+                            normalized = parsed_out["weights"]
+                            purpose = parsed_out["purpose"]
+                            cycle = parsed_out["cycle"]
+                            fixed_amounts = parsed_out["fixed_amounts"]
+                    else:
+                        normalized = _validate_weights(weights)
                 except ValueError as error:
                     raise _Blocked(
                         "strategy_error",
                         f"The frozen strategy returned invalid target weights: {error}",
                     ) from error
-                signal = {
-                    "date": session,
-                    "execution_date": next_session,
-                    "target_weights": normalized,
-                    "total_return_values": latest_values,
-                    "window": list(window["sessions"]),
-                }
-                next_orders = _next_orders(
-                    body,
-                    normalized,
-                    shares,
-                    cash,
-                    cash + market_value,
-                    fee_rate,
-                    slippage_rate,
-                )
-                target_changed = _target_changed(prior.get("signal_target"), normalized)
-                if not next_orders and not target_changed:
-                    # The target required no order and did not change: record the
-                    # reason in the signal diagnostics, never an opportunity.
-                    signal["opportunity"] = {
-                        "due": False,
-                        "reason": "no_target_change",
+                if normalized is not None:
+                    if stateful_active:
+                        signal_meta = {
+                            "signal_date": session,
+                            "purpose": purpose,
+                            "cycle": cycle,
+                            "weights": normalized,
+                        }
+                    signal = {
+                        "date": session,
+                        "execution_date": next_session,
+                        "target_weights": normalized,
+                        **({"purpose": purpose, "cycle": cycle} if stateful_active else {}),
+                        **({"fixed_amounts": fixed_amounts} if fixed_amounts else {}),
+                        "total_return_values": latest_values,
+                        "window": list(window["sessions"]),
                     }
-                elif next_orders and not target_changed:
-                    # Price drift needed rebalancing orders but the strategy's
-                    # target is unchanged, so this is not a decision opportunity.
-                    signal["opportunity"] = {
-                        "due": False,
-                        "reason": "target_unchanged",
-                    }
+                    if rule_version == ACTUAL_OPEN_LOT_RULES:
+                        next_orders = _next_open_lot_orders(
+                            body,
+                            normalized,
+                            shares,
+                            fixed_amounts=fixed_amounts,
+                            symbol_order=execution.get("symbol_order", ETF_SYMBOLS),
+                        )
+                    else:
+                        next_orders = _next_orders(
+                            body,
+                            normalized,
+                            shares,
+                            cash,
+                            cash + market_value,
+                            fee_rate,
+                            slippage_rate,
+                        )
+                    target_changed = _target_changed(prior.get("signal_target"), normalized)
+                    if not next_orders and not target_changed:
+                        # The target required no order and did not change: record the
+                        # reason in the signal diagnostics, never an opportunity.
+                        signal["opportunity"] = {
+                            "due": False,
+                            "reason": "no_target_change",
+                        }
+                    elif next_orders and not target_changed:
+                        # Price drift needed rebalancing orders but the strategy's
+                        # target is unchanged, so this is not a decision opportunity.
+                        signal["opportunity"] = {
+                            "due": False,
+                            "reason": "target_unchanged",
+                        }
 
     # One due opportunity per decision point whose normalized target weights
     # changed from the version's previous signal target.  Drift-only orders are
@@ -3444,7 +4919,9 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
     )
 
     status = "committed"
-    if anomalies or any(order["status"] != "filled" for order in orders):
+    if anomalies or any(
+        order["status"] not in ("filled", "no_trade_required") for order in orders
+    ):
         status = "committed_with_anomalies"
     return {
         "schema_version": SCHEMA_VERSION,
@@ -3464,7 +4941,18 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
             "transaction_cost_bps": body["execution"]["transaction_cost_bps"],
             "slippage_bps": body["execution"]["slippage_bps"],
             "signal_window_sessions": body["execution"]["signal_window_sessions"],
+            **(
+                {"decision_policy": body["execution"]["decision_policy"]}
+                if "decision_policy" in body["execution"]
+                else {}
+            ),
+            **(
+                {"history_requirements": body["execution"]["history_requirements"]}
+                if "history_requirements" in body["execution"]
+                else {}
+            ),
         },
+        **decision_extra,
         "previous": {"date": prior["date"], "nav": prior["nav"]},
         "corporate_actions": applied,
         "dividends": {
@@ -3484,10 +4972,28 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
         "market_value": market_value,
         "dividend_receivables": receivable_total,
         "nav": nav,
+        **valuation_extra,
+        **settlement_extra,
         "fees": {"day": day_fees, "total": fees_total},
         "slippage": {"day": day_slippage, "total": slippage_total},
         "signal": signal,
         "next_orders": next_orders,
+        **(
+            {
+                "strategy_state": {
+                    "rebalance_anchor_date": rebalance_anchor_date,
+                    "last_filled_target": last_filled_target,
+                    "last_monthly_filled_target": last_monthly_filled_target,
+                    "previous_order_attempted": previous_order_attempted,
+                    "monthly_signal_cycle": monthly_signal_cycle,
+                    "active_deferral": active_deferral,
+                    "monthly_deferrals": monthly_deferrals,
+                },
+                **({"signal_meta": signal_meta} if signal_meta is not None else {}),
+            }
+            if stateful_active
+            else {}
+        ),
         "signal_target": (
             normalized if signal is not None else prior.get("signal_target")
         ),
@@ -3543,9 +5049,16 @@ def _next_orders(
     next_session = body["session"]["next_session"]
     raw = body["session"]["raw_bars"]
     deadline = _session_open(next_session)
-    submitted_at = _signal_point(session)
+    dec_policy = body.get("execution", {}).get("decision_policy")
+    if dec_policy is not None:
+        from prajnatrade.decision_window import decision_cutoff
+
+        close_cutoff = decision_cutoff(session, dec_policy)
+        submitted_at = close_cutoff.isoformat()
+    else:
+        submitted_at = _signal_point(session)
+        close_cutoff = _session_close(session)
     cost_multiplier = (1.0 + fee_rate) * (1.0 + slippage_rate)
-    close_cutoff = _session_close(session)
     intents: list[dict[str, Any]] = []
     sell_value = 0.0
     buy_cost = 0.0
@@ -3555,7 +5068,12 @@ def _next_orders(
         if weight <= _EPSILON and quantity_held <= _EPSILON:
             continue
         row = raw.get(symbol)
-        if not _valid_close(row, close_cutoff, data_kind=body.get("data_kind", DATA_KIND)):
+        if not _valid_close(
+            row,
+            close_cutoff,
+            data_kind=body.get("data_kind", DATA_KIND),
+            schema_version=body.get("feed_schema_version"),
+        ):
             raise _Blocked(
                 "missing_close",
                 f"{symbol} has no confirmed unadjusted close for order sizing.",
@@ -3611,3 +5129,340 @@ def _next_orders(
             }
         )
     return orders
+
+
+def _next_open_lot_orders(
+    body: dict[str, Any],
+    weights: dict[str, float],
+    shares: dict[str, float],
+    *,
+    fixed_amounts: Mapping[str, float] | None = None,
+    symbol_order: Sequence[str] = ETF_SYMBOLS,
+) -> list[dict[str, Any]]:
+    """Freeze pre-open target-weight / fixed-amount instructions without close sizing."""
+    session = body["date"]
+    next_session = body["session"]["next_session"]
+    deadline = _session_open(next_session)
+    dec_policy = body.get("execution", {}).get("decision_policy")
+    if dec_policy is not None:
+        from prajnatrade.decision_window import decision_cutoff
+
+        submitted_at = decision_cutoff(session, dec_policy).isoformat()
+    else:
+        submitted_at = _signal_point(session)
+    fixed_map = {
+        sym: float(val)
+        for sym, val in (fixed_amounts or {}).items()
+        if val is not None and float(val) > _EPSILON
+    }
+    orders: list[dict[str, Any]] = []
+    for symbol in symbol_order:
+        weight = float(weights.get(symbol, 0.0))
+        held = float(shares.get(symbol, 0.0))
+        if symbol in fixed_map:
+            mode = "fixed_amount"
+            identity = {
+                "version_id": body["version_id"],
+                "signal_date": session,
+                "symbol": symbol,
+                "order_sizing_mode": mode,
+                "fixed_amount": fixed_map[symbol],
+                "target_weight": weight,
+            }
+            orders.append(
+                {
+                    **identity,
+                    "order_id": "ord-" + _hash(identity)[:32],
+                    "execution_date": next_session,
+                    "submitted_at": submitted_at,
+                    "deadline": deadline.isoformat(),
+                }
+            )
+            continue
+        if weight <= _EPSILON and held <= _EPSILON:
+            continue
+        mode = "open_weight"
+        identity = {
+            "version_id": body["version_id"],
+            "signal_date": session,
+            "symbol": symbol,
+            "order_sizing_mode": mode,
+            "target_weight": weight,
+        }
+        orders.append(
+            {
+                **identity,
+                "order_id": "ord-" + _hash(identity)[:32],
+                "execution_date": next_session,
+                "submitted_at": submitted_at,
+                "deadline": deadline.isoformat(),
+            }
+        )
+    return orders
+
+
+def verify_or_migrate_ledger(
+    ledger_dir: str | Path,
+    version_id: str,
+    *,
+    new_start_date: str | None = None,
+    initial_cash: float | None = None,
+    initial_positions: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
+    """Verify or migrate a legacy Shadow ledger's stateful tracking state.
+
+    When ``new_start_date`` is omitted, reconstructs ``strategy_state`` from the
+    stored committed days if and only if it is uniquely reconstructible; otherwise
+    fails closed with ``STATE_NOT_UNIQUELY_RECONSTRUCTIBLE`` and preserves all
+    existing rows intact. When ``new_start_date`` is provided, preserves old rows
+    and records an explicit clean-start migration point.
+    """
+    database = Ledger(ledger_dir)
+    try:
+        rows = database.connection.execute(
+            "SELECT date, result_json, result_hash FROM days "
+            "WHERE version_id = ? ORDER BY date ASC",
+            (version_id,),
+        ).fetchall()
+        now_iso = _now()
+        if new_start_date is not None:
+            parsed_start = datetime.fromisoformat(new_start_date).date().isoformat()
+            last_date = rows[-1][0] if rows else None
+            if last_date is not None and parsed_start <= last_date:
+                raise ShadowRejection(
+                    "INVALID_NEW_START_DATE",
+                    "migrate_state",
+                    "provide a --new-start-date strictly after the last committed day",
+                    f"new_start_date {parsed_start} must be after last committed day {last_date}.",
+                )
+            if initial_cash is not None and (
+                not math.isfinite(float(initial_cash)) or float(initial_cash) < 0.0
+            ):
+                raise ShadowRejection(
+                    "INVALID_INITIAL_CASH",
+                    "migrate_state",
+                    "provide a finite non-negative --initial-cash",
+                    f"initial_cash must be finite and non-negative, got {initial_cash!r}.",
+                )
+            init_pos: dict[str, float] | None = None
+            if initial_positions is not None:
+                unknown = sorted(set(initial_positions) - set(ETF_SYMBOLS))
+                if unknown:
+                    raise ShadowRejection(
+                        "INVALID_INITIAL_POSITIONS",
+                        "migrate_state",
+                        "provide only supported ETF symbols in --initial-positions",
+                        f"Unsupported initial_positions symbols: {', '.join(unknown)}.",
+                    )
+                init_pos = {}
+                for symbol in ETF_SYMBOLS:
+                    qty = float(initial_positions.get(symbol, 0.0))
+                    if not math.isfinite(qty) or qty < 0.0:
+                        raise ShadowRejection(
+                            "INVALID_INITIAL_POSITIONS",
+                            "migrate_state",
+                            "provide finite non-negative quantities in --initial-positions",
+                            f"initial_positions[{symbol}] must be finite and non-negative.",
+                        )
+                    init_pos[symbol] = qty
+            clean_state = _initial_strategy_state()
+            database.connection.execute(
+                "INSERT OR REPLACE INTO state_migrations "
+                "(version_id, mode, migrated_from_date, new_start_date, initial_cash, initial_positions_json, strategy_state_json, created_at) "
+                "VALUES (?, 'clean_start', ?, ?, ?, ?, ?, ?)",
+                (
+                    version_id,
+                    last_date,
+                    parsed_start,
+                    float(initial_cash) if initial_cash is not None else None,
+                    _canonical(init_pos) if init_pos is not None else None,
+                    _canonical(clean_state),
+                    now_iso,
+                ),
+            )
+            return {
+                "version_id": version_id,
+                "status": "clean_start",
+                "preserved_through_date": last_date,
+                "new_start_date": parsed_start,
+                "initial_cash": float(initial_cash) if initial_cash is not None else None,
+                "initial_positions": init_pos,
+                "strategy_state": clean_state,
+            }
+
+        state = _initial_strategy_state()
+        signals_by_date: dict[str, dict[str, Any]] = {}
+        pending_zero_trade: dict[str, Any] | None = None
+        untyped_rebalances = 0
+        for day_str, raw_json, _ in rows:
+            res = json.loads(raw_json)
+            if "strategy_state" in res:
+                state = dict(res["strategy_state"])
+                pending_zero_trade = None
+                continue
+            if res.get("status") == "committed_with_anomalies":
+                raise ShadowRejection(
+                    "STATE_NOT_UNIQUELY_RECONSTRUCTIBLE",
+                    "migrate_state",
+                    "rerun shadow migrate-state with an explicit --new-start-date",
+                    f"Day {day_str} has committed_with_anomalies; strategy state cannot be uniquely reconstructed.",
+                )
+            orders = res.get("orders") or []
+            if orders:
+                pending_zero_trade = None
+                sig_dates = {o.get("signal_date") for o in orders}
+                if None in sig_dates or len(sig_dates) != 1:
+                    raise ShadowRejection(
+                        "STATE_NOT_UNIQUELY_RECONSTRUCTIBLE",
+                        "migrate_state",
+                        "rerun shadow migrate-state with an explicit --new-start-date",
+                        f"Day {day_str} has orders with missing or mixed signal_date.",
+                    )
+                sig_date = str(next(iter(sig_dates)))
+                all_ok = all(o.get("status") in ("filled", "no_trade_required") for o in orders)
+                origin_sig = signals_by_date.get(sig_date)
+                raw_purpose = (
+                    origin_sig.get("purpose") if isinstance(origin_sig, Mapping) else None
+                )
+                explicit_purpose = (
+                    str(raw_purpose)
+                    if isinstance(raw_purpose, str) and raw_purpose in STRATEGY_PURPOSES
+                    else None
+                )
+                if isinstance(origin_sig, Mapping) and isinstance(
+                    origin_sig.get("target_weights"), Mapping
+                ):
+                    target_w = {
+                        asset: float(origin_sig["target_weights"].get(asset, 0.0))
+                        for asset in (*ETF_SYMBOLS, CASH)
+                    }
+                else:
+                    target_w = {s: 0.0 for s in (*ETF_SYMBOLS, CASH)}
+                    for o in orders:
+                        sym = o.get("symbol")
+                        if sym in ETF_SYMBOLS and o.get("target_weight") is not None:
+                            target_w[sym] = float(o["target_weight"])
+                    target_w[CASH] = max(0.0, 1.0 - math.fsum(target_w[s] for s in ETF_SYMBOLS))
+                attempt_summary = {
+                    "signal_date": sig_date,
+                    "date": day_str,
+                    "status": "filled" if all_ok else "partially_filled",
+                    "batch_complete": all_ok,
+                    **({"purpose": explicit_purpose} if explicit_purpose is not None else {}),
+                }
+                if all_ok:
+                    if explicit_purpose is None:
+                        untyped_rebalances += 1
+                        if (
+                            untyped_rebalances > 1
+                            or state["last_monthly_filled_target"] is not None
+                        ):
+                            raise ShadowRejection(
+                                "STATE_NOT_UNIQUELY_RECONSTRUCTIBLE",
+                                "migrate_state",
+                                "rerun shadow migrate-state with an explicit --new-start-date",
+                                f"Multiple rebalance signals without explicit purpose metadata through {day_str}; "
+                                "last_monthly_filled_target cannot be uniquely reconstructed.",
+                            )
+                        purpose_for_advance = "rebalance"
+                    else:
+                        purpose_for_advance = explicit_purpose
+                    (
+                        state["rebalance_anchor_date"],
+                        state["last_filled_target"],
+                        state["last_monthly_filled_target"],
+                        state["previous_order_attempted"],
+                    ) = advance_rebalance_anchor(
+                        rebalance_anchor_date=state["rebalance_anchor_date"],
+                        last_filled_target=state["last_filled_target"],
+                        last_monthly_filled_target=state["last_monthly_filled_target"],
+                        attempt=attempt_summary,
+                        batch_ok=True,
+                        signal_date=sig_date,
+                        target_weights=target_w,
+                        purpose=purpose_for_advance,
+                    )
+                else:
+                    state["previous_order_attempted"] = attempt_summary
+            elif pending_zero_trade is not None:
+                zt_sig = pending_zero_trade
+                pending_zero_trade = None
+                sig_date = str(zt_sig["date"])
+                raw_purpose = zt_sig.get("purpose")
+                explicit_purpose = (
+                    str(raw_purpose)
+                    if isinstance(raw_purpose, str) and raw_purpose in STRATEGY_PURPOSES
+                    else None
+                )
+                target_w = {
+                    asset: float(zt_sig["target_weights"].get(asset, 0.0))
+                    for asset in (*ETF_SYMBOLS, CASH)
+                }
+                if explicit_purpose is None:
+                    untyped_rebalances += 1
+                    if (
+                        untyped_rebalances > 1
+                        or state["last_monthly_filled_target"] is not None
+                    ):
+                        raise ShadowRejection(
+                            "STATE_NOT_UNIQUELY_RECONSTRUCTIBLE",
+                            "migrate_state",
+                            "rerun shadow migrate-state with an explicit --new-start-date",
+                            f"Zero-trade rebalance signal on {sig_date} lacks explicit purpose metadata; "
+                            "last_monthly_filled_target cannot be uniquely reconstructed.",
+                        )
+                    purpose_for_advance = "rebalance"
+                else:
+                    purpose_for_advance = explicit_purpose
+                zt_attempt = {
+                    "signal_date": sig_date,
+                    "date": day_str,
+                    "status": "filled",
+                    "batch_complete": True,
+                    "zero_trade_satisfied": True,
+                    **({"purpose": explicit_purpose} if explicit_purpose is not None else {}),
+                }
+                (
+                    state["rebalance_anchor_date"],
+                    state["last_filled_target"],
+                    state["last_monthly_filled_target"],
+                    state["previous_order_attempted"],
+                ) = advance_rebalance_anchor(
+                    rebalance_anchor_date=state["rebalance_anchor_date"],
+                    last_filled_target=state["last_filled_target"],
+                    last_monthly_filled_target=state["last_monthly_filled_target"],
+                    attempt=zt_attempt,
+                    batch_ok=True,
+                    signal_date=sig_date,
+                    target_weights=target_w,
+                    purpose=purpose_for_advance,
+                )
+            sig = res.get("signal")
+            if isinstance(sig, Mapping) and isinstance(sig.get("date"), str):
+                signals_by_date[sig["date"]] = dict(sig)
+                if not (res.get("next_orders") or []):
+                    opp = sig.get("opportunity")
+                    if (
+                        not (isinstance(opp, Mapping) and opp.get("reason") == "no_target_change")
+                        and isinstance(sig.get("target_weights"), Mapping)
+                    ):
+                        pending_zero_trade = dict(sig)
+                    else:
+                        pending_zero_trade = None
+                else:
+                    pending_zero_trade = None
+        last_date = rows[-1][0] if rows else None
+        database.connection.execute(
+            "INSERT OR REPLACE INTO state_migrations "
+            "(version_id, mode, migrated_from_date, new_start_date, initial_cash, initial_positions_json, strategy_state_json, created_at) "
+            "VALUES (?, 'reconstructed', ?, NULL, NULL, NULL, ?, ?)",
+            (version_id, last_date, _canonical(state), now_iso),
+        )
+        return {
+            "version_id": version_id,
+            "status": "reconstructed",
+            "migrated_from_date": last_date,
+            "strategy_state": state,
+        }
+    finally:
+        database.close()

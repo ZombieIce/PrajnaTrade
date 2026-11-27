@@ -57,7 +57,7 @@ from prajnatrade.snapshot_baseline import (
     run_partition_strategy,
     valuation_policy_version,
 )
-from prajnatrade.strategies import make_strategy
+from prajnatrade.strategies import STRATEGY_FAMILIES, make_strategy
 from prajnatrade.validation import make_robustness_plan
 
 SCHEMA_VERSION = 1
@@ -224,6 +224,19 @@ def _hash(value: object) -> str:
 
 def _bytes(value: object) -> bytes:
     return snapshot._bytes(value)
+
+
+def _reject_local_plugin(
+    strategy: dict[str, Any], *, as_value_error: bool = False
+) -> None:
+    if (
+        strategy.get("plugin") is not None
+        or strategy.get("family") not in (*STRATEGY_FAMILIES, "python")
+    ):
+        message = "Local plugin strategies are not allowed in protected evaluation."
+        if as_value_error:
+            raise ValueError(f"PLUGIN_NOT_ALLOWED_IN_PROTECTED_EVAL: {message}")
+        raise _reject("PLUGIN_NOT_ALLOWED_IN_PROTECTED_EVAL", "run", "stop", message)
 
 
 def _store(path: str | Path) -> Path:
@@ -778,6 +791,11 @@ def _build_plan(
     if not isinstance(evaluation, dict) or evaluation.get("snapshot_id") != snapshot_id:
         raise ValueError("The frozen candidate snapshot reference is inconsistent.")
     schema_version = metadata.get("schema_version")
+    if evaluation.get("decision_policy") is not None:
+        raise _invalid(
+            f"Protected Evaluation does not support decision policy "
+            f"{evaluation['decision_policy'].get('version')!r}."
+        )
     problem = _protected_protocol_problem(schema_version, candidate["execution_rules"])
     if problem is not None:
         raise _invalid(problem)
@@ -798,6 +816,7 @@ def _build_plan(
     if data_kind == "real" and not payload["thresholds"]:
         raise _invalid("Real Validation requires preregistered hard thresholds.")
     family = candidate["strategy"]["family"]
+    _reject_local_plugin(candidate["strategy"], as_value_error=True)
     neighbourhood = _neighbourhood(candidate)
     executor_config = evaluation.get("strategy_executor", {"kind": "none"})
     if evaluation.get("runtime") != runtime_identity(
@@ -3101,6 +3120,7 @@ def run_evaluation(
             f"The frozen snapshot manifest could not be verified: {error}",
         )
     schema_version = metadata.get("schema_version")
+    _reject_local_plugin(plan["candidate"]["strategy"])
     problem = _protected_protocol_problem(schema_version, plan["execution_rules"])
     if problem is not None:
         reject("UNSUPPORTED_PROTECTED_PROTOCOL", problem, next_action="stop")
@@ -3489,6 +3509,7 @@ def _research_run_context(
     evaluation = plan["candidate"]["evaluation"]
     metadata = snapshot.manifest(snapshot_store, plan["snapshot_id"])
     schema_version = metadata.get("schema_version")
+    _reject_local_plugin(plan["candidate"]["strategy"])
     problem = _protected_protocol_problem(schema_version, plan["execution_rules"])
     if problem is not None:
         raise _reject("UNSUPPORTED_PROTECTED_PROTOCOL", "run", "stop", problem)

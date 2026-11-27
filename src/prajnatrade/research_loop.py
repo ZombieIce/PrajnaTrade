@@ -99,6 +99,7 @@ from prajnatrade.experiment import (
 )
 from prajnatrade.research_direction import direction_id
 from prajnatrade.snapshot_baseline import (
+    ACTUAL_OPEN_LOT_RULES,
     ACTUAL_OPEN_RULES,
     EXECUTION_PRICE_BASIS,
     NEXT_OPEN_RULES,
@@ -968,6 +969,8 @@ def _locked_strategy(attempt: Mapping[str, Any]) -> dict[str, Any]:
         "family": strategy["family"],
         "parameters": attempt["parameters"],
     }
+    if "plugin" in strategy:
+        locked["plugin"] = dict(strategy["plugin"])
     if strategy["family"] == "python":
         locked["source"] = strategy["source"]
         if "source_sha256" in strategy:
@@ -1189,6 +1192,11 @@ def submit(
                 "runtime": evaluation["runtime"],
                 "strategy": strategy,
                 **(
+                    {"decision_policy": evaluation["decision_policy"]}
+                    if evaluation.get("decision_policy") is not None
+                    else {}
+                ),
+                **(
                     {
                         "protocol": record["kickoff"]["protocol"],
                         "research_partition": record["kickoff"]["research_partition"],
@@ -1232,14 +1240,20 @@ def submit(
 
 
 def _strategy_from_locked(
-    strategy: Mapping[str, Any], executor: Mapping[str, Any],
+    strategy: Mapping[str, Any],
+    executor: Mapping[str, Any],
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ):
     spec: dict[str, Any] = {
         "family": strategy["family"],
         "parameters": strategy["parameters"],
     }
+    if "plugin" in strategy:
+        spec["plugin"] = strategy["plugin"]
+        return make_strategy(spec, plugin_registry=plugin_registry)
     if strategy["family"] != "python":
-        return make_strategy(spec)
+        return make_strategy(spec, plugin_registry=plugin_registry)
     source = strategy["source"]
     if "source_sha256" in strategy:
         digest = hashlib.sha256(str(strategy["source"]).encode("utf-8")).hexdigest()
@@ -1274,6 +1288,8 @@ def _evidence_runs(
     submission: Mapping[str, Any],
     campaign: Mapping[str, Any],
     source: Mapping[str, Any],
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run the locked candidate and the benchmark over one Discovery source."""
     kickoff = record["kickoff"]
@@ -1304,6 +1320,9 @@ def _evidence_runs(
     rules = locked["execution_rules"]
     rule_version = rules.get("version", NEXT_OPEN_RULES)
     valuation_version = valuation_policy_version(rules)
+    decision_policy = locked.get("decision_policy")
+    lot_sizes = rules.get("execution", {}).get("lot_sizes")
+    symbol_order = rules.get("execution", {}).get("symbol_order")
     options = {
         "data_kind": source["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
@@ -1313,10 +1332,15 @@ def _evidence_runs(
         "slippage_bps": locked["base_costs"]["slippage_bps"],
         "execution_rule_version": rule_version,
         "valuation_policy_version": valuation_version,
+        "lot_sizes": lot_sizes,
+        "symbol_order": symbol_order,
         "history_requirements": locked["history_requirements"],
         "scoring_start": scoring_start,
+        "decision_policy": decision_policy,
     }
-    strategy = _strategy_from_locked(locked["strategy"], locked["strategy_executor"])
+    strategy = _strategy_from_locked(
+        locked["strategy"], locked["strategy_executor"], plugin_registry=plugin_registry,
+    )
     candidate = run_partition_strategy(
         data,
         source["snapshot_id"],
@@ -1335,8 +1359,11 @@ def _evidence_runs(
         slippage_bps=locked["base_costs"]["slippage_bps"],
         execution_rule_version=rule_version,
         valuation_policy_version=valuation_version,
+        lot_sizes=lot_sizes,
+        symbol_order=symbol_order,
         history_requirements=[],
         scoring_start=scoring_start,
+        decision_policy=decision_policy,
     )
     return {
         "candidate": candidate,
@@ -1366,6 +1393,8 @@ def _replay(
     submission: Mapping[str, Any],
     campaign: Mapping[str, Any],
     evidence: Mapping[str, Any] | None = None,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     evaluation = campaign["evaluation"]
     source = evidence if evidence is not None else {
@@ -1373,7 +1402,9 @@ def _replay(
         "partition_content_hash": evaluation["partition_content_hash"],
         "data_kind": evaluation["data_kind"],
     }
-    runs = _evidence_runs(snapshot_store, record, submission, campaign, source)
+    runs = _evidence_runs(
+        snapshot_store, record, submission, campaign, source, plugin_registry=plugin_registry,
+    )
     experiment = _experiment_result(
         project, record["campaign_id"], submission["experiment_id"]
     )
@@ -1930,10 +1961,12 @@ def _receipt(
         "version", NEXT_OPEN_RULES
     )
     valuation_version = valuation_policy_version(submission["locked"]["execution_rules"])
+    decision_policy = submission["locked"].get("decision_policy")
     if (
         (type(snapshot_schema_version) is int and snapshot_schema_version >= 3)
-        or execution_rule_version == ACTUAL_OPEN_RULES
+        or execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES)
         or valuation_version != STRICT_CLOSE_VALUATION
+        or decision_policy is not None
     ):
         provenance = {
             "snapshot_id": replay["snapshot"]["snapshot_id"],
@@ -1941,8 +1974,18 @@ def _receipt(
             "execution_rule_version": execution_rule_version,
             "price_basis": EXECUTION_PRICE_BASIS,
         }
+        if execution_rule_version == ACTUAL_OPEN_LOT_RULES:
+            exec_rules = submission["locked"]["execution_rules"].get("execution", {})
+            if "lot_sizes" in exec_rules:
+                provenance["lot_sizes"] = dict(exec_rules["lot_sizes"])
+            if "daily_simulation_assumptions" in exec_rules:
+                provenance["daily_simulation_assumptions"] = dict(
+                    exec_rules["daily_simulation_assumptions"]
+                )
         if valuation_version != STRICT_CLOSE_VALUATION:
             provenance["valuation_policy_version"] = valuation_version
+        if decision_policy is not None:
+            provenance["decision_policy"] = decision_policy
         receipt["provenance"] = provenance
     if corrected is not None:
         receipt.update(dict(corrected))
@@ -2466,6 +2509,7 @@ def _formal_runs(
     read_as_of: str | None = None,
     frozen_read: bool = True,
     snapshot_id: str | None = None,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Score the locked candidate and benchmark on the trailing segment only."""
     split = _formal_split(record)
@@ -2522,6 +2566,9 @@ def _formal_runs(
     rules = locked["execution_rules"]
     rule_version = rules.get("version", NEXT_OPEN_RULES)
     valuation_version = valuation_policy_version(rules)
+    decision_policy = locked.get("decision_policy")
+    lot_sizes = rules.get("execution", {}).get("lot_sizes")
+    symbol_order = rules.get("execution", {}).get("symbol_order")
     options = {
         "data_kind": evaluation["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
@@ -2531,10 +2578,15 @@ def _formal_runs(
         "slippage_bps": locked["base_costs"]["slippage_bps"],
         "execution_rule_version": rule_version,
         "valuation_policy_version": valuation_version,
+        "lot_sizes": lot_sizes,
+        "symbol_order": symbol_order,
         "history_requirements": list(locked["history_requirements"] or []),
         "scoring_start": scoring_start,
+        "decision_policy": decision_policy,
     }
-    strategy = _strategy_from_locked(locked["strategy"], locked["strategy_executor"])
+    strategy = _strategy_from_locked(
+        locked["strategy"], locked["strategy_executor"], plugin_registry=plugin_registry,
+    )
     candidate = run_partition_strategy(
         data,
         evaluation["snapshot_id"],
@@ -2553,8 +2605,11 @@ def _formal_runs(
         slippage_bps=locked["base_costs"]["slippage_bps"],
         execution_rule_version=rule_version,
         valuation_policy_version=valuation_version,
+        lot_sizes=lot_sizes,
+        symbol_order=symbol_order,
         history_requirements=[],
         scoring_start=scoring_start,
+        decision_policy=decision_policy,
     )
     readiness = candidate.get("history_readiness") or {}
     warmup = {
@@ -2706,6 +2761,7 @@ def _formal_receipt(
         "valued_sessions": candidate_metrics["valued_sessions"],
     }
     valuation_version = valuation_policy_version(submission["locked"]["execution_rules"])
+    decision_policy = submission["locked"].get("decision_policy")
     provenance = {
         "snapshot_id": runs["snapshot"]["snapshot_id"],
         "partition_content_hash": runs["snapshot"]["partition_content_hash"],
@@ -2726,8 +2782,27 @@ def _formal_receipt(
         ),
         "price_basis": EXECUTION_PRICE_BASIS,
         **(
+            {
+                "lot_sizes": dict(
+                    submission["locked"]["execution_rules"].get("execution", {}).get("lot_sizes", {})
+                ),
+                "daily_simulation_assumptions": dict(
+                    submission["locked"]["execution_rules"]
+                    .get("execution", {})
+                    .get("daily_simulation_assumptions", {"late_resume_sell_funds_same_day_buy": True})
+                ),
+            }
+            if submission["locked"]["execution_rules"].get("version") == ACTUAL_OPEN_LOT_RULES
+            else {}
+        ),
+        **(
             {"valuation_policy_version": valuation_version}
             if valuation_version != STRICT_CLOSE_VALUATION
+            else {}
+        ),
+        **(
+            {"decision_policy": decision_policy}
+            if decision_policy is not None
             else {}
         ),
     }
@@ -2749,6 +2824,11 @@ def _formal_receipt(
                 "end": split["partition"]["end"],
                 "sessions": split["partition"]["sessions"],
             },
+            **(
+                {"decision_policy": decision_policy}
+                if decision_policy is not None
+                else {}
+            ),
         },
         "development": dict(split["development"]),
         "trailing": dict(split["trailing"]),
@@ -3388,12 +3468,49 @@ def _submission(
     return body
 
 
+def _resolve_round_plugins(
+    project: Path,
+    plugin_config: Path | None = None,
+    plugin_specs: tuple[str, ...] | list[str] = (),
+) -> dict[str, dict[str, Any]]:
+    from prajnatrade.experiment import load_project_plugin_registry
+    from prajnatrade.plugins import load_plugin_registry
+
+    registry = load_project_plugin_registry(project)
+    explicit = load_plugin_registry(plugin_config=plugin_config, plugin_specs=plugin_specs)
+    if explicit:
+        registry = {**registry, **explicit}
+    return registry
+
+
+def _verify_locked_plugin(
+    submission: Mapping[str, Any],
+    plugin_registry: Mapping[str, Mapping[str, Any]],
+) -> None:
+    from prajnatrade.plugins import PluginError, verify_plugin_identity
+    from prajnatrade.strategies import STRATEGY_FAMILIES
+
+    strategy = submission["locked"]["strategy"]
+    family = strategy["family"]
+    if "plugin" not in strategy and family in (*STRATEGY_FAMILIES, "python"):
+        return
+    if "plugin" not in strategy or not isinstance(strategy["plugin"], Mapping):
+        raise PluginError(
+            "PLUGIN_NOT_REGISTERED",
+            f"Locked strategy {family!r} is missing its frozen plugin identity.",
+        )
+    verify_plugin_identity(strategy["plugin"], plugin_registry)
+
+
 def validate(
     project: Path,
     store: Path,
     snapshot_store: Path,
     round_id: str,
     version_id: str,
+    *,
+    plugin_config: Path | None = None,
+    plugin_specs: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
     """Validate a locked version under the round's recorded protocol.
 
@@ -3485,6 +3602,16 @@ def validate(
                     "runtime to resume.",
                 )
             attempts = _attempt_rows(connection, validation_id)
+            plugin_registry = _resolve_round_plugins(project, plugin_config, plugin_specs)
+            if recovered is None:
+                from prajnatrade.plugins import PluginError
+
+                try:
+                    _verify_locked_plugin(submission, plugin_registry)
+                except PluginError as error:
+                    raise ProtocolError(
+                        error.code, "validation", "correct", error.message,
+                    ) from error
             discovery_precheck: dict[str, Any] | None = None
             if formal and recovered is None:
                 # The summary and frozen scoring premises are checked before
@@ -3549,7 +3676,9 @@ def validate(
         elif formal:
             if use is None:
                 raise ValueError("The formal Validation use was not reserved.")
-            runs = _formal_runs(snapshot_store, record, submission, campaign)
+            runs = _formal_runs(
+                snapshot_store, record, submission, campaign, plugin_registry=plugin_registry,
+            )
             receipt = _formal_receipt(
                 record,
                 submission,
@@ -3559,7 +3688,10 @@ def validate(
                 discovery_precheck=discovery_precheck,
             )
         else:
-            replay = _replay(project, snapshot_store, record, submission, campaign)
+            replay = _replay(
+                project, snapshot_store, record, submission, campaign,
+                plugin_registry=plugin_registry,
+            )
             receipt = _receipt(
                 record,
                 submission,
@@ -4584,6 +4716,16 @@ def _tracking_artifact(
             "history_policy": locked["history_policy"],
             "strategy_executor": locked["strategy_executor"],
             "runtime": locked["runtime"],
+            **(
+                {"decision_policy": locked["decision_policy"]}
+                if locked.get("decision_policy") is not None
+                else {}
+            ),
+            **(
+                {"history_requirements": list(locked["history_requirements"] or [])}
+                if locked.get("decision_policy") is not None or locked.get("history_requirements")
+                else {}
+            ),
         },
         "initial_cash": locked["base_costs"]["initial_cash"],
         "observation": body["observation"],
@@ -5415,6 +5557,91 @@ def _revalidation_body(
     return body
 
 
+def _require_revalidation_eligible(
+    submission: Mapping[str, Any],
+    prior: Mapping[str, Any],
+    campaign: Mapping[str, Any],
+    plugin_registry: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Enforce #75 platform-fix revalidation eligibility before re-running."""
+    from prajnatrade.plugins import PluginError, verify_plugin_identity
+    from prajnatrade.strategies import STRATEGY_FAMILIES, normalize_strategy_spec
+
+    if prior.get("version_id") != submission["version_id"] or (
+        "strategy_fingerprint" in prior
+        and prior["strategy_fingerprint"] != submission["strategy_fingerprint"]
+    ):
+        raise ProtocolError(
+            "REVALIDATION_INELIGIBLE",
+            "revalidation",
+            "correct",
+            "PRIOR_IDENTITY_UNVERIFIABLE: prior receipt identity does not match locked version.",
+        )
+    locked = submission["locked"]
+    evaluation = campaign["evaluation"]
+    if locked["execution_rules"] != evaluation["execution_rules"]:
+        raise ProtocolError(
+            "REVALIDATION_INELIGIBLE",
+            "revalidation",
+            "correct",
+            "EXECUTION_RULES_CHANGED: frozen execution/valuation/lot rules differ from Campaign.",
+        )
+    if locked.get("decision_policy") != evaluation.get("decision_policy"):
+        raise ProtocolError(
+            "REVALIDATION_INELIGIBLE",
+            "revalidation",
+            "correct",
+            "DECISION_POLICY_CHANGED: frozen decision policy differs from Campaign.",
+        )
+    strategy = locked["strategy"]
+    family = strategy["family"]
+    if "plugin" in strategy or family not in (*STRATEGY_FAMILIES, "python"):
+        frozen_plugin = strategy.get("plugin")
+        if (
+            not isinstance(frozen_plugin, Mapping)
+            or not frozen_plugin.get("plugin_id")
+            or not frozen_plugin.get("dependencies_hash")
+        ):
+            raise ProtocolError(
+                "REVALIDATION_INELIGIBLE",
+                "revalidation",
+                "correct",
+                "PRIOR_IDENTITY_UNVERIFIABLE: locked plugin source identity is missing.",
+            )
+        try:
+            verify_plugin_identity(frozen_plugin, plugin_registry)
+        except PluginError as error:
+            raise ProtocolError(
+                "REVALIDATION_INELIGIBLE",
+                "revalidation",
+                "correct",
+                f"{error.code}: {error.message}",
+            ) from error
+    if family == "python":
+        source_text = strategy.get("source")
+        source_hash = strategy.get("source_sha256")
+        if (
+            not isinstance(source_text, str)
+            or not source_hash
+            or hashlib.sha256(source_text.encode("utf-8")).hexdigest() != source_hash
+        ):
+            raise ProtocolError(
+                "REVALIDATION_INELIGIBLE",
+                "revalidation",
+                "correct",
+                "PRIOR_IDENTITY_UNVERIFIABLE: locked Python source identity is unverifiable.",
+            )
+    try:
+        normalize_strategy_spec(strategy, plugin_registry=plugin_registry)
+    except (ValueError, TypeError) as error:
+        raise ProtocolError(
+            "REVALIDATION_INELIGIBLE",
+            "revalidation",
+            "correct",
+            f"PRIOR_IDENTITY_UNVERIFIABLE: {error}",
+        ) from error
+
+
 def revalidate(
     project: Path,
     store: Path,
@@ -5423,6 +5650,9 @@ def revalidate(
     version_id: str,
     reason: str,
     evidence_snapshot_id: str | None = None,
+    *,
+    plugin_config: Path | None = None,
+    plugin_specs: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
     """Recompute lightweight Validation after the evidence source or platform changed.
 
@@ -5487,6 +5717,8 @@ def revalidate(
             if formal and use is None:
                 raise ValueError("The formal Validation use for this version is missing.")
             campaign = campaign_discovery(project, record["campaign_id"])
+            plugin_registry = _resolve_round_plugins(project, plugin_config, plugin_specs)
+            _require_revalidation_eligible(submission, prior, campaign, plugin_registry)
             locked_snapshot_id = submission["locked"]["snapshot_id"]
             corrected_evidence = _corrected_evidence(
                 snapshot_store,
@@ -5606,6 +5838,7 @@ def revalidate(
                 read_as_of=evidence.get("as_of"),
                 frozen_read=False,
                 snapshot_id=evidence["snapshot_id"],
+                plugin_registry=plugin_registry,
             )
             receipt = _formal_receipt(
                 record,
@@ -5637,10 +5870,12 @@ def revalidate(
             )
         elif corrected:
             recomputed = _evidence_runs(
-                snapshot_store, record, submission, campaign, evidence
+                snapshot_store, record, submission, campaign, evidence,
+                plugin_registry=plugin_registry,
             )
             replay = _evidence_runs(
-                snapshot_store, record, submission, campaign, evidence
+                snapshot_store, record, submission, campaign, evidence,
+                plugin_registry=plugin_registry,
             )
             original = _experiment_result(
                 project, record["campaign_id"], submission["experiment_id"]

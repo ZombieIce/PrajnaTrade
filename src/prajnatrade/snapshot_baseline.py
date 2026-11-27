@@ -19,8 +19,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_left
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any
@@ -35,7 +34,26 @@ from prajnatrade.backtest import (
     equal_weight_buy_and_hold,
 )
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.decision_window import (
+    advance_rebalance_anchor,
+    build_strategy_state,
+    close_expired_deferral,
+    close_month_end_deferral,
+    compute_prior_close_weights,
+    consume_monthly_deferral,
+    maybe_trigger_monthly_deferral,
+    parse_strategy_output,
+    scheduled_monthly_session,
+    select_common_observations,
+)
+from prajnatrade.lot_execution import (
+    classify_unfilled_reason,
+    match_open_lot_day,
+)
 from prajnatrade.snapshot import read_discovery
+from prajnatrade.trading_status import (
+    ACTUAL_OPEN_LOT_RULES as ACTUAL_OPEN_LOT_RULES,
+)
 from prajnatrade.trading_status import (
     ACTUAL_OPEN_RULES as ACTUAL_OPEN_RULES,
 )
@@ -64,14 +82,12 @@ from prajnatrade.trading_status import (
     VALUATION_POLICY_VERSIONS as VALUATION_POLICY_VERSIONS,
 )
 from prajnatrade.trading_status import (
-    confirmed_no_trade_shape,
-    halt_conflicts_with_trade,
-    halt_conflicts_with_volume,
     halt_covers_session,
 )
 from prajnatrade.trading_status import (
     valuation_policy_version as valuation_policy_version,
 )
+from prajnatrade.valuation import CarryState, value_carry_forward_session
 
 _CN_TZ = CN_TZ  # backward-compatible private alias
 _TARGET_WEIGHTS = {symbol: 1.0 / len(ETF_SYMBOLS) for symbol in ETF_SYMBOLS}
@@ -91,9 +107,13 @@ def run_discovery_strategy(
     slippage_bps: float = 0.0,
     execution_rule_version: str = NEXT_OPEN_RULES,
     valuation_policy_version: str = STRICT_CLOSE_VALUATION,
+    lot_sizes: Mapping[str, int] | None = None,
+    symbol_order: Sequence[str] | None = None,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
+    schema_version: int | None = None,
 ) -> dict[str, Any]:
     """Run a strategy with point-in-time signals and formal Discovery accounting."""
     return run_partition_strategy(
@@ -110,8 +130,12 @@ def run_discovery_strategy(
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rule_version,
         valuation_policy_version=valuation_policy_version,
+        lot_sizes=lot_sizes,
+        symbol_order=symbol_order,
         history_requirements=history_requirements,
         scoring_start=scoring_start,
+        decision_policy=decision_policy,
+        schema_version=schema_version,
     )
 
 
@@ -162,8 +186,12 @@ def run_partition_strategy(
     slippage_bps: float = 0.0,
     execution_rule_version: str = NEXT_OPEN_RULES,
     valuation_policy_version: str = STRICT_CLOSE_VALUATION,
+    lot_sizes: Mapping[str, int] | None = None,
+    symbol_order: Sequence[str] | None = None,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
+    schema_version: int | None = None,
 ) -> dict[str, Any]:
     """Run a strategy over one sealed partition with formal accounting.
 
@@ -183,6 +211,16 @@ def run_partition_strategy(
         raise ValueError("signal_window_sessions must be positive.")
     if not isinstance(partition_name, str) or not partition_name.strip():
         raise ValueError("partition_name must be a nonempty string.")
+    resolved_schema_version = (
+        schema_version
+        if schema_version is not None
+        else (
+            data.get("schema_version")
+            if isinstance(data.get("schema_version"), int)
+            and not isinstance(data.get("schema_version"), bool)
+            else None
+        )
+    )
     sessions = sorted({row["date"] for row in data["calendar"]})
     if not sessions:
         raise ValueError(f"The {partition_name} partition has no trading sessions.")
@@ -214,11 +252,13 @@ def run_partition_strategy(
     unresolved_actions: dict[str, list[dict[str, str]]] = {
         symbol: [] for symbol in ETF_SYMBOLS
     }
-    carry_states: dict[str, _CarryState] = {
-        symbol: _CarryState() for symbol in ETF_SYMBOLS
+    carry_states: dict[str, CarryState] = {
+        symbol: CarryState() for symbol in ETF_SYMBOLS
     }
     signals: list[dict[str, Any]] = []
     signal_gaps: list[dict[str, Any]] = []
+    signal_pauses: list[dict[str, Any]] = []
+    decision_records: list[dict[str, Any]] = []
     first_scored_open = None
     first_ready_date = None
     history_gaps: list[dict[str, Any]] = []
@@ -233,10 +273,29 @@ def run_partition_strategy(
     fee_rate = transaction_cost_bps / 10_000.0
     slippage_rate = slippage_bps / 10_000.0
     pending: tuple[dict[str, Any], dict[str, float]] | None = None
+    stateful_active = (
+        decision_policy is not None or execution_rule_version == ACTUAL_OPEN_LOT_RULES
+    )
+    monthly_deferral_enabled = bool(
+        decision_policy is not None and decision_policy.get("monthly_deferral")
+    )
+    scheduled_month_idx = scheduled_monthly_session(decision_policy)
+    rebalance_anchor_date: str | None = None
+    last_filled_target: dict[str, float] | None = None
+    last_monthly_filled_target: dict[str, float] | None = None
+    previous_order_attempted: dict[str, Any] | None = None
+    rebalance_anchors: list[dict[str, Any]] = []
+    monthly_signal_cycle: str | None = None
+    active_deferral: dict[str, Any] | None = None
+    monthly_deferrals: list[dict[str, Any]] = []
 
     for day_index, day in enumerate(sessions):
+        if monthly_deferral_enabled:
+            active_deferral, monthly_deferrals = close_expired_deferral(
+                active_deferral, monthly_deferrals, current_cycle=day[:7]
+            )
         ready = False
-        if history_requirements is not None:
+        if history_requirements is not None and decision_policy is None:
             readiness, windows, observation_values = _history_at_open(
                 history_sessions, history_derived, day, history_requirements,
             )
@@ -246,14 +305,40 @@ def run_partition_strategy(
             if ready:
                 if first_ready_date is None:
                     first_ready_date = day
-                state = {
-                    "cash": cash,
-                    "shares": dict(shares),
-                    "equity": equity_curve[-1]["nav"] if equity_curve else cash,
-                    "history_windows": {
-                        indicator: list(days) for indicator, days in windows.items()
-                    },
-                }
+                if stateful_active:
+                    prev_nav_point = equity_curve[-1] if equity_curve else None
+                    receivable_total_pre = math.fsum(item["amount"] for item in receivables)
+                    prior_close_w = (
+                        compute_prior_close_weights(
+                            prev_nav_point, shares, cash, receivable_total_pre
+                        )
+                        if prev_nav_point is not None
+                        else {**{symbol: 0.0 for symbol in ETF_SYMBOLS}, "CASH": 1.0}
+                    )
+                    state = build_strategy_state(
+                        signal_date=day,
+                        sessions=history_sessions,
+                        cash=cash,
+                        shares=shares,
+                        equity=prev_nav_point["nav"] if prev_nav_point else cash,
+                        prior_close_weights=prior_close_w,
+                        rebalance_anchor_date=rebalance_anchor_date,
+                        previous_order_attempted=previous_order_attempted,
+                        last_filled_target=last_filled_target,
+                        last_monthly_filled_target=last_monthly_filled_target,
+                        history_windows={
+                            indicator: list(days) for indicator, days in windows.items()
+                        },
+                    )
+                else:
+                    state = {
+                        "cash": cash,
+                        "shares": dict(shares),
+                        "equity": equity_curve[-1]["nav"] if equity_curve else cash,
+                        "history_windows": {
+                            indicator: list(days) for indicator, days in windows.items()
+                        },
+                    }
                 observation_days = sorted(observation_values)
                 history_rows = [
                     {"date": observation_day, "symbol": symbol, "close": value}
@@ -263,20 +348,47 @@ def run_partition_strategy(
                 history = pd.DataFrame(history_rows, columns=["date", "symbol", "close"])
                 weights = strategy(history, state)
                 if weights is not None:
-                    normalized = _validate_weights(weights)
-                    signal = {
-                        "date": day,
-                        "decision_date": day,
-                        "execution_date": day,
-                        "target_weights": normalized,
-                        "total_return_values": (
-                            observation_values[observation_days[-1]] if observation_days else {}
-                        ),
-                        "window": observation_days,
-                        "history_windows": windows,
-                    }
-                    signals.append(signal)
-                    pending = (signal, normalized)
+                    if stateful_active:
+                        parsed_out = parse_strategy_output(weights, signal_date=day)
+                        if parsed_out is not None:
+                            normalized = parsed_out["weights"]
+                            signal = {
+                                "date": day,
+                                "decision_date": day,
+                                "execution_date": day,
+                                "target_weights": normalized,
+                                "purpose": parsed_out["purpose"],
+                                "cycle": parsed_out["cycle"],
+                                **(
+                                    {"fixed_amounts": parsed_out["fixed_amounts"]}
+                                    if parsed_out["fixed_amounts"]
+                                    else {}
+                                ),
+                                "total_return_values": (
+                                    observation_values[observation_days[-1]]
+                                    if observation_days
+                                    else {}
+                                ),
+                                "window": observation_days,
+                                "history_windows": windows,
+                            }
+                            signals.append(signal)
+                            pending = (signal, normalized)
+                    else:
+                        normalized = _validate_weights(weights)
+                        signal = {
+                            "date": day,
+                            "decision_date": day,
+                            "execution_date": day,
+                            "target_weights": normalized,
+                            "total_return_values": (
+                                observation_values[observation_days[-1]] if observation_days else {}
+                            ),
+                            "window": observation_days,
+                            "history_windows": windows,
+                        }
+                        signals.append(signal)
+                        pending = (signal, normalized)
             else:
                 history_gaps.append(readiness)
                 missing = {
@@ -331,7 +443,22 @@ def run_partition_strategy(
                 for symbol in ETF_SYMBOLS
                 if (row := raw_bars.get((day, symbol))) is not None
             }
-            if execution_rule_version == ACTUAL_OPEN_RULES:
+            if execution_rule_version == ACTUAL_OPEN_LOT_RULES:
+                attempt, day_fills, cash, shares, costs = match_open_lot_day(
+                    day,
+                    signal,
+                    weights,
+                    open_prices,
+                    raw_bars,
+                    cash,
+                    shares,
+                    fee_rate,
+                    slippage_rate,
+                    lot_sizes=lot_sizes,
+                    symbol_order=symbol_order or ETF_SYMBOLS,
+                    fixed_amounts=signal.get("fixed_amounts"),
+                )
+            elif execution_rule_version == ACTUAL_OPEN_RULES:
                 # Every required symbol matches on its own: one missing open no
                 # longer aborts the basket, and no sell funds a buy unless it
                 # actually filled.
@@ -376,7 +503,7 @@ def run_partition_strategy(
             for fill in day_fills:
                 fill["raw_open"] = open_prices[fill["symbol"]]
                 fill["price_basis"] = EXECUTION_PRICE_BASIS
-                if execution_rule_version == ACTUAL_OPEN_RULES:
+                if execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES):
                     open_source = raw_bars[(day, fill["symbol"])].get("open_source")
                     if isinstance(open_source, Mapping):
                         fill["open_evidence"] = {
@@ -389,13 +516,47 @@ def run_partition_strategy(
             order_attempts.append(attempt)
             if positive_order:
                 positive_attempts.append(attempt)
+            if stateful_active:
+                batch_ok = (
+                    bool(attempt.get("batch_complete"))
+                    if execution_rule_version == ACTUAL_OPEN_LOT_RULES
+                    else attempt.get("status") == "filled"
+                )
+                purpose = str(signal.get("purpose", "rebalance"))
+                (
+                    rebalance_anchor_date,
+                    last_filled_target,
+                    last_monthly_filled_target,
+                    previous_order_attempted,
+                ) = advance_rebalance_anchor(
+                    rebalance_anchor_date=rebalance_anchor_date,
+                    last_filled_target=last_filled_target,
+                    last_monthly_filled_target=last_monthly_filled_target,
+                    attempt=attempt,
+                    batch_ok=batch_ok,
+                    signal_date=signal["date"],
+                    target_weights=signal["target_weights"],
+                    purpose=purpose,
+                )
+                if batch_ok:
+                    rebalance_anchors.append(
+                        {
+                            "signal_date": signal["date"],
+                            "execution_date": day,
+                            "purpose": purpose,
+                            "cycle": signal.get("cycle", signal["date"][:7]),
+                            "zero_trade_satisfied": bool(
+                                attempt.get("zero_trade_satisfied", False)
+                            ),
+                        }
+                    )
 
         invested = _has_position(shares)
         invested_sessions += invested
         if ready and not invested and not positive_order:
             ready_cash_sessions.append(day)
         if valuation_policy_version == CARRY_FORWARD_SUSPENDED_VALUATION:
-            nav_point, gaps = _valuation_carry_forward(
+            nav_point, gaps = value_carry_forward_session(
                 day,
                 raw_bars,
                 shares,
@@ -405,6 +566,7 @@ def run_partition_strategy(
                 carry_states,
                 applied_actions_today,
                 data_kind=data_kind,
+                schema_version=resolved_schema_version,
             )
         else:
             nav_point, gaps = _valuation(
@@ -415,9 +577,216 @@ def run_partition_strategy(
                 receivables,
                 unresolved_actions,
                 data_kind=data_kind,
+                schema_version=resolved_schema_version,
             )
         equity_curve.append(nav_point)
         valuation_gaps.extend(gaps)
+
+        if decision_policy is not None:
+            if day_index + 1 >= len(sessions):
+                continue
+            next_session_day = sessions[day_index + 1]
+            reqs = (
+                history_requirements
+                if history_requirements is not None
+                else [
+                    {
+                        "id": "strategy_lookback",
+                        "observations": signal_window_sessions,
+                        "mode": "valid_observations",
+                    }
+                ]
+            )
+            max_req_obs = max((int(req["observations"]) for req in reqs), default=1)
+            obs_result = select_common_observations(
+                history_sessions,
+                raw_bars,
+                history_derived,
+                day,
+                decision_policy,
+                reqs,
+                data_kind=data_kind,
+                schema_version=resolved_schema_version,
+            )
+            if day_index == 0:
+                first_scored_open = {
+                    "decision_date": day,
+                    "ready": obs_result["ready"],
+                    "requirements": obs_result["requirements"],
+                    "signal_status": obs_result["signal_status"],
+                }
+            if obs_result["signal_status"] == "paused":
+                pause_info = obs_result["signal_pause"]
+                signal_pauses.append(pause_info)
+                signal_gaps.append(pause_info)
+                active_deferral = maybe_trigger_monthly_deferral(
+                    enabled=monthly_deferral_enabled,
+                    active_deferral=active_deferral,
+                    monthly_signal_cycle=monthly_signal_cycle,
+                    signal_date=day,
+                    sessions=history_sessions,
+                    pause_info=pause_info,
+                    scheduled_month_session=scheduled_month_idx,
+                    warmup_ready=(
+                        first_ready_date is not None or (positions[day] + 1) >= max_req_obs
+                    ),
+                )
+                if monthly_deferral_enabled:
+                    active_deferral, monthly_deferrals = close_month_end_deferral(
+                        active_deferral,
+                        monthly_deferrals,
+                        session=day,
+                        next_session=next_session_day,
+                    )
+                decision_records.append(
+                    {
+                        "date": day,
+                        "signal_cutoff": obs_result["signal_cutoff"],
+                        "signal_status": "paused",
+                        "signal_pause": pause_info,
+                        "observation_dates": [],
+                        "observation_sources": {},
+                    }
+                )
+                continue
+            if not obs_result["ready"]:
+                if monthly_deferral_enabled:
+                    active_deferral, monthly_deferrals = close_month_end_deferral(
+                        active_deferral,
+                        monthly_deferrals,
+                        session=day,
+                        next_session=next_session_day,
+                    )
+                history_gaps.append(
+                    {
+                        "decision_date": day,
+                        "ready": False,
+                        "requirements": obs_result["requirements"],
+                    }
+                )
+                decision_records.append(
+                    {
+                        "date": day,
+                        "signal_cutoff": obs_result["signal_cutoff"],
+                        "signal_status": obs_result["signal_status"],
+                        "signal_pause": None,
+                        "observation_dates": list(obs_result["observation_dates"]),
+                        "observation_sources": obs_result["observation_sources"],
+                    }
+                )
+                continue
+            if first_ready_date is None:
+                first_ready_date = day
+            obs_values = obs_result["observation_values"]
+            obs_days = obs_result["observation_dates"]
+            history_rows = [
+                {"date": obs_day, "symbol": symbol, "close": value}
+                for obs_day in obs_days
+                for symbol, value in obs_values[obs_day].items()
+            ]
+            receivable_total = math.fsum(item["amount"] for item in receivables)
+            prior_close_weights = compute_prior_close_weights(
+                nav_point, shares, cash, receivable_total
+            )
+            deferral_ctx = (
+                active_deferral
+                if (
+                    monthly_deferral_enabled
+                    and active_deferral is not None
+                    and active_deferral["cycle"] == day[:7]
+                )
+                else None
+            )
+            state = build_strategy_state(
+                signal_date=day,
+                sessions=history_sessions,
+                cash=cash,
+                shares=shares,
+                equity=nav_point["nav"],
+                prior_close_weights=prior_close_weights,
+                rebalance_anchor_date=rebalance_anchor_date,
+                previous_order_attempted=previous_order_attempted,
+                last_filled_target=last_filled_target,
+                last_monthly_filled_target=last_monthly_filled_target,
+                history_windows={
+                    indicator: list(days) for indicator, days in obs_result["windows"].items()
+                },
+                monthly_deferral=deferral_ctx,
+            )
+            raw_output = strategy(pd.DataFrame(history_rows), state)
+            parsed_output = parse_strategy_output(raw_output, signal_date=day)
+            if parsed_output is None:
+                if monthly_deferral_enabled:
+                    active_deferral, monthly_deferrals = close_month_end_deferral(
+                        active_deferral,
+                        monthly_deferrals,
+                        session=day,
+                        next_session=next_session_day,
+                    )
+                ready_cash_sessions.append(day)
+                decision_records.append(
+                    {
+                        "date": day,
+                        "signal_cutoff": obs_result["signal_cutoff"],
+                        "signal_status": "no_target",
+                        "signal_pause": None,
+                        "observation_dates": list(obs_days),
+                        "observation_sources": obs_result["observation_sources"],
+                    }
+                )
+                continue
+            normalized = parsed_output["weights"]
+            purpose = parsed_output["purpose"]
+            cycle = parsed_output["cycle"]
+            fixed_amounts = parsed_output["fixed_amounts"]
+            if purpose == "monthly":
+                monthly_signal_cycle = day[:7]
+            deferral_fields, active_deferral, monthly_deferrals = consume_monthly_deferral(
+                active_deferral=deferral_ctx,
+                monthly_deferrals=monthly_deferrals,
+                purpose=purpose,
+                signal_date=day,
+                execution_date=next_session_day,
+            )
+            if monthly_deferral_enabled:
+                active_deferral, monthly_deferrals = close_month_end_deferral(
+                    active_deferral,
+                    monthly_deferrals,
+                    session=day,
+                    next_session=next_session_day,
+                )
+            signal = {
+                "date": day,
+                "execution_date": next_session_day,
+                "target_weights": normalized,
+                "purpose": purpose,
+                "cycle": cycle,
+                **({"fixed_amounts": fixed_amounts} if fixed_amounts else {}),
+                **deferral_fields,
+                "total_return_values": obs_result["latest_values"],
+                "window": list(obs_days),
+                "observation_dates": list(obs_days),
+                "observation_sources": obs_result["observation_sources"],
+                "signal_cutoff": obs_result["signal_cutoff"],
+                "signal_status": "generated",
+                "signal_pause": None,
+            }
+            signals.append(signal)
+            pending = (signal, normalized)
+            decision_records.append(
+                {
+                    "date": day,
+                    "signal_cutoff": obs_result["signal_cutoff"],
+                    "signal_status": "generated",
+                    "signal_pause": None,
+                    "purpose": purpose,
+                    "cycle": cycle,
+                    **deferral_fields,
+                    "observation_dates": list(obs_days),
+                    "observation_sources": obs_result["observation_sources"],
+                }
+            )
+            continue
 
         if history_requirements is not None or day_index + 1 >= len(sessions):
             continue
@@ -458,23 +827,67 @@ def run_partition_strategy(
             })
             continue
 
-        state = {
-            "cash": cash,
-            "shares": dict(shares),
-            "equity": nav_point["nav"],
-        }
+        if stateful_active:
+            receivable_total = math.fsum(item["amount"] for item in receivables)
+            prior_close_weights = compute_prior_close_weights(
+                nav_point, shares, cash, receivable_total
+            )
+            state = build_strategy_state(
+                signal_date=day,
+                sessions=history_sessions,
+                cash=cash,
+                shares=shares,
+                equity=nav_point["nav"],
+                prior_close_weights=prior_close_weights,
+                rebalance_anchor_date=rebalance_anchor_date,
+                previous_order_attempted=previous_order_attempted,
+                last_filled_target=last_filled_target,
+                last_monthly_filled_target=last_monthly_filled_target,
+            )
+        else:
+            state = {
+                "cash": cash,
+                "shares": dict(shares),
+                "equity": nav_point["nav"],
+            }
         weights = strategy(pd.DataFrame(history_rows), state)
         if weights is not None:
-            normalized = _validate_weights(weights)
-            signal = {
-                "date": day,
-                "execution_date": sessions[day_index + 1],
-                "target_weights": normalized,
-                "total_return_values": latest_values,
-                "window": list(window_days),
-            }
-            signals.append(signal)
-            pending = (signal, normalized)
+            if stateful_active:
+                parsed_out = parse_strategy_output(weights, signal_date=day)
+                if parsed_out is not None:
+                    normalized = parsed_out["weights"]
+                    signal = {
+                        "date": day,
+                        "execution_date": sessions[day_index + 1],
+                        "target_weights": normalized,
+                        "purpose": parsed_out["purpose"],
+                        "cycle": parsed_out["cycle"],
+                        **(
+                            {"fixed_amounts": parsed_out["fixed_amounts"]}
+                            if parsed_out["fixed_amounts"]
+                            else {}
+                        ),
+                        "total_return_values": latest_values,
+                        "window": list(window_days),
+                    }
+                    signals.append(signal)
+                    pending = (signal, normalized)
+            else:
+                normalized = _validate_weights(weights)
+                signal = {
+                    "date": day,
+                    "execution_date": sessions[day_index + 1],
+                    "target_weights": normalized,
+                    "total_return_values": latest_values,
+                    "window": list(window_days),
+                }
+                signals.append(signal)
+                pending = (signal, normalized)
+
+    if monthly_deferral_enabled and active_deferral is not None:
+        active_deferral, monthly_deferrals = close_expired_deferral(
+            active_deferral, monthly_deferrals, current_cycle=""
+        )
 
     metrics = _metrics(
         sessions,
@@ -515,6 +928,20 @@ def run_partition_strategy(
                 "ready_cash_sessions": ready_cash_sessions,
             },
         } if history_requirements is not None else {}),
+        **({
+            "decision_records": decision_records,
+            "signal_pauses": signal_pauses,
+        } if decision_policy is not None else {}),
+        **({
+            "strategy_state": {
+                "rebalance_anchor_date": rebalance_anchor_date,
+                "last_filled_target": last_filled_target,
+                "last_monthly_filled_target": last_monthly_filled_target,
+                "previous_order_attempted": previous_order_attempted,
+            },
+            "rebalance_anchors": rebalance_anchors,
+            "monthly_deferrals": monthly_deferrals,
+        } if stateful_active else {}),
         **(
             {
                 "valuation_summary": _valuation_summary(
@@ -651,7 +1078,7 @@ def _position_evidence(
         "first_position_signal_date": positive[0]["date"] if positive else None,
         "first_fill_date": fills[0]["date"] if fills else None,
     }
-    if execution_rule_version == ACTUAL_OPEN_RULES:
+    if execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES):
         latest = positive_attempts[-1] if positive_attempts else None
         # ``partial`` means the last positive target started building: at least
         # one fill and at least one unfilled required symbol.  A target that
@@ -729,7 +1156,7 @@ def _metrics(
         "signal_gaps": len(signal_gaps),
         "valuation_gaps": len(valuation_gaps),
     }
-    if execution_rule_version == ACTUAL_OPEN_RULES:
+    if execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES):
         # A partial attempt still counts as unfilled above; this additive count
         # records the baskets that matched some symbols but not all of them.
         metrics["orders_partially_filled"] = sum(
@@ -787,9 +1214,13 @@ def run_discovery_equal_weight(
     slippage_bps: float,
     execution_rule_version: str = NEXT_OPEN_RULES,
     valuation_policy_version: str = STRICT_CLOSE_VALUATION,
+    lot_sizes: Mapping[str, int] | None = None,
+    symbol_order: Sequence[str] | None = None,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
+    schema_version: int | None = None,
 ) -> dict[str, Any]:
     """Run the fixed equal-weight buy-and-hold comparator."""
     submitted = False
@@ -814,9 +1245,13 @@ def run_discovery_equal_weight(
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rule_version,
         valuation_policy_version=valuation_policy_version,
+        lot_sizes=lot_sizes,
+        symbol_order=symbol_order,
         history_requirements=history_requirements,
         scoring_start=scoring_start,
         prior_history=prior_history,
+        decision_policy=decision_policy,
+        schema_version=schema_version,
     )
 
 
@@ -1085,7 +1520,7 @@ def is_executable_open(
     if row is None or not _valid_price(row.get("open")):
         return False
     status = row.get("trading_status")
-    if execution_rule_version == ACTUAL_OPEN_RULES:
+    if execution_rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES):
         if not _valid_price(row.get("volume")):
             return False
         if status == "partial_halt":
@@ -1216,24 +1651,7 @@ def _match_actual_open_day(
 
 def unfilled_reason(row: dict | None) -> str:
     """Classify a required symbol the sealed row shows cannot match today."""
-    if row is None:
-        return "missing_bar"
-    status = row.get("trading_status")
-    if status == "unknown":
-        return "unknown_trading_status"
-    if status == "suspended":
-        return "confirmed_no_trade"
-    # A sealed source conflict is never resolved into a confirmed no-trade or a
-    # fill: the required open is missing.  An explicit null is not a conflict.
-    if row.get("open_conflict") is not None:
-        return "missing_required_open"
-    if status == "partial_halt":
-        halt, day = row.get("halt"), row.get("date")
-        if halt_conflicts_with_volume(halt, day, row.get("volume")):
-            return "unknown_trading_status"
-        if halt_covers_session(halt, day):
-            return "confirmed_no_trade"
-    return "missing_required_open"
+    return classify_unfilled_reason(row)
 
 
 def _close_available(row: dict, cutoff: datetime, data_kind: str) -> bool:
@@ -1427,366 +1845,6 @@ def _apply_actions(
     return cash
 
 
-def _parse_instant(value: object) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else None
-
-
-def _close_source_evidence(row: Mapping[str, Any], *, data_kind: str) -> dict[str, Any]:
-    evidence: dict[str, Any] = {
-        "availability_evidence": row.get("availability_evidence"),
-        "available_at": (
-            row.get("close_available_at") if data_kind == "real" else row.get("available_at")
-        ),
-    }
-    open_source = row.get("open_source")
-    if isinstance(open_source, Mapping):
-        evidence["source"] = open_source.get("source")
-        evidence["evidence_id"] = open_source.get("evidence_id")
-    return evidence
-
-
-def _status_source_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
-    evidence: dict[str, Any] = {
-        "trading_status": row.get("trading_status"),
-        "availability_evidence": row.get("availability_evidence"),
-        "available_at": row.get("available_at"),
-    }
-    status_id = row.get("status_evidence_id")
-    if isinstance(status_id, str) and status_id.strip():
-        evidence["status_evidence_id"] = status_id
-    halt = row.get("halt")
-    if isinstance(halt, Mapping):
-        evidence["halt"] = dict(halt)
-    return evidence
-
-
-def _classify_no_trade_for_valuation(
-    row: Mapping[str, Any] | None,
-    close_cutoff: datetime,
-    *,
-    data_kind: str,
-) -> tuple[bool, str | None]:
-    """Return whether ``row`` confirms full-day no-trade by ``close_cutoff``.
-
-    When False, returns a specific ``valuation_gap_reason`` distinguishing
-    missing bars, unknown status, late notices, conflicting evidence and
-    resumed partial halts without a confirmed close.
-    """
-    if row is None:
-        return False, "missing_bar"
-    confirmed_shape, shape_reason = confirmed_no_trade_shape(row, data_kind=data_kind)
-    if confirmed_shape:
-        if not _available_by(dict(row), close_cutoff):
-            available_at = _parse_instant(row.get("available_at"))
-            if available_at is not None and available_at > close_cutoff:
-                return False, "status_evidence_after_cutoff"
-            return False, "missing_status_availability_evidence"
-        return True, None
-    if shape_reason is not None:
-        return False, shape_reason
-    if row.get("trading_status") == "trading" and _valid_price(row.get("close")):
-        ts_field = "close_available_at" if data_kind == "real" else "available_at"
-        available_at = _parse_instant(row.get(ts_field))
-        if available_at is not None and available_at > close_cutoff:
-            return False, "close_evidence_after_cutoff"
-        return False, "missing_close_availability_evidence"
-    return False, "missing_or_unconfirmed_unadjusted_close"
-
-
-@dataclass
-class _CarryState:
-    """Per-symbol carry-forward valuation anchor and chain-break status."""
-
-    anchor: dict[str, Any] | None = None
-    chain_broken: bool = False
-
-    def reset(self) -> None:
-        self.anchor = None
-        self.chain_broken = False
-
-    def break_chain(self) -> None:
-        if self.anchor is not None:
-            self.chain_broken = True
-        self.anchor = None
-
-
-def _missing_holding(
-    quantity: float, gap_reason: str | None, *, close: float | None = None
-) -> dict[str, Any]:
-    return {
-        "quantity": quantity,
-        "close": close,
-        "market_value": None,
-        "valuation_price": None,
-        "valuation_basis": "missing",
-        "gap_reason": gap_reason,
-    }
-
-
-def _valuation_gap(
-    day: str,
-    symbol: str,
-    gap_reason: str | None,
-    *,
-    status: str | None = None,
-    row: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    gap: dict[str, Any] = {
-        "date": day,
-        "symbol": symbol,
-        "reason": "missing_or_unconfirmed_unadjusted_close",
-        "valuation_gap_reason": gap_reason,
-    }
-    if status is not None:
-        gap["trading_status"] = status
-    if row is not None and isinstance(row.get("halt"), dict):
-        gap["halt"] = row["halt"]
-    return gap
-
-
-def _adjust_carried_basis_for_actions(
-    day: str,
-    anchor: dict[str, Any],
-    applied_actions: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Adjust a carried-forward valuation anchor for corporate actions on ``day``."""
-    if not applied_actions:
-        return anchor, None
-    price = float(anchor["valuation_price"])
-    adjustments = [dict(item) for item in anchor["adjustments"]]
-    for action in applied_actions:
-        action_type = action.get("type")
-        if action_type == "cash_dividend":
-            amount = float(action["cash_per_share"])
-            new_price = price - amount
-            extra: dict[str, Any] = {
-                "cash_per_share": amount,
-                "pay_date": action["pay_date"],
-            }
-        elif action_type == "share_adjustment":
-            ratio = float(action["ratio"])
-            new_price = price / ratio
-            extra = {"ratio": ratio}
-        else:
-            return None, "suspended_corporate_action_unadjusted"
-        if not _valid_price(new_price) or new_price <= _EPSILON:
-            return None, "carried_valuation_price_non_positive"
-        entry: dict[str, Any] = {
-            "date": day,
-            "type": action_type,
-            **extra,
-            "terms_evidence": action["terms_evidence"],
-            "available_at": action["available_at"],
-            "availability_evidence": action["availability_evidence"],
-            "valuation_price_before": price,
-            "valuation_price_after": new_price,
-        }
-        if "sequence" in action:
-            entry["sequence"] = action["sequence"]
-        adjustments.append(entry)
-        price = new_price
-    updated = dict(anchor)
-    updated["valuation_price"] = price
-    updated["adjustments"] = adjustments
-    return updated, None
-
-
-def _valuation_carry_forward(
-    day: str,
-    raw_bars: dict[tuple[str, str], dict],
-    shares: dict[str, float],
-    cash: float,
-    receivables: list[dict[str, Any]],
-    unresolved: dict[str, list[dict[str, str]]],
-    carry_states: dict[str, _CarryState],
-    applied_actions_today: Mapping[str, list[dict[str, Any]]],
-    *,
-    data_kind: str = "synthetic",
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Value holdings under ``carry-forward-suspended-v1`` (ADR 0003)."""
-    holdings: dict[str, Any] = {}
-    gaps: list[dict[str, Any]] = []
-    carried_symbols: list[str] = []
-    market_value = 0.0
-    valid = True
-    close_cutoff = datetime.combine(
-        datetime.fromisoformat(day).date(), time(23, 59, 59), tzinfo=_CN_TZ
-    )
-    for symbol in ETF_SYMBOLS:
-        quantity = shares[symbol]
-        state = carry_states[symbol]
-        row = raw_bars.get((day, symbol))
-        status = row.get("trading_status") if row is not None else None
-        markable = status == "trading" or (
-            data_kind == "real" and status == "partial_halt"
-        )
-        close_conflict = row is not None and (
-            row.get("status_conflict") is not None
-            or (
-                data_kind == "real"
-                and status == "partial_halt"
-                and halt_conflicts_with_trade(row.get("halt"), day, row)
-            )
-        )
-        raw_close = row.get("close") if row is not None else None
-        has_trusted_close = (
-            row is not None
-            and markable
-            and not close_conflict
-            and _valid_price(raw_close)
-            and _close_available(row, close_cutoff, data_kind)
-        )
-
-        if quantity <= _EPSILON:
-            state.reset()
-            trusted_close = float(raw_close) if has_trusted_close else None
-            if unresolved[symbol]:
-                valid = False
-                for action_gap in unresolved[symbol]:
-                    gaps.append({"symbol": symbol, **action_gap})
-                holdings[symbol] = _missing_holding(
-                    quantity, unresolved[symbol][0]["reason"], close=trusted_close
-                )
-            else:
-                holdings[symbol] = {
-                    "quantity": quantity,
-                    "close": trusted_close,
-                    "market_value": 0.0,
-                    "valuation_price": None,
-                    "valuation_basis": "not_held",
-                }
-            continue
-
-        if has_trusted_close:
-            actual_close = float(raw_close)
-            state.anchor = {
-                "source_close_date": day,
-                "source_close_price": actual_close,
-                "source_close_evidence": _close_source_evidence(row, data_kind=data_kind),
-                "valuation_price": actual_close,
-                "carried_sessions": 0,
-                "adjustments": [],
-            }
-            state.chain_broken = False
-            if unresolved[symbol]:
-                valid = False
-                for action_gap in unresolved[symbol]:
-                    gaps.append({"symbol": symbol, **action_gap})
-                holdings[symbol] = _missing_holding(
-                    quantity, unresolved[symbol][0]["reason"], close=actual_close
-                )
-            else:
-                value = quantity * actual_close
-                market_value += value
-                holdings[symbol] = {
-                    "quantity": quantity,
-                    "close": actual_close,
-                    "market_value": value,
-                    "valuation_price": actual_close,
-                    "valuation_basis": "actual_close",
-                }
-            continue
-
-        confirmed_no_trade, non_trade_reason = _classify_no_trade_for_valuation(
-            row, close_cutoff, data_kind=data_kind
-        )
-        if confirmed_no_trade:
-            if unresolved[symbol]:
-                valid = False
-                state.break_chain()
-                for action_gap in unresolved[symbol]:
-                    gaps.append({"symbol": symbol, **action_gap})
-                holdings[symbol] = _missing_holding(
-                    quantity, unresolved[symbol][0]["reason"]
-                )
-                continue
-
-            anchor = state.anchor
-            if anchor is None:
-                valid = False
-                gap_reason = (
-                    "carry_forward_chain_broken"
-                    if state.chain_broken
-                    else "missing_authorized_prior_close"
-                )
-                gaps.append(_valuation_gap(day, symbol, gap_reason, status=status))
-                holdings[symbol] = _missing_holding(quantity, gap_reason)
-                continue
-
-            day_actions = applied_actions_today.get(symbol, [])
-            if day_actions:
-                adjusted, adj_gap_reason = _adjust_carried_basis_for_actions(
-                    day, anchor, day_actions
-                )
-                if adjusted is None:
-                    valid = False
-                    state.break_chain()
-                    gaps.append(_valuation_gap(day, symbol, adj_gap_reason, status=status))
-                    holdings[symbol] = _missing_holding(quantity, adj_gap_reason)
-                    continue
-                anchor = adjusted
-                state.anchor = anchor
-
-            anchor["carried_sessions"] += 1
-            valuation_price = float(anchor["valuation_price"])
-            value = quantity * valuation_price
-            market_value += value
-            carried_symbols.append(symbol)
-            holdings[symbol] = {
-                "quantity": quantity,
-                "close": None,
-                "market_value": value,
-                "valuation_price": valuation_price,
-                "valuation_basis": "carried_forward_prior_close",
-                "carry_forward": {
-                    "source_close_date": anchor["source_close_date"],
-                    "source_close_price": anchor["source_close_price"],
-                    "source_close_evidence": dict(anchor["source_close_evidence"]),
-                    "valuation_price": valuation_price,
-                    "carried_sessions": anchor["carried_sessions"],
-                    "adjustments": [dict(item) for item in anchor["adjustments"]],
-                    "status_evidence": _status_source_evidence(row),
-                },
-            }
-            continue
-
-        # Not a trusted close and not a confirmed full-day no-trade: gap & break chain.
-        valid = False
-        state.break_chain()
-        gaps.append(_valuation_gap(day, symbol, non_trade_reason, status=status, row=row))
-        if unresolved[symbol]:
-            for action_gap in unresolved[symbol]:
-                gaps.append({"symbol": symbol, **action_gap})
-        holdings[symbol] = _missing_holding(quantity, non_trade_reason)
-
-    receivable_total = math.fsum(item["amount"] for item in receivables)
-    nav = cash + market_value + receivable_total if valid else None
-    day_basis = (
-        "missing"
-        if not valid
-        else "carried_forward"
-        if carried_symbols
-        else "actual_close"
-    )
-    return {
-        "date": day,
-        "nav": nav,
-        "cash": cash,
-        "market_value": market_value if valid else None,
-        "dividend_receivables": receivable_total if valid else None,
-        "receivables": [dict(item) for item in receivables],
-        "holdings": holdings,
-        "valuation_basis": day_basis,
-        "carried_forward_symbols": sorted(carried_symbols),
-    }, gaps
-
-
 def _valuation(
     day: str,
     raw_bars: dict[tuple[str, str], dict],
@@ -1796,11 +1854,15 @@ def _valuation(
     unresolved: dict[str, list[dict[str, str]]],
     *,
     data_kind: str = "synthetic",
+    schema_version: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     holdings = {}
     gaps = []
     market_value = 0.0
     valid = True
+    allow_partial_halt = data_kind == "real" or (
+        schema_version is not None and schema_version >= 3
+    )
     close_cutoff = datetime.combine(
         datetime.fromisoformat(day).date(), time(23, 59, 59), tzinfo=_CN_TZ
     )
@@ -1809,7 +1871,7 @@ def _valuation(
         row = raw_bars.get((day, symbol))
         status = row.get("trading_status") if row is not None else None
         markable = status == "trading" or (
-            data_kind == "real" and status == "partial_halt"
+            allow_partial_halt and status == "partial_halt"
         )
         close = row.get("close") if row is not None else None
         if quantity > _EPSILON and (

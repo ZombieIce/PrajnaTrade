@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from prajnatrade.decision_window import DECISION_POLICY_VERSIONS
 from prajnatrade.trading_status import (
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
@@ -18,6 +19,11 @@ from prajnatrade.trading_status import (
 
 if TYPE_CHECKING:
     from prajnatrade.providers import ResearchProvider
+
+
+def _add_plugin_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--plugin-config", type=Path, default=None)
+    parser.add_argument("--plugin", action="append", default=[], dest="plugin_specs")
 
 
 def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
@@ -30,11 +36,25 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         project_action = project_commands.add_parser(action)
         project_action.add_argument("--project", required=True, type=Path)
 
+    plugin_parser = commands.add_parser(
+        "plugin",
+        help="list registered local strategy plugins" if agent_only else "register or list local strategy plugins",
+    )
+    plugin_commands = plugin_parser.add_subparsers(dest="plugin_command", required=True)
+    plugin_list = plugin_commands.add_parser("list", help="list registered local strategy plugins")
+    plugin_list.add_argument("--project", required=True, type=Path)
+    if not agent_only:
+        plugin_register = plugin_commands.add_parser("register", help="register operator-approved local strategy plugins")
+        plugin_register.add_argument("--project", required=True, type=Path)
+        _add_plugin_flags(plugin_register)
+
     experiment = commands.add_parser("experiment", help="submit, inspect, and resume Discovery experiments")
     experiment_commands = experiment.add_subparsers(dest="experiment_command", required=True)
     submit = experiment_commands.add_parser("submit")
     submit.add_argument("--project", required=True, type=Path)
     submit.add_argument("--input", required=True, type=Path)
+    if not agent_only:
+        _add_plugin_flags(submit)
     for action in ("status", "resume"):
         lookup = experiment_commands.add_parser(action)
         lookup.add_argument("--project", required=True, type=Path)
@@ -212,6 +232,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
         dest="release_ids",
         help="process this exact release ID (repeatable); default is every tracked version",
     )
+    _add_plugin_flags(shadow_update)
     shadow_report = shadow_commands.add_parser(
         "report", help="dump the committed day records for trusted audit"
     )
@@ -226,6 +247,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_tick.add_argument("--calendar", type=Path, required=True)
     shadow_tick.add_argument("--data", type=Path, required=True)
     shadow_tick.add_argument("--corrections-store", type=Path, required=True)
+    _add_plugin_flags(shadow_tick)
     shadow_alerts = shadow_commands.add_parser("alerts", help="show recorded Shadow Live scheduler alerts")
     shadow_alerts.add_argument("--ledger", type=Path, required=True)
     shadow_compare = shadow_commands.add_parser(
@@ -244,6 +266,23 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_compare.add_argument(
         "--output", type=Path, help="write the deterministic comparison document"
     )
+    shadow_export = shadow_commands.add_parser(
+        "export-feed",
+        help="export a verifiable daily Shadow feed from a sealed Discovery payload",
+    )
+    shadow_export.add_argument("--store", required=True, type=Path)
+    shadow_export.add_argument("--snapshot-id", required=True)
+    shadow_export.add_argument("--through-date", required=True)
+    shadow_export.add_argument("--output", required=True, type=Path)
+    shadow_migrate = shadow_commands.add_parser(
+        "migrate-state",
+        help="verify or migrate a legacy Shadow ledger's stateful tracking state",
+    )
+    shadow_migrate.add_argument("--ledger", required=True, type=Path)
+    shadow_migrate.add_argument("--version", required=True)
+    shadow_migrate.add_argument("--new-start-date", default=None)
+    shadow_migrate.add_argument("--initial-cash", type=float, default=None)
+    shadow_migrate.add_argument("--initial-positions", default=None)
 
     acceptance = commands.add_parser(
         "acceptance",
@@ -286,6 +325,30 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     create.add_argument(
         "--valuation-policy", choices=VALUATION_POLICY_VERSIONS, default=STRICT_CLOSE_VALUATION,
         help="freeze close valuation policy for held symbols (default: strict-close-v1)",
+    )
+    create.add_argument(
+        "--decision-policy", choices=DECISION_POLICY_VERSIONS, default=None,
+        help="opt-in frozen after-close decision timing policy (e.g. after-close-common-v1)",
+    )
+    create.add_argument(
+        "--signal-cutoff", default=None,
+        help="frozen signal cutoff time HH:MM (requires --decision-policy)",
+    )
+    create.add_argument(
+        "--signal-timezone", default=None,
+        help="frozen signal cutoff IANA timezone (requires --decision-policy)",
+    )
+    create.add_argument(
+        "--monthly-deferral", action="store_true", default=None,
+        help="enable intra-month deferral of paused scheduled monthly signals (requires --decision-policy)",
+    )
+    create.add_argument(
+        "--lot-size", type=int,
+        help="uniform positive integer lot size per ETF (only for actual-open-lot-v1)",
+    )
+    create.add_argument(
+        "--lot-sizes",
+        help="JSON mapping of ETF symbol to positive integer lot size (only for actual-open-lot-v1)",
     )
     create.add_argument(
         "--strategy-executor", choices=["none", "container"], default="none",
@@ -511,6 +574,7 @@ def _add_research_loop_workflow(
     validate.add_argument("--snapshot-store", required=True, type=Path)
     validate.add_argument("--round-id", required=True)
     validate.add_argument("--version-id", required=True)
+    _add_plugin_flags(validate)
 
     revalidate = rounds.add_parser(
         "revalidate",
@@ -529,6 +593,7 @@ def _add_research_loop_workflow(
         "--evidence-snapshot-id",
         help="corrected successor snapshot to recompute the Discovery evidence on",
     )
+    _add_plugin_flags(revalidate)
 
     reviewed = rounds.add_parser(
         "review", help="record the human approve, return or end decision for one version"
@@ -739,7 +804,12 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                     raise ProtocolError(
                         "INVALID_SUBMISSION", "admission", "correct", str(error),
                     ) from error
-                result = experiment_submit(args.project, request)
+                result = experiment_submit(
+                    args.project,
+                    request,
+                    plugin_config=getattr(args, "plugin_config", None),
+                    plugin_specs=getattr(args, "plugin_specs", ()),
+                )
             elif args.experiment_command == "status":
                 result = experiment_status(args.project, args.campaign_id, args.submission_id)
             else:
@@ -802,15 +872,48 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
             )
             print(json.dumps(result, sort_keys=True))
             return 0
+        if args.command == "plugin":
+            from prajnatrade.experiment import list_registered_plugins, register_plugins
+            from prajnatrade.plugins import PluginError
+
+            try:
+                if args.plugin_command == "list":
+                    result = list_registered_plugins(args.project)
+                else:
+                    result = register_plugins(
+                        args.project,
+                        plugin_config=args.plugin_config,
+                        plugin_specs=args.plugin_specs,
+                    )
+            except PluginError as error:
+                print(
+                    json.dumps(
+                        {"schema_version": 1, "status": "rejected", "error": error.details},
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                )
+                return 2
+            print(json.dumps(result, sort_keys=True, allow_nan=False))
+            return 0
         if args.command == "campaign":
             from prajnatrade.experiment import campaign_create
 
+            parsed_lot_sizes = None
+            if args.lot_sizes is not None:
+                parsed_lot_sizes = json.loads(args.lot_sizes)
             result = campaign_create(
                 args.project, args.store, args.snapshot_id, args.attempts,
                 args.max_seconds, args.initial_cash, args.transaction_cost_bps,
                 args.slippage_bps, args.as_of,
                 execution_rules=args.execution_rules,
                 valuation_policy=args.valuation_policy,
+                decision_policy=args.decision_policy,
+                signal_cutoff=args.signal_cutoff,
+                signal_timezone=args.signal_timezone,
+                monthly_deferral=True if args.monthly_deferral else None,
+                lot_size=args.lot_size,
+                lot_sizes=parsed_lot_sizes,
                 strategy_executor=args.strategy_executor,
                 strategy_image=args.strategy_image,
                 discovery_warmup_sessions=args.discovery_warmup_sessions,
@@ -1096,6 +1199,8 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 args.snapshot_store,
                 args.round_id,
                 args.version_id,
+                plugin_config=args.plugin_config,
+                plugin_specs=args.plugin_specs,
             )
         elif args.round_action == "revalidate":
             result = research_loop.revalidate(
@@ -1106,6 +1211,8 @@ def _research_loop_command(args: argparse.Namespace) -> int:
                 args.version_id,
                 args.reason,
                 evidence_snapshot_id=args.evidence_snapshot_id,
+                plugin_config=args.plugin_config,
+                plugin_specs=args.plugin_specs,
             )
         elif args.round_action == "review":
             source = (
@@ -1409,6 +1516,8 @@ def _shadow_command(args: argparse.Namespace) -> int:
             result, blocked = shadow_schedule.tick(
                 args.ledger, args.store, args.calendar, args.data,
                 corrections_store=args.corrections_store,
+                plugin_config=getattr(args, "plugin_config", None),
+                plugin_specs=getattr(args, "plugin_specs", ()),
             )
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 2 if blocked else 0
@@ -1420,12 +1529,34 @@ def _shadow_command(args: argparse.Namespace) -> int:
                 args.date,
                 getattr(args, "release_ids", None),
                 corrections_store=getattr(args, "corrections_store", None),
+                plugin_config=getattr(args, "plugin_config", None),
+                plugin_specs=getattr(args, "plugin_specs", ()),
             )
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 2 if blocked else 0
         if args.shadow_command == "compare":
             result = shadow.compare(
                 args.ledger, args.data, args.versions, args.output
+            )
+        elif args.shadow_command == "export-feed":
+            result = shadow.build_daily_feed_from_snapshot(
+                args.store,
+                args.snapshot_id,
+                through_date=args.through_date,
+                output=args.output,
+            )
+        elif args.shadow_command == "migrate-state":
+            parsed_pos = (
+                json.loads(args.initial_positions)
+                if args.initial_positions is not None
+                else None
+            )
+            result = shadow.verify_or_migrate_ledger(
+                args.ledger,
+                args.version,
+                new_start_date=args.new_start_date,
+                initial_cash=args.initial_cash,
+                initial_positions=parsed_pos,
             )
         else:
             result = shadow.write_report(args.ledger, args.version, args.output)

@@ -37,8 +37,10 @@ from prajnatrade.snapshot import (
     slice_content,
 )
 from prajnatrade.trading_status import (
+    ACTUAL_OPEN_LOT_RULES,
     ACTUAL_OPEN_RULES,
     CARRY_FORWARD_SUSPENDED_VALUATION,
+    ETF_SYMBOLS,
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
     RETRY_INITIAL_RULES,
@@ -58,6 +60,7 @@ def _runtime_components(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     directory = Path(__file__).parent
     files = (
@@ -65,14 +68,22 @@ def _runtime_components(
         "container_executor.py",
     )
     valuation_version = valuation_policy_version(execution_rules)
+    rule_version = execution_rules.get("version") if execution_rules is not None else None
     # Actual-open matching and carry-forward valuation consult trading_status.py.
     if (
-        (execution_rules is not None and execution_rules.get("version") == ACTUAL_OPEN_RULES)
+        rule_version in (ACTUAL_OPEN_RULES, ACTUAL_OPEN_LOT_RULES)
         or valuation_version != STRICT_CLOSE_VALUATION
+        or decision_policy is not None
     ):
         files += ("trading_status.py",)
+    if rule_version == ACTUAL_OPEN_LOT_RULES:
+        files += ("lot_execution.py",)
+    if valuation_version != STRICT_CLOSE_VALUATION or decision_policy is not None:
+        files += ("valuation.py",)
     if history_policy is not None:
         files += ("experiment.py",)
+    if decision_policy is not None:
+        files += ("decision_window.py",)
     executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}
     return {
         **{
@@ -104,6 +115,7 @@ def runtime_identity(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> str:
     """Fingerprint the accounting dependencies and optional strategy executor.
 
@@ -112,10 +124,14 @@ def runtime_identity(
     (``experiment.py``). A source fix changes the corresponding identity.
     """
     dependencies = _runtime_components(
-        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+        strategy_executor,
+        execution_rules=execution_rules,
+        history_policy=history_policy,
+        decision_policy=decision_policy,
     )
     if (
         history_policy is None
+        and decision_policy is None
         and execution_rules is not None
         and "version" not in execution_rules
         and dependencies["snapshot_baseline.py"] == _LEGACY_ACCOUNTING_SOURCE
@@ -130,15 +146,20 @@ def runtime_matches(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> bool:
     """Check the exact current runtime or a compatible legacy dependency set."""
     dependencies = _runtime_components(
-        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+        strategy_executor,
+        execution_rules=execution_rules,
+        history_policy=history_policy,
+        decision_policy=decision_policy,
     )
     if stored == _fingerprint(dependencies):
         return True
     if (
         history_policy is not None
+        or decision_policy is not None
         or "trading_status.py" in dependencies
         or "valuation_policy" in dependencies
         or any(
@@ -189,12 +210,19 @@ _NEXT_OPEN_EXECUTION = {
 
 
 def _execution_policy(
-    version: str, *, valuation_policy: str = STRICT_CLOSE_VALUATION,
+    version: str,
+    *,
+    valuation_policy: str = STRICT_CLOSE_VALUATION,
+    lot_sizes: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     if version not in EXECUTION_RULE_VERSIONS:
         raise ValueError(f"Unknown execution rules version: {version!r}.")
     if valuation_policy not in VALUATION_POLICY_VERSIONS:
         raise ValueError(f"Unknown valuation policy version: {valuation_policy!r}.")
+    if lot_sizes is not None and version != ACTUAL_OPEN_LOT_RULES:
+        raise ValueError(
+            "lot_sizes is only supported with execution rules actual-open-lot-v1."
+        )
     rules = {"version": version, **deepcopy(_NEXT_OPEN_EXECUTION)}
     if version == RETRY_INITIAL_RULES:
         rules["execution"].update(
@@ -214,6 +242,22 @@ def _execution_policy(
             funding="initial_cash_plus_realized_sell_net",
             order="sells_before_buys",
             matching="per_symbol",
+        )
+    elif version == ACTUAL_OPEN_LOT_RULES:
+        from prajnatrade.lot_execution import normalize_lot_sizes
+
+        rules["execution"].update(
+            halted_open="actual_daily_open_when_evidenced",
+            partial_halt_open_availability="not_gated_by_0930",
+            missing_required_open="symbol_not_filled",
+            partial_fill="recorded_per_symbol",
+            funding="initial_cash_plus_realized_sell_net",
+            order="sells_before_buys",
+            matching="per_symbol_whole_lot",
+            sizing="pre_open_frozen_target_weights",
+            lot_sizes=normalize_lot_sizes(lot_sizes),
+            symbol_order=list(ETF_SYMBOLS),
+            daily_simulation_assumptions={"late_resume_sell_funds_same_day_buy": True},
         )
     if valuation_policy == CARRY_FORWARD_SUSPENDED_VALUATION:
         rules["valuation"] = {
@@ -243,9 +287,13 @@ def _campaign_evaluation(
     history_policy: Mapping[str, Any] | None = None,
     discovery_split: Mapping[str, Any] | None = None,
     full_history: Mapping[str, Any] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_dependencies = _runtime_components(
-        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+        strategy_executor,
+        execution_rules=execution_rules,
+        history_policy=history_policy,
+        decision_policy=decision_policy,
     )
     valuation_version = valuation_policy_version(execution_rules)
     return {
@@ -270,6 +318,7 @@ def _campaign_evaluation(
             if valuation_version != STRICT_CLOSE_VALUATION
             else {}
         ),
+        **({"decision_policy": dict(decision_policy)} if decision_policy is not None else {}),
         "strategy_executor": strategy_executor,
         "runtime_dependencies": runtime_dependencies,
         "runtime": _fingerprint(runtime_dependencies),
@@ -324,6 +373,22 @@ def project_init(project: Path) -> dict[str, object]:
             BEGIN SELECT RAISE(ABORT, 'frozen candidates are immutable'); END;
             """
         )
+        connection.execute(
+            """CREATE TABLE registered_plugins (
+                family TEXT PRIMARY KEY,
+                plugin_id TEXT NOT NULL,
+                entrypoint TEXT NOT NULL,
+                entrypoint_path TEXT NOT NULL,
+                base_dir TEXT NOT NULL,
+                entrypoint_sha256 TEXT NOT NULL,
+                dependencies_json TEXT NOT NULL,
+                dependencies_hash TEXT NOT NULL,
+                declared_dependencies_json TEXT NOT NULL DEFAULT '[]',
+                normalize_parameters TEXT,
+                normalize_parameters_path TEXT,
+                registered_at TEXT NOT NULL
+            )"""
+        )
         project_id = str(uuid.uuid4())
         connection.execute("INSERT INTO project VALUES (?)", (project_id,))
     return {"schema_version": 1, "project_id": project_id}
@@ -340,12 +405,156 @@ def project_status(project: Path) -> dict[str, object]:
     return {"schema_version": 1, "project_id": row[0]}
 
 
+def register_plugins(
+    project: Path,
+    *,
+    plugin_config: Path | None = None,
+    plugin_specs: list[str] | tuple[str, ...] = (),
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate and record operator-approved local strategy plugins in project.sqlite."""
+    from prajnatrade.plugins import PluginError, load_plugin_registry, public_plugin_metadata
+
+    database = project / ".prajnatrade" / "project.sqlite"
+    if not database.is_file():
+        raise ValueError("Project is not initialized.")
+    registry = load_plugin_registry(
+        plugin_config=plugin_config, plugin_specs=plugin_specs, env=env,
+    )
+    if not registry:
+        raise PluginError(
+            "PLUGIN_ENTRYPOINT_UNRESOLVABLE",
+            "At least one --plugin-config, --plugin, or PRAJNATRADE_PLUGIN_CONFIG entry is required.",
+        )
+    now = datetime.now(UTC).isoformat()
+    recorded: list[dict[str, Any]] = []
+    with sqlite3.connect(database) as connection:
+        _ensure_project_schema(connection)
+        for family in sorted(registry):
+            entry = registry[family]
+            connection.execute(
+                """INSERT INTO registered_plugins (
+                    family, plugin_id, entrypoint, entrypoint_path, base_dir,
+                    entrypoint_sha256, dependencies_json, dependencies_hash,
+                    declared_dependencies_json, normalize_parameters,
+                    normalize_parameters_path, registered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(family) DO UPDATE SET
+                    plugin_id = excluded.plugin_id,
+                    entrypoint = excluded.entrypoint,
+                    entrypoint_path = excluded.entrypoint_path,
+                    base_dir = excluded.base_dir,
+                    entrypoint_sha256 = excluded.entrypoint_sha256,
+                    dependencies_json = excluded.dependencies_json,
+                    dependencies_hash = excluded.dependencies_hash,
+                    declared_dependencies_json = excluded.declared_dependencies_json,
+                    normalize_parameters = excluded.normalize_parameters,
+                    normalize_parameters_path = excluded.normalize_parameters_path,
+                    registered_at = excluded.registered_at""",
+                (
+                    entry["family"],
+                    entry["plugin_id"],
+                    entry["entrypoint"],
+                    entry["entrypoint_path"],
+                    entry["base_dir"],
+                    entry["entrypoint_sha256"],
+                    json.dumps(entry["dependencies"], sort_keys=True, separators=(",", ":")),
+                    entry["dependencies_hash"],
+                    json.dumps(entry.get("declared_dependencies", [])),
+                    entry.get("normalize_parameters"),
+                    entry.get("normalize_parameters_path"),
+                    now,
+                ),
+            )
+            recorded.append(public_plugin_metadata(entry))
+    return {"schema_version": 1, "status": "registered", "plugins": recorded}
+
+
+def list_registered_plugins(project: Path) -> dict[str, Any]:
+    """List operator-approved local strategy plugins for this project."""
+    database = project / ".prajnatrade" / "project.sqlite"
+    if not database.is_file():
+        raise ValueError("Project is not initialized.")
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        _ensure_project_schema(connection)
+        rows = connection.execute(
+            "SELECT family, plugin_id, entrypoint, entrypoint_sha256, dependencies_json, "
+            "dependencies_hash, normalize_parameters "
+            "FROM registered_plugins ORDER BY family"
+        ).fetchall()
+    return {
+        "schema_version": 1,
+        "status": "ok",
+        "plugins": [
+            {
+                "family": row["family"],
+                "plugin_id": row["plugin_id"],
+                "entrypoint": row["entrypoint"],
+                "entrypoint_sha256": row["entrypoint_sha256"],
+                "dependencies": json.loads(row["dependencies_json"]),
+                "dependencies_hash": row["dependencies_hash"],
+                **(
+                    {"normalize_parameters": row["normalize_parameters"]}
+                    if row["normalize_parameters"]
+                    else {}
+                ),
+            }
+            for row in rows
+        ],
+    }
+
+
+def load_project_plugin_registry(project: Path) -> dict[str, dict[str, Any]]:
+    """Load registered plugin entries from project.sqlite for operator/agent execution."""
+    database = project / ".prajnatrade" / "project.sqlite"
+    if not database.is_file():
+        return {}
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        _ensure_project_schema(connection)
+        rows = connection.execute(
+            "SELECT family, plugin_id, entrypoint, entrypoint_path, base_dir, "
+            "entrypoint_sha256, dependencies_json, dependencies_hash, declared_dependencies_json, "
+            "normalize_parameters, normalize_parameters_path "
+            "FROM registered_plugins ORDER BY family"
+        ).fetchall()
+    return {
+        row["family"]: {
+            "family": row["family"],
+            "plugin_id": row["plugin_id"],
+            "entrypoint": row["entrypoint"],
+            "entrypoint_path": row["entrypoint_path"],
+            "base_dir": row["base_dir"],
+            "entrypoint_sha256": row["entrypoint_sha256"],
+            "dependencies": json.loads(row["dependencies_json"]),
+            "dependencies_hash": row["dependencies_hash"],
+            "declared_dependencies": json.loads(row["declared_dependencies_json"]),
+            **(
+                {
+                    "normalize_parameters": row["normalize_parameters"],
+                    "normalize_parameters_path": row["normalize_parameters_path"],
+                }
+                if row["normalize_parameters"]
+                else {}
+            ),
+        }
+        for row in rows
+    }
+
+
 def campaign_create(
     project: Path, store: Path, snapshot_id: str, attempts: int, max_seconds: float,
     initial_cash: float, transaction_cost_bps: float, slippage_bps: float,
     as_of: str | None = None, *,
     execution_rules: str = NEXT_OPEN_RULES,
     valuation_policy: str = STRICT_CLOSE_VALUATION,
+    decision_policy: str | None = None,
+    signal_cutoff: str | None = None,
+    signal_timezone: str | None = None,
+    monthly_deferral: bool | None = None,
+    lot_size: int | None = None,
+    lot_sizes: Mapping[str, int] | None = None,
     strategy_executor: str = "none",
     strategy_image: str | None = None,
     executor: ContainerStrategyExecutor | None = None,
@@ -355,7 +564,30 @@ def campaign_create(
     project_id = project_status(project)["project_id"]
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("Attempts and execution seconds must be positive.")
-    execution_policy = _execution_policy(execution_rules, valuation_policy=valuation_policy)
+    if lot_size is not None and lot_sizes is not None:
+        raise ValueError("Specify either --lot-size or --lot-sizes, not both.")
+    resolved_lot_sizes = (
+        {symbol: lot_size for symbol in ETF_SYMBOLS}
+        if lot_size is not None
+        else lot_sizes
+    )
+    execution_policy = _execution_policy(
+        execution_rules, valuation_policy=valuation_policy, lot_sizes=resolved_lot_sizes
+    )
+    normalized_decision_policy: dict[str, Any] | None = None
+    if decision_policy is not None:
+        from prajnatrade.decision_window import normalize_decision_policy
+
+        normalized_decision_policy = normalize_decision_policy(
+            decision_policy,
+            signal_cutoff=signal_cutoff,
+            signal_timezone=signal_timezone,
+            monthly_deferral=monthly_deferral,
+        )
+    elif signal_cutoff is not None or signal_timezone is not None or monthly_deferral is not None:
+        raise ValueError(
+            "--signal-cutoff, --signal-timezone, and --monthly-deferral require --decision-policy."
+        )
     executor_config = _resolve_executor_config(
         strategy_executor, strategy_image, executor,
     )
@@ -460,6 +692,7 @@ def campaign_create(
         history_policy=history_policy,
         discovery_split=split_descriptor,
         full_history=full_history,
+        decision_policy=normalized_decision_policy,
     )
     from prajnatrade.snapshot_baseline import run_discovery_equal_weight
 
@@ -473,6 +706,9 @@ def campaign_create(
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rules,
         valuation_policy_version=valuation_policy,
+        decision_policy=normalized_decision_policy,
+        lot_sizes=execution_policy["execution"].get("lot_sizes"),
+        symbol_order=execution_policy["execution"].get("symbol_order"),
         **baseline_options,
     )
     campaign_id = str(uuid.uuid4())
@@ -519,6 +755,11 @@ def campaign_create(
         **(
             {"valuation_policy": dict(execution_policy["valuation"])}
             if valuation_policy != STRICT_CLOSE_VALUATION
+            else {}
+        ),
+        **(
+            {"decision_policy": normalized_decision_policy}
+            if normalized_decision_policy is not None
             else {}
         ),
         "strategy_executor": executor_config,
@@ -643,6 +884,31 @@ def _ensure_project_schema(connection: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'frozen candidates are immutable'); END;
         """
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS registered_plugins (
+            family TEXT PRIMARY KEY,
+            plugin_id TEXT NOT NULL,
+            entrypoint TEXT NOT NULL,
+            entrypoint_path TEXT NOT NULL,
+            base_dir TEXT NOT NULL,
+            entrypoint_sha256 TEXT NOT NULL,
+            dependencies_json TEXT NOT NULL,
+            dependencies_hash TEXT NOT NULL,
+            declared_dependencies_json TEXT NOT NULL DEFAULT '[]',
+            normalize_parameters TEXT,
+            normalize_parameters_path TEXT,
+            registered_at TEXT NOT NULL
+        )"""
+    )
+    plugin_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(registered_plugins)").fetchall()
+    }
+    if "normalize_parameters" not in plugin_columns:
+        connection.execute("ALTER TABLE registered_plugins ADD COLUMN normalize_parameters TEXT")
+    if "normalize_parameters_path" not in plugin_columns:
+        connection.execute(
+            "ALTER TABLE registered_plugins ADD COLUMN normalize_parameters_path TEXT"
+        )
 
 
 class ProtocolError(Exception):
@@ -740,7 +1006,11 @@ def _receipt(
     return result
 
 
-def _normalize_request(raw: object) -> dict[str, Any]:
+def _normalize_request(
+    raw: object,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("Submission must be an object.")
     required = {"schema_version", "campaign_id", "submission_id", "hypothesis", "strategy", "parameters"}
@@ -757,6 +1027,7 @@ def _normalize_request(raw: object) -> dict[str, Any]:
     strategy = raw["strategy"]
     if not isinstance(strategy, dict):
         raise ValueError("Strategy must be a JSON object.")
+    from prajnatrade.plugins import PluginError
     from prajnatrade.strategies import STRATEGY_FAMILIES, normalize_strategy_spec
 
     family = strategy.get("family")
@@ -791,6 +1062,20 @@ def _normalize_request(raw: object) -> dict[str, Any]:
         }
         if "parameter_schema" in spec:
             canonical_strategy["parameter_schema"] = spec["parameter_schema"]
+    elif isinstance(family, str) and family.strip():
+        if set(strategy) - {"family", "history_requirements"}:
+            raise PluginError(
+                "PLUGIN_REGISTRATION_FORBIDDEN",
+                "Submissions cannot supply plugin paths, entrypoints, or source; register via operator CLI.",
+            )
+        spec = normalize_strategy_spec(
+            {"family": family, "parameters": raw["parameters"]},
+            plugin_registry=plugin_registry,
+        )
+        canonical_strategy = {
+            "family": spec["family"],
+            "plugin": spec["plugin"],
+        }
     else:
         raise ValueError("Unsupported strategy family.")
     if "history_requirements" in strategy:
@@ -852,12 +1137,31 @@ def _timeout(_signum: int, _frame: object) -> None:
     raise _TimeExpired()
 
 
-def experiment_submit(project: Path, raw: object) -> dict[str, Any]:
+def experiment_submit(
+    project: Path,
+    raw: object,
+    *,
+    plugin_config: Path | None = None,
+    plugin_specs: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    from prajnatrade.plugins import PluginError, load_plugin_registry
+
+    registry = load_project_plugin_registry(project)
+    if plugin_config is not None or plugin_specs:
+        registry = {
+            **registry,
+            **load_plugin_registry(plugin_config=plugin_config, plugin_specs=plugin_specs),
+        }
     try:
-        request = _normalize_request(raw)
+        request = _normalize_request(raw, plugin_registry=registry)
+    except PluginError as error:
+        raise ProtocolError(error.code, "admission", "correct", error.message) from error
     except (ValueError, TypeError) as error:
         raise ProtocolError("INVALID_SUBMISSION", "admission", "correct", str(error)) from error
-    return _execute_request(project, request["campaign_id"], request["submission_id"], request)
+    return _execute_request(
+        project, request["campaign_id"], request["submission_id"], request,
+        plugin_registry=registry,
+    )
 
 
 def experiment_resume(project: Path, campaign_id: str, submission_id: str) -> dict[str, Any]:
@@ -874,7 +1178,12 @@ def _find_experiment(
 
 
 def _execute_request(
-    project: Path, campaign_id: str, submission_id: str, request: dict[str, Any] | None,
+    project: Path,
+    campaign_id: str,
+    submission_id: str,
+    request: dict[str, Any] | None,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     from prajnatrade.research_direction import require_discovery_work
 
@@ -918,7 +1227,16 @@ def _execute_request(
             )
         connection.commit()
         return _run_attempt(
-            connection, campaign, project_id, experiment_id, request, started, remaining,
+            connection,
+            campaign,
+            project_id,
+            experiment_id,
+            request,
+            started,
+            remaining,
+            plugin_registry=(
+                plugin_registry if plugin_registry is not None else load_project_plugin_registry(project)
+            ),
         )
 
 
@@ -937,9 +1255,11 @@ def _require_container_executor(
 
 
 def _freeze_history_requirements(campaign: sqlite3.Row, request: dict[str, Any]) -> None:
-    policy = json.loads(campaign["evaluation_json"]).get("history_policy")
+    evaluation = json.loads(campaign["evaluation_json"])
+    policy = evaluation.get("history_policy")
+    decision_policy = evaluation.get("decision_policy")
     strategy = request["strategy"]
-    if policy is not None:
+    if policy is not None or decision_policy is not None:
         strategy["history_requirements"] = strategy_history_requirements({
             **strategy, "parameters": request["parameters"],
         })
@@ -1005,6 +1325,8 @@ def _executor_evidence(
 def _run_attempt(
     connection: sqlite3.Connection, campaign: sqlite3.Row, project_id: object,
     experiment_id: str, request: dict[str, Any], started: float, remaining: float,
+    *,
+    plugin_registry: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     campaign_id = campaign["campaign_id"]
     family = request["strategy"]["family"]
@@ -1028,17 +1350,27 @@ def _run_attempt(
         executor_config = _executor_config(config)
         rules = config["execution_rules"]
         policy = config.get("history_policy")
+        decision_policy = config.get("decision_policy")
         if not runtime_matches(
             config["runtime"], executor_config, execution_rules=rules, history_policy=policy,
+            decision_policy=decision_policy,
         ):
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec: dict[str, Any] = {
             "family": family, "parameters": request["parameters"],
         }
-        history_options = (
-            _attempt_history_options(connection, campaign_id, policy, data, request["strategy"])
-            if policy is not None else {}
-        )
+        if "plugin" in request["strategy"]:
+            spec["plugin"] = request["strategy"]["plugin"]
+        if policy is not None:
+            history_options = _attempt_history_options(
+                connection, campaign_id, policy, data, request["strategy"],
+            )
+        elif decision_policy is not None and "history_requirements" in request["strategy"]:
+            history_options = {
+                "history_requirements": request["strategy"]["history_requirements"],
+            }
+        else:
+            history_options = {}
         from prajnatrade.snapshot_baseline import run_discovery_strategy
         from prajnatrade.strategies import make_strategy
 
@@ -1057,6 +1389,8 @@ def _run_attempt(
                 container_executor=executor_from_config(executor_config),
                 evidence_callback=executor_evidence.append,
             )
+        elif "plugin" in request["strategy"]:
+            strategy = make_strategy(spec, plugin_registry=plugin_registry)
         else:
             strategy = make_strategy(spec)
         window = signal_window_sessions(spec)
@@ -1072,6 +1406,9 @@ def _run_attempt(
             slippage_bps=config["slippage_bps"],
             execution_rule_version=rules.get("version", NEXT_OPEN_RULES),
             valuation_policy_version=valuation_policy_version(rules),
+            decision_policy=decision_policy,
+            lot_sizes=rules.get("execution", {}).get("lot_sizes"),
+            symbol_order=rules.get("execution", {}).get("symbol_order"),
             **history_options,
         )
         benchmark = json.loads(campaign["baseline_json"])
