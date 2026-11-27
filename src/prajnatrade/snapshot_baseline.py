@@ -92,6 +92,7 @@ def run_discovery_strategy(
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a strategy with point-in-time signals and formal Discovery accounting."""
     return run_partition_strategy(
@@ -110,6 +111,7 @@ def run_discovery_strategy(
         valuation_policy_version=valuation_policy_version,
         history_requirements=history_requirements,
         scoring_start=scoring_start,
+        decision_policy=decision_policy,
     )
 
 
@@ -162,6 +164,7 @@ def run_partition_strategy(
     valuation_policy_version: str = STRICT_CLOSE_VALUATION,
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a strategy over one sealed partition with formal accounting.
 
@@ -217,6 +220,8 @@ def run_partition_strategy(
     }
     signals: list[dict[str, Any]] = []
     signal_gaps: list[dict[str, Any]] = []
+    signal_pauses: list[dict[str, Any]] = []
+    decision_records: list[dict[str, Any]] = []
     first_scored_open = None
     first_ready_date = None
     history_gaps: list[dict[str, Any]] = []
@@ -234,7 +239,7 @@ def run_partition_strategy(
 
     for day_index, day in enumerate(sessions):
         ready = False
-        if history_requirements is not None:
+        if history_requirements is not None and decision_policy is None:
             readiness, windows, observation_values = _history_at_open(
                 history_sessions, history_derived, day, history_requirements,
             )
@@ -417,6 +422,131 @@ def run_partition_strategy(
         equity_curve.append(nav_point)
         valuation_gaps.extend(gaps)
 
+        if decision_policy is not None:
+            if day_index + 1 >= len(sessions):
+                continue
+            from prajnatrade.decision_window import select_common_observations
+
+            reqs = (
+                history_requirements
+                if history_requirements is not None
+                else [
+                    {
+                        "id": "strategy_lookback",
+                        "observations": signal_window_sessions,
+                        "mode": "valid_observations",
+                    }
+                ]
+            )
+            obs_result = select_common_observations(
+                history_sessions,
+                raw_bars,
+                history_derived,
+                day,
+                decision_policy,
+                reqs,
+                data_kind=data_kind,
+            )
+            if day_index == 0:
+                first_scored_open = {
+                    "decision_date": day,
+                    "ready": obs_result["ready"],
+                    "requirements": obs_result["requirements"],
+                    "signal_status": obs_result["signal_status"],
+                }
+            if obs_result["signal_status"] == "paused":
+                pause_info = obs_result["signal_pause"]
+                signal_pauses.append(pause_info)
+                signal_gaps.append(pause_info)
+                decision_records.append(
+                    {
+                        "date": day,
+                        "signal_cutoff": obs_result["signal_cutoff"],
+                        "signal_status": "paused",
+                        "signal_pause": pause_info,
+                        "observation_dates": [],
+                        "observation_sources": {},
+                    }
+                )
+                continue
+            if not obs_result["ready"]:
+                history_gaps.append(
+                    {
+                        "decision_date": day,
+                        "ready": False,
+                        "requirements": obs_result["requirements"],
+                    }
+                )
+                decision_records.append(
+                    {
+                        "date": day,
+                        "signal_cutoff": obs_result["signal_cutoff"],
+                        "signal_status": obs_result["signal_status"],
+                        "signal_pause": None,
+                        "observation_dates": list(obs_result["observation_dates"]),
+                        "observation_sources": obs_result["observation_sources"],
+                    }
+                )
+                continue
+            if first_ready_date is None:
+                first_ready_date = day
+            obs_values = obs_result["observation_values"]
+            obs_days = obs_result["observation_dates"]
+            history_rows = [
+                {"date": obs_day, "symbol": symbol, "close": value}
+                for obs_day in obs_days
+                for symbol, value in obs_values[obs_day].items()
+            ]
+            state = {
+                "cash": cash,
+                "shares": dict(shares),
+                "equity": nav_point["nav"],
+                "history_windows": {
+                    indicator: list(days) for indicator, days in obs_result["windows"].items()
+                },
+                "signal_date": day,
+            }
+            weights = strategy(pd.DataFrame(history_rows), state)
+            if weights is None:
+                ready_cash_sessions.append(day)
+                decision_records.append(
+                    {
+                        "date": day,
+                        "signal_cutoff": obs_result["signal_cutoff"],
+                        "signal_status": "no_target",
+                        "signal_pause": None,
+                        "observation_dates": list(obs_days),
+                        "observation_sources": obs_result["observation_sources"],
+                    }
+                )
+                continue
+            normalized = _validate_weights(weights)
+            signal = {
+                "date": day,
+                "execution_date": sessions[day_index + 1],
+                "target_weights": normalized,
+                "total_return_values": obs_result["latest_values"],
+                "window": list(obs_days),
+                "observation_dates": list(obs_days),
+                "observation_sources": obs_result["observation_sources"],
+                "signal_cutoff": obs_result["signal_cutoff"],
+                "signal_status": "generated",
+                "signal_pause": None,
+            }
+            signals.append(signal)
+            pending = (signal, normalized)
+            decision_records.append(
+                {
+                    "date": day,
+                    "signal_cutoff": obs_result["signal_cutoff"],
+                    "signal_status": "generated",
+                    "signal_pause": None,
+                    "observation_dates": list(obs_days),
+                    "observation_sources": obs_result["observation_sources"],
+                }
+            )
+            continue
+
         if history_requirements is not None or day_index + 1 >= len(sessions):
             continue
         cutoff = datetime.combine(
@@ -513,6 +643,10 @@ def run_partition_strategy(
                 "ready_cash_sessions": ready_cash_sessions,
             },
         } if history_requirements is not None else {}),
+        **({
+            "decision_records": decision_records,
+            "signal_pauses": signal_pauses,
+        } if decision_policy is not None else {}),
         **(
             {
                 "valuation_summary": _valuation_summary(
@@ -788,6 +922,7 @@ def run_discovery_equal_weight(
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the fixed equal-weight buy-and-hold comparator."""
     submitted = False
@@ -815,6 +950,7 @@ def run_discovery_equal_weight(
         history_requirements=history_requirements,
         scoring_start=scoring_start,
         prior_history=prior_history,
+        decision_policy=decision_policy,
     )
 
 

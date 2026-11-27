@@ -778,6 +778,11 @@ def _build_plan(
     if not isinstance(evaluation, dict) or evaluation.get("snapshot_id") != snapshot_id:
         raise ValueError("The frozen candidate snapshot reference is inconsistent.")
     schema_version = metadata.get("schema_version")
+    if evaluation.get("decision_policy") is not None:
+        raise _invalid(
+            f"Protected Evaluation does not support decision policy "
+            f"{evaluation['decision_policy'].get('version')!r}."
+        )
     problem = _protected_protocol_problem(schema_version, candidate["execution_rules"])
     if problem is not None:
         raise _invalid(problem)

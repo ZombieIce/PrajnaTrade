@@ -2500,6 +2500,25 @@ def _execution_settings(
             "RELEASE_INVALID",
             f"The release artifact declares unsupported valuation policy {val_policy!r}.",
         )
+    dec_policy = execution.get("decision_policy")
+    normalized_dec_policy: dict[str, Any] | None = None
+    if dec_policy is not None:
+        from prajnatrade.decision_window import normalize_decision_policy
+
+        try:
+            normalized_dec_policy = normalize_decision_policy(dec_policy)
+        except ValueError as error:
+            raise _Blocked(
+                "RELEASE_INVALID",
+                f"The release artifact's decision_policy is invalid: {error}",
+            ) from error
+    hist_reqs = execution.get("history_requirements")
+    if hist_reqs is not None:
+        if not isinstance(hist_reqs, list):
+            raise _Blocked(
+                "RELEASE_INVALID",
+                "The release artifact's history_requirements must be a list.",
+            )
     return {
         "strategy": identity,
         **runtime,
@@ -2510,6 +2529,8 @@ def _execution_settings(
         "signal_window_sessions": window,
         "execution_rules": execution["execution_rules"],
         "valuation_policy": val_policy,
+        **({"decision_policy": normalized_dec_policy} if normalized_dec_policy is not None else {}),
+        **({"history_requirements": hist_reqs} if hist_reqs is not None else {}),
     }
 
 
@@ -3060,8 +3081,42 @@ def _build_input(
                 )
             )
 
+    dec_policy = execution.get("decision_policy")
+    dec_window: dict[str, Any] | None = None
     signal_due = state == "enabled" and next_session is not None
-    if signal_due:
+    if dec_policy is not None:
+        from prajnatrade.decision_window import select_common_observations
+
+        reqs = execution.get("history_requirements")
+        if reqs is None:
+            reqs = [
+                {
+                    "id": "strategy_lookback",
+                    "observations": window_size,
+                    "mode": "valid_observations",
+                }
+            ]
+        dec_window = select_common_observations(
+            feed.sessions[: index + 1],
+            feed.raw,
+            feed.derived,
+            session,
+            dec_policy,
+            reqs,
+            data_kind=feed.data_kind,
+        )
+        if signal_due:
+            if dec_window["signal_status"] == "paused":
+                anomalies.append(dec_window["signal_pause"])
+            elif not dec_window["ready"]:
+                anomalies.append(
+                    {
+                        "code": "signal_window_incomplete",
+                        "date": session,
+                        "requirements": dec_window["requirements"],
+                    }
+                )
+    elif signal_due:
         if len(window_sessions) < window_size:
             if artifact.get("workflow") == release.RESEARCH_HOLDOUT:
                 blockers.append((
@@ -3138,6 +3193,16 @@ def _build_input(
             "slippage_bps": execution["slippage_bps"],
             "signal_window_sessions": execution["signal_window_sessions"],
             "execution_rules": execution["execution_rules"],
+            **(
+                {"decision_policy": dec_policy}
+                if dec_policy is not None
+                else {}
+            ),
+            **(
+                {"history_requirements": execution["history_requirements"]}
+                if "history_requirements" in execution
+                else {}
+            ),
         },
         "release_state_at_signal_point": state,
         "previous": prior,
@@ -3151,6 +3216,7 @@ def _build_input(
                 "sessions": window_sessions,
                 "rows": derived_window,
             },
+            **({"decision_window": dec_window} if dec_window is not None else {}),
         },
         "anomalies": anomalies,
         "corrections": correction_decisions,
@@ -3927,7 +3993,107 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
     next_orders: list[dict[str, Any]] = []
     invocations: list[dict[str, Any]] = []
     target_changed = False
-    if state == "enabled" and next_session is not None:
+    dec_policy = execution.get("decision_policy")
+    decision_extra: dict[str, Any] = {}
+    if dec_policy is not None:
+        dw = body["session"]["decision_window"]
+        sig_status = dw["signal_status"]
+        sig_pause = dw["signal_pause"]
+        obs_dates = list(dw["observation_dates"])
+        obs_sources = dw["observation_sources"]
+        sig_cutoff = dw["signal_cutoff"]
+        if state == "enabled" and next_session is not None:
+            if sig_status == "ready":
+                obs_values = dw["observation_values"]
+                history_rows = [
+                    {"date": obs_day, "symbol": symbol, "close": value}
+                    for obs_day in obs_dates
+                    for symbol, value in obs_values[obs_day].items()
+                ]
+                try:
+                    strategy = make_strategy(
+                        execution.get("strategy_spec", execution["strategy"]),
+                        container_executor=execution.get("container_executor"),
+                        evidence_callback=invocations.append,
+                        plugin_registry=execution.get("plugin_registry"),
+                    )
+                    weights = strategy(
+                        pd.DataFrame(history_rows),
+                        {
+                            "cash": cash,
+                            "shares": dict(shares),
+                            "equity": nav,
+                            "history_windows": dw["windows"],
+                            "signal_date": session,
+                        },
+                    )
+                except IsolationError as error:
+                    raise _Blocked(
+                        "strategy_isolation_failed", f"The frozen container strategy failed: {error}",
+                    ) from error
+                except (ValueError, TypeError) as error:
+                    from prajnatrade.plugins import PluginError
+
+                    if isinstance(error, PluginError):
+                        raise _Blocked(error.code, error.message) from error
+                    raise _Blocked(
+                        "strategy_error",
+                        f"The frozen strategy failed on the after-close signal input: {error}",
+                    ) from error
+                if weights is not None:
+                    try:
+                        normalized = _validate_weights(weights)
+                    except ValueError as error:
+                        raise _Blocked(
+                            "strategy_error",
+                            f"The frozen strategy returned invalid target weights: {error}",
+                        ) from error
+                    sig_status = "generated"
+                    signal = {
+                        "date": session,
+                        "execution_date": next_session,
+                        "target_weights": normalized,
+                        "total_return_values": dw["latest_values"],
+                        "window": list(obs_dates),
+                        "observation_dates": list(obs_dates),
+                        "observation_sources": obs_sources,
+                        "signal_cutoff": sig_cutoff,
+                        "signal_status": "generated",
+                        "signal_pause": None,
+                    }
+                    next_orders = _next_orders(
+                        body,
+                        normalized,
+                        shares,
+                        cash,
+                        cash + market_value,
+                        fee_rate,
+                        slippage_rate,
+                    )
+                    target_changed = _target_changed(prior.get("signal_target"), normalized)
+                    if not next_orders and not target_changed:
+                        signal["opportunity"] = {
+                            "due": False,
+                            "reason": "no_target_change",
+                        }
+                    elif next_orders and not target_changed:
+                        signal["opportunity"] = {
+                            "due": False,
+                            "reason": "target_unchanged",
+                        }
+                else:
+                    sig_status = "no_target"
+        else:
+            sig_status = "disabled" if state != "enabled" else "no_next_session"
+        decision_extra = {
+            "decision_policy": dec_policy,
+            "signal_cutoff": sig_cutoff,
+            "signal_status": sig_status,
+            "signal_pause": sig_pause,
+            "observation_dates": obs_dates,
+            "observation_sources": obs_sources,
+        }
+    elif state == "enabled" and next_session is not None:
         window = body["session"]["derived_window"]
         if len(window["sessions"]) >= execution["signal_window_sessions"]:
             history_rows: list[dict[str, Any]] = []
@@ -4058,7 +4224,18 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
             "transaction_cost_bps": body["execution"]["transaction_cost_bps"],
             "slippage_bps": body["execution"]["slippage_bps"],
             "signal_window_sessions": body["execution"]["signal_window_sessions"],
+            **(
+                {"decision_policy": body["execution"]["decision_policy"]}
+                if "decision_policy" in body["execution"]
+                else {}
+            ),
+            **(
+                {"history_requirements": body["execution"]["history_requirements"]}
+                if "history_requirements" in body["execution"]
+                else {}
+            ),
         },
+        **decision_extra,
         "previous": {"date": prior["date"], "nav": prior["nav"]},
         "corporate_actions": applied,
         "dividends": {
@@ -4138,9 +4315,16 @@ def _next_orders(
     next_session = body["session"]["next_session"]
     raw = body["session"]["raw_bars"]
     deadline = _session_open(next_session)
-    submitted_at = _signal_point(session)
+    dec_policy = body.get("execution", {}).get("decision_policy")
+    if dec_policy is not None:
+        from prajnatrade.decision_window import decision_cutoff
+
+        close_cutoff = decision_cutoff(session, dec_policy)
+        submitted_at = close_cutoff.isoformat()
+    else:
+        submitted_at = _signal_point(session)
+        close_cutoff = _session_close(session)
     cost_multiplier = (1.0 + fee_rate) * (1.0 + slippage_rate)
-    close_cutoff = _session_close(session)
     intents: list[dict[str, Any]] = []
     sell_value = 0.0
     buy_cost = 0.0

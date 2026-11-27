@@ -59,6 +59,7 @@ def _runtime_components(
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
     plugins_active: bool = False,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     directory = Path(__file__).parent
     files = (
@@ -70,14 +71,17 @@ def _runtime_components(
     if (
         (execution_rules is not None and execution_rules.get("version") == ACTUAL_OPEN_RULES)
         or valuation_version != STRICT_CLOSE_VALUATION
+        or decision_policy is not None
     ):
         files += ("trading_status.py",)
-    if valuation_version != STRICT_CLOSE_VALUATION:
+    if valuation_version != STRICT_CLOSE_VALUATION or decision_policy is not None:
         files += ("valuation.py",)
     if history_policy is not None:
         files += ("experiment.py",)
     if plugins_active:
         files += ("plugins.py",)
+    if decision_policy is not None:
+        files += ("decision_window.py",)
     executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}
     return {
         **{
@@ -110,6 +114,7 @@ def runtime_identity(
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
     plugins_active: bool = False,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> str:
     """Fingerprint the accounting dependencies and optional strategy executor.
 
@@ -122,10 +127,12 @@ def runtime_identity(
         execution_rules=execution_rules,
         history_policy=history_policy,
         plugins_active=plugins_active,
+        decision_policy=decision_policy,
     )
     if (
         history_policy is None
         and not plugins_active
+        and decision_policy is None
         and execution_rules is not None
         and "version" not in execution_rules
         and dependencies["snapshot_baseline.py"] == _LEGACY_ACCOUNTING_SOURCE
@@ -141,6 +148,7 @@ def runtime_matches(
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
     plugins_active: bool = False,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> bool:
     """Check the exact current runtime or a compatible legacy dependency set."""
     dependencies = _runtime_components(
@@ -148,12 +156,14 @@ def runtime_matches(
         execution_rules=execution_rules,
         history_policy=history_policy,
         plugins_active=plugins_active,
+        decision_policy=decision_policy,
     )
     if stored == _fingerprint(dependencies):
         return True
     if (
         history_policy is not None
         or plugins_active
+        or decision_policy is not None
         or "trading_status.py" in dependencies
         or "valuation_policy" in dependencies
         or any(
@@ -258,9 +268,13 @@ def _campaign_evaluation(
     history_policy: Mapping[str, Any] | None = None,
     discovery_split: Mapping[str, Any] | None = None,
     full_history: Mapping[str, Any] | None = None,
+    decision_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_dependencies = _runtime_components(
-        strategy_executor, execution_rules=execution_rules, history_policy=history_policy,
+        strategy_executor,
+        execution_rules=execution_rules,
+        history_policy=history_policy,
+        decision_policy=decision_policy,
     )
     valuation_version = valuation_policy_version(execution_rules)
     return {
@@ -285,6 +299,7 @@ def _campaign_evaluation(
             if valuation_version != STRICT_CLOSE_VALUATION
             else {}
         ),
+        **({"decision_policy": dict(decision_policy)} if decision_policy is not None else {}),
         "strategy_executor": strategy_executor,
         "runtime_dependencies": runtime_dependencies,
         "runtime": _fingerprint(runtime_dependencies),
@@ -493,6 +508,9 @@ def campaign_create(
     as_of: str | None = None, *,
     execution_rules: str = NEXT_OPEN_RULES,
     valuation_policy: str = STRICT_CLOSE_VALUATION,
+    decision_policy: str | None = None,
+    signal_cutoff: str | None = None,
+    signal_timezone: str | None = None,
     strategy_executor: str = "none",
     strategy_image: str | None = None,
     executor: ContainerStrategyExecutor | None = None,
@@ -503,6 +521,17 @@ def campaign_create(
     if attempts <= 0 or not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("Attempts and execution seconds must be positive.")
     execution_policy = _execution_policy(execution_rules, valuation_policy=valuation_policy)
+    normalized_decision_policy: dict[str, Any] | None = None
+    if decision_policy is not None:
+        from prajnatrade.decision_window import normalize_decision_policy
+
+        normalized_decision_policy = normalize_decision_policy(
+            decision_policy,
+            signal_cutoff=signal_cutoff,
+            signal_timezone=signal_timezone,
+        )
+    elif signal_cutoff is not None or signal_timezone is not None:
+        raise ValueError("--signal-cutoff and --signal-timezone require --decision-policy.")
     executor_config = _resolve_executor_config(
         strategy_executor, strategy_image, executor,
     )
@@ -607,6 +636,7 @@ def campaign_create(
         history_policy=history_policy,
         discovery_split=split_descriptor,
         full_history=full_history,
+        decision_policy=normalized_decision_policy,
     )
     from prajnatrade.snapshot_baseline import run_discovery_equal_weight
 
@@ -620,6 +650,7 @@ def campaign_create(
         slippage_bps=slippage_bps,
         execution_rule_version=execution_rules,
         valuation_policy_version=valuation_policy,
+        decision_policy=normalized_decision_policy,
         **baseline_options,
     )
     campaign_id = str(uuid.uuid4())
@@ -666,6 +697,11 @@ def campaign_create(
         **(
             {"valuation_policy": dict(execution_policy["valuation"])}
             if valuation_policy != STRICT_CLOSE_VALUATION
+            else {}
+        ),
+        **(
+            {"decision_policy": normalized_decision_policy}
+            if normalized_decision_policy is not None
             else {}
         ),
         "strategy_executor": executor_config,
@@ -1150,9 +1186,11 @@ def _require_container_executor(
 
 
 def _freeze_history_requirements(campaign: sqlite3.Row, request: dict[str, Any]) -> None:
-    policy = json.loads(campaign["evaluation_json"]).get("history_policy")
+    evaluation = json.loads(campaign["evaluation_json"])
+    policy = evaluation.get("history_policy")
+    decision_policy = evaluation.get("decision_policy")
     strategy = request["strategy"]
-    if policy is not None:
+    if policy is not None or decision_policy is not None:
         strategy["history_requirements"] = strategy_history_requirements({
             **strategy, "parameters": request["parameters"],
         })
@@ -1243,10 +1281,11 @@ def _run_attempt(
         executor_config = _executor_config(config)
         rules = config["execution_rules"]
         policy = config.get("history_policy")
+        decision_policy = config.get("decision_policy")
         plugins_active = "plugins.py" in config.get("runtime_dependencies", {})
         if not runtime_matches(
             config["runtime"], executor_config, execution_rules=rules, history_policy=policy,
-            plugins_active=plugins_active,
+            plugins_active=plugins_active, decision_policy=decision_policy,
         ):
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec: dict[str, Any] = {
@@ -1254,10 +1293,16 @@ def _run_attempt(
         }
         if "plugin" in request["strategy"]:
             spec["plugin"] = request["strategy"]["plugin"]
-        history_options = (
-            _attempt_history_options(connection, campaign_id, policy, data, request["strategy"])
-            if policy is not None else {}
-        )
+        if policy is not None:
+            history_options = _attempt_history_options(
+                connection, campaign_id, policy, data, request["strategy"],
+            )
+        elif decision_policy is not None and "history_requirements" in request["strategy"]:
+            history_options = {
+                "history_requirements": request["strategy"]["history_requirements"],
+            }
+        else:
+            history_options = {}
         from prajnatrade.snapshot_baseline import run_discovery_strategy
         from prajnatrade.strategies import make_strategy
 
@@ -1293,6 +1338,7 @@ def _run_attempt(
             slippage_bps=config["slippage_bps"],
             execution_rule_version=rules.get("version", NEXT_OPEN_RULES),
             valuation_policy_version=valuation_policy_version(rules),
+            decision_policy=decision_policy,
             **history_options,
         )
         benchmark = json.loads(campaign["baseline_json"])

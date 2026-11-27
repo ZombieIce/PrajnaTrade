@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from prajnatrade.decision_window import DECISION_POLICY_VERSIONS
 from prajnatrade.trading_status import (
     EXECUTION_RULE_VERSIONS,
     NEXT_OPEN_RULES,
@@ -314,6 +315,18 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     create.add_argument(
         "--valuation-policy", choices=VALUATION_POLICY_VERSIONS, default=STRICT_CLOSE_VALUATION,
         help="freeze close valuation policy for held symbols (default: strict-close-v1)",
+    )
+    create.add_argument(
+        "--decision-policy", choices=DECISION_POLICY_VERSIONS, default=None,
+        help="opt-in frozen after-close decision timing policy (e.g. after-close-common-v1)",
+    )
+    create.add_argument(
+        "--signal-cutoff", default=None,
+        help="frozen signal cutoff time HH:MM (requires --decision-policy)",
+    )
+    create.add_argument(
+        "--signal-timezone", default=None,
+        help="frozen signal cutoff IANA timezone (requires --decision-policy)",
     )
     create.add_argument(
         "--strategy-executor", choices=["none", "container"], default="none",
@@ -870,6 +883,9 @@ def _main(argv: Sequence[str] | None, *, agent_only: bool) -> int:
                 args.slippage_bps, args.as_of,
                 execution_rules=args.execution_rules,
                 valuation_policy=args.valuation_policy,
+                decision_policy=args.decision_policy,
+                signal_cutoff=args.signal_cutoff,
+                signal_timezone=args.signal_timezone,
                 strategy_executor=args.strategy_executor,
                 strategy_image=args.strategy_image,
                 discovery_warmup_sessions=args.discovery_warmup_sessions,

@@ -1191,6 +1191,11 @@ def submit(
                 "runtime": evaluation["runtime"],
                 "strategy": strategy,
                 **(
+                    {"decision_policy": evaluation["decision_policy"]}
+                    if evaluation.get("decision_policy") is not None
+                    else {}
+                ),
+                **(
                     {
                         "protocol": record["kickoff"]["protocol"],
                         "research_partition": record["kickoff"]["research_partition"],
@@ -1314,6 +1319,7 @@ def _evidence_runs(
     rules = locked["execution_rules"]
     rule_version = rules.get("version", NEXT_OPEN_RULES)
     valuation_version = valuation_policy_version(rules)
+    decision_policy = locked.get("decision_policy")
     options = {
         "data_kind": source["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
@@ -1325,6 +1331,7 @@ def _evidence_runs(
         "valuation_policy_version": valuation_version,
         "history_requirements": locked["history_requirements"],
         "scoring_start": scoring_start,
+        "decision_policy": decision_policy,
     }
     strategy = _strategy_from_locked(
         locked["strategy"], locked["strategy_executor"], plugin_registry=plugin_registry,
@@ -1349,6 +1356,7 @@ def _evidence_runs(
         valuation_policy_version=valuation_version,
         history_requirements=[],
         scoring_start=scoring_start,
+        decision_policy=decision_policy,
     )
     return {
         "candidate": candidate,
@@ -1946,10 +1954,12 @@ def _receipt(
         "version", NEXT_OPEN_RULES
     )
     valuation_version = valuation_policy_version(submission["locked"]["execution_rules"])
+    decision_policy = submission["locked"].get("decision_policy")
     if (
         (type(snapshot_schema_version) is int and snapshot_schema_version >= 3)
         or execution_rule_version == ACTUAL_OPEN_RULES
         or valuation_version != STRICT_CLOSE_VALUATION
+        or decision_policy is not None
     ):
         provenance = {
             "snapshot_id": replay["snapshot"]["snapshot_id"],
@@ -1959,6 +1969,8 @@ def _receipt(
         }
         if valuation_version != STRICT_CLOSE_VALUATION:
             provenance["valuation_policy_version"] = valuation_version
+        if decision_policy is not None:
+            provenance["decision_policy"] = decision_policy
         receipt["provenance"] = provenance
     if corrected is not None:
         receipt.update(dict(corrected))
@@ -2539,6 +2551,7 @@ def _formal_runs(
     rules = locked["execution_rules"]
     rule_version = rules.get("version", NEXT_OPEN_RULES)
     valuation_version = valuation_policy_version(rules)
+    decision_policy = locked.get("decision_policy")
     options = {
         "data_kind": evaluation["data_kind"],
         "signal_window_sessions": locked["signal_window_sessions"],
@@ -2550,6 +2563,7 @@ def _formal_runs(
         "valuation_policy_version": valuation_version,
         "history_requirements": list(locked["history_requirements"] or []),
         "scoring_start": scoring_start,
+        "decision_policy": decision_policy,
     }
     strategy = _strategy_from_locked(
         locked["strategy"], locked["strategy_executor"], plugin_registry=plugin_registry,
@@ -2574,6 +2588,7 @@ def _formal_runs(
         valuation_policy_version=valuation_version,
         history_requirements=[],
         scoring_start=scoring_start,
+        decision_policy=decision_policy,
     )
     readiness = candidate.get("history_readiness") or {}
     warmup = {
@@ -2725,6 +2740,7 @@ def _formal_receipt(
         "valued_sessions": candidate_metrics["valued_sessions"],
     }
     valuation_version = valuation_policy_version(submission["locked"]["execution_rules"])
+    decision_policy = submission["locked"].get("decision_policy")
     provenance = {
         "snapshot_id": runs["snapshot"]["snapshot_id"],
         "partition_content_hash": runs["snapshot"]["partition_content_hash"],
@@ -2749,6 +2765,11 @@ def _formal_receipt(
             if valuation_version != STRICT_CLOSE_VALUATION
             else {}
         ),
+        **(
+            {"decision_policy": decision_policy}
+            if decision_policy is not None
+            else {}
+        ),
     }
     receipt = {
         "schema_version": SCHEMA_VERSION,
@@ -2768,6 +2789,11 @@ def _formal_receipt(
                 "end": split["partition"]["end"],
                 "sessions": split["partition"]["sessions"],
             },
+            **(
+                {"decision_policy": decision_policy}
+                if decision_policy is not None
+                else {}
+            ),
         },
         "development": dict(split["development"]),
         "trailing": dict(split["trailing"]),
@@ -4655,6 +4681,16 @@ def _tracking_artifact(
             "history_policy": locked["history_policy"],
             "strategy_executor": locked["strategy_executor"],
             "runtime": locked["runtime"],
+            **(
+                {"decision_policy": locked["decision_policy"]}
+                if locked.get("decision_policy") is not None
+                else {}
+            ),
+            **(
+                {"history_requirements": list(locked["history_requirements"] or [])}
+                if locked.get("decision_policy") is not None or locked.get("history_requirements")
+                else {}
+            ),
         },
         "initial_cash": locked["base_costs"]["initial_cash"],
         "observation": body["observation"],
