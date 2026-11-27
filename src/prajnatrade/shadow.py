@@ -1813,6 +1813,21 @@ def mark_version_ended(
     return Ledger(ledger).end_version(version_id, release_id)
 
 
+def _lot_order_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not any("lot_orders" in result for result in results):
+        return {}
+    lot_orders = [order for result in results for order in result.get("lot_orders", [])]
+    return {
+        "lot_order_count": len(lot_orders),
+        "lot_orders_unfilled": sum(order.get("status") == "unfilled" for order in lot_orders),
+        "shortfall_lots": math.fsum(
+            float(order["shortfall_lots"])
+            for order in lot_orders
+            if order.get("shortfall_lots") is not None
+        ),
+    }
+
+
 def _report_summary(
     entries: list[dict[str, Any]], progress: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -1866,6 +1881,7 @@ def _report_summary(
         "unfilled_opportunities": opportunities["unfilled_opportunities"],
         "intent_without_fill": opportunities["intent_without_fill"],
         "metrics_not_ready": opportunities["metrics_not_ready"],
+        **_lot_order_summary([entry["result"] for entry in entries]),
     }
 
 
@@ -2025,6 +2041,7 @@ def _comparison_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "filled_opportunities": opportunities["filled_opportunities"],
         "unfilled_opportunities": opportunities["unfilled_opportunities"],
         "intent_without_fill": opportunities["intent_without_fill"],
+        **_lot_order_summary(results),
     }
 
 
@@ -2074,6 +2091,7 @@ def _full_history_entry(days: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "filled_opportunities": opportunities["filled_opportunities"],
         "unfilled_opportunities": opportunities["unfilled_opportunities"],
         "intent_without_fill": opportunities["intent_without_fill"],
+        **_lot_order_summary(results),
     }
 
 
@@ -4150,12 +4168,25 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
                 fills.append(fill)
 
             unfilled_map = {item["symbol"]: item["reason"] for item in attempt["unfilled"]}
+            lot_order_by_symbol = {
+                item["symbol"]: item for item in attempt.get("lot_orders", [])
+            }
             for sym, base_record in record_by_symbol.items():
+                lot_order = lot_order_by_symbol.get(sym)
+                if lot_order is not None:
+                    base_record["lot_execution"] = lot_order
                 if sym in fill_by_symbol:
                     matched = fill_by_symbol[sym]
                     base_record["side"] = matched["side"]
                     base_record["quantity"] = matched["quantity"]
-                    base_record["status"] = "filled"
+                    base_record["status"] = (
+                        "cash_constrained"
+                        if lot_order is not None
+                        and lot_order.get("reason") == "cash_constrained"
+                        else "filled"
+                    )
+                    if base_record["status"] == "cash_constrained":
+                        base_record["reason"] = "cash_constrained"
                     base_record["fill"] = matched
                 elif sym in unfilled_map:
                     base_record["status"] = "unfilled"
@@ -4175,6 +4206,7 @@ def _compute_day(body: dict[str, Any], execution: dict[str, Any]) -> dict[str, A
                 "lot_rounding_residual": attempt["lot_rounding_residual"],
                 "residual_reason": attempt["residual_reason"],
                 "daily_simulation_assumptions": attempt["daily_simulation_assumptions"],
+                "lot_orders": attempt.get("lot_orders", []),
             }
             if stateful_active:
                 sig_date_att = str(attempt["signal_date"])

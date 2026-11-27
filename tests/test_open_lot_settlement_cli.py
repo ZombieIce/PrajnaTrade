@@ -148,6 +148,250 @@ def test_match_open_lot_day_proportional_allocation_and_fee_cap() -> None:
     assert attempt_fee["batch_complete"] is False
 
 
+@pytest.mark.parametrize(
+    (
+        "target_amounts",
+        "initial_cash",
+        "cost_bps",
+        "slippage_bps",
+        "expected_target_lots",
+        "expected_filled_lots",
+        "complete",
+        "expected_ending_cash",
+        "missing_open",
+        "expected_status",
+        "expected_reason",
+    ),
+    [
+        (
+            {ETF_SYMBOLS[0]: 2050.0},
+            2000.0,
+            0,
+            0,
+            {ETF_SYMBOLS[0]: 2},
+            {ETF_SYMBOLS[0]: 2},
+            True,
+            0.0,
+            False,
+            "filled",
+            None,
+        ),
+        (
+            {ETF_SYMBOLS[0]: 3000.0},
+            2000.0,
+            0,
+            0,
+            {ETF_SYMBOLS[0]: 3},
+            {ETF_SYMBOLS[0]: 2},
+            False,
+            0.0,
+            False,
+            "partially_filled",
+            "cash_constrained",
+        ),
+        ({}, 2000.0, 0, 0, {}, {}, True, 2000.0, False, "filled", None),
+        (
+            {ETF_SYMBOLS[0]: 2050.0, ETF_SYMBOLS[1]: 2050.0},
+            4008.005,
+            10,
+            10,
+            {ETF_SYMBOLS[0]: 2, ETF_SYMBOLS[1]: 2},
+            {ETF_SYMBOLS[0]: 2, ETF_SYMBOLS[1]: 2},
+            True,
+            0.001,
+            False,
+            "filled",
+            None,
+        ),
+        (
+            {ETF_SYMBOLS[0]: 2050.0},
+            2000.0,
+            0,
+            0,
+            {ETF_SYMBOLS[0]: None},
+            {ETF_SYMBOLS[0]: 0},
+            False,
+            2000.0,
+            True,
+            "not_filled",
+            "missing_required_open",
+        ),
+    ],
+)
+def test_public_discovery_compares_fills_with_preallocation_target_lots(
+    tmp_path,
+    target_amounts,
+    initial_cash,
+    cost_bps,
+    slippage_bps,
+    expected_target_lots,
+    expected_filled_lots,
+    complete,
+    expected_ending_cash,
+    missing_open,
+    expected_status,
+    expected_reason,
+) -> None:
+    """Whole-lot completion follows executable lots, not nominal target dollars."""
+    import json
+
+    from cli_helpers import cli, ok, write_json
+    from test_actual_open_cli import (
+        make_missing_required_open,
+        schema_v3_fixture,
+        seal_v3,
+    )
+
+    payload = schema_v3_fixture(10)
+    payload["corporate_actions"] = []
+    for row in payload["raw_bars"]:
+        row.update(open=10.0, high=10.0, low=10.0, close=10.0, volume=10_000.0)
+    if missing_open:
+        for day in [row["date"] for row in payload["calendar"]]:
+            make_missing_required_open(payload, day, ETF_SYMBOLS[0])
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "strategy.py").write_text(
+        "\n".join(
+            [
+                "from prajnatrade.data import CASH, ETF_SYMBOLS",
+                "def make_plugin(parameters):",
+                "    def strategy(history, state):",
+                "        if state['previous_order_attempted'] is not None:",
+                "            return None",
+                "        return {",
+                "            'weights': {**{s: 0.0 for s in ETF_SYMBOLS}, CASH: 1.0},",
+                "            'purpose': 'initial',",
+                f"            'fixed_amounts': {target_amounts!r},",
+                "        }",
+                "    return strategy",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    plugin_config = plugin_dir / "plugins.json"
+    plugin_config.write_text(
+        json.dumps(
+            {"plugins": [{"family": "fixed_budget", "entrypoint": "strategy.py:make_plugin"}]}
+        ),
+        encoding="utf-8",
+    )
+
+    sealed = seal_v3(tmp_path, payload, store="store", name="lot-target")
+    project = tmp_path / "project"
+    ok(cli("project", "init", "--project", str(project)))
+    campaign = ok(
+        cli(
+            "campaign",
+            "create",
+            "--project",
+            str(project),
+            "--store",
+            str(sealed["store"]),
+            "--snapshot-id",
+            sealed["snapshot_id"],
+            "--attempts",
+            "1",
+            "--max-seconds",
+            "60",
+            "--initial-cash",
+            str(initial_cash),
+            "--transaction-cost-bps",
+            str(cost_bps),
+            "--slippage-bps",
+            str(slippage_bps),
+            "--execution-rules",
+            ACTUAL_OPEN_LOT_RULES,
+            "--lot-size",
+            "100",
+            "--discovery-warmup-sessions",
+            "3",
+        )
+    )
+    submission = write_json(
+        tmp_path / "submission.json",
+        {
+            "schema_version": 1,
+            "campaign_id": campaign["campaign_id"],
+            "submission_id": "lot-target",
+            "hypothesis": "Compare executable target lots to funded fills.",
+            "strategy": {"family": "fixed_budget"},
+            "parameters": {},
+        },
+    )
+    result = ok(
+        cli(
+            "experiment",
+            "submit",
+            "--project",
+            str(project),
+            "--plugin-config",
+            str(plugin_config),
+            "--input",
+            str(submission),
+        )
+    )["discovery"]
+    attempt = result["order_attempts"][0]
+
+    lot_orders = {order["symbol"]: order for order in attempt["lot_orders"]}
+    assert {
+        symbol: order["target_executable_lots"]
+        for symbol, order in lot_orders.items()
+    } == expected_target_lots
+    assert {
+        symbol: order["actual_filled_lots"]
+        for symbol, order in lot_orders.items()
+    } == expected_filled_lots
+    assert {
+        symbol: order["shortfall_lots"]
+        for symbol, order in lot_orders.items()
+    } == {
+        symbol: (
+            expected_target_lots[symbol] - expected_filled_lots[symbol]
+            if expected_target_lots[symbol] is not None
+            else None
+        )
+        for symbol in expected_target_lots
+    }
+    assert attempt["batch_complete"] is complete
+    assert attempt["status"] == expected_status
+    if expected_reason == "cash_constrained":
+        assert attempt["residual_reason"] == "cash_constrained"
+    if lot_orders:
+        assert lot_orders[ETF_SYMBOLS[0]]["reason"] == expected_reason
+    if expected_reason == "missing_required_open":
+        assert lot_orders[ETF_SYMBOLS[0]]["target_amount"] == 2050.0
+    if target_amounts == {ETF_SYMBOLS[0]: 2050.0} and not missing_open:
+        assert attempt["cash_constrained"] is False
+        assert attempt["lot_rounding_residual"] == pytest.approx(50.0)
+        assert attempt["residual_reason"] == "lot_rounding_residual"
+    assert result["metrics"]["orders_filled"] == int(complete)
+    assert result["metrics"]["orders_unfilled"] == int(not complete)
+    assert result["metrics"]["lot_order_count"] == len(target_amounts)
+    assert result["metrics"]["shortfall_lots"] == pytest.approx(
+        sum(
+            lots for lots in expected_target_lots.values() if lots is not None
+        )
+        - sum(expected_filled_lots.values())
+    )
+    assert result["equity_curve"][-1]["cash"] == pytest.approx(expected_ending_cash)
+    if cost_bps:
+        assert result["metrics"]["fees_paid"] == pytest.approx(4.004)
+        assert result["metrics"]["slippage_paid"] == pytest.approx(4.0)
+        ratio = initial_cash / sum(target_amounts.values())
+        for symbol, order in lot_orders.items():
+            assert order["allocated_amount"] == pytest.approx(
+                target_amounts[symbol] * ratio
+            )
+    assert result["strategy_state"]["rebalance_anchor_date"] == (
+        attempt["signal_date"] if complete else None
+    )
+    if not target_amounts:
+        assert attempt["zero_trade_satisfied"] is True
+        assert attempt["lot_orders"] == []
+
+
 def test_match_open_lot_day_unknown_equity_and_unfilled_sell_no_buying_power() -> None:
     day = "2026-01-05"
     raw_bars = {
@@ -186,6 +430,10 @@ def test_match_open_lot_day_unknown_equity_and_unfilled_sell_no_buying_power() -
     unfilled_map = {item["symbol"]: item["reason"] for item in attempt["unfilled"]}
     assert unfilled_map["511260"] == "confirmed_no_trade"
     assert unfilled_map["515080"] == "equity_basis_unknown"
+    lot_order_map = {item["symbol"]: item for item in attempt["lot_orders"]}
+    assert lot_order_map["511260"]["reason"] == "confirmed_no_trade"
+    assert lot_order_map["515080"]["reason"] == "equity_basis_unknown"
+    assert lot_order_map["515080"]["target_executable_lots"] is None
 
     # Case 2: unfilled sell of A produces ZERO buying power for fixed-amount buy of C
     attempt2, fills2, cash2, new_shares2, _ = match_open_lot_day(
@@ -359,6 +607,19 @@ def test_discovery_and_formal_validation_freeze_lot_rules_and_size_at_actual_ope
     assert receipt["provenance"]["daily_simulation_assumptions"]["late_resume_sell_funds_same_day_buy"] is True
     assert receipt["summary"]["candidate"]["total_return"] == pytest.approx(-0.16)
     assert receipt["summary"]["benchmark"]["total_return"] == pytest.approx(-0.16)
+    for side in ("candidate", "benchmark"):
+        formal_run = receipt["runs"][side]
+        assert formal_run["metrics"]["lot_order_count"] == 5
+        entry_attempt = next(
+            attempt for attempt in formal_run["order_attempts"] if attempt["lot_orders"]
+        )
+        assert {
+            order["target_executable_lots"] for order in entry_attempt["lot_orders"]
+        } == {16}
+        assert {
+            order["actual_filled_lots"] for order in entry_attempt["lot_orders"]
+        } == {16}
+        assert entry_attempt["batch_complete"] is True
 
 
 def test_shadow_live_freezes_pre_open_weights_and_reconciles_with_discovery(tmp_path) -> None:
@@ -366,7 +627,7 @@ def test_shadow_live_freezes_pre_open_weights_and_reconciles_with_discovery(tmp_
 
     from cli_helpers import cli, ok
     from test_actual_open_cli import schema_v3_fixture
-    from test_shadow_cli import day_record
+    from test_shadow_cli import day_record, shadow_report
     from test_shadow_feed_v3_valuation_cli import _build_manual_tracking_release
 
     from prajnatrade.trading_status import STRICT_CLOSE_VALUATION
@@ -469,7 +730,19 @@ def test_shadow_live_freezes_pre_open_weights_and_reconciles_with_discovery(tmp_
     assert day3["nav"] == pytest.approx(83_400.0)  # 400 + 8300 * 10
     assert day3["batch_complete"] is True
     assert day3["cash_constrained"] is False
+    lot_order = next(
+        order for order in day3["lot_orders"] if order["symbol"] == "511260"
+    )
+    assert lot_order["target_executable_lots"] == 83
+    assert lot_order["actual_filled_lots"] == 83
+    assert lot_order["shortfall_lots"] == 0
+    assert lot_order["status"] == "filled"
     assert day3["daily_simulation_assumptions"]["late_resume_sell_funds_same_day_buy"] is True
+    ok(shadow_report(ledger, release_id, report_out))
+    shadow_receipt = json.loads(report_out.read_text(encoding="utf-8"))
+    assert shadow_receipt["summary"]["lot_order_count"] == 1
+    assert shadow_receipt["summary"]["lot_orders_unfilled"] == 0
+    assert shadow_receipt["summary"]["shortfall_lots"] == 0
 
     # Reconcile Discovery on the same data + momentum strategy
     from prajnatrade.snapshot_baseline import run_discovery_strategy
@@ -496,6 +769,30 @@ def test_shadow_live_freezes_pre_open_weights_and_reconciles_with_discovery(tmp_
     assert disc["fills"][0]["quantity"] == day3["fills"][0]["quantity"]
     assert disc["fills"][0]["raw_open"] == day3["fills"][0]["raw_open"]
     assert disc["equity_curve"][3]["nav"] == pytest.approx(day3["nav"])
+    discovery_order = next(
+        order
+        for attempt in disc["order_attempts"]
+        if attempt["date"] == sessions[3]
+        for order in attempt["lot_orders"]
+        if order["symbol"] == "511260"
+    )
+    assert {
+        key: discovery_order[key]
+        for key in (
+            "target_executable_lots",
+            "actual_filled_lots",
+            "shortfall_lots",
+            "reason",
+        )
+    } == {
+        key: lot_order[key]
+        for key in (
+            "target_executable_lots",
+            "actual_filled_lots",
+            "shortfall_lots",
+            "reason",
+        )
+    }
 
     # Legacy next-open-v1 Shadow release still freezes concrete share quantities
     store_legacy = tmp_path / "release-store-legacy"

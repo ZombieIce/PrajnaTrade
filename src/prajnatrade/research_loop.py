@@ -1608,6 +1608,8 @@ def _run_record(run: Mapping[str, Any]) -> dict[str, Any]:
         "valuation_gaps": metrics["valuation_gaps"],
         "metrics": metrics,
     }
+    if any("lot_orders" in attempt for attempt in run.get("order_attempts", [])):
+        record["order_attempts"] = [dict(attempt) for attempt in run["order_attempts"]]
     if "valuation_summary" in run:
         record["valuation_summary"] = dict(run["valuation_summary"])
     return record

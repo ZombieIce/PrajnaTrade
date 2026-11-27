@@ -1162,6 +1162,36 @@ def _metrics(
         metrics["orders_partially_filled"] = sum(
             1 for attempt in order_attempts if attempt.get("status") == "partially_filled"
         )
+    if execution_rule_version == ACTUAL_OPEN_LOT_RULES:
+        lot_orders = [
+            order
+            for attempt in order_attempts
+            for order in attempt.get("lot_orders", [])
+        ]
+        metrics.update(
+            {
+                "lot_order_count": len(lot_orders),
+                "lot_orders_filled": sum(
+                    order.get("status") == "filled" for order in lot_orders
+                ),
+                "lot_orders_unfilled": sum(
+                    order.get("status") == "unfilled" for order in lot_orders
+                ),
+                "target_executable_lots": math.fsum(
+                    float(order["target_executable_lots"])
+                    for order in lot_orders
+                    if order.get("target_executable_lots") is not None
+                ),
+                "actual_filled_lots": math.fsum(
+                    float(order["actual_filled_lots"]) for order in lot_orders
+                ),
+                "shortfall_lots": math.fsum(
+                    float(order["shortfall_lots"])
+                    for order in lot_orders
+                    if order.get("shortfall_lots") is not None
+                ),
+            }
+        )
     if valuation_policy_version == CARRY_FORWARD_SUSPENDED_VALUATION:
         metrics["actual_close_sessions"] = sum(
             point["nav"] is not None and point.get("valuation_basis") == "actual_close"
