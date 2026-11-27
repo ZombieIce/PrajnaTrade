@@ -226,6 +226,19 @@ def _bytes(value: object) -> bytes:
     return snapshot._bytes(value)
 
 
+def _reject_local_plugin(
+    strategy: dict[str, Any], *, as_value_error: bool = False
+) -> None:
+    if (
+        strategy.get("plugin") is not None
+        or strategy.get("family") not in (*STRATEGY_FAMILIES, "python")
+    ):
+        message = "Local plugin strategies are not allowed in protected evaluation."
+        if as_value_error:
+            raise ValueError(f"PLUGIN_NOT_ALLOWED_IN_PROTECTED_EVAL: {message}")
+        raise _reject("PLUGIN_NOT_ALLOWED_IN_PROTECTED_EVAL", "run", "stop", message)
+
+
 def _store(path: str | Path) -> Path:
     resolved = snapshot._store_path(Path(path))
     resolved.mkdir(parents=True, exist_ok=True)
@@ -803,14 +816,7 @@ def _build_plan(
     if data_kind == "real" and not payload["thresholds"]:
         raise _invalid("Real Validation requires preregistered hard thresholds.")
     family = candidate["strategy"]["family"]
-    if (
-        candidate["strategy"].get("plugin") is not None
-        or family not in (*STRATEGY_FAMILIES, "python")
-    ):
-        raise ValueError(
-            "PLUGIN_NOT_ALLOWED_IN_PROTECTED_EVAL: "
-            "Local plugin strategies are not allowed in protected evaluation."
-        )
+    _reject_local_plugin(candidate["strategy"], as_value_error=True)
     neighbourhood = _neighbourhood(candidate)
     executor_config = evaluation.get("strategy_executor", {"kind": "none"})
     if evaluation.get("runtime") != runtime_identity(
@@ -3114,17 +3120,7 @@ def run_evaluation(
             f"The frozen snapshot manifest could not be verified: {error}",
         )
     schema_version = metadata.get("schema_version")
-    candidate_strategy = plan["candidate"]["strategy"]
-    if (
-        candidate_strategy.get("plugin") is not None
-        or candidate_strategy.get("family") not in (*STRATEGY_FAMILIES, "python")
-    ):
-        raise _reject(
-            "PLUGIN_NOT_ALLOWED_IN_PROTECTED_EVAL",
-            "run",
-            "stop",
-            "Local plugin strategies are not allowed in protected evaluation.",
-        )
+    _reject_local_plugin(plan["candidate"]["strategy"])
     problem = _protected_protocol_problem(schema_version, plan["execution_rules"])
     if problem is not None:
         reject("UNSUPPORTED_PROTECTED_PROTOCOL", problem, next_action="stop")
@@ -3513,17 +3509,7 @@ def _research_run_context(
     evaluation = plan["candidate"]["evaluation"]
     metadata = snapshot.manifest(snapshot_store, plan["snapshot_id"])
     schema_version = metadata.get("schema_version")
-    candidate_strategy = plan["candidate"]["strategy"]
-    if (
-        candidate_strategy.get("plugin") is not None
-        or candidate_strategy.get("family") not in (*STRATEGY_FAMILIES, "python")
-    ):
-        raise _reject(
-            "PLUGIN_NOT_ALLOWED_IN_PROTECTED_EVAL",
-            "run",
-            "stop",
-            "Local plugin strategies are not allowed in protected evaluation.",
-        )
+    _reject_local_plugin(plan["candidate"]["strategy"])
     problem = _protected_protocol_problem(schema_version, plan["execution_rules"])
     if problem is not None:
         raise _reject("UNSUPPORTED_PROTECTED_PROTOCOL", "run", "stop", problem)

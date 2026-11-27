@@ -41,6 +41,7 @@ def normalize_strategy_spec(
     if family not in (*STRATEGY_FAMILIES, "python"):
         from prajnatrade.plugins import (
             PluginError,
+            normalize_plugin_parameters,
             public_plugin_metadata,
             resolve_plugin,
             verify_plugin_identity,
@@ -56,7 +57,7 @@ def normalize_strategy_spec(
         if any(not isinstance(key, str) for key in params):
             raise ValueError("Plugin strategy parameter keys must be strings.")
         try:
-            parameters = json.loads(json.dumps(params, allow_nan=False))
+            raw_parameters = json.loads(json.dumps(params, allow_nan=False))
         except (TypeError, ValueError) as error:
             raise ValueError(f"Invalid plugin strategy parameters: {error}") from error
         frozen_plugin = spec.get("plugin")
@@ -65,6 +66,7 @@ def normalize_strategy_spec(
         else:
             entry = resolve_plugin(family, plugin_registry)
             verified = verify_plugin_identity(entry, plugin_registry)
+        parameters = normalize_plugin_parameters(verified, raw_parameters)
         return {
             "family": str(family),
             "parameters": parameters,

@@ -599,3 +599,369 @@ def test_manual_tracking_approval_and_shadow_blocks_tamper_preserving_committed_
     assert days_after == days_before
 
 
+def test_plugin_parameter_normalizer_config_and_attribute(tmp_path: Path) -> None:
+    from prajnatrade.plugins import PluginError, load_plugin_registry
+    from prajnatrade.strategies import normalize_strategy_spec
+
+    plugin_dir = tmp_path / "norm_plugins"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    norm_path = plugin_dir / "param_norm.py"
+    norm_path.write_text(
+        "\n".join(
+            [
+                "def normalize_params(params):",
+                "    top_k = int(params.get('top_k', 2))",
+                "    if top_k < 1 or top_k > 5:",
+                "        raise ValueError('top_k must be between 1 and 5')",
+                "    return {'top_k': top_k, 'mode': str(params.get('mode', 'canonical')).lower()}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    wrapper_path = plugin_dir / "norm_wrapper.py"
+    wrapper_path.write_text(
+        "\n".join(
+            [
+                "from prajnatrade.data import CASH, ETF_SYMBOLS",
+                "",
+                "def make_plugin(parameters):",
+                "    def strategy(history, state):",
+                "        return {**{s: (0.5 if s == ETF_SYMBOLS[0] else 0.0) for s in ETF_SYMBOLS}, CASH: 0.5}",
+                "    return strategy",
+                "",
+                "def _attr_normalize(params):",
+                "    return {'window': int(params.get('window', 5)), 'tag': 'from_attr'}",
+                "",
+                "def make_attr_plugin(parameters):",
+                "    return make_plugin(parameters)",
+                "",
+                "make_attr_plugin.normalize_parameters = _attr_normalize",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg_path = plugin_dir / "plugins.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "plugins": [
+                    {
+                        "family": "norm_cfg_family",
+                        "entrypoint": "norm_wrapper.py:make_plugin",
+                        "normalize_parameters": "param_norm.py:normalize_params",
+                    },
+                    {
+                        "family": "norm_attr_family",
+                        "entrypoint": "norm_wrapper.py:make_attr_plugin",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_plugin_registry(plugin_config=cfg_path)
+    cfg_entry = registry["norm_cfg_family"]
+    dep_keys = {d["relpath_or_key"] for d in cfg_entry["dependencies"]}
+    assert "param_norm.py" in dep_keys
+    assert "norm_wrapper.py" in dep_keys
+
+    # Config-declared normalizer fills defaults and canonicalizes values
+    spec_cfg = normalize_strategy_spec(
+        {"family": "norm_cfg_family", "parameters": {"mode": "FAST"}},
+        plugin_registry=registry,
+    )
+    assert spec_cfg["parameters"] == {"top_k": 2, "mode": "fast"}
+
+    # Invalid parameter rejected by normalizer
+    try:
+        normalize_strategy_spec(
+            {"family": "norm_cfg_family", "parameters": {"top_k": 99}},
+            plugin_registry=registry,
+        )
+        raise AssertionError("Expected ValueError from normalizer")
+    except ValueError as err:
+        assert "top_k" in str(err)
+
+    # Attribute-declared normalizer on factory callable
+    spec_attr = normalize_strategy_spec(
+        {"family": "norm_attr_family", "parameters": {}},
+        plugin_registry=registry,
+    )
+    assert spec_attr["parameters"] == {"window": 5, "tag": "from_attr"}
+
+    # Freeze via CLI experiment submit and verify normalized parameters are frozen on disk
+    snap = seal_snapshot(tmp_path, synthetic_snapshot(day_count=15))
+    project = tmp_path / "proj_norm"
+    ok(cli("project", "init", "--project", str(project)))
+    ok(cli("plugin", "register", "--project", str(project), "--plugin-config", str(cfg_path)))
+    camp = ok(
+        cli(
+            "campaign", "create",
+            "--project", str(project),
+            "--store", str(snap["store"]),
+            "--snapshot-id", snap["snapshot_id"],
+            "--attempts", "3",
+            "--max-seconds", "30",
+        )
+    )
+    sub_req = write_json(
+        tmp_path / "sub-norm.json",
+        {
+            "schema_version": 1,
+            "campaign_id": camp["campaign_id"],
+            "submission_id": "sub-norm-1",
+            "hypothesis": "normalizer frozen params",
+            "strategy": {"family": "norm_cfg_family"},
+            "parameters": {"mode": "UPPER"},
+        },
+    )
+    exp = ok(cli("experiment", "submit", "--project", str(project), "--input", str(sub_req), agent=True))
+    assert exp["status"] == "succeeded"
+    exp_status = ok(
+        cli(
+            "experiment", "status",
+            "--project", str(project),
+            "--campaign-id", camp["campaign_id"],
+            "--submission-id", "sub-norm-1",
+            agent=True,
+        )
+    )
+    assert exp_status["parameters"] == {"top_k": 2, "mode": "upper"}
+
+    # Editing the separate normalizer file triggers PLUGIN_CONTENT_CHANGED
+    norm_path.write_text(norm_path.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+    try:
+        normalize_strategy_spec(spec_cfg, plugin_registry=registry)
+        raise AssertionError("Expected PLUGIN_CONTENT_CHANGED")
+    except PluginError as err:
+        assert err.code == "PLUGIN_CONTENT_CHANGED"
+
+
+def test_plugin_submodule_and_package_relative_imports(tmp_path: Path) -> None:
+    from prajnatrade.plugins import PluginError, load_plugin_registry, make_plugin_strategy, verify_plugin_identity
+
+    pkg_root = tmp_path / "pkg_plugins"
+    helper_pkg = pkg_root / "helper_pkg"
+    sub_pkg = helper_pkg / "sub"
+    sub_pkg.mkdir(parents=True, exist_ok=True)
+    (helper_pkg / "__init__.py").write_text("# package init\n", encoding="utf-8")
+    (sub_pkg / "__init__.py").write_text("# subpackage init\n", encoding="utf-8")
+    leaf_path = sub_pkg / "leaf.py"
+    leaf_path.write_text("WEIGHT = 0.4\n", encoding="utf-8")
+    impl_path = helper_pkg / "impl.py"
+    impl_path.write_text(
+        "\n".join(
+            [
+                "from prajnatrade.data import CASH, ETF_SYMBOLS",
+                "from .sub import leaf",
+                "",
+                "def target():",
+                "    w = leaf.WEIGHT",
+                "    return {**{s: (w if s == ETF_SYMBOLS[0] else 0.0) for s in ETF_SYMBOLS}, CASH: 1.0 - w}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    # Wrapper A: outside package using `from helper_pkg import impl`
+    outer_wrapper = pkg_root / "outer_wrapper.py"
+    outer_wrapper.write_text(
+        "\n".join(
+            [
+                "from helper_pkg import impl",
+                "",
+                "def make_plugin(params):",
+                "    return lambda history, state: impl.target()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    # Wrapper B: inside package using relative import `from . import impl`
+    inner_wrapper = helper_pkg / "entry.py"
+    inner_wrapper.write_text(
+        "\n".join(
+            [
+                "from . import impl",
+                "",
+                "def make_plugin(params):",
+                "    return lambda history, state: impl.target()",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg_path = pkg_root / "plugins.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "plugins": [
+                    {"family": "outer_pkg_plugin", "entrypoint": "outer_wrapper.py:make_plugin"},
+                    {"family": "inner_rel_plugin", "entrypoint": "helper_pkg/entry.py:make_plugin"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_plugin_registry(plugin_config=cfg_path)
+    outer_deps = {d["relpath_or_key"] for d in registry["outer_pkg_plugin"]["dependencies"]}
+    assert "helper_pkg/impl.py" in outer_deps
+    assert "helper_pkg/sub/leaf.py" in outer_deps
+
+    inner_deps = {d["relpath_or_key"] for d in registry["inner_rel_plugin"]["dependencies"]}
+    assert "helper_pkg/entry.py" in inner_deps
+    assert "helper_pkg/impl.py" in inner_deps
+    assert "helper_pkg/sub/leaf.py" in inner_deps
+
+    # Both plugins execute cleanly at runtime (including relative imports inside package)
+    strat_outer = make_plugin_strategy(registry["outer_pkg_plugin"], {})
+    strat_inner = make_plugin_strategy(registry["inner_rel_plugin"], {})
+    assert strat_outer(None, {})["511260"] == 0.4
+    assert strat_inner(None, {})["511260"] == 0.4
+
+    # Editing leaf.py triggers PLUGIN_CONTENT_CHANGED on BOTH plugins
+    leaf_path.write_text("WEIGHT = 0.7\n", encoding="utf-8")
+    for fam in ("outer_pkg_plugin", "inner_rel_plugin"):
+        try:
+            verify_plugin_identity(registry[fam], registry)
+            raise AssertionError(f"Expected PLUGIN_CONTENT_CHANGED for {fam}")
+        except PluginError as err:
+            assert err.code == "PLUGIN_CONTENT_CHANGED"
+
+
+def test_shadow_tick_cli_with_local_plugin(tmp_path: Path) -> None:
+    setup = formal_scenario(tmp_path)
+    project = setup["project"]
+    store = setup["store"]
+    snapshot_store = setup["snapshots"]
+    campaign_id = setup["campaign"]["campaign_id"]
+    round_id = setup["opened"]["round_id"]
+
+    plugin_dir = tmp_path / "plugins"
+    config_path, _, impl_path = _write_thin_plugin(plugin_dir, family="synth_tick_plugin", weight=0.5)
+    ok(cli("plugin", "register", "--project", str(project), "--plugin-config", str(config_path)))
+
+    req = write_json(
+        tmp_path / "exp-tick.json",
+        {
+            "schema_version": 1,
+            "campaign_id": campaign_id,
+            "submission_id": "sub-tick",
+            "hypothesis": "shadow tick plugin forwarding",
+            "strategy": {"family": "synth_tick_plugin"},
+            "parameters": {},
+        },
+    )
+    exp = ok(cli("experiment", "submit", "--project", str(project), "--input", str(req), agent=True))
+    version = ok(
+        submit_version(
+            project,
+            round_id,
+            "ver-tick",
+            write_json(tmp_path / "ver-tick.json", version_input(exp["experiment_id"])),
+        )
+    )
+    version_id = version["version_id"]
+    ok(validate_version(project, store, snapshot_store, round_id, version_id))
+
+    from datetime import datetime
+
+    from prajnatrade import shadow_schedule
+
+    sessions = ["2099-01-02", "2099-01-03", "2099-01-04"]
+    calendar_path = write_json(
+        tmp_path / "calendar.json",
+        {
+            "schema_version": 1,
+            "data_kind": "synthetic",
+            "source": "synthetic_calendar",
+            "sessions": sessions,
+        },
+    )
+    review_input = write_json(
+        tmp_path / "approve.json",
+        {
+            "observation_sessions": 2,
+            "observation_reason": "Synthetic operator confirms 2 sessions.",
+            "accepted_risks": ["Synthetic prices do not establish real-market evidence."],
+        },
+    )
+    reviewed = ok(
+        cli(
+            "round", "review",
+            "--project", str(project),
+            "--store", str(store),
+            "--round-id", round_id,
+            "--version-id", version_id,
+            "--decision", "approve",
+            "--reviewer", "synth-operator",
+            "--reason", "synthetic approval",
+            "--input", str(review_input),
+            "--calendar", str(calendar_path),
+        )
+    )
+    release_id = reviewed["tracking"]["release_id"]
+    feed = shadow_feed(sessions)
+    feed_path = write_json(tmp_path / "feed.json", feed)
+    ledger = tmp_path / "ledger"
+
+    # Public CLI accepts --plugin-config and --plugin on `shadow tick`
+    cli_tick = ok(
+        cli(
+            "shadow", "tick",
+            "--ledger", str(ledger),
+            "--store", str(store),
+            "--calendar", str(calendar_path),
+            "--data", str(feed_path),
+            "--corrections-store", str(snapshot_store),
+            "--plugin-config", str(config_path),
+        )
+    )
+    assert cli_tick["status"] == "ok"
+
+    # Forwarded plugin_config through shadow_schedule.tick commits due sessions for local plugin
+    tick_res, blocked = shadow_schedule.tick(
+        ledger,
+        store,
+        calendar_path,
+        feed_path,
+        corrections_store=snapshot_store,
+        now=datetime.fromisoformat("2099-01-03T16:00:00+08:00"),
+        plugin_config=config_path,
+    )
+    assert not blocked, tick_res
+    assert tick_res["target_date"] == "2099-01-03"
+    assert tick_res["update"]["versions"][0]["release_id"] == release_id
+    assert tick_res["update"]["versions"][0]["status"] == "committed"
+
+    # Tampering implementation file blocks subsequent scheduled tick with PLUGIN_CONTENT_CHANGED
+    impl_path.write_text(impl_path.read_text(encoding="utf-8") + "\n# tampered tick\n", encoding="utf-8")
+    sessions_4 = [*sessions, "2099-01-05"]
+    write_json(
+        calendar_path,
+        {
+            "schema_version": 1,
+            "data_kind": "synthetic",
+            "source": "synthetic_calendar",
+            "sessions": sessions_4,
+        },
+    )
+    write_json(feed_path, shadow_feed(sessions_4))
+    tampered_tick, tampered_blocked = shadow_schedule.tick(
+        ledger,
+        store,
+        calendar_path,
+        feed_path,
+        corrections_store=snapshot_store,
+        now=datetime.fromisoformat("2099-01-04T16:00:00+08:00"),
+        plugin_config=config_path,
+    )
+    assert tampered_blocked
+    assert any(n["code"] == "PLUGIN_CONTENT_CHANGED" for n in tampered_tick["notifications"])
+
+
+

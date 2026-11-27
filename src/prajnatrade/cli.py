@@ -247,6 +247,7 @@ def build_parser(*, agent_only: bool = False) -> argparse.ArgumentParser:
     shadow_tick.add_argument("--calendar", type=Path, required=True)
     shadow_tick.add_argument("--data", type=Path, required=True)
     shadow_tick.add_argument("--corrections-store", type=Path, required=True)
+    _add_plugin_flags(shadow_tick)
     shadow_alerts = shadow_commands.add_parser("alerts", help="show recorded Shadow Live scheduler alerts")
     shadow_alerts.add_argument("--ledger", type=Path, required=True)
     shadow_compare = shadow_commands.add_parser(
@@ -1515,6 +1516,8 @@ def _shadow_command(args: argparse.Namespace) -> int:
             result, blocked = shadow_schedule.tick(
                 args.ledger, args.store, args.calendar, args.data,
                 corrections_store=args.corrections_store,
+                plugin_config=getattr(args, "plugin_config", None),
+                plugin_specs=getattr(args, "plugin_specs", ()),
             )
             print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
             return 2 if blocked else 0

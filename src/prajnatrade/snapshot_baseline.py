@@ -34,6 +34,18 @@ from prajnatrade.backtest import (
     equal_weight_buy_and_hold,
 )
 from prajnatrade.data import ETF_SYMBOLS
+from prajnatrade.decision_window import (
+    advance_rebalance_anchor,
+    build_strategy_state,
+    close_expired_deferral,
+    close_month_end_deferral,
+    compute_prior_close_weights,
+    consume_monthly_deferral,
+    maybe_trigger_monthly_deferral,
+    parse_strategy_output,
+    scheduled_monthly_session,
+    select_common_observations,
+)
 from prajnatrade.lot_execution import (
     classify_unfilled_reason,
     match_open_lot_day,
@@ -101,6 +113,7 @@ def run_discovery_strategy(
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
     decision_policy: Mapping[str, Any] | None = None,
+    schema_version: int | None = None,
 ) -> dict[str, Any]:
     """Run a strategy with point-in-time signals and formal Discovery accounting."""
     return run_partition_strategy(
@@ -122,6 +135,7 @@ def run_discovery_strategy(
         history_requirements=history_requirements,
         scoring_start=scoring_start,
         decision_policy=decision_policy,
+        schema_version=schema_version,
     )
 
 
@@ -177,6 +191,7 @@ def run_partition_strategy(
     history_requirements: list[dict] | None = None,
     scoring_start: str | None = None,
     decision_policy: Mapping[str, Any] | None = None,
+    schema_version: int | None = None,
 ) -> dict[str, Any]:
     """Run a strategy over one sealed partition with formal accounting.
 
@@ -196,6 +211,16 @@ def run_partition_strategy(
         raise ValueError("signal_window_sessions must be positive.")
     if not isinstance(partition_name, str) or not partition_name.strip():
         raise ValueError("partition_name must be a nonempty string.")
+    resolved_schema_version = (
+        schema_version
+        if schema_version is not None
+        else (
+            data.get("schema_version")
+            if isinstance(data.get("schema_version"), int)
+            and not isinstance(data.get("schema_version"), bool)
+            else None
+        )
+    )
     sessions = sorted({row["date"] for row in data["calendar"]})
     if not sessions:
         raise ValueError(f"The {partition_name} partition has no trading sessions.")
@@ -254,6 +279,7 @@ def run_partition_strategy(
     monthly_deferral_enabled = bool(
         decision_policy is not None and decision_policy.get("monthly_deferral")
     )
+    scheduled_month_idx = scheduled_monthly_session(decision_policy)
     rebalance_anchor_date: str | None = None
     last_filled_target: dict[str, float] | None = None
     last_monthly_filled_target: dict[str, float] | None = None
@@ -264,21 +290,10 @@ def run_partition_strategy(
     monthly_deferrals: list[dict[str, Any]] = []
 
     for day_index, day in enumerate(sessions):
-        if (
-            monthly_deferral_enabled
-            and active_deferral is not None
-            and active_deferral["cycle"] != day[:7]
-        ):
-            monthly_deferrals.append(
-                {
-                    "cycle": active_deferral["cycle"],
-                    "scheduled_date": active_deferral["scheduled_date"],
-                    "actual_signal_date": None,
-                    "status": "not_executed",
-                    "deferral_reason": active_deferral["deferral_reason"],
-                }
+        if monthly_deferral_enabled:
+            active_deferral, monthly_deferrals = close_expired_deferral(
+                active_deferral, monthly_deferrals, current_cycle=day[:7]
             )
-            active_deferral = None
         ready = False
         if history_requirements is not None and decision_policy is None:
             readiness, windows, observation_values = _history_at_open(
@@ -290,14 +305,40 @@ def run_partition_strategy(
             if ready:
                 if first_ready_date is None:
                     first_ready_date = day
-                state = {
-                    "cash": cash,
-                    "shares": dict(shares),
-                    "equity": equity_curve[-1]["nav"] if equity_curve else cash,
-                    "history_windows": {
-                        indicator: list(days) for indicator, days in windows.items()
-                    },
-                }
+                if stateful_active:
+                    prev_nav_point = equity_curve[-1] if equity_curve else None
+                    receivable_total_pre = math.fsum(item["amount"] for item in receivables)
+                    prior_close_w = (
+                        compute_prior_close_weights(
+                            prev_nav_point, shares, cash, receivable_total_pre
+                        )
+                        if prev_nav_point is not None
+                        else {**{symbol: 0.0 for symbol in ETF_SYMBOLS}, "CASH": 1.0}
+                    )
+                    state = build_strategy_state(
+                        signal_date=day,
+                        sessions=history_sessions,
+                        cash=cash,
+                        shares=shares,
+                        equity=prev_nav_point["nav"] if prev_nav_point else cash,
+                        prior_close_weights=prior_close_w,
+                        rebalance_anchor_date=rebalance_anchor_date,
+                        previous_order_attempted=previous_order_attempted,
+                        last_filled_target=last_filled_target,
+                        last_monthly_filled_target=last_monthly_filled_target,
+                        history_windows={
+                            indicator: list(days) for indicator, days in windows.items()
+                        },
+                    )
+                else:
+                    state = {
+                        "cash": cash,
+                        "shares": dict(shares),
+                        "equity": equity_curve[-1]["nav"] if equity_curve else cash,
+                        "history_windows": {
+                            indicator: list(days) for indicator, days in windows.items()
+                        },
+                    }
                 observation_days = sorted(observation_values)
                 history_rows = [
                     {"date": observation_day, "symbol": symbol, "close": value}
@@ -307,20 +348,47 @@ def run_partition_strategy(
                 history = pd.DataFrame(history_rows, columns=["date", "symbol", "close"])
                 weights = strategy(history, state)
                 if weights is not None:
-                    normalized = _validate_weights(weights)
-                    signal = {
-                        "date": day,
-                        "decision_date": day,
-                        "execution_date": day,
-                        "target_weights": normalized,
-                        "total_return_values": (
-                            observation_values[observation_days[-1]] if observation_days else {}
-                        ),
-                        "window": observation_days,
-                        "history_windows": windows,
-                    }
-                    signals.append(signal)
-                    pending = (signal, normalized)
+                    if stateful_active:
+                        parsed_out = parse_strategy_output(weights, signal_date=day)
+                        if parsed_out is not None:
+                            normalized = parsed_out["weights"]
+                            signal = {
+                                "date": day,
+                                "decision_date": day,
+                                "execution_date": day,
+                                "target_weights": normalized,
+                                "purpose": parsed_out["purpose"],
+                                "cycle": parsed_out["cycle"],
+                                **(
+                                    {"fixed_amounts": parsed_out["fixed_amounts"]}
+                                    if parsed_out["fixed_amounts"]
+                                    else {}
+                                ),
+                                "total_return_values": (
+                                    observation_values[observation_days[-1]]
+                                    if observation_days
+                                    else {}
+                                ),
+                                "window": observation_days,
+                                "history_windows": windows,
+                            }
+                            signals.append(signal)
+                            pending = (signal, normalized)
+                    else:
+                        normalized = _validate_weights(weights)
+                        signal = {
+                            "date": day,
+                            "decision_date": day,
+                            "execution_date": day,
+                            "target_weights": normalized,
+                            "total_return_values": (
+                                observation_values[observation_days[-1]] if observation_days else {}
+                            ),
+                            "window": observation_days,
+                            "history_windows": windows,
+                        }
+                        signals.append(signal)
+                        pending = (signal, normalized)
             else:
                 history_gaps.append(readiness)
                 missing = {
@@ -449,18 +517,28 @@ def run_partition_strategy(
             if positive_order:
                 positive_attempts.append(attempt)
             if stateful_active:
-                previous_order_attempted = dict(attempt)
                 batch_ok = (
                     bool(attempt.get("batch_complete"))
                     if execution_rule_version == ACTUAL_OPEN_LOT_RULES
                     else attempt.get("status") == "filled"
                 )
+                purpose = str(signal.get("purpose", "rebalance"))
+                (
+                    rebalance_anchor_date,
+                    last_filled_target,
+                    last_monthly_filled_target,
+                    previous_order_attempted,
+                ) = advance_rebalance_anchor(
+                    rebalance_anchor_date=rebalance_anchor_date,
+                    last_filled_target=last_filled_target,
+                    last_monthly_filled_target=last_monthly_filled_target,
+                    attempt=attempt,
+                    batch_ok=batch_ok,
+                    signal_date=signal["date"],
+                    target_weights=signal["target_weights"],
+                    purpose=purpose,
+                )
                 if batch_ok:
-                    rebalance_anchor_date = signal["date"]
-                    last_filled_target = dict(signal["target_weights"])
-                    purpose = str(signal.get("purpose", "rebalance"))
-                    if last_monthly_filled_target is None or purpose == "monthly":
-                        last_monthly_filled_target = dict(signal["target_weights"])
                     rebalance_anchors.append(
                         {
                             "signal_date": signal["date"],
@@ -488,6 +566,7 @@ def run_partition_strategy(
                 carry_states,
                 applied_actions_today,
                 data_kind=data_kind,
+                schema_version=resolved_schema_version,
             )
         else:
             nav_point, gaps = _valuation(
@@ -498,6 +577,7 @@ def run_partition_strategy(
                 receivables,
                 unresolved_actions,
                 data_kind=data_kind,
+                schema_version=resolved_schema_version,
             )
         equity_curve.append(nav_point)
         valuation_gaps.extend(gaps)
@@ -505,8 +585,7 @@ def run_partition_strategy(
         if decision_policy is not None:
             if day_index + 1 >= len(sessions):
                 continue
-            from prajnatrade.decision_window import select_common_observations
-
+            next_session_day = sessions[day_index + 1]
             reqs = (
                 history_requirements
                 if history_requirements is not None
@@ -518,6 +597,7 @@ def run_partition_strategy(
                     }
                 ]
             )
+            max_req_obs = max((int(req["observations"]) for req in reqs), default=1)
             obs_result = select_common_observations(
                 history_sessions,
                 raw_bars,
@@ -526,6 +606,7 @@ def run_partition_strategy(
                 decision_policy,
                 reqs,
                 data_kind=data_kind,
+                schema_version=resolved_schema_version,
             )
             if day_index == 0:
                 first_scored_open = {
@@ -538,16 +619,25 @@ def run_partition_strategy(
                 pause_info = obs_result["signal_pause"]
                 signal_pauses.append(pause_info)
                 signal_gaps.append(pause_info)
-                if (
-                    monthly_deferral_enabled
-                    and monthly_signal_cycle != day[:7]
-                    and active_deferral is None
-                ):
-                    active_deferral = {
-                        "cycle": day[:7],
-                        "scheduled_date": day,
-                        "deferral_reason": pause_info.get("reasons") or pause_info.get("code"),
-                    }
+                active_deferral = maybe_trigger_monthly_deferral(
+                    enabled=monthly_deferral_enabled,
+                    active_deferral=active_deferral,
+                    monthly_signal_cycle=monthly_signal_cycle,
+                    signal_date=day,
+                    sessions=history_sessions,
+                    pause_info=pause_info,
+                    scheduled_month_session=scheduled_month_idx,
+                    warmup_ready=(
+                        first_ready_date is not None or (positions[day] + 1) >= max_req_obs
+                    ),
+                )
+                if monthly_deferral_enabled:
+                    active_deferral, monthly_deferrals = close_month_end_deferral(
+                        active_deferral,
+                        monthly_deferrals,
+                        session=day,
+                        next_session=next_session_day,
+                    )
                 decision_records.append(
                     {
                         "date": day,
@@ -560,6 +650,13 @@ def run_partition_strategy(
                 )
                 continue
             if not obs_result["ready"]:
+                if monthly_deferral_enabled:
+                    active_deferral, monthly_deferrals = close_month_end_deferral(
+                        active_deferral,
+                        monthly_deferrals,
+                        session=day,
+                        next_session=next_session_day,
+                    )
                 history_gaps.append(
                     {
                         "decision_date": day,
@@ -587,12 +684,6 @@ def run_partition_strategy(
                 for obs_day in obs_days
                 for symbol, value in obs_values[obs_day].items()
             ]
-            from prajnatrade.decision_window import (
-                build_strategy_state,
-                compute_prior_close_weights,
-                parse_strategy_output,
-            )
-
             receivable_total = math.fsum(item["amount"] for item in receivables)
             prior_close_weights = compute_prior_close_weights(
                 nav_point, shares, cash, receivable_total
@@ -625,6 +716,13 @@ def run_partition_strategy(
             raw_output = strategy(pd.DataFrame(history_rows), state)
             parsed_output = parse_strategy_output(raw_output, signal_date=day)
             if parsed_output is None:
+                if monthly_deferral_enabled:
+                    active_deferral, monthly_deferrals = close_month_end_deferral(
+                        active_deferral,
+                        monthly_deferrals,
+                        session=day,
+                        next_session=next_session_day,
+                    )
                 ready_cash_sessions.append(day)
                 decision_records.append(
                     {
@@ -643,27 +741,23 @@ def run_partition_strategy(
             fixed_amounts = parsed_output["fixed_amounts"]
             if purpose == "monthly":
                 monthly_signal_cycle = day[:7]
-            deferral_fields: dict[str, Any] = {}
-            if deferral_ctx is not None and purpose == "monthly":
-                deferral_fields = {
-                    "scheduled_date": deferral_ctx["scheduled_date"],
-                    "actual_signal_date": day,
-                    "deferral_reason": deferral_ctx["deferral_reason"],
-                }
-                monthly_deferrals.append(
-                    {
-                        "cycle": day[:7],
-                        "scheduled_date": deferral_ctx["scheduled_date"],
-                        "actual_signal_date": day,
-                        "execution_date": sessions[day_index + 1],
-                        "status": "executed",
-                        "deferral_reason": deferral_ctx["deferral_reason"],
-                    }
+            deferral_fields, active_deferral, monthly_deferrals = consume_monthly_deferral(
+                active_deferral=deferral_ctx,
+                monthly_deferrals=monthly_deferrals,
+                purpose=purpose,
+                signal_date=day,
+                execution_date=next_session_day,
+            )
+            if monthly_deferral_enabled:
+                active_deferral, monthly_deferrals = close_month_end_deferral(
+                    active_deferral,
+                    monthly_deferrals,
+                    session=day,
+                    next_session=next_session_day,
                 )
-                active_deferral = None
             signal = {
                 "date": day,
-                "execution_date": sessions[day_index + 1],
+                "execution_date": next_session_day,
                 "target_weights": normalized,
                 "purpose": purpose,
                 "cycle": cycle,
@@ -733,35 +827,67 @@ def run_partition_strategy(
             })
             continue
 
-        state = {
-            "cash": cash,
-            "shares": dict(shares),
-            "equity": nav_point["nav"],
-        }
+        if stateful_active:
+            receivable_total = math.fsum(item["amount"] for item in receivables)
+            prior_close_weights = compute_prior_close_weights(
+                nav_point, shares, cash, receivable_total
+            )
+            state = build_strategy_state(
+                signal_date=day,
+                sessions=history_sessions,
+                cash=cash,
+                shares=shares,
+                equity=nav_point["nav"],
+                prior_close_weights=prior_close_weights,
+                rebalance_anchor_date=rebalance_anchor_date,
+                previous_order_attempted=previous_order_attempted,
+                last_filled_target=last_filled_target,
+                last_monthly_filled_target=last_monthly_filled_target,
+            )
+        else:
+            state = {
+                "cash": cash,
+                "shares": dict(shares),
+                "equity": nav_point["nav"],
+            }
         weights = strategy(pd.DataFrame(history_rows), state)
         if weights is not None:
-            normalized = _validate_weights(weights)
-            signal = {
-                "date": day,
-                "execution_date": sessions[day_index + 1],
-                "target_weights": normalized,
-                "total_return_values": latest_values,
-                "window": list(window_days),
-            }
-            signals.append(signal)
-            pending = (signal, normalized)
+            if stateful_active:
+                parsed_out = parse_strategy_output(weights, signal_date=day)
+                if parsed_out is not None:
+                    normalized = parsed_out["weights"]
+                    signal = {
+                        "date": day,
+                        "execution_date": sessions[day_index + 1],
+                        "target_weights": normalized,
+                        "purpose": parsed_out["purpose"],
+                        "cycle": parsed_out["cycle"],
+                        **(
+                            {"fixed_amounts": parsed_out["fixed_amounts"]}
+                            if parsed_out["fixed_amounts"]
+                            else {}
+                        ),
+                        "total_return_values": latest_values,
+                        "window": list(window_days),
+                    }
+                    signals.append(signal)
+                    pending = (signal, normalized)
+            else:
+                normalized = _validate_weights(weights)
+                signal = {
+                    "date": day,
+                    "execution_date": sessions[day_index + 1],
+                    "target_weights": normalized,
+                    "total_return_values": latest_values,
+                    "window": list(window_days),
+                }
+                signals.append(signal)
+                pending = (signal, normalized)
 
     if monthly_deferral_enabled and active_deferral is not None:
-        monthly_deferrals.append(
-            {
-                "cycle": active_deferral["cycle"],
-                "scheduled_date": active_deferral["scheduled_date"],
-                "actual_signal_date": None,
-                "status": "not_executed",
-                "deferral_reason": active_deferral["deferral_reason"],
-            }
+        active_deferral, monthly_deferrals = close_expired_deferral(
+            active_deferral, monthly_deferrals, current_cycle=""
         )
-        active_deferral = None
 
     metrics = _metrics(
         sessions,
@@ -1094,6 +1220,7 @@ def run_discovery_equal_weight(
     scoring_start: str | None = None,
     prior_history: tuple[list[str], list[dict]] | None = None,
     decision_policy: Mapping[str, Any] | None = None,
+    schema_version: int | None = None,
 ) -> dict[str, Any]:
     """Run the fixed equal-weight buy-and-hold comparator."""
     submitted = False
@@ -1124,6 +1251,7 @@ def run_discovery_equal_weight(
         scoring_start=scoring_start,
         prior_history=prior_history,
         decision_policy=decision_policy,
+        schema_version=schema_version,
     )
 
 
@@ -1726,11 +1854,15 @@ def _valuation(
     unresolved: dict[str, list[dict[str, str]]],
     *,
     data_kind: str = "synthetic",
+    schema_version: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     holdings = {}
     gaps = []
     market_value = 0.0
     valid = True
+    allow_partial_halt = data_kind == "real" or (
+        schema_version is not None and schema_version >= 3
+    )
     close_cutoff = datetime.combine(
         datetime.fromisoformat(day).date(), time(23, 59, 59), tzinfo=_CN_TZ
     )
@@ -1739,7 +1871,7 @@ def _valuation(
         row = raw_bars.get((day, symbol))
         status = row.get("trading_status") if row is not None else None
         markable = status == "trading" or (
-            data_kind == "real" and status == "partial_halt"
+            allow_partial_halt and status == "partial_halt"
         )
         close = row.get("close") if row is not None else None
         if quantity > _EPSILON and (

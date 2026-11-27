@@ -103,12 +103,15 @@ def halt_conflicts_with_trade(
 
 
 def confirmed_no_trade_shape(
-    row: Mapping[str, Any], *, data_kind: str
+    row: Mapping[str, Any],
+    *,
+    data_kind: str,
+    schema_version: int | None = None,
 ) -> tuple[bool, str | None]:
     """Classify whether a raw bar has a confirmed full-day no-trade row shape (ADR 0003).
 
-    Checks trading status, OHLCV/halt consistency, conflicts, and (for real
-    snapshots) presence of ``status_evidence_id``. Callers still verify
+    Checks trading status, OHLCV/halt consistency, conflicts, and (for real or
+    schema-3+ rows) presence of ``status_evidence_id``. Callers still verify
     availability cutoff evidence as needed. Returns ``(True, None)`` when the
     row shape confirms full-day no-trade, or ``(False, reason_or_none)``
     otherwise.
@@ -118,6 +121,7 @@ def confirmed_no_trade_shape(
     status = row.get("trading_status")
     day = str(row.get("date"))
     is_real = data_kind == "real"
+    allow_v3_status = is_real or (schema_version is not None and schema_version >= 3)
     if status == "unknown":
         return False, "unknown_trading_status"
     if status == "suspended":
@@ -128,10 +132,10 @@ def confirmed_no_trade_shape(
         bad_halt = halt is not None and not halt_covers_session(halt, day)
         if has_price or bad_volume or bad_halt:
             return False, "conflicting_status_or_trade_evidence"
-        if is_real and not has_status_evidence_id(row.get("status_evidence_id")):
+        if allow_v3_status and not has_status_evidence_id(row.get("status_evidence_id")):
             return False, "missing_status_evidence"
         return True, None
-    if is_real and status == "partial_halt":
+    if allow_v3_status and status == "partial_halt":
         halt = row.get("halt")
         volume = row.get("volume")
         if halt_conflicts_with_trade(halt, day, row):

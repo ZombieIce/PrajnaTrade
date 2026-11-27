@@ -72,6 +72,11 @@ def _hash(value: object) -> str:
     return hashlib.sha256(_bytes(value)).hexdigest()
 
 
+def canonical_hash(value: object) -> str:
+    """Return the SHA-256 hex digest of a canonical JSON value (public seam)."""
+    return _hash(value)
+
+
 def _date(value: object) -> str:
     if not isinstance(value, str):
         raise ValueError("Trading dates must be ISO dates.")
@@ -82,6 +87,11 @@ def _date(value: object) -> str:
     if parsed.isoformat() != value:
         raise ValueError(f"Invalid trading date: {value!r}.")
     return value
+
+
+def parse_iso_date(value: object) -> str:
+    """Validate and return a canonical YYYY-MM-DD ISO date string (public seam)."""
+    return _date(value)
 
 
 def _instant(value: object, key: str) -> datetime:

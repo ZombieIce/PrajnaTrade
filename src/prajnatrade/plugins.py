@@ -113,6 +113,36 @@ def _is_ignored_external_origin(origin: str) -> bool:
     return normalized.startswith(prajna_root + "/") or normalized == prajna_root
 
 
+def _package_chain(path: Path) -> tuple[list[Path], Path]:
+    """Return enclosing Python package dirs (outermost to innermost) and parent search root."""
+    pkg_dirs: list[Path] = []
+    cur = path.parent
+    while (cur / "__init__.py").is_file():
+        pkg_dirs.append(cur)
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    if not pkg_dirs:
+        return [], path.parent
+    pkg_dirs.reverse()
+    return pkg_dirs, pkg_dirs[0].parent
+
+
+def _resolve_submodule_aliases(
+    pkg_dir: Path, mod_prefix: str, alias_names: Sequence[str]
+) -> list[tuple[str, Path]]:
+    found: list[tuple[str, Path]] = []
+    for alias in alias_names:
+        if alias == "*":
+            continue
+        for candidate in (pkg_dir / f"{alias}.py", pkg_dir / alias / "__init__.py"):
+            if candidate.is_file():
+                found.append((f"{mod_prefix}.{alias}", candidate.resolve()))
+                break
+    return found
+
+
 def _resolve_relative_import(
     source_path: Path, level: int, module: str | None, alias_names: Sequence[str]
 ) -> list[tuple[str, Path]]:
@@ -128,6 +158,10 @@ def _resolve_relative_import(
         ):
             if candidate.is_file():
                 resolved.append((mod_key, candidate.resolve()))
+                if candidate.name == "__init__.py":
+                    resolved.extend(
+                        _resolve_submodule_aliases(candidate.parent, module, alias_names)
+                    )
                 return resolved
         raise PluginError(
             "PLUGIN_DEPENDENCY_UNBINDABLE",
@@ -149,7 +183,10 @@ def _resolve_relative_import(
 
 
 def _resolve_absolute_import(
-    mod_name: str, search_dirs: Sequence[Path], source_path: Path
+    mod_name: str,
+    search_dirs: Sequence[Path],
+    source_path: Path,
+    alias_names: Sequence[str] = (),
 ) -> list[tuple[str, Path]]:
     top_level = mod_name.split(".", 1)[0]
     if top_level in sys.stdlib_module_names:
@@ -160,7 +197,16 @@ def _resolve_absolute_import(
     for directory in search_dirs:
         for candidate in (directory / f"{rel}.py", directory / rel / "__init__.py"):
             if candidate.is_file():
-                return [(mod_name, candidate.resolve())]
+                resolved = [(mod_name, candidate.resolve())]
+                if candidate.name == "__init__.py" and alias_names:
+                    resolved.extend(
+                        _resolve_submodule_aliases(candidate.parent, mod_name, alias_names)
+                    )
+                return resolved
+        if alias_names and (directory / rel).is_dir():
+            sub_resolved = _resolve_submodule_aliases(directory / rel, mod_name, alias_names)
+            if sub_resolved:
+                return sub_resolved
     try:
         spec = importlib.util.find_spec(mod_name)
     except (ImportError, ValueError):
@@ -187,7 +233,11 @@ def _resolve_absolute_import(
             "PLUGIN_DEPENDENCY_UNBINDABLE",
             f"Import {mod_name!r} in {source_path.name} is not a verifiable local .py file.",
         )
-    return [(mod_name, Path(spec.origin).resolve())]
+    origin_path = Path(spec.origin).resolve()
+    resolved = [(mod_name, origin_path)]
+    if origin_path.name == "__init__.py" and alias_names:
+        resolved.extend(_resolve_submodule_aliases(origin_path.parent, mod_name, alias_names))
+    return resolved
 
 
 def _resolve_declared_dependency(dep: object, base_dir: Path) -> tuple[str, Path]:
@@ -237,22 +287,59 @@ def _relpath_key(path: Path, roots: Sequence[Path]) -> str:
 
 
 def _load_callable(entrypoint_path: Path, attr_name: str, search_dirs: Sequence[Path]) -> Callable[..., Any]:
+    pkg_dirs, pkg_root_parent = _package_chain(entrypoint_path)
+    effective_dirs = list(dict.fromkeys([*search_dirs, pkg_root_parent]))
     added: list[str] = []
-    for d in reversed(search_dirs):
+    for d in reversed(effective_dirs):
         s = str(d)
         if s not in sys.path:
             sys.path.insert(0, s)
             added.append(s)
-    module_name = f"_prajnatrade_plugin_{_sha256_bytes(str(entrypoint_path).encode('utf-8'))[:16]}"
     try:
-        spec = importlib.util.spec_from_file_location(module_name, entrypoint_path)
-        if spec is None or spec.loader is None:
-            raise PluginError(
-                "PLUGIN_ENTRYPOINT_UNRESOLVABLE",
-                f"Could not create module spec for {entrypoint_path.name}.",
-            )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        if pkg_dirs:
+            root_pkg = f"_prajnatrade_pkg_{_sha256_bytes(str(pkg_dirs[0]).encode('utf-8'))[:16]}"
+            for key in list(sys.modules):
+                if key == root_pkg or key.startswith(root_pkg + "."):
+                    del sys.modules[key]
+            cur_pkg = ""
+            for idx, pkg_dir in enumerate(pkg_dirs):
+                pkg_name = root_pkg if idx == 0 else f"{cur_pkg}.{pkg_dir.name}"
+                pkg_init = pkg_dir / "__init__.py"
+                pkg_spec = importlib.util.spec_from_file_location(
+                    pkg_name, pkg_init, submodule_search_locations=[str(pkg_dir)]
+                )
+                if pkg_spec is None or pkg_spec.loader is None:
+                    raise PluginError(
+                        "PLUGIN_ENTRYPOINT_UNRESOLVABLE",
+                        f"Could not create package spec for {pkg_dir.name}.",
+                    )
+                pkg_mod = importlib.util.module_from_spec(pkg_spec)
+                sys.modules[pkg_name] = pkg_mod
+                pkg_spec.loader.exec_module(pkg_mod)
+                cur_pkg = pkg_name
+            if entrypoint_path.name == "__init__.py":
+                module = sys.modules[cur_pkg]
+            else:
+                module_name = f"{cur_pkg}.{entrypoint_path.stem}"
+                spec = importlib.util.spec_from_file_location(module_name, entrypoint_path)
+                if spec is None or spec.loader is None:
+                    raise PluginError(
+                        "PLUGIN_ENTRYPOINT_UNRESOLVABLE",
+                        f"Could not create module spec for {entrypoint_path.name}.",
+                    )
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+        else:
+            module_name = f"_prajnatrade_plugin_{_sha256_bytes(str(entrypoint_path).encode('utf-8'))[:16]}"
+            spec = importlib.util.spec_from_file_location(module_name, entrypoint_path)
+            if spec is None or spec.loader is None:
+                raise PluginError(
+                    "PLUGIN_ENTRYPOINT_UNRESOLVABLE",
+                    f"Could not create module spec for {entrypoint_path.name}.",
+                )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
     except PluginError:
         raise
     except Exception as error:
@@ -279,6 +366,7 @@ def analyze_plugin_entry(
     *,
     base_dir: Path,
     declared_dependencies: Sequence[str] = (),
+    normalize_parameters: str | None = None,
 ) -> dict[str, Any]:
     """Resolve entrypoint, trace local .py dependency closure, and compute content hashes."""
     if not isinstance(family, str) or not family.strip() or family != family.strip():
@@ -293,9 +381,22 @@ def analyze_plugin_entry(
         )
     target, attr_name = _parse_entrypoint(entrypoint)
     entrypoint_path = _resolve_target_path(target, base_dir)
-    search_dirs = [entrypoint_path.parent, base_dir]
+    _, ep_root_parent = _package_chain(entrypoint_path)
+    search_dirs: list[Path] = list(
+        dict.fromkeys([entrypoint_path.parent, ep_root_parent, base_dir])
+    )
 
     queue: list[tuple[str, Path]] = [(entrypoint_path.stem, entrypoint_path)]
+    norm_path: Path | None = None
+    norm_attr: str | None = None
+    if normalize_parameters is not None:
+        norm_target, norm_attr = _parse_entrypoint(normalize_parameters)
+        norm_path = _resolve_target_path(norm_target, base_dir)
+        _, norm_root_parent = _package_chain(norm_path)
+        for extra_dir in (norm_path.parent, norm_root_parent):
+            if extra_dir not in search_dirs:
+                search_dirs.append(extra_dir)
+        queue.append((norm_path.stem, norm_path))
     for dep in declared_dependencies:
         queue.append(_resolve_declared_dependency(dep, base_dir))
 
@@ -314,7 +415,7 @@ def analyze_plugin_entry(
             ) from error
         visited[dep_path] = {
             "module": mod_name,
-            "relpath_or_key": _relpath_key(dep_path, [base_dir, entrypoint_path.parent]),
+            "relpath_or_key": _relpath_key(dep_path, [base_dir, ep_root_parent, entrypoint_path.parent]),
             "sha256": _sha256_bytes(raw_bytes),
         }
         for node in ast.walk(tree):
@@ -334,11 +435,20 @@ def analyze_plugin_entry(
                         if resolved[1] not in visited:
                             queue.append(resolved)
                 elif node.module:
-                    for resolved in _resolve_absolute_import(node.module, search_dirs, dep_path):
+                    for resolved in _resolve_absolute_import(
+                        node.module,
+                        search_dirs,
+                        dep_path,
+                        alias_names=[alias.name for alias in node.names],
+                    ):
                         if resolved[1] not in visited:
                             queue.append(resolved)
 
     _load_callable(entrypoint_path, attr_name, search_dirs)
+    canonical_normalizer: str | None = None
+    if norm_path is not None and norm_attr is not None:
+        _load_callable(norm_path, norm_attr, search_dirs)
+        canonical_normalizer = f"{visited[norm_path]['relpath_or_key']}:{norm_attr}"
     dependencies = sorted(
         visited.values(),
         key=lambda item: (item["relpath_or_key"], item["module"]),
@@ -346,14 +456,15 @@ def analyze_plugin_entry(
     entrypoint_sha256 = visited[entrypoint_path]["sha256"]
     dependencies_hash = _sha256_json(dependencies)
     canonical_entrypoint = f"{visited[entrypoint_path]['relpath_or_key']}:{attr_name}"
-    plugin_id = _sha256_json(
-        {
-            "family": family,
-            "entrypoint": canonical_entrypoint,
-            "entrypoint_sha256": entrypoint_sha256,
-            "dependencies_hash": dependencies_hash,
-        }
-    )
+    plugin_id_payload: dict[str, Any] = {
+        "family": family,
+        "entrypoint": canonical_entrypoint,
+        "entrypoint_sha256": entrypoint_sha256,
+        "dependencies_hash": dependencies_hash,
+    }
+    if canonical_normalizer is not None:
+        plugin_id_payload["normalize_parameters"] = canonical_normalizer
+    plugin_id = _sha256_json(plugin_id_payload)
     return {
         "family": family,
         "plugin_id": plugin_id,
@@ -364,12 +475,20 @@ def analyze_plugin_entry(
         "declared_dependencies": list(declared_dependencies),
         "entrypoint_path": str(entrypoint_path),
         "base_dir": str(base_dir),
+        **(
+            {
+                "normalize_parameters": canonical_normalizer,
+                "normalize_parameters_path": str(norm_path),
+            }
+            if canonical_normalizer is not None and norm_path is not None
+            else {}
+        ),
     }
 
 
 def public_plugin_metadata(entry: Mapping[str, Any]) -> dict[str, Any]:
     """Return the deterministic, path-free plugin identity record."""
-    return {
+    metadata: dict[str, Any] = {
         "plugin_id": str(entry["plugin_id"]),
         "family": str(entry["family"]),
         "entrypoint": str(entry["entrypoint"]),
@@ -377,6 +496,9 @@ def public_plugin_metadata(entry: Mapping[str, Any]) -> dict[str, Any]:
         "dependencies": [dict(dep) for dep in entry["dependencies"]],
         "dependencies_hash": str(entry["dependencies_hash"]),
     }
+    if entry.get("normalize_parameters"):
+        metadata["normalize_parameters"] = str(entry["normalize_parameters"])
+    return metadata
 
 
 def _load_config_file(config_path: Path) -> list[dict[str, Any]]:
@@ -408,6 +530,7 @@ def _load_config_file(config_path: Path) -> list[dict[str, Any]]:
         family = item.get("family")
         entrypoint = item.get("entrypoint")
         declared = item.get("declared_dependencies", [])
+        norm_spec = item.get("normalize_parameters")
         if not isinstance(declared, list):
             raise PluginError(
                 "PLUGIN_DEPENDENCY_UNBINDABLE",
@@ -419,6 +542,7 @@ def _load_config_file(config_path: Path) -> list[dict[str, Any]]:
                 entrypoint,
                 base_dir=resolved.parent,
                 declared_dependencies=declared,
+                normalize_parameters=norm_spec,
             )
         )
     return entries
@@ -496,6 +620,7 @@ def verify_plugin_identity(
         entry["entrypoint"],
         base_dir=Path(entry["base_dir"]),
         declared_dependencies=entry.get("declared_dependencies", ()),
+        normalize_parameters=entry.get("normalize_parameters"),
     )
     if (
         fresh["plugin_id"] != frozen_plugin.get("plugin_id")
@@ -514,6 +639,44 @@ def verify_plugin_identity(
             },
         )
     return fresh
+
+
+def normalize_plugin_parameters(
+    entry: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize plugin parameters via declared/attribute normalizer or deterministic JSON fallback."""
+    base_dir = Path(entry["base_dir"])
+    normalizer: Callable[[dict[str, Any]], Any] | None = None
+    norm_spec = entry.get("normalize_parameters")
+    if isinstance(norm_spec, str) and norm_spec.strip():
+        norm_target, norm_attr = _parse_entrypoint(norm_spec)
+        norm_path_raw = entry.get("normalize_parameters_path")
+        norm_path = (
+            Path(norm_path_raw)
+            if isinstance(norm_path_raw, str) and norm_path_raw
+            else _resolve_target_path(norm_target, base_dir)
+        )
+        normalizer = _load_callable(norm_path, norm_attr, [norm_path.parent, base_dir])
+    else:
+        entrypoint_path = Path(entry["entrypoint_path"])
+        _, attr_name = _parse_entrypoint(entry["entrypoint"])
+        factory = _load_callable(entrypoint_path, attr_name, [entrypoint_path.parent, base_dir])
+        candidate = getattr(factory, "normalize_parameters", None)
+        if callable(candidate):
+            normalizer = candidate
+
+    raw_normalized: Any = dict(parameters)
+    if normalizer is not None:
+        raw_normalized = normalizer(dict(parameters))
+        if not isinstance(raw_normalized, Mapping):
+            raise ValueError("Plugin parameter normalizer must return a JSON object.")
+        if any(not isinstance(key, str) for key in raw_normalized):
+            raise ValueError("Normalized plugin parameter keys must be strings.")
+    try:
+        return json.loads(json.dumps(raw_normalized, allow_nan=False))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid normalized plugin parameters: {error}") from error
 
 
 def make_plugin_strategy(

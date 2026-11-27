@@ -71,6 +71,9 @@ class _Tick:
         calendar: str | Path,
         data: str | Path,
         corrections_store: str | Path | None,
+        *,
+        plugin_config: str | Path | None = None,
+        plugin_specs: list[str] | tuple[str, ...] = (),
     ) -> dict[str, Any]:
         report: dict[str, Any] = {"target_date": None, "update": None}
         try:
@@ -157,6 +160,8 @@ class _Tick:
                 corrections_store=corrections_store,
                 expected_sessions=tuple(sessions[start_index:through + 1]),
                 expected_data_kind=self.scope,
+                plugin_config=plugin_config,
+                plugin_specs=plugin_specs,
             )
         except shadow.ShadowRejection as error:
             self.error(error, target)
@@ -272,7 +277,14 @@ def tick(
         with (database.directory / "schedule.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             run = _Tick(database, clock)
-            result = run.run(Path(store), calendar, data, corrections_store)
+            result = run.run(
+                Path(store),
+                calendar,
+                data,
+                corrections_store,
+                plugin_config=plugin_config,
+                plugin_specs=plugin_specs,
+            )
     finally:
         database.close()
     return {

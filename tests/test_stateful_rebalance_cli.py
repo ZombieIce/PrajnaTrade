@@ -21,7 +21,7 @@ from prajnatrade.decision_window import (
     parse_strategy_output,
 )
 from prajnatrade.lot_execution import ACTUAL_OPEN_LOT_RULES
-from prajnatrade.shadow import Ledger, ShadowError, verify_or_migrate_ledger
+from prajnatrade.shadow import Ledger, ShadowRejection, verify_or_migrate_ledger
 from prajnatrade.snapshot_baseline import run_partition_strategy
 from prajnatrade.trading_status import CARRY_FORWARD_SUSPENDED_VALUATION, CASH, ETF_SYMBOLS
 
@@ -447,7 +447,7 @@ def test_shadow_legacy_ledger_migration_reconstructible_and_ambiguous(tmp_path: 
     }
     db_bad.commit_day("rel-v1", "rel-v1", "2024-01-31", bad_res, None, "2024-01-31", "enabled", "2024-01-31T16:00:00+08:00")
 
-    with pytest.raises(ShadowError) as exc_info:
+    with pytest.raises(ShadowRejection) as exc_info:
         verify_or_migrate_ledger(ledger_bad, "rel-v1")
     assert exc_info.value.code == "STATE_NOT_UNIQUELY_RECONSTRUCTIBLE"
     # Public CLI also fails closed with STATE_NOT_UNIQUELY_RECONSTRUCTIBLE
@@ -745,3 +745,169 @@ def test_shadow_own_initial_account_warmup_and_restart_idempotency(tmp_path: Pat
     assert days[1]["result"]["cash"] == pytest.approx(10000.0, abs=1e-8)
     assert days[1]["result"]["positions"][sym_a]["quantity"] == pytest.approx(1000.0, abs=1e-8)
     assert days[1]["result"]["strategy_state"]["rebalance_anchor_date"] == full_cal[2]
+    # Spec #6: lot order submitted_at must match decision_cutoff (15:30:00+08:00), not hardcoded 15:00
+    assert days[0]["result"]["next_orders"][0]["submitted_at"] == f"{full_cal[2]}T15:30:00+08:00"
+
+
+def test_discovery_actual_open_lot_without_decision_policy_supports_structured_output() -> None:
+    """Spec #5: actual-open-lot-v1 without decision_policy parses structured dicts & passes state."""
+    sym_a = ETF_SYMBOLS[0]
+    sessions = ["2024-01-30", "2024-01-31", "2024-02-01"]
+    data = _make_bars_and_derived(sessions)
+    seen_states: list[dict] = []
+
+    def structured_strategy(history, state):
+        seen_states.append(dict(state))
+        if state["signal_date"] == "2024-01-30":
+            return {
+                "weights": {sym_a: 0.20, CASH: 0.80},
+                "fixed_amounts": {sym_a: 3000.0},
+                "purpose": "monthly",
+                "cycle": "2024-01",
+            }
+        return None
+
+    result = run_partition_strategy(
+        data,
+        "snap-lot-nodec",
+        "hash-lot-nodec",
+        structured_strategy,
+        partition_name="discovery",
+        initial_cash=10000.0,
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+        signal_window_sessions=1,
+        execution_rule_version=ACTUAL_OPEN_LOT_RULES,
+        lot_sizes={s: 100 for s in ETF_SYMBOLS},
+        symbol_order=ETF_SYMBOLS,
+    )
+    assert seen_states and "rebalance_anchor_date" in seen_states[0]
+    assert seen_states[0]["prior_close_weights"] is not None
+    assert len(result["fills"]) == 1
+    assert result["fills"][0]["quantity"] == pytest.approx(300.0)
+    assert result["strategy_state"]["rebalance_anchor_date"] == "2024-01-30"
+    assert pytest.approx(result["strategy_state"]["last_monthly_filled_target"][sym_a]) == 0.20
+
+
+def test_monthly_deferral_non_scheduled_day_and_month_end_not_executed() -> None:
+    """Spec #7: pause on non-scheduled day does not trigger deferral; final month day closes not_executed."""
+    sessions = [
+        "2024-02-01",  # month_session=1 (clean, strategy emits None)
+        "2024-02-02",  # month_session=2 (PAUSED -> non-scheduled day, must NOT trigger deferral!)
+        "2024-02-05",  # month_session=3 (clean -> deferred_monthly must be False!)
+        "2024-03-01",  # month_session=1 (PAUSED -> scheduled day, triggers deferral)
+        "2024-03-04",  # month_session=2 (final session in March, PAUSED -> records not_executed on 03-04!)
+        "2024-04-01",  # month_session=1 (April)
+    ]
+    data = _make_bars_and_derived(
+        sessions,
+        late_close_days={"2024-02-02", "2024-03-01", "2024-03-04"},
+    )
+    seen_states: dict[str, dict] = {}
+
+    def strategy(history, state):
+        seen_states[state["signal_date"]] = dict(state)
+        return None
+
+    policy = normalize_decision_policy(AFTER_CLOSE_COMMON_POLICY, monthly_deferral=True)
+    result = run_partition_strategy(
+        data,
+        "snap-def",
+        "hash-def",
+        strategy,
+        partition_name="discovery",
+        initial_cash=10000.0,
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+        signal_window_sessions=1,
+        execution_rule_version=ACTUAL_OPEN_LOT_RULES,
+        decision_policy=policy,
+        history_requirements=[{"id": "lookback", "observations": 1, "mode": "valid_observations"}],
+        lot_sizes={s: 100 for s in ETF_SYMBOLS},
+        symbol_order=ETF_SYMBOLS,
+    )
+    # Feb pause on month_session=2 must NOT trigger deferral
+    assert seen_states["2024-02-05"]["deferred_monthly"] is False
+    assert all(d["cycle"] != "2024-02" for d in result["monthly_deferrals"])
+    # March pause on month_session=1 with unrecovered final March day records exactly one not_executed
+    mar_defs = [d for d in result["monthly_deferrals"] if d["cycle"] == "2024-03"]
+    assert len(mar_defs) == 1
+    assert mar_defs[0]["status"] == "not_executed"
+    assert mar_defs[0]["scheduled_date"] == "2024-03-01"
+
+
+def test_legacy_migration_rejects_multiple_untyped_rebalances_and_zero_trade(tmp_path: Path) -> None:
+    """Spec #8: multiple untyped legacy rebalances (filled or zero-trade) fail closed."""
+    sym_a, sym_b = ETF_SYMBOLS[0], ETF_SYMBOLS[1]
+
+    # Case 1: two filled legacy signals without purpose -> ambiguous last_monthly_filled_target
+    ledger_multi = tmp_path / "ledger_multi"
+    db = Ledger(ledger_multi)
+    base_day = {
+        "schema_version": 1,
+        "kind": "shadow_day",
+        "version_id": "rel-m",
+        "status": "committed",
+        "fills": [],
+        "cash": 10000.0,
+        "positions": {s: {"quantity": 0.0, "market_value": 0.0} for s in ETF_SYMBOLS},
+        "nav": 10000.0,
+        "signal": None,
+        "next_orders": [],
+        "orders": [],
+    }
+    db.commit_day(
+        "rel-m", "rel-m", "2024-01-30",
+        {**base_day, "date": "2024-01-30", "signal": {"date": "2024-01-30", "target_weights": {sym_a: 0.2, CASH: 0.8}},
+         "next_orders": [{"order_id": "o1", "symbol": sym_a, "target_weight": 0.2, "deadline": "2024-01-31T09:30:00+08:00"}]},
+        None, "2024-01-30", "enabled", "2024-01-30T16:00:00+08:00",
+    )
+    db.commit_day(
+        "rel-m", "rel-m", "2024-01-31",
+        {**base_day, "date": "2024-01-31",
+         "orders": [{"order_id": "o1", "symbol": sym_a, "signal_date": "2024-01-30", "target_weight": 0.2, "status": "filled"}],
+         "signal": {"date": "2024-01-31", "target_weights": {sym_b: 0.3, CASH: 0.7}},
+         "next_orders": [{"order_id": "o2", "symbol": sym_b, "target_weight": 0.3, "deadline": "2024-02-01T09:30:00+08:00"}]},
+        "2024-01-30", "2024-01-30", "enabled", "2024-01-31T16:00:00+08:00",
+    )
+    db.commit_day(
+        "rel-m", "rel-m", "2024-02-01",
+        {**base_day, "date": "2024-02-01",
+         "orders": [{"order_id": "o2", "symbol": sym_b, "signal_date": "2024-01-31", "target_weight": 0.3, "status": "filled"}]},
+        "2024-01-31", "2024-01-30", "enabled", "2024-02-01T16:00:00+08:00",
+    )
+    db.close()
+
+    with pytest.raises(ShadowRejection) as exc_info:
+        verify_or_migrate_ledger(ledger_multi, "rel-m")
+    assert exc_info.value.code == "STATE_NOT_UNIQUELY_RECONSTRUCTIBLE"
+
+    # Case 2: one untyped fill + one untyped zero-trade signal -> also fails closed
+    ledger_zt = tmp_path / "ledger_zt"
+    db2 = Ledger(ledger_zt)
+    db2.commit_day(
+        "rel-z", "rel-z", "2024-01-30",
+        {**base_day, "version_id": "rel-z", "date": "2024-01-30",
+         "signal": {"date": "2024-01-30", "target_weights": {sym_a: 0.2, CASH: 0.8}},
+         "next_orders": [{"order_id": "o1", "symbol": sym_a, "target_weight": 0.2, "deadline": "2024-01-31T09:30:00+08:00"}]},
+        None, "2024-01-30", "enabled", "2024-01-30T16:00:00+08:00",
+    )
+    db2.commit_day(
+        "rel-z", "rel-z", "2024-01-31",
+        {**base_day, "version_id": "rel-z", "date": "2024-01-31",
+         "orders": [{"order_id": "o1", "symbol": sym_a, "signal_date": "2024-01-30", "target_weight": 0.2, "status": "filled"}],
+         "signal": {"date": "2024-01-31", "target_weights": {sym_a: 0.205, CASH: 0.795}},
+         "next_orders": []},
+        "2024-01-30", "2024-01-30", "enabled", "2024-01-31T16:00:00+08:00",
+    )
+    db2.commit_day(
+        "rel-z", "rel-z", "2024-02-01",
+        {**base_day, "version_id": "rel-z", "date": "2024-02-01", "orders": []},
+        "2024-01-31", "2024-01-30", "enabled", "2024-02-01T16:00:00+08:00",
+    )
+    db2.close()
+
+    with pytest.raises(ShadowRejection) as exc_info2:
+        verify_or_migrate_ledger(ledger_zt, "rel-z")
+    assert exc_info2.value.code == "STATE_NOT_UNIQUELY_RECONSTRUCTIBLE"
+

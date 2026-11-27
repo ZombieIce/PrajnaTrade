@@ -60,7 +60,6 @@ def _runtime_components(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
-    plugins_active: bool = False,
     decision_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
     directory = Path(__file__).parent
@@ -83,8 +82,6 @@ def _runtime_components(
         files += ("valuation.py",)
     if history_policy is not None:
         files += ("experiment.py",)
-    if plugins_active:
-        files += ("plugins.py",)
     if decision_policy is not None:
         files += ("decision_window.py",)
     executor = dict(strategy_executor) if strategy_executor is not None else {"kind": "none"}
@@ -118,7 +115,6 @@ def runtime_identity(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
-    plugins_active: bool = False,
     decision_policy: Mapping[str, Any] | None = None,
 ) -> str:
     """Fingerprint the accounting dependencies and optional strategy executor.
@@ -131,12 +127,10 @@ def runtime_identity(
         strategy_executor,
         execution_rules=execution_rules,
         history_policy=history_policy,
-        plugins_active=plugins_active,
         decision_policy=decision_policy,
     )
     if (
         history_policy is None
-        and not plugins_active
         and decision_policy is None
         and execution_rules is not None
         and "version" not in execution_rules
@@ -152,7 +146,6 @@ def runtime_matches(
     *,
     execution_rules: Mapping[str, Any] | None = None,
     history_policy: Mapping[str, Any] | None = None,
-    plugins_active: bool = False,
     decision_policy: Mapping[str, Any] | None = None,
 ) -> bool:
     """Check the exact current runtime or a compatible legacy dependency set."""
@@ -160,14 +153,12 @@ def runtime_matches(
         strategy_executor,
         execution_rules=execution_rules,
         history_policy=history_policy,
-        plugins_active=plugins_active,
         decision_policy=decision_policy,
     )
     if stored == _fingerprint(dependencies):
         return True
     if (
         history_policy is not None
-        or plugins_active
         or decision_policy is not None
         or "trading_status.py" in dependencies
         or "valuation_policy" in dependencies
@@ -393,6 +384,8 @@ def project_init(project: Path) -> dict[str, object]:
                 dependencies_json TEXT NOT NULL,
                 dependencies_hash TEXT NOT NULL,
                 declared_dependencies_json TEXT NOT NULL DEFAULT '[]',
+                normalize_parameters TEXT,
+                normalize_parameters_path TEXT,
                 registered_at TEXT NOT NULL
             )"""
         )
@@ -443,8 +436,9 @@ def register_plugins(
                 """INSERT INTO registered_plugins (
                     family, plugin_id, entrypoint, entrypoint_path, base_dir,
                     entrypoint_sha256, dependencies_json, dependencies_hash,
-                    declared_dependencies_json, registered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    declared_dependencies_json, normalize_parameters,
+                    normalize_parameters_path, registered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(family) DO UPDATE SET
                     plugin_id = excluded.plugin_id,
                     entrypoint = excluded.entrypoint,
@@ -454,6 +448,8 @@ def register_plugins(
                     dependencies_json = excluded.dependencies_json,
                     dependencies_hash = excluded.dependencies_hash,
                     declared_dependencies_json = excluded.declared_dependencies_json,
+                    normalize_parameters = excluded.normalize_parameters,
+                    normalize_parameters_path = excluded.normalize_parameters_path,
                     registered_at = excluded.registered_at""",
                 (
                     entry["family"],
@@ -465,6 +461,8 @@ def register_plugins(
                     json.dumps(entry["dependencies"], sort_keys=True, separators=(",", ":")),
                     entry["dependencies_hash"],
                     json.dumps(entry.get("declared_dependencies", [])),
+                    entry.get("normalize_parameters"),
+                    entry.get("normalize_parameters_path"),
                     now,
                 ),
             )
@@ -481,7 +479,8 @@ def list_registered_plugins(project: Path) -> dict[str, Any]:
         connection.row_factory = sqlite3.Row
         _ensure_project_schema(connection)
         rows = connection.execute(
-            "SELECT family, plugin_id, entrypoint, entrypoint_sha256, dependencies_json, dependencies_hash "
+            "SELECT family, plugin_id, entrypoint, entrypoint_sha256, dependencies_json, "
+            "dependencies_hash, normalize_parameters "
             "FROM registered_plugins ORDER BY family"
         ).fetchall()
     return {
@@ -495,6 +494,11 @@ def list_registered_plugins(project: Path) -> dict[str, Any]:
                 "entrypoint_sha256": row["entrypoint_sha256"],
                 "dependencies": json.loads(row["dependencies_json"]),
                 "dependencies_hash": row["dependencies_hash"],
+                **(
+                    {"normalize_parameters": row["normalize_parameters"]}
+                    if row["normalize_parameters"]
+                    else {}
+                ),
             }
             for row in rows
         ],
@@ -511,7 +515,8 @@ def load_project_plugin_registry(project: Path) -> dict[str, dict[str, Any]]:
         _ensure_project_schema(connection)
         rows = connection.execute(
             "SELECT family, plugin_id, entrypoint, entrypoint_path, base_dir, "
-            "entrypoint_sha256, dependencies_json, dependencies_hash, declared_dependencies_json "
+            "entrypoint_sha256, dependencies_json, dependencies_hash, declared_dependencies_json, "
+            "normalize_parameters, normalize_parameters_path "
             "FROM registered_plugins ORDER BY family"
         ).fetchall()
     return {
@@ -525,6 +530,14 @@ def load_project_plugin_registry(project: Path) -> dict[str, dict[str, Any]]:
             "dependencies": json.loads(row["dependencies_json"]),
             "dependencies_hash": row["dependencies_hash"],
             "declared_dependencies": json.loads(row["declared_dependencies_json"]),
+            **(
+                {
+                    "normalize_parameters": row["normalize_parameters"],
+                    "normalize_parameters_path": row["normalize_parameters_path"],
+                }
+                if row["normalize_parameters"]
+                else {}
+            ),
         }
         for row in rows
     }
@@ -882,9 +895,20 @@ def _ensure_project_schema(connection: sqlite3.Connection) -> None:
             dependencies_json TEXT NOT NULL,
             dependencies_hash TEXT NOT NULL,
             declared_dependencies_json TEXT NOT NULL DEFAULT '[]',
+            normalize_parameters TEXT,
+            normalize_parameters_path TEXT,
             registered_at TEXT NOT NULL
         )"""
     )
+    plugin_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(registered_plugins)").fetchall()
+    }
+    if "normalize_parameters" not in plugin_columns:
+        connection.execute("ALTER TABLE registered_plugins ADD COLUMN normalize_parameters TEXT")
+    if "normalize_parameters_path" not in plugin_columns:
+        connection.execute(
+            "ALTER TABLE registered_plugins ADD COLUMN normalize_parameters_path TEXT"
+        )
 
 
 class ProtocolError(Exception):
@@ -1327,10 +1351,9 @@ def _run_attempt(
         rules = config["execution_rules"]
         policy = config.get("history_policy")
         decision_policy = config.get("decision_policy")
-        plugins_active = "plugins.py" in config.get("runtime_dependencies", {})
         if not runtime_matches(
             config["runtime"], executor_config, execution_rules=rules, history_policy=policy,
-            plugins_active=plugins_active, decision_policy=decision_policy,
+            decision_policy=decision_policy,
         ):
             raise ValueError("Campaign runtime fingerprint mismatch.")
         spec: dict[str, Any] = {

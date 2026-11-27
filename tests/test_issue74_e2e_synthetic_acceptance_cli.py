@@ -30,10 +30,6 @@ FEE_RATE = 0.0005
 LOT_SIZE = 100
 
 
-def _ok(*args: str, agent: bool = False) -> dict:
-    return ok(agent_cli(*args) if agent else cli(*args))
-
-
 def _month_boundary_forward_sessions() -> tuple[list[str], list[str]]:
     """Return 2 warmup dates + 7 active forward dates spanning a calendar month boundary.
 
@@ -298,40 +294,44 @@ def test_spec74_full_e2e_synthetic_acceptance_cli(tmp_path: Path) -> None:
     trusted = tmp_path / "trusted"
 
     # 1. Seal schema-3 snapshot
-    sealed = _ok("snapshot", "seal", "--input", str(snap_input), "--store", str(snap_store))
+    sealed = ok(cli("snapshot", "seal", "--input", str(snap_input), "--store", str(snap_store)))
     snapshot_id = sealed["snapshot_id"]
 
     # 2. Init project & register local plugin (operator only; agent forbidden)
-    _ok("project", "init", "--project", str(project))
+    ok(cli("project", "init", "--project", str(project)))
     agent_reg = agent_cli(
         "plugin", "register", "--project", str(project), "--plugin-config", str(plugin_config),
     )
     assert agent_reg.returncode != 0
-    reg = _ok(
-        "plugin", "register",
-        "--project", str(project),
-        "--plugin-config", str(plugin_config),
+    reg = ok(
+        cli(
+            "plugin", "register",
+            "--project", str(project),
+            "--plugin-config", str(plugin_config),
+        )
     )
     assert reg["plugins"][0]["family"] == "synth_stateful_monthly"
 
     # 3. Create Campaign with all Spec #74 opt-in policies (lot=100, fee=5bps)
-    campaign = _ok(
-        "campaign", "create",
-        "--project", str(project),
-        "--store", str(snap_store),
-        "--snapshot-id", snapshot_id,
-        "--attempts", "4",
-        "--max-seconds", "30",
-        "--initial-cash", str(int(INITIAL_CASH)),
-        "--transaction-cost-bps", str(FEE_BPS),
-        "--slippage-bps", "0",
-        "--execution-rules", "actual-open-lot-v1",
-        "--valuation-policy", "carry-forward-suspended-v1",
-        "--decision-policy", "after-close-common-v1",
-        "--monthly-deferral",
-        "--lot-size", str(LOT_SIZE),
-        "--discovery-warmup-sessions", "2",
-        "--discovery-split", "70/30",
+    campaign = ok(
+        cli(
+            "campaign", "create",
+            "--project", str(project),
+            "--store", str(snap_store),
+            "--snapshot-id", snapshot_id,
+            "--attempts", "4",
+            "--max-seconds", "30",
+            "--initial-cash", str(int(INITIAL_CASH)),
+            "--transaction-cost-bps", str(FEE_BPS),
+            "--slippage-bps", "0",
+            "--execution-rules", "actual-open-lot-v1",
+            "--valuation-policy", "carry-forward-suspended-v1",
+            "--decision-policy", "after-close-common-v1",
+            "--monthly-deferral",
+            "--lot-size", str(LOT_SIZE),
+            "--discovery-warmup-sessions", "2",
+            "--discovery-split", "70/30",
+        )
     )
     campaign_id = campaign["campaign_id"]
 
@@ -351,42 +351,46 @@ def test_spec74_full_e2e_synthetic_acceptance_cli(tmp_path: Path) -> None:
     assert unreg_res.returncode != 0
 
     # 4. Submit Discovery experiments: V1 (local stateful plugin) and V2 (built-in equal_weight comparator)
-    exp_v1 = _ok(
-        "experiment", "submit",
-        "--project", str(project),
-        "--plugin-config", str(plugin_config),
-        "--input", str(
-            write_json(
-                tmp_path / "exp-v1.json",
-                {
-                    "schema_version": 1,
-                    "campaign_id": campaign_id,
-                    "submission_id": "sub-e2e-v1",
-                    "hypothesis": "Spec 74 E2E stateful monthly plugin",
-                    "strategy": {"family": "synth_stateful_monthly"},
-                    "parameters": {},
-                },
-            )
-        ),
+    exp_v1 = ok(
+        cli(
+            "experiment", "submit",
+            "--project", str(project),
+            "--plugin-config", str(plugin_config),
+            "--input", str(
+                write_json(
+                    tmp_path / "exp-v1.json",
+                    {
+                        "schema_version": 1,
+                        "campaign_id": campaign_id,
+                        "submission_id": "sub-e2e-v1",
+                        "hypothesis": "Spec 74 E2E stateful monthly plugin",
+                        "strategy": {"family": "synth_stateful_monthly"},
+                        "parameters": {},
+                    },
+                )
+            ),
+        )
     )
     assert exp_v1["status"] == "succeeded"
 
-    exp_v2 = _ok(
-        "experiment", "submit",
-        "--project", str(project),
-        "--input", str(
-            write_json(
-                tmp_path / "exp-v2.json",
-                {
-                    "schema_version": 1,
-                    "campaign_id": campaign_id,
-                    "submission_id": "sub-e2e-v2",
-                    "hypothesis": "Spec 74 built-in equal_weight control",
-                    "strategy": {"family": "equal_weight"},
-                    "parameters": {},
-                },
-            )
-        ),
+    exp_v2 = ok(
+        cli(
+            "experiment", "submit",
+            "--project", str(project),
+            "--input", str(
+                write_json(
+                    tmp_path / "exp-v2.json",
+                    {
+                        "schema_version": 1,
+                        "campaign_id": campaign_id,
+                        "submission_id": "sub-e2e-v2",
+                        "hypothesis": "Spec 74 built-in equal_weight control",
+                        "strategy": {"family": "equal_weight"},
+                        "parameters": {},
+                    },
+                )
+            ),
+        )
     )
     assert exp_v2["status"] == "succeeded"
 
@@ -404,39 +408,45 @@ def test_spec74_full_e2e_synthetic_acceptance_cli(tmp_path: Path) -> None:
     ver_v2 = ok(submit_version(project, round_id, "ver-2", write_json(tmp_path / "ver-2.json", version_input(exp_v2["experiment_id"]))))
     v1_id, v2_id = ver_v1["version_id"], ver_v2["version_id"]
 
-    val_v1 = _ok(
-        "round", "validate",
-        "--project", str(project),
-        "--store", str(trusted),
-        "--snapshot-store", str(snap_store),
-        "--round-id", round_id,
-        "--version-id", v1_id,
-        "--plugin-config", str(plugin_config),
+    val_v1 = ok(
+        cli(
+            "round", "validate",
+            "--project", str(project),
+            "--store", str(trusted),
+            "--snapshot-store", str(snap_store),
+            "--round-id", round_id,
+            "--version-id", v1_id,
+            "--plugin-config", str(plugin_config),
+        )
     )
     assert val_v1["outcome"] == "passed"
     assert val_v1["usage"]["sequence"] == 1
 
     # Platform-fix revalidation with identical plugin & frozen rules -> zero allowance increment
-    reval_ok = _ok(
-        "round", "revalidate",
-        "--project", str(project),
-        "--store", str(trusted),
-        "--snapshot-store", str(snap_store),
-        "--round-id", round_id,
-        "--version-id", v1_id,
-        "--reason", "platform_fix_check",
-        "--plugin-config", str(plugin_config),
+    reval_ok = ok(
+        cli(
+            "round", "revalidate",
+            "--project", str(project),
+            "--store", str(trusted),
+            "--snapshot-store", str(snap_store),
+            "--round-id", round_id,
+            "--version-id", v1_id,
+            "--reason", "platform_fix_check",
+            "--plugin-config", str(plugin_config),
+        )
     )
     assert reval_ok["outcome"] == "passed"
     assert ok(round_status(project, round_id))["validation_allowance"]["automatic_used"] == 1
 
-    val_v2 = _ok(
-        "round", "validate",
-        "--project", str(project),
-        "--store", str(trusted),
-        "--snapshot-store", str(snap_store),
-        "--round-id", round_id,
-        "--version-id", v2_id,
+    val_v2 = ok(
+        cli(
+            "round", "validate",
+            "--project", str(project),
+            "--store", str(trusted),
+            "--snapshot-store", str(snap_store),
+            "--round-id", round_id,
+            "--version-id", v2_id,
+        )
     )
     assert val_v2["outcome"] == "passed"
     assert val_v2["usage"]["sequence"] == 2
@@ -459,12 +469,14 @@ def test_spec74_full_e2e_synthetic_acceptance_cli(tmp_path: Path) -> None:
 
     # 7. Verify shadow export-feed from Discovery payload (zero future leakage)
     exported_path = tmp_path / "exported-feed.json"
-    exported = _ok(
-        "shadow", "export-feed",
-        "--store", str(snap_store),
-        "--snapshot-id", snapshot_id,
-        "--through-date", sessions[5],
-        "--output", str(exported_path),
+    exported = ok(
+        cli(
+            "shadow", "export-feed",
+            "--store", str(snap_store),
+            "--snapshot-id", snapshot_id,
+            "--through-date", sessions[5],
+            "--output", str(exported_path),
+        )
     )
     assert exported["schema_version"] == 3
     exported_body = json.loads(exported_path.read_text(encoding="utf-8"))
@@ -528,8 +540,8 @@ def test_spec74_full_e2e_synthetic_acceptance_cli(tmp_path: Path) -> None:
     # 9. Hand-reconcile V1 day-by-day report against exact arithmetic
     rep_v1_path = tmp_path / "report-v1.json"
     rep_v2_path = tmp_path / "report-v2.json"
-    rep_v1 = _ok("shadow", "report", "--ledger", str(ledger_dir), "--version", rel_v1, "--output", str(rep_v1_path))
-    rep_v2 = _ok("shadow", "report", "--ledger", str(ledger_dir), "--version", rel_v2, "--output", str(rep_v2_path))
+    rep_v1 = ok(cli("shadow", "report", "--ledger", str(ledger_dir), "--version", rel_v1, "--output", str(rep_v1_path)))
+    rep_v2 = ok(cli("shadow", "report", "--ledger", str(ledger_dir), "--version", rel_v2, "--output", str(rep_v2_path)))
     assert rep_v1["days"] == 7
     assert rep_v2["days"] == 7
 
@@ -539,6 +551,7 @@ def test_spec74_full_e2e_synthetic_acceptance_cli(tmp_path: Path) -> None:
     assert days_v1[d1]["nav"] == pytest.approx(100_000.0, abs=1e-8)
     assert days_v1[d1]["signal"]["purpose"] == "initial"
     assert days_v1[d1]["next_orders"][0]["order_sizing_mode"] == "open_weight"
+    assert days_v1[d1]["next_orders"][0]["submitted_at"] == f"{d1}T15:30:00+08:00"
     assert days_v1[d1]["strategy_state"]["rebalance_anchor_date"] is None
 
     # D2 (M-end): SYM_A gaps to 12.00 on open!
@@ -659,7 +672,7 @@ def test_spec74_full_e2e_synthetic_acceptance_cli(tmp_path: Path) -> None:
         or "REVALIDATION_INELIGIBLE" in tampered_body["error"]["code"]
     )
     # Committed Shadow days remain byte-for-byte verifiable even after plugin tampering
-    rep_after = _ok("shadow", "report", "--ledger", str(ledger_dir), "--version", rel_v1, "--output", str(tmp_path / "report-after.json"))
+    rep_after = ok(cli("shadow", "report", "--ledger", str(ledger_dir), "--version", rel_v1, "--output", str(tmp_path / "report-after.json")))
     assert rep_after["days"] == 7
 
     # (b) Unresolved valuation gap (single mutation: remove SYM_C's status_evidence_id on D4 in a fresh ledger)

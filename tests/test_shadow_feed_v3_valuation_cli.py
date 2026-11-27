@@ -198,16 +198,16 @@ def _build_manual_tracking_release(
         "source": "synthetic-calendar",
         "sessions": list(sessions),
     }
-    cal_hash = snapshot._hash(calendar)
-    version_id = snapshot._hash({"strategy": strategy, "rules": execution_rules_obj, "cash": initial_cash})
-    validation_id = snapshot._hash({"val": version_id})
+    cal_hash = snapshot.canonical_hash(calendar)
+    version_id = snapshot.canonical_hash({"strategy": strategy, "rules": execution_rules_obj, "cash": initial_cash})
+    validation_id = snapshot.canonical_hash({"val": version_id})
     receipt_body = {
         "validation_id": validation_id,
         "version_id": version_id,
         "status": "completed",
         "outcome": "passed",
     }
-    receipt_hash = snapshot._hash(receipt_body)
+    receipt_hash = snapshot.canonical_hash(receipt_body)
     receipt = {**receipt_body, "receipt_hash": receipt_hash}
     val_dir = store / "research-loop-validations"
     val_dir.mkdir(parents=True, exist_ok=True)
@@ -278,7 +278,7 @@ def _build_manual_tracking_release(
             "calendar_hash": cal_hash,
         },
     }
-    artifact = {**artifact_body, "artifact_hash": snapshot._hash(artifact_body)}
+    artifact = {**artifact_body, "artifact_hash": snapshot.canonical_hash(artifact_body)}
     store.mkdir(parents=True, exist_ok=True)
     rid = release.register_tracking_version(store, artifact, effective, "synthetic test")
     return {"release_id": rid, "artifact": artifact}
@@ -635,3 +635,114 @@ def test_shadow_backfill_never_rewrites_committed_days_and_detects_frozen_input_
     res_frozen, blocked_frozen = shadow.update(ledger, store, mutated_feed, future_sessions[4], [rid])
     assert blocked_frozen
     assert res_frozen["versions"][0]["reason_code"] == "FROZEN_INPUT_CHANGED"
+
+
+def test_synthetic_v3_partial_halt_resumed_and_full_day_parity(tmp_path: Path) -> None:
+    """Synthetic schema-3 feed supports resumed partial_halt close & full-day partial_halt carry-forward."""
+    payload = _v3_feed_from_fixture(8, data_kind="synthetic")
+    sessions = [row["date"] for row in payload["calendar"]]
+    for idx, day in enumerate(sessions):
+        for sym in shadow.ETF_SYMBOLS:
+            row = raw_row(payload, day, sym)
+            row["open"] = 10.0
+            row["high"] = 10.0
+            row["low"] = 10.0
+            row["close"] = 10.0
+            row["open_available_at"] = f"{day}T09:30:00+08:00"
+            row["close_available_at"] = f"{day}T15:00:00+08:00"
+            row["available_at"] = f"{day}T09:30:00+08:00"
+            d_row = next(
+                d for d in payload["derived"] if d["date"] == day and d["symbol"] == sym
+            )
+            d_row["value"] = 10.0 + (0.5 * idx if sym == "511260" else 0.0)
+            d_row["available_at"] = f"{day}T15:00:00+08:00"
+
+    # Day 4: resumed partial_halt on held 511260 (halt 09:30-10:30, close=10.20)
+    resumed = make_actual_open_halt(payload, sessions[4], "511260", open_price=10.10)
+    resumed["high"] = 10.20
+    resumed["low"] = 10.10
+    resumed["close"] = 10.20
+    resumed["volume"] = 500.0
+    resumed["close_available_at"] = f"{sessions[4]}T15:00:00+08:00"
+    resumed["available_at"] = f"{sessions[4]}T15:00:00+08:00"
+
+    # Day 5: full-day partial_halt on held 511260 (halt 09:30-15:00, null OHLC, volume=0, status_evidence_id)
+    full_ph = raw_row(payload, sessions[5], "511260")
+    full_ph["trading_status"] = "partial_halt"
+    full_ph["halt"] = {
+        "start": f"{sessions[5]}T09:30:00+08:00",
+        "end": f"{sessions[5]}T15:00:00+08:00",
+    }
+    full_ph["open"] = None
+    full_ph["high"] = None
+    full_ph["low"] = None
+    full_ph["close"] = None
+    full_ph["volume"] = 0.0
+    full_ph["open_source"] = None
+    full_ph["status_evidence_id"] = STATUS_EVIDENCE
+    full_ph["available_at"] = f"{sessions[5]}T15:00:00+08:00"
+    full_ph["close_available_at"] = None
+
+    # Day 6: resumed normal trading close 10.50
+    raw_row(payload, sessions[6], "511260").update(open=10.40, high=10.50, low=10.40, close=10.50)
+
+    # Re-anchor to future dates so orders persist before 09:30 open deadline
+    base = datetime(2031, 1, 2, tzinfo=UTC).date()
+    date_map = {old: (base + timedelta(days=i)).isoformat() for i, old in enumerate(sessions)}
+    text = json.dumps(payload)
+    for old, new in date_map.items():
+        text = text.replace(old, new)
+    future_payload = json.loads(text)
+    future_sessions = [date_map[s] for s in sessions]
+
+    store = tmp_path / "ph_store"
+    ledger = tmp_path / "ph_ledger"
+    report_out = tmp_path / "ph_report.json"
+    rel = _build_manual_tracking_release(store, future_sessions)
+    rid = rel["release_id"]
+    feed_path = write_feed(tmp_path / "ph_feed.json", future_payload)
+
+    res3, blocked3 = shadow.update(ledger, store, feed_path, future_sessions[3], [rid])
+    assert not blocked3, res3
+    release.pause(store, rid, future_sessions[4], "hold position through partial_halt days")
+    res6, blocked6 = shadow.update(ledger, store, feed_path, future_sessions[6], [rid])
+    assert not blocked6, res6
+
+    d4 = day_record(ledger, rid, report_out, future_sessions[4])["result"]
+    assert d4["positions"]["511260"]["valuation_basis"] == "actual_close"
+    assert d4["positions"]["511260"]["close"] == pytest.approx(10.20)
+    assert d4["nav"] == pytest.approx(1020.0)
+
+    d5 = day_record(ledger, rid, report_out, future_sessions[5])["result"]
+    assert d5["positions"]["511260"]["valuation_basis"] == "carried_forward_prior_close"
+    assert d5["positions"]["511260"]["close"] is None
+    assert d5["positions"]["511260"]["valuation_price"] == pytest.approx(10.20)
+    assert d5["nav"] == pytest.approx(1020.0)
+
+    d6 = day_record(ledger, rid, report_out, future_sessions[6])["result"]
+    assert d6["positions"]["511260"]["valuation_basis"] == "actual_close"
+    assert d6["nav"] == pytest.approx(1050.0)
+
+    # Discovery parity on identical synthetic schema-3 payload
+    disc = snapshot_baseline.run_discovery_strategy(
+        future_payload,
+        "a" * 64,
+        "b" * 64,
+        strategy=make_strategy(
+            {"family": "momentum", "parameters": {"lookback": 2, "top_k": 1, "cash_if_negative": False}}
+        ),
+        data_kind="synthetic",
+        initial_cash=1000.0,
+        transaction_cost_bps=0.0,
+        slippage_bps=0.0,
+        signal_window_sessions=3,
+        execution_rule_version=ACTUAL_OPEN_RULES,
+        valuation_policy_version=CARRY_FORWARD_SUSPENDED_VALUATION,
+    )
+    curve_by_date = {pt["date"]: pt for pt in disc["equity_curve"]}
+    for s in future_sessions[4:7]:
+        s_day = day_record(ledger, rid, report_out, s)["result"]
+        assert curve_by_date[s]["nav"] == pytest.approx(s_day["nav"])
+        assert curve_by_date[s]["market_value"] == pytest.approx(s_day["market_value"])
+        assert curve_by_date[s]["cash"] == pytest.approx(s_day["cash"])
+

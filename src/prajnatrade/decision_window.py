@@ -186,6 +186,7 @@ def select_common_observations(
     history_requirements: Sequence[Mapping[str, Any]],
     *,
     data_kind: str = "synthetic",
+    schema_version: int | None = None,
     symbols: Sequence[str] = ETF_SYMBOLS,
 ) -> dict[str, Any]:
     """Select common valid close observations up to ``decision_date`` at ``decision_cutoff``."""
@@ -208,7 +209,7 @@ def select_common_observations(
         raw = raw_bars.get((decision_date, symbol))
         drv = derived.get((decision_date, symbol))
         confirmed_no_trade, _ = classify_no_trade_for_valuation(
-            raw, cutoff, data_kind=data_kind
+            raw, cutoff, data_kind=data_kind, schema_version=schema_version
         )
         if confirmed_no_trade:
             continue
@@ -507,3 +508,164 @@ def parse_strategy_output(
         "cycle": signal_date[:7],
         "fixed_amounts": None,
     }
+
+
+def initial_strategy_state() -> dict[str, Any]:
+    """Return the canonical initial persisted stateful-rebalance tracking state."""
+    return {
+        "rebalance_anchor_date": None,
+        "last_filled_target": None,
+        "last_monthly_filled_target": None,
+        "previous_order_attempted": None,
+        "monthly_signal_cycle": None,
+        "active_deferral": None,
+        "monthly_deferrals": [],
+    }
+
+
+def scheduled_monthly_session(policy: Mapping[str, Any] | None) -> int:
+    """Return the 1-based monthly trading session index scheduled for monthly decisions."""
+    if isinstance(policy, Mapping) and "monthly_decision_session" in policy:
+        raw = policy["monthly_decision_session"]
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+            return raw
+    return 1
+
+
+def close_expired_deferral(
+    active_deferral: dict[str, Any] | None,
+    monthly_deferrals: Sequence[Mapping[str, Any]],
+    *,
+    current_cycle: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Record ``not_executed`` and clear ``active_deferral`` once the calendar enters a new month."""
+    updated = [dict(item) for item in monthly_deferrals]
+    if active_deferral is not None and active_deferral["cycle"] != current_cycle:
+        updated.append(
+            {
+                "cycle": active_deferral["cycle"],
+                "scheduled_date": active_deferral["scheduled_date"],
+                "actual_signal_date": None,
+                "status": "not_executed",
+                "deferral_reason": active_deferral["deferral_reason"],
+            }
+        )
+        return None, updated
+    return active_deferral, updated
+
+
+def close_month_end_deferral(
+    active_deferral: dict[str, Any] | None,
+    monthly_deferrals: Sequence[Mapping[str, Any]],
+    *,
+    session: str,
+    next_session: str | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Record ``not_executed`` on a month's final trading session when no same-month session remains."""
+    updated = [dict(item) for item in monthly_deferrals]
+    if (
+        active_deferral is not None
+        and active_deferral["cycle"] == session[:7]
+        and next_session is not None
+        and next_session[:7] != session[:7]
+    ):
+        updated.append(
+            {
+                "cycle": active_deferral["cycle"],
+                "scheduled_date": active_deferral["scheduled_date"],
+                "actual_signal_date": None,
+                "status": "not_executed",
+                "deferral_reason": active_deferral["deferral_reason"],
+            }
+        )
+        return None, updated
+    return active_deferral, updated
+
+
+def maybe_trigger_monthly_deferral(
+    *,
+    enabled: bool,
+    active_deferral: dict[str, Any] | None,
+    monthly_signal_cycle: str | None,
+    signal_date: str,
+    sessions: Sequence[str],
+    pause_info: Mapping[str, Any],
+    scheduled_month_session: int = 1,
+    warmup_ready: bool = True,
+) -> dict[str, Any] | None:
+    """Start an intra-month deferral ONLY when paused on the scheduled monthly decision session."""
+    if not enabled or not warmup_ready or active_deferral is not None:
+        return active_deferral
+    if monthly_signal_cycle == signal_date[:7]:
+        return active_deferral
+    month_session, _ = _month_session_and_week_start(signal_date, sessions)
+    if month_session != scheduled_month_session:
+        return active_deferral
+    return {
+        "cycle": signal_date[:7],
+        "scheduled_date": signal_date,
+        "deferral_reason": pause_info.get("reasons") or pause_info.get("code"),
+    }
+
+
+def consume_monthly_deferral(
+    *,
+    active_deferral: dict[str, Any] | None,
+    monthly_deferrals: Sequence[Mapping[str, Any]],
+    purpose: str,
+    signal_date: str,
+    execution_date: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None, list[dict[str, Any]]]:
+    """Consume an active intra-month deferral when a deferred monthly signal is emitted."""
+    updated = [dict(item) for item in monthly_deferrals]
+    if (
+        active_deferral is not None
+        and active_deferral["cycle"] == signal_date[:7]
+        and purpose == "monthly"
+    ):
+        deferral_fields = {
+            "scheduled_date": active_deferral["scheduled_date"],
+            "actual_signal_date": signal_date,
+            "deferral_reason": active_deferral["deferral_reason"],
+        }
+        updated.append(
+            {
+                "cycle": signal_date[:7],
+                "scheduled_date": active_deferral["scheduled_date"],
+                "actual_signal_date": signal_date,
+                "execution_date": execution_date,
+                "status": "executed",
+                "deferral_reason": active_deferral["deferral_reason"],
+            }
+        )
+        return deferral_fields, None, updated
+    return {}, active_deferral, updated
+
+
+def advance_rebalance_anchor(
+    *,
+    rebalance_anchor_date: str | None,
+    last_filled_target: dict[str, float] | None,
+    last_monthly_filled_target: dict[str, float] | None,
+    attempt: Mapping[str, Any],
+    batch_ok: bool,
+    signal_date: str,
+    target_weights: Mapping[str, float],
+    purpose: str,
+) -> tuple[str | None, dict[str, float] | None, dict[str, float] | None, dict[str, Any]]:
+    """Advance rebalance anchor and target history iff the settled order batch completed."""
+    previous_order_attempted = dict(attempt)
+    if not batch_ok:
+        return (
+            rebalance_anchor_date,
+            last_filled_target,
+            last_monthly_filled_target,
+            previous_order_attempted,
+        )
+    new_target = dict(target_weights)
+    new_monthly = (
+        dict(target_weights)
+        if last_monthly_filled_target is None or purpose == "monthly"
+        else last_monthly_filled_target
+    )
+    return signal_date, new_target, new_monthly, previous_order_attempted

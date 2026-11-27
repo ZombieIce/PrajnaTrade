@@ -106,6 +106,7 @@ def classify_no_trade_for_valuation(
     close_cutoff: datetime,
     *,
     data_kind: str,
+    schema_version: int | None = None,
 ) -> tuple[bool, str | None]:
     """Return whether ``row`` confirms full-day no-trade by ``close_cutoff``.
 
@@ -115,7 +116,9 @@ def classify_no_trade_for_valuation(
     """
     if row is None:
         return False, "missing_bar"
-    confirmed_shape, shape_reason = confirmed_no_trade_shape(row, data_kind=data_kind)
+    confirmed_shape, shape_reason = confirmed_no_trade_shape(
+        row, data_kind=data_kind, schema_version=schema_version
+    )
     if confirmed_shape:
         if not available_by(row, close_cutoff):
             available_at = parse_instant(row.get("available_at"))
@@ -279,6 +282,7 @@ def value_carry_forward_session(
     applied_actions_today: Mapping[str, list[dict[str, Any]]],
     *,
     data_kind: str = "synthetic",
+    schema_version: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Value holdings under ``carry-forward-suspended-v1`` (ADR 0003).
 
@@ -290,6 +294,9 @@ def value_carry_forward_session(
     carried_symbols: list[str] = []
     market_value = 0.0
     valid = True
+    allow_partial_halt = data_kind == "real" or (
+        schema_version is not None and schema_version >= 3
+    )
     close_cutoff = datetime.combine(
         datetime.fromisoformat(day).date(), time(23, 59, 59), tzinfo=CN_TZ
     )
@@ -301,13 +308,13 @@ def value_carry_forward_session(
             row = raw_bars.get(symbol)  # type: ignore[arg-type]
         status = row.get("trading_status") if row is not None else None
         markable = status == "trading" or (
-            data_kind == "real" and status == "partial_halt"
+            allow_partial_halt and status == "partial_halt"
         )
         close_conflict = row is not None and (
             row.get("status_conflict") is not None
             or row.get("close_conflict") is not None
             or (
-                data_kind == "real"
+                allow_partial_halt
                 and status == "partial_halt"
                 and halt_conflicts_with_trade(row.get("halt"), day, row)
             )
@@ -372,7 +379,7 @@ def value_carry_forward_session(
             continue
 
         confirmed_no_trade, non_trade_reason = classify_no_trade_for_valuation(
-            row, close_cutoff, data_kind=data_kind
+            row, close_cutoff, data_kind=data_kind, schema_version=schema_version
         )
         if confirmed_no_trade:
             if unresolved.get(symbol):
